@@ -1,0 +1,39 @@
+{
+  "name": "@skillnull/ai-tidu9",
+  "version": "1.0.0",
+  "description": "九门赛博提督 — 专治 AI 跑偏。The Cyber-JiumenTidu for LLMs: Keeping your AI from going rogue.",
+  "keywords": [
+    "ai-pack",
+    "agents-md",
+    "skill",
+    "prompt-contract",
+    "cursor",
+    "claude-code",
+    "codex",
+    "chatgpt"
+  ],
+  "homepage": "https://github.com/skillnull/AI-Tidu9#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com:skillnull/AI-Tidu9.git"
+  },
+  "bugs": {
+    "url": "https://github.com/skillnull/AI-Tidu9/issues"
+  },
+  "license": "MIT",
+  "author": "skillnull",
+  "main": ".ai-tidu9/scripts/install.js",
+  "files": [
+    ".ai-tidu9/",
+    "AGENTS.md"
+  ],
+  "scripts": {
+    "postinstall": "node .ai-tidu9/scripts/install.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
