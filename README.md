@@ -13,12 +13,19 @@ AI-Tidu9 是一个 **AI 规则包** —— 一套基于 [agents.md](https://agen
 - 📦 **Skill 改动即时生效** — 改 `.ai-tidu9/skills/` 下的文件，下次对话自动读取
 - 🔒 **强制契约** — 内置 core skill，定义 Step 0→4 工作流 + 门禁检查
 - 🌐 **全平台兼容** — IDE 内嵌（AGENTS.md）+ 浏览器上传（browser.md）
-- 📦 **npm 一键安装** — `npm install @skillnull/ai-tidu9` 自动生成所有文件
 
 ### 安装
 
 ```bash
-npm install @skillnull/ai-tidu9
+> npm i @skillnull/ai-tidu9
+
+or 
+
+> yarn add @skillnull/ai-tidu9
+
+or 
+
+> pnpm i @skillnull/ai-tidu9
 ```
 
 安装后自动生成：
