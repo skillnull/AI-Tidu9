@@ -1,64 +1,42 @@
-# AI-Tidu9
+# My Project Rules
 
-> [agents.md](https://agents.md/) 标准文件 · 放在**项目根目录**即可生效
+> 这是我的项目
 
-## 适用范围
+## 编码规范
 
-本文件是项目内的 **AI 规则包**（AI-Tidu9）。
-**规则对整个仓库生效**，不限于本文件所在目录。
-无论当前编辑的文件在仓库哪个路径，都必须遵守本文件及下方全部 Skill。
-
-## 强制指令
-
-1. 第一行：`[AI-TIDU9] 已加载`
-2. 第二行：`已加载 Skill：core`
-3. 递归读取 `skills/` 下全部 `SKILL.md` 文件
-4. 按读取到的 Skill 内容执行 Step 0→4 工作流
-5. 结束前完成检查表全 [x]，最后一行：`[AI-TIDU9] 任务完成 · 完成检查已全部通过`
-
-## 使用说明
-
-**Skill 改动即时生效，无需 rebuild。**
-
-- 新增 Skill：在 `skills/` 下创建新目录，放入 `SKILL.md`
-- 修改 Skill：直接编辑 `skills/xxx/SKILL.md`
-- 删除 Skill：删除对应目录
-
-下次对话时 AI 会自动读取最新的 `skills/` 内容。
+- 使用 TypeScript
+- 组件命名用 PascalCase
 
 # AI-Tidu9
 
-> [agents.md](https://agents.md/) 标准文件 · 放在**项目根目录**即可生效
+> [agents.md](https://agents.md/) standard file · place in **project root** to take effect
 
-## 适用范围
+## Scope
 
-本文件是项目内的 **AI 规则包**（AI-Tidu9）。
-**规则对整个仓库生效**，不限于本文件所在目录。
-无论当前编辑的文件在仓库哪个路径，都必须遵守本文件及下方全部 Skill。
+This file is the **AI Rules Pack** (AI-Tidu9) for the project.
+**Rules apply to the entire repository**, not just this folder.
+No matter which path you are editing, you must follow this file and all Skills below.
 
-## 强制指令
+## Mandatory Instructions
 
-1. 第一行：`[AI-TIDU9] 已加载`
-2. 第二行：`已加载 Skill：core`
-3. 递归读取 `skills/` 下全部 `SKILL.md` 文件
-4. 按读取到的 Skill 内容执行 Step 0→4 工作流
-5. 结束前完成检查表全 [x]，最后一行：`[AI-TIDU9] 任务完成 · 完成检查已全部通过`
+1. First line: `[AI-TIDU9] Loaded`
+2. Recursively read all `SKILL.md` files under `.ai-tidu9/skills/`
+3. Execute the Step 0→4 workflow based on loaded Skills
+4. Before finishing, check all boxes in the checklist. Last line: `[AI-TIDU9] Done · All checks passed`
 
-## 使用说明
+## How It Works
 
-**Skill 改动即时生效，无需 rebuild。**
+**Skill changes take effect immediately — no rebuild needed.**
 
-- 新增 Skill：在 `skills/` 下创建新目录，放入 `SKILL.md`
-- 修改 Skill：直接编辑 `skills/xxx/SKILL.md`
-- 删除 Skill：删除对应目录
+- Add a Skill: create a new folder under `.ai-tidu9/skills/` with a `SKILL.md` file
+- Edit a Skill: modify `.ai-tidu9/skills/<name>/SKILL.md`
+- Remove a Skill: delete its folder
 
-下次对话时 AI 会自动读取最新的 `skills/` 内容。
+On the next conversation, the AI will automatically read the latest `.ai-tidu9/skills/` content.
 
-## Skill 目录
+## Skill Directory
 
-`skills/` 目录下每个子文件夹是一个 Skill，每个 Skill 包含一个 `SKILL.md` 文件。
-
-当前已加载的 Skill：core
+Each subfolder under `.ai-tidu9/skills/` is a Skill, containing a `SKILL.md` file.
+AI reads all `.ai-tidu9/skills/**/SKILL.md` files before responding.
 
 ---
-*改 skills/ 后直接生效，无需 rebuild*

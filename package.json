@@ -1,7 +1,7 @@
 {
   "name": "@skillnull/ai-tidu9",
   "version": "1.0.0",
-  "description": "九门赛博提督 — 专治 AI 跑偏。The Cyber-JiumenTidu for LLMs: Keeping your AI from going rogue.",
+  "description": "九门赛博提督 — 专治 AI 跑偏。The Cyber-JiumenTidu for LLMs.",
   "keywords": [
     "ai-pack",
     "agents-md",
@@ -24,8 +24,7 @@
   "author": "skillnull",
   "main": ".ai-tidu9/scripts/install.js",
   "files": [
-    ".ai-tidu9/",
-    "AGENTS.md"
+    ".ai-tidu9/"
   ],
   "scripts": {
     "postinstall": "node .ai-tidu9/scripts/install.js"

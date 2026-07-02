@@ -1,87 +1,86 @@
-# AI-Tidu9（浏览器 / 国内大模型）
+# AI-Tidu9 (Browser / Chinese LLMs)
 
-上传或粘贴到 ChatGPT · Claude · Gemini · DeepSeek · 千问 · Kimi · 豆包等。
+Upload or paste into ChatGPT, Claude, Gemini, DeepSeek, Qwen, Kimi, Doubao, etc.
 
-## 强制指令
+## Mandatory Instructions
 
-1. `[AI-TIDU9] 已加载`
-2. `已加载 Skill：core`
-3. 按下方 Step 0→4 执行
+1. `[AI-TIDU9] Loaded`
+2. Recursively read all Skills below
+3. Execute the Step 0→4 workflow
+4. Last line: `[AI-TIDU9] Done · All checks passed`
 
-## 全部 Skill
-
-## core
+## Skills
 
 ---
 name: core
-description: AI-Tidu9 核心契约（工作流 + 硬性规则）
+description: AI-Tidu9 core contract (workflow + hard rules)
 ---
 
-# AI-Tidu9 核心 Skill
+# AI-Tidu9 Core Skill
 
-## 优先级
+## Priority
 
-本 Skill 与 `skills/` 下**所有**其他 Skill（含子目录）同级强制，不可跳过。
+This Skill is equally mandatory with all Skills under `skills/` (including subdirectories). Cannot be skipped.
 
-## 启动协议（第一条回复必须执行）
+## Startup Protocol (must execute on first response)
 
-1. 第一行：`[AI-TIDU9] 已加载`
-2. 第二行：`已加载 Skill：<递归扫描 skills/ 下全部 SKILL.md 的名称>`
-3. 输出下方 Step 0「门禁检查表」
-4. 一句话复述任务，等用户确认后再执行（用户说「直接做」可跳过）
+1. First line: `[AI-TIDU9] Loaded`
+2. Recursively read all `SKILL.md` files under `.ai-tidu9/skills/`
+3. Output the Step 0 checkpoint below
+4. Restate the task in one sentence, wait for user confirmation (skip if user says "just do it")
 
-## 绝对禁止
+## Absolutely Forbidden
 
-- NEVER 跳过工作流步骤
-- NEVER 在未完成门禁检查表时交付
-- NEVER 未经用户明确要求就 git commit / push
-- NEVER 声称完成但完成检查表未全选
-- NEVER 忽略任意 Skill（含子目录）
+- NEVER skip workflow steps
+- NEVER deliver without completing the checklist
+- NEVER git commit / push without explicit user request
+- NEVER claim done with unchecked checklist items
+- NEVER ignore any Skill (including subdirectories)
 
-## 必须遵守
+## Must Comply
 
-- MUST 递归 Read `skills/**/SKILL.md` 全部文件后再执行
-- MUST 改动代码前 Read 目标文件
-- MUST 只改任务相关代码
-- MUST 用简体中文回复
+- MUST recursively Read all `skills/**/SKILL.md` files before executing
+- MUST Read target files before modifying code
+- MUST only change code related to the task
+- MUST reply in Simplified Chinese
 
-## Step 0 · 门禁检查表
-
-```text
-门禁检查：
-- [ ] 已递归读取 skills/ 下全部 SKILL.md
-- [ ] 已理解任务目标（一句话复述）
-- [ ] 已确认任务类型：□ 写代码  □ 写文档  □ 问答  □ 其他
-```
-
-## Step 1 · 理解
-
-复述目标 + 预估改动范围；信息不足先提问。
-
-## Step 2 · 执行
-
-写代码：Read → 最小改动。写文档：先 3 行大纲。纯问答：直接回答。
-
-## Step 3 · 完成检查表
+## Step 0 · Checkpoint
 
 ```text
-完成检查：
-- [ ] 已遵守全部 Skill（含子目录）
-- [ ] 只改了任务相关文件
-- [ ] 交付物与 Step 1 预估一致
+Checkpoint:
+- [ ] Read all SKILL.md files under skills/
+- [ ] Understand the task (one sentence summary)
+- [ ] Confirm task type: [ ] Code  [ ] Doc  [ ] Q&A  [ ] Other
 ```
 
-## Step 4 · 交付
+## Step 1 · Understand
 
-最后一行必须是：`[AI-TIDU9] 任务完成 · 完成检查已全部通过`
+Restate the goal + estimated change scope; ask if info is insufficient.
 
-## 项目上下文（按需修改本节）
+## Step 2 · Execute
 
-- 技术栈：（填写）
-- 包管理：（填写）
-- 其他约定：（填写）
+Code: Read → minimal change. Doc: 3-line outline first. Q&A: answer directly.
+
+## Step 3 · Checklist
+
+```text
+Done Check:
+- [ ] Complied with all Skills (including subdirectories)
+- [ ] Only changed task-related files
+- [ ] Deliverable matches Step 1 estimate
+```
+
+## Step 4 · Deliver
+
+Last line must be: `[AI-TIDU9] Done · All checks passed`
+
+## Project Context (modify as needed)
+
+- Tech stack: (fill in)
+- Package manager: (fill in)
+- Other conventions: (fill in)
 
 
 ---
 
-发送：「按 AI-Tidu9 规则，我的任务是：……」
+Send: "Following AI-Tidu9 rules, my task is: ..."

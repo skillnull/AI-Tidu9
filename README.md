@@ -6,62 +6,42 @@
 
 ---
 
-AI-Tidu9 是一个 **AI 规则包** —— 一套基于 [agents.md](https://agents.md/) 标准的 Prompt 契约，用于让 AI 编码助手（Cursor、Claude Code、Codex、ChatGPT 等）严格遵循项目规范工作，不再"放飞自我"。
+AI-Tidu9 是一个 **AI 规则包** —— 一套基于 [agents.md](https://agents.md/) 标准的 Prompt 契约，用于让 AI 编码助手（Cursor、Claude Code、Codex、ChatGPT 等）严格遵循项目规范工作。
 
 ### 核心特性
 
-- 📦 **Skill 改动即时生效** — 改 `skills/` 下的文件，下次对话自动读取，无需 rebuild
+- 📦 **Skill 改动即时生效** — 改 `.ai-tidu9/skills/` 下的文件，下次对话自动读取
 - 🔒 **强制契约** — 内置 core skill，定义 Step 0→4 工作流 + 门禁检查
 - 🌐 **全平台兼容** — IDE 内嵌（AGENTS.md）+ 浏览器上传（browser.md）
-- 📦 **npm 一键安装** — `npm install @ai-tidu9/core` 自动生成所有文件
+- 📦 **npm 一键安装** — `npm install @skillnull/ai-tidu9` 自动生成所有文件
 
-### 安装方式
-
-#### npm 安装（推荐）
+### 安装
 
 ```bash
-npm install @ai-tidu9/core
+npm install @skillnull/ai-tidu9
 ```
 
 安装后自动生成：
-- 项目根目录 `AGENTS.md`（指向 `skills/` 目录）
-- `.ai-tidu9/` 目录（包含所有规则文件和 Skill 源）
-
-#### 手动安装
-
-```bash
-# 1. 复制 .ai-tidu9 文件夹到项目根目录
-cp -r .ai-tidu9 /path/to/your-project/
-
-# 2. 进入项目，运行安装脚本
-cd /path/to/your-project
-node .ai-tidu9/scripts/install.js
-```
+- 项目根目录 `AGENTS.md`
+- `.ai-tidu9/` 目录（包含规则和 Skill 文件）
 
 ### 目录结构
 
 ```
 your-project/
 ├── AGENTS.md              ← 项目根目录（AI 助手自动加载）
-├── package.json           ← 版本信息源（npm 包发布配置）
-└── .ai-tidu9/             ← 规则包本体
+└── .ai-tidu9/             ← 规则包本体（安装后生成）
     ├── browser.md         ← 浏览器 / 国内大模型上传用
-    ├── manifest.json      ← 元信息（版本从 package.json 同步）
     ├── scripts/
-    │   └── install.js     ← 安装/初始化脚本（postinstall 自动运行）
-    └── skills/            ← Skill 目录（改这里即时生效！）
+    │   └── install.js     ← 安装脚本（npm postinstall 自动运行）
+    └── skills/            ← Skill 目录（改这里即时生效）
         └── _core/
             └── SKILL.md   ← core 契约
 ```
 
-### 使用方式
-
-#### 日常开发
-
-改 Skill 文件，直接生效：
+### 添加新 Skill
 
 ```bash
-# 新增 Skill
 mkdir -p .ai-tidu9/skills/my-rule
 cat > .ai-tidu9/skills/my-rule/SKILL.md << 'EOF'
 ---
@@ -73,33 +53,60 @@ description: 何时触发
 （指令正文）
 EOF
 
-# 下次对话自动生效，无需 rebuild
+# 下次对话自动生效，无需任何操作
 ```
 
-#### 浏览器 / 国内大模型
+### 兼容性
 
-上传 `.ai-tidu9/browser.md` 文件，或复制其内容粘贴到对话框。
+| 工具 | 生效方式 |
+|------|---------|
+| Cursor / Claude Code / Codex | 项目根 `AGENTS.md` 自动加载 |
+| ChatGPT / Claude Web / 国内大模型 | 上传 `browser.md` |
+| Trae | 项目根 `AGENTS.md` 自动加载 |
 
-### 兼容性说明
+### 已有 AGENTS.md？
 
-| 工具 | 生效方式 | 可靠性 |
-|------|---------|--------|
-| ChatGPT / Claude / 国内大模型 | 上传 `browser.md` | ✅ 最高 |
-| Cursor（项目根有 `AGENTS.md`） | 自动加载 | ✅ 100% |
-| Codex / Claude Code（项目根有 `AGENTS.md`） | 自动加载 | ✅ 100% |
-| Trae（项目根有 `AGENTS.md`） | 自动加载 | ✅ 100% |
+运行安装脚本后会自动合并：保留原有头部内容，替换 Skill 相关部分。
 
-> **关键**：把 `AGENTS.md` 放在**项目根目录**，AI 助手会在编辑任何文件时自动加载规则。
+---
 
-### 已有 AGENTS.md 怎么办？
+## 核心原理
 
-如果项目中已有 `AGENTS.md`，运行 `install.js` 会自动合并：
-- 保留原有头部内容（标题、描述、项目自定义规则等）
-- 替换 Skill 相关部分
+AI-Tidu9 的工作原理基于 [agents.md](https://agents.md/) 标准：
 
-### 版本管理
+```
+AGENTS.md（项目根）
+  │
+  ├─ 告诉 AI：读取 .ai-tidu9/skills/**/SKILL.md
+  │
+  └─ AI 在每次对话前自动读取这些文件
+         │
+         ├─ core/SKILL.md  → 定义工作流（Step 0→4）
+         ├─ my-rule/SKILL.md  → 项目特定规则
+         └─ ... 更多 Skill
+```
 
-版本号统一在 `package.json` 中管理，`install.js` 运行时自动同步到 `.ai-tidu9/manifest.json` 和 `AGENTS.md`。
+**关键设计决策：**
+
+1. **Skill 内容不嵌入 AGENTS.md** — AGENTS.md 只告诉 AI "去哪里读 Skill"，不预先写入内容。因此新增/修改 Skill 不需要 rebuild，AI 下次对话自然读到最新内容。
+
+2. **browser.md 内联 core skill** — 浏览器 AI 无法读取项目文件，所以 browser.md 内联了 core skill 的完整内容。新增的 skill 需要通过上传完整 browser.md 来覆盖。
+
+3. **版本单一事实来源** — 版本号只在 `package.json` 中管理，安装时同步到 `AGENTS.md` 和 `browser.md`。
+
+4. **智能合并** — 如果项目已有 `AGENTS.md`，安装脚本保留原有头部（标题、描述、项目自定义规则），只替换 `## Skill` 之后的内容。
+
+### 为什么不需要 build 脚本？
+
+传统方案：改 Skill → 运行 build.js → 生成 AGENTS.md → AI 读到新内容
+
+AI-Tidu9 方案：改 Skill → 下次对话 AI 自动读取 → 新内容生效
+
+区别在于 AGENTS.md 的角色不同：
+- 传统方案：AGENTS.md = Skill 内容的静态快照
+- AI-Tidu9：AGENTS.md = 指向 Skill 文件的导航指令
+
+AI 助手（Cursor、Claude Code 等）在收到请求时会先读取 AGENTS.md，然后根据其中的指令去读取 `.ai-tidu9/skills/` 下的文件。这是一个动态过程，Skill 文件本身就是数据源，不需要编译。
 
 ---
 
