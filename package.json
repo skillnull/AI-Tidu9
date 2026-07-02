@@ -29,9 +29,6 @@
   "scripts": {
     "postinstall": "node .ai-tidu9/scripts/install.js"
   },
-  "publishConfig": {
-    "access": "public"
-  },
   "engines": {
     "node": ">=16"
   }
