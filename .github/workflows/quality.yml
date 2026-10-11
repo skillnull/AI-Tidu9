@@ -78,3 +78,13 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm test
+
+  verify-required:
+    name: Verify
+    if: always()
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - if: needs.verify.result != 'success'
+        run: exit 1
+      - run: echo "All verification jobs passed."
