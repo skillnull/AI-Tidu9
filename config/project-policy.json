@@ -1,7 +1,7 @@
 {
   "repository": "skillnull/AI-Tidu9",
   "owner": "skillnull",
-  "rulesetName": "Protect main — owner only",
+  "rulesetName": "Protect release lines — owner only",
   "primaryBranch": "main",
   "protectedBranches": ["main"],
   "workBranchTypes": [

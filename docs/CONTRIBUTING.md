@@ -92,9 +92,9 @@ Validate a message with `npm run policy:commit -- "feat(scope): description"`.
 
 ## Required repository settings / 仓库必需设置
 
-The active `Protect main — owner only` Ruleset restricts `main` updates to the sole bypass actor `@skillnull`. Apply the same protections to every `support/*` line when it is created. Require the `Policy` and `Verify` checks after their first successful remote run. Local Git hooks provide early feedback, while Rulesets and required CI are the authoritative merge gate.
+The active `Protect release lines — owner only` Ruleset restricts `main` and `support/*` updates to the sole bypass actor `@skillnull`. It requires the stable `Policy` and `Verify` checks. Local Git hooks provide early feedback, while the Ruleset and required CI are the authoritative merge gate.
 
-远端已启用 `Protect main — owner only` Ruleset，并仅将 `@skillnull` 加入绕过名单。创建任何 `support/*` 时必须应用同级保护。首次远端CI成功后，将 `Policy` 与 `Verify` 设为必需检查。本地Git Hooks用于提前反馈，Ruleset和必需CI才是最终合并门禁。
+远端已启用 `Protect release lines — owner only` Ruleset，对 `main` 与 `support/*` 应用同级保护，并仅将 `@skillnull` 加入绕过名单。稳定的 `Policy` 与 `Verify` 已设为必需检查。本地Git Hooks用于提前反馈，Ruleset和必需CI才是最终合并门禁。
 
 ## General requirements / 通用要求
 
