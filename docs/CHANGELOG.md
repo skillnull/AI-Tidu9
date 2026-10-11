@@ -6,6 +6,8 @@ All notable changes to AI-Tidu9 will be documented in this file.
 
 ## Unreleased / 未发布
 
+## 0.1.0-alpha.2 - 2026-10-11
+
 - Rebuild the project from an early AI rules package into the AI-Tidu9 Super Agent platform.
 - 将早期AI规则包重构为九门赛博提督超级Agent平台。
 - Establish the `tidu` CLI, TypeScript workspaces, versioned configuration and protocol contracts, a shared error model, and automated quality gates.
