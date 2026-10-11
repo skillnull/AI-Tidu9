@@ -4,7 +4,7 @@
 
 九门赛博提督是面向全领域场景的智能协作中枢，以目标驱动内外部 Agent、模型、工具、知识与专家协同执行，交付可验证的业务结果。
 
-[English](./README.en.md)
+[English](./docs/README.en.md)
 
 ## 当前状态
 
@@ -36,10 +36,10 @@ npx tidu
 
 ## 发版计划
 
-开发阶段和验收状态见 [RELEASE_PLAN.md](./RELEASE_PLAN.md)。该临时文件将在 `v1.0.0` 最终验收后删除，实际发布历史将保留在 `CHANGELOG.md` 和Git Tag中。
+开发阶段和验收状态见 [发版计划](./docs/RELEASE_PLAN.md)。该临时文件将在 `v1.0.0` 最终验收后删除，实际发布历史将保留在 [变更记录](./docs/CHANGELOG.md) 和Git Tag中。
 
 模块边界和当前限制见 [架构基线](./docs/architecture.md)。
 
 ## 开源协议
 
-本项目使用 [GNU Affero General Public License v3.0 only](./LICENSE)。品牌和署名规则见 [TRADEMARKS.md](./TRADEMARKS.md) 与 [NOTICE](./NOTICE)。
+本项目使用 [GNU Affero General Public License v3.0 only](./LICENSE)。品牌和署名规则见 [商标政策](./docs/TRADEMARKS.md) 与 [NOTICE](./NOTICE)。

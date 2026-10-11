@@ -1,8 +1,8 @@
-# AI-Tidu9 Release Plan / 九门赛博提督发版计划
+# AI-Tidu9 Release Plan · 九门赛博提督发版计划
 
-> Temporary public-safe execution checklist. Remove after `v1.0.0` final acceptance; preserve actual history in `CHANGELOG.md` and Git tags.
+> Temporary public-safe execution checklist. Remove after `v1.0.0` final acceptance; preserve actual history in `docs/CHANGELOG.md` and Git tags.
 >
-> 临时公开工程清单。`v1.0.0` 最终验收后删除；实际发布历史永久保留在 `CHANGELOG.md` 与 Git Tag 中。
+> 临时公开工程清单。`v1.0.0` 最终验收后删除；实际发布历史永久保留在 `docs/CHANGELOG.md` 与 Git Tag 中。
 
 ## Product baseline / 产品基线
 
@@ -21,7 +21,7 @@ An item is complete only after implementation, automated tests, real-scenario ve
 - [ ] Never mark code-only work as complete / 仅完成代码不得勾选
 - [ ] Never include private or company-confidential data / 不记录私人或公司机密
 - [ ] Do not create or push a release tag without explicit confirmation / 未确认不得创建或推送正式 Tag
-- [ ] Keep `CHANGELOG.md` synchronized with every release / 每次发布同步更新 `CHANGELOG.md`
+- [ ] Keep `docs/CHANGELOG.md` synchronized with every release / 每次发布同步更新 `docs/CHANGELOG.md`
 - [ ] Record real compatibility limits / 如实记录兼容性边界
 
 ## Stage 0 — Baseline audit / 阶段0：项目基线审计
@@ -44,7 +44,7 @@ Audience: maintainers and internal contributors only.
 - [x] Replace legacy product wording and remove rejected slogan / 替换旧定位并移除已否决口号
 - [x] Publish concise Chinese and English README entry points / 完成精简中英文README入口
 - [x] Replace MIT metadata with AGPL-3.0-only / 将MIT元数据替换为AGPL-3.0-only
-- [x] Add `NOTICE`, `TRADEMARKS.md`, and `CONTRIBUTING.md` / 增加必要治理文件
+- [x] Add `NOTICE`, `docs/TRADEMARKS.md`, and `docs/CONTRIBUTING.md` / 增加必要治理文件
 - [x] Define reasonable AI-Tidu9 attribution rules / 明确合理署名规则
 - [x] Establish modular-monolith boundaries / 建立模块化单体边界
 - [x] Establish versioned configuration schema / 建立版本化配置Schema
@@ -219,9 +219,9 @@ Audience: owner and invited developers.
 - [ ] No blocking known issue remains / 无阻断性已知问题
 - [ ] Final acceptance report is approved / 最终验收报告获确认
 - [ ] Create confirmed `v1.0.0` tag / 创建经确认的 `v1.0.0` Tag
-- [ ] Move all historical facts into `CHANGELOG.md` / 将实际历史沉淀到 `CHANGELOG.md`
+- [ ] Move all historical facts into `docs/CHANGELOG.md` / 将实际历史沉淀到 `docs/CHANGELOG.md`
 - [ ] Remove README references to this temporary plan / 移除README中的临时计划链接
-- [ ] Delete this `RELEASE_PLAN.md` after explicit confirmation / 明确确认后删除本文件
+- [ ] Delete this `docs/RELEASE_PLAN.md` after explicit confirmation / 明确确认后删除本文件
 
 ## Release artifacts / 发版产物
 

@@ -1,10 +1,10 @@
-# 九门赛博提督 / AI-Tidu9
+# 九门赛博提督 · AI-Tidu9
 
 **AI-Tidu9 · Intelligent Collaboration Hub**
 
 AI-Tidu9 is an intelligent collaboration hub for cross-domain scenarios. It coordinates internal and external agents, models, tools, knowledge, and experts around a goal to deliver verifiable business outcomes.
 
-[简体中文](./README.md)
+[简体中文](../README.md)
 
 ## Status
 
@@ -36,10 +36,10 @@ npx tidu
 
 ## Release plan
 
-See [RELEASE_PLAN.md](./RELEASE_PLAN.md) for development stages and acceptance status. This temporary file will be removed after final `v1.0.0` acceptance; actual release history will remain in `CHANGELOG.md` and Git tags.
+See the [release plan](./RELEASE_PLAN.md) for development stages and acceptance status. This temporary file will be removed after final `v1.0.0` acceptance; actual release history will remain in the [changelog](./CHANGELOG.md) and Git tags.
 
-See the [architecture baseline](./docs/architecture.en.md) for module boundaries and current limitations.
+See the [architecture baseline](./architecture.en.md) for module boundaries and current limitations.
 
 ## License
 
-This project is licensed under the [GNU Affero General Public License v3.0 only](./LICENSE). See [TRADEMARKS.md](./TRADEMARKS.md) and [NOTICE](./NOTICE) for branding and attribution terms.
+This project is licensed under the [GNU Affero General Public License v3.0 only](../LICENSE). See the [trademark policy](./TRADEMARKS.md) and [NOTICE](../NOTICE) for branding and attribution terms.
