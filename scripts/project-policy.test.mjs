@@ -101,6 +101,6 @@ test("requires release tags to match the repository version", () => {
   assert.equal(validateReleaseTag("v1.2.4", "1.2.3").valid, false);
 });
 
-test("keeps all workspace versions synchronized", () => {
+test("keeps each published workspace version synchronized with the lockfile", () => {
   assert.deepEqual(validateRepositoryVersions(fileURLToPath(new URL("../", import.meta.url))), []);
 });

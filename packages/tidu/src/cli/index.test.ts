@@ -1,17 +1,24 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { runCli } from "./index.js";
+
+const packageVersion = (
+  JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as {
+    version: string;
+  }
+).version;
 
 test("shows concise help by default", () => {
   assert.match(runCli([]), /Usage:/);
   assert.match(runCli([]), /九门赛博提督/);
 });
 
-test("prints the planned alpha version", () => {
-  assert.equal(runCli(["version"]), "0.1.0-alpha.1");
+test("prints the published package version", () => {
+  assert.equal(runCli(["version"]), packageVersion);
 });
 
 test("rejects unsupported commands", () => {
@@ -26,5 +33,5 @@ test("runs as an executable entry point", () => {
 
   assert.equal(result.status, 0);
   assert.equal(result.stderr, "");
-  assert.equal(result.stdout.trim(), "0.1.0-alpha.1");
+  assert.equal(result.stdout.trim(), packageVersion);
 });

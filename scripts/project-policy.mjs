@@ -189,42 +189,46 @@ export const validateRepositoryVersions = (repositoryRoot) => {
   const packageFiles = findWorkspacePackages(repositoryRoot);
   const lockFile = readJson(join(repositoryRoot, "package-lock.json"));
   const problems = [];
+  const workspacePackages = packageFiles.map((packageFile) => ({
+    file: packageFile,
+    metadata: readJson(packageFile),
+  }));
+  const workspaceVersions = new Map(
+    workspacePackages.map(({ metadata }) => [metadata.name, metadata.version]),
+  );
 
-  if (!validateVersion(rootPackage.version)) {
-    problems.push(`Invalid root version: ${rootPackage.version}`);
+  if (!rootPackage.private) {
+    problems.push("The repository root must remain private.");
+  }
+  if (rootPackage.version !== undefined) {
+    problems.push("The private repository root must not declare a release version.");
   }
 
-  for (const packageFile of packageFiles) {
-    const workspacePackage = readJson(packageFile);
-    if (workspacePackage.version !== rootPackage.version) {
-      problems.push(
-        `${workspacePackage.name} uses ${workspacePackage.version}; expected ${rootPackage.version}`,
-      );
+  for (const { file: packageFile, metadata: workspacePackage } of workspacePackages) {
+    if (!validateVersion(workspacePackage.version)) {
+      problems.push(`Invalid ${workspacePackage.name} version: ${workspacePackage.version}`);
     }
 
     const workspacePath = relative(repositoryRoot, dirname(packageFile)).replaceAll("\\", "/");
-    if (lockFile.packages?.[workspacePath]?.version !== rootPackage.version) {
+    if (lockFile.packages?.[workspacePath]?.version !== workspacePackage.version) {
       problems.push(`${workspacePackage.name} version is not synchronized in package-lock.json.`);
     }
 
     const internalDependencies = Object.entries(workspacePackage.dependencies ?? {}).filter(
-      ([dependencyName]) =>
-        dependencyName === "@skillnull/tidu" || dependencyName.startsWith("@skillnull/tidu-"),
+      ([dependencyName]) => workspaceVersions.has(dependencyName),
     );
     for (const [dependencyName, dependencyVersion] of internalDependencies) {
-      if (dependencyVersion !== rootPackage.version) {
+      const expectedVersion = workspaceVersions.get(dependencyName);
+      if (dependencyVersion !== expectedVersion) {
         problems.push(
-          `${workspacePackage.name} depends on ${dependencyName}@${dependencyVersion}; expected ${rootPackage.version}`,
+          `${workspacePackage.name} depends on ${dependencyName}@${dependencyVersion}; expected ${expectedVersion}`,
         );
       }
     }
   }
 
-  if (
-    lockFile.version !== rootPackage.version ||
-    lockFile.packages?.[""]?.version !== rootPackage.version
-  ) {
-    problems.push("package-lock.json root version is not synchronized.");
+  if (lockFile.version !== undefined || lockFile.packages?.[""]?.version !== undefined) {
+    problems.push("package-lock.json must not declare a private root release version.");
   }
 
   return problems;
@@ -334,9 +338,13 @@ const run = () => {
   }
 
   if (command === "release-lines") {
-    const rootPackage = readJson(join(repositoryRoot, "package.json"));
+    const publishedPackage = readJson(join(repositoryRoot, "packages/tidu/package.json"));
     const branchName = argumentsList[0] ?? process.env.TIDU_RELEASE_LINE ?? getBranchName();
-    const problems = validateReleaseLines(branchName, rootPackage.version, getSupportBranches());
+    const problems = validateReleaseLines(
+      branchName,
+      publishedPackage.version,
+      getSupportBranches(),
+    );
     if (problems.length > 0) {
       throw new Error(problems.join("\n"));
     }
@@ -345,9 +353,9 @@ const run = () => {
   }
 
   if (command === "tag") {
-    const rootPackage = readJson(join(repositoryRoot, "package.json"));
+    const publishedPackage = readJson(join(repositoryRoot, "packages/tidu/package.json"));
     const tagName = argumentsList[0] ?? process.env.TIDU_TAG_NAME ?? "";
-    const result = validateReleaseTag(tagName, rootPackage.version);
+    const result = validateReleaseTag(tagName, publishedPackage.version);
     if (!result.valid) {
       throw new Error(result.reason);
     }

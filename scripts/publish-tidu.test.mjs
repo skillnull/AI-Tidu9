@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  formatPublishedPackageSyncFailure,
   formatPublishFailure,
   formatPublishSuccess,
   formatReleaseSummary,
   getDistributionTag,
   getNextPrereleaseVersion,
+  parseGitStatusPaths,
   prepareChangelog,
   validatePublishContext,
 } from "./publish-tidu.mjs";
@@ -44,16 +46,37 @@ test("moves unreleased notes under an automatically generated release heading", 
   assert.equal(prepareChangelog(prepared, "1.2.3-alpha.2", "2026-10-11"), prepared);
 });
 
+test("preserves paths from git porcelain status", () => {
+  assert.deepEqual(
+    parseGitStatusPaths(
+      " M docs/CHANGELOG.md\nM  package.json\n?? packages/tidu/generated-file.json",
+    ),
+    ["docs/CHANGELOG.md", "package.json", "packages/tidu/generated-file.json"],
+  );
+});
+
 test("prints unambiguous publish outcomes", () => {
   assert.match(formatPublishFailure("Missing release tag."), /^✖ PUBLISH BLOCKED/u);
   assert.equal(formatPublishFailure("Missing release tag.", true).startsWith("\u001b[1;31m"), true);
   assert.match(
-    formatPublishSuccess({ distributionTag: "alpha", dryRun: true, version: "1.2.3-alpha.1" }),
+    formatPublishSuccess({
+      distributionTag: "alpha",
+      dryRun: true,
+      version: "1.2.3-alpha.1",
+    }),
     /validated but not published/u,
   );
   assert.match(
-    formatPublishSuccess({ distributionTag: "latest", dryRun: false, version: "1.2.3" }),
+    formatPublishSuccess({
+      distributionTag: "latest",
+      dryRun: false,
+      version: "1.2.3",
+    }),
     /^✔ PUBLISHED/u,
+  );
+  assert.match(
+    formatPublishedPackageSyncFailure("Push rejected."),
+    /^✖ REMOTE SYNC FAILED.*is published/u,
   );
 });
 
@@ -73,6 +96,7 @@ test("prints a concise color-aware release summary", () => {
   );
 
   assert.match(summary, /1\.2\.3-alpha\.1 → 1\.2\.3-alpha\.2/u);
+  assert.match(summary, /local commit\/tag → npm publish → push/u);
   assert.doesNotMatch(summary, /diff --git/u);
   assert.equal(coloredSummary.includes("\u001b[1;36mRelease summary"), true);
 });
@@ -89,7 +113,10 @@ test("allows a dry-run before release tags are created", () => {
 });
 
 test("rejects releases from a support branch for another major", () => {
-  const problems = validatePublishContext({ ...validContext, branchName: "support/2.x" });
+  const problems = validatePublishContext({
+    ...validContext,
+    branchName: "support/2.x",
+  });
 
   assert.deepEqual(problems, ["The support/2.x branch may publish only major 2."]);
 });

@@ -21,6 +21,8 @@ const TERMINAL_COLOR = Object.freeze({
   yellow: "\u001b[1;33m",
 });
 
+class PublishedPackageSyncError extends Error {}
+
 const readJson = (filePath) => JSON.parse(readFileSync(filePath, "utf8"));
 const writeJson = (filePath, value) =>
   writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
@@ -75,14 +77,21 @@ export const formatReleaseSummary = (
     `  ${applyTerminalColor("Version:", "blue", colorEnabled)}   ${currentVersion} → ${version}`,
     `  ${applyTerminalColor("npm tag:", "yellow", colorEnabled)}   ${getDistributionTag(version)}`,
     `  ${applyTerminalColor("CHANGELOG:", "yellow", colorEnabled)} ${version} (${releaseDate})`,
-    `  ${applyTerminalColor("Files:", "magenta", colorEnabled)}     package.json, package-lock.json, packages/tidu/package.json, docs/CHANGELOG.md`,
-    `  ${applyTerminalColor("Next:", "magenta", colorEnabled)}      commit → tag → push → npm publish`,
+    `  ${applyTerminalColor("Files:", "magenta", colorEnabled)}     package-lock.json, packages/tidu/package.json, docs/CHANGELOG.md`,
+    `  ${applyTerminalColor("Next:", "magenta", colorEnabled)}      local commit/tag → npm publish → push`,
     "",
   ].join("\n");
 
 export const formatPublishFailure = (message, colorEnabled = false) =>
   applyTerminalColor(
     `✖ PUBLISH BLOCKED — ${RELEASE.packageName} was not published.\n${message}`,
+    "red",
+    colorEnabled,
+  );
+
+export const formatPublishedPackageSyncFailure = (message, colorEnabled = false) =>
+  applyTerminalColor(
+    `✖ REMOTE SYNC FAILED — ${RELEASE.packageName} is published, but Git is not fully synchronized.\n${message}`,
     "red",
     colorEnabled,
   );
@@ -151,10 +160,28 @@ export const validatePublishContext = (
 };
 
 const runCommand = (command, argumentsList, options = {}) =>
-  execFileSync(command, argumentsList, { encoding: "utf8", stdio: "inherit", ...options });
+  execFileSync(command, argumentsList, {
+    encoding: "utf8",
+    stdio: "inherit",
+    ...options,
+  });
+
+const readCommandOutput = (command, argumentsList, options = {}) =>
+  execFileSync(command, argumentsList, { encoding: "utf8", ...options });
 
 const readCommand = (command, argumentsList, options = {}) =>
-  execFileSync(command, argumentsList, { encoding: "utf8", ...options }).trim();
+  readCommandOutput(command, argumentsList, options).trim();
+
+const readGitStatus = (repositoryRoot) =>
+  readCommandOutput("git", ["status", "--porcelain"], {
+    cwd: repositoryRoot,
+  }).replace(/\r?\n$/u, "");
+
+export const parseGitStatusPaths = (status) =>
+  status
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .map((statusLine) => statusLine.slice(3));
 
 const readTagCommit = (repositoryRoot, tagName) => {
   const result = spawnSync("git", ["rev-list", "-n", "1", tagName], {
@@ -178,6 +205,11 @@ const readRemoteTagCommit = (repositoryRoot, tagName) => {
   return selectedReference.split(/\s+/u, 1)[0] ?? "";
 };
 
+const isCommitAncestor = (repositoryRoot, ancestorCommit, descendantCommit) =>
+  spawnSync("git", ["merge-base", "--is-ancestor", ancestorCommit, descendantCommit], {
+    cwd: repositoryRoot,
+  }).status === 0;
+
 const isVersionPublished = (packageName, version, repositoryRoot) => {
   const result = spawnSync("npm", ["view", `${packageName}@${version}`, "version", "--json"], {
     cwd: repositoryRoot,
@@ -200,11 +232,33 @@ const assertVersionIsUnpublished = (packageName, version, repositoryRoot) => {
   }
 };
 
+const publishPackage = (repositoryRoot, version, argumentsList = []) => {
+  const distributionTag = getDistributionTag(version);
+  runCommand(
+    "npm",
+    [
+      "publish",
+      "--workspace",
+      RELEASE.packageName,
+      "--access",
+      "public",
+      "--tag",
+      distributionTag,
+      ...argumentsList,
+    ],
+    { cwd: repositoryRoot },
+  );
+  return {
+    distributionTag,
+    dryRun: argumentsList.includes("--dry-run"),
+    version,
+  };
+};
+
 const getReleaseFiles = (repositoryRoot) => ({
   changelog: resolve(repositoryRoot, "docs/CHANGELOG.md"),
   lock: resolve(repositoryRoot, "package-lock.json"),
   package: resolve(repositoryRoot, RELEASE.packagePath, "package.json"),
-  root: resolve(repositoryRoot, "package.json"),
 });
 
 const captureReleaseFiles = (releaseFiles) =>
@@ -223,16 +277,11 @@ const synchronizeReleaseFiles = (releaseFiles, snapshots, version, releaseDate) 
     throw new Error(`Invalid release version ${version}.`);
   }
 
-  const rootPackage = JSON.parse(snapshots.get(releaseFiles.root));
   const publishedPackage = JSON.parse(snapshots.get(releaseFiles.package));
   const lockFile = JSON.parse(snapshots.get(releaseFiles.lock));
-  rootPackage.version = version;
   publishedPackage.version = version;
-  lockFile.version = version;
-  lockFile.packages[""].version = version;
   lockFile.packages[RELEASE.packagePath].version = version;
 
-  writeJson(releaseFiles.root, rootPackage);
   writeJson(releaseFiles.package, publishedPackage);
   writeJson(releaseFiles.lock, lockFile);
   writeFileSync(
@@ -242,62 +291,47 @@ const synchronizeReleaseFiles = (releaseFiles, snapshots, version, releaseDate) 
 };
 
 const readPublishContext = (repositoryRoot) => {
-  const rootPackage = readJson(resolve(repositoryRoot, "package.json"));
   const publishedPackage = readJson(resolve(repositoryRoot, RELEASE.packagePath, "package.json"));
-  const releaseTag = `v${rootPackage.version}`;
+  const releaseTag = `v${publishedPackage.version}`;
   return {
-    branchName: readCommand("git", ["branch", "--show-current"], { cwd: repositoryRoot }),
+    branchName: readCommand("git", ["branch", "--show-current"], {
+      cwd: repositoryRoot,
+    }),
     changelog: readFileSync(resolve(repositoryRoot, "docs/CHANGELOG.md"), "utf8"),
-    headCommit: readCommand("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot }),
+    headCommit: readCommand("git", ["rev-parse", "HEAD"], {
+      cwd: repositoryRoot,
+    }),
     packageName: publishedPackage.name,
     packageVersion: publishedPackage.version,
     releaseTag,
     remoteTagCommit: readRemoteTagCommit(repositoryRoot, releaseTag),
-    repositoryVersion: rootPackage.version,
-    status: readCommand("git", ["status", "--porcelain"], { cwd: repositoryRoot }),
+    repositoryVersion: publishedPackage.version,
+    status: readGitStatus(repositoryRoot),
     tagCommit: readTagCommit(repositoryRoot, releaseTag),
   };
 };
 
-const publishPreparedRelease = (repositoryRoot, argumentsList, { skipChecks = false } = {}) => {
+const publishPreparedRelease = (repositoryRoot, argumentsList) => {
   const context = readPublishContext(repositoryRoot);
   const isDryRun = argumentsList.includes("--dry-run");
-  const problems = validatePublishContext(context, { requireReleaseTag: !isDryRun });
+  const problems = validatePublishContext(context, {
+    requireReleaseTag: !isDryRun,
+  });
   if (problems.length > 0) {
     throw new Error(problems.join("\n"));
   }
 
   assertVersionIsUnpublished(RELEASE.packageName, context.repositoryVersion, repositoryRoot);
-  if (!skipChecks) {
-    runCommand("npm", ["run", "check"], { cwd: repositoryRoot });
-  }
+  runCommand("npm", ["run", "check"], { cwd: repositoryRoot });
 
-  const distributionTag = getDistributionTag(context.repositoryVersion);
-  runCommand(
-    "npm",
-    [
-      "publish",
-      "--workspace",
-      RELEASE.packageName,
-      "--access",
-      "public",
-      "--tag",
-      distributionTag,
-      ...argumentsList,
-    ],
-    { cwd: repositoryRoot },
-  );
-  return { distributionTag, dryRun: isDryRun, version: context.repositoryVersion };
+  return publishPackage(repositoryRoot, context.repositoryVersion, argumentsList);
 };
 
 const ensureReleaseFilesAreIsolated = (repositoryRoot, releaseFiles) => {
   const allowedPaths = new Set(
     Object.values(releaseFiles).map((filePath) => filePath.slice(repositoryRoot.length + 1)),
   );
-  const changedPaths = readCommand("git", ["status", "--porcelain"], { cwd: repositoryRoot })
-    .split(/\r?\n/u)
-    .filter(Boolean)
-    .map((statusLine) => statusLine.slice(3));
+  const changedPaths = parseGitStatusPaths(readGitStatus(repositoryRoot));
   const unexpectedPaths = changedPaths.filter((filePath) => !allowedPaths.has(filePath));
   if (unexpectedPaths.length > 0) {
     throw new Error(
@@ -337,7 +371,18 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
     ["rev-parse", `origin/${initialContext.branchName}`],
     { cwd: repositoryRoot },
   );
-  if (remoteBranchCommit !== initialContext.headCommit) {
+  const currentChangelogPrepared = getChangelogVersionPattern(
+    initialContext.repositoryVersion,
+  ).test(initialContext.changelog);
+  const localReleasePrepared =
+    currentChangelogPrepared && initialContext.tagCommit === initialContext.headCommit;
+  const localReleaseAhead =
+    remoteBranchCommit !== initialContext.headCommit &&
+    isCommitAncestor(repositoryRoot, remoteBranchCommit, initialContext.headCommit);
+  if (
+    remoteBranchCommit !== initialContext.headCommit &&
+    !(localReleasePrepared && localReleaseAhead)
+  ) {
     throw new Error(`Local ${initialContext.branchName} must match origin before publishing.`);
   }
 
@@ -351,16 +396,25 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
     initialContext.repositoryVersion,
     repositoryRoot,
   );
-  const changelogAlreadyPrepared = getChangelogVersionPattern(
-    initialContext.repositoryVersion,
-  ).test(initialContext.changelog);
-  let candidateVersion =
-    versionAlreadyPublished || (versionAlreadyTagged && !changelogAlreadyPrepared)
+  const changelogAlreadyPrepared = currentChangelogPrepared;
+  const remoteSyncPending =
+    versionAlreadyPublished &&
+    localReleasePrepared &&
+    (remoteBranchCommit !== initialContext.headCommit ||
+      initialContext.remoteTagCommit !== initialContext.headCommit);
+  let candidateVersion = remoteSyncPending
+    ? initialContext.repositoryVersion
+    : versionAlreadyPublished || (versionAlreadyTagged && !changelogAlreadyPrepared)
       ? getNextPrereleaseVersion(initialContext.repositoryVersion)
       : initialContext.repositoryVersion;
   let releaseConfirmed = false;
+  let packagePublished = false;
+  let releaseCommitPrepared = false;
   const colorEnabled = isTerminalColorEnabled(process.stdout);
-  const prompt = createInterface({ input: process.stdin, output: process.stdout });
+  const prompt = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
 
   try {
     synchronizeReleaseFiles(releaseFiles, snapshots, candidateVersion, releaseDate);
@@ -383,7 +437,11 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
         throw new Error(`CHANGELOG must contain a heading for ${candidateVersion}.`);
       }
       ensureReleaseFilesAreIsolated(repositoryRoot, releaseFiles);
-      assertVersionIsUnpublished(RELEASE.packageName, candidateVersion, repositoryRoot);
+      const synchronizingPublishedVersion =
+        remoteSyncPending && candidateVersion === initialContext.repositoryVersion;
+      if (!synchronizingPublishedVersion) {
+        assertVersionIsUnpublished(RELEASE.packageName, candidateVersion, repositoryRoot);
+      }
       runCommand("npm", ["run", "check"], { cwd: repositoryRoot });
       runCommand("npm", ["pack", "--workspace", RELEASE.packageName, "--dry-run"], {
         cwd: repositoryRoot,
@@ -434,38 +492,83 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
     }
 
     process.stdout.write(
-      `${applyTerminalColor("Publishing confirmed release...", "magenta", colorEnabled)}\n`,
+      `${applyTerminalColor("Preparing local release commit...", "magenta", colorEnabled)}\n`,
     );
 
-    const releaseChanges = readCommand("git", ["status", "--porcelain"], {
-      cwd: repositoryRoot,
-    });
+    const releaseChanges = readGitStatus(repositoryRoot);
     if (releaseChanges !== "") {
-      runCommand("git", ["add", ...Object.values(releaseFiles)], { cwd: repositoryRoot });
+      runCommand("git", ["add", ...Object.values(releaseFiles)], {
+        cwd: repositoryRoot,
+      });
       runCommand("git", ["commit", "-m", `chore(release): v${candidateVersion}`], {
         cwd: repositoryRoot,
       });
     }
 
     const releaseTag = `v${candidateVersion}`;
-    const releaseCommit = readCommand("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot });
+    const releaseCommit = readCommand("git", ["rev-parse", "HEAD"], {
+      cwd: repositoryRoot,
+    });
     const existingTagCommit = readTagCommit(repositoryRoot, releaseTag);
     if (existingTagCommit === "") {
-      runCommand("git", ["tag", "-a", releaseTag, "-m", releaseTag], { cwd: repositoryRoot });
+      runCommand("git", ["tag", "-a", releaseTag, "-m", releaseTag], {
+        cwd: repositoryRoot,
+      });
     } else if (existingTagCommit !== releaseCommit) {
       throw new Error(`${releaseTag} already points to another commit.`);
     }
-    runCommand("git", ["push", "origin", initialContext.branchName], { cwd: repositoryRoot });
+    releaseCommitPrepared = true;
+
+    const synchronizingPublishedVersion =
+      remoteSyncPending && candidateVersion === initialContext.repositoryVersion;
+    let publishResult = {
+      distributionTag: getDistributionTag(candidateVersion),
+      dryRun: false,
+      version: candidateVersion,
+    };
+    if (synchronizingPublishedVersion) {
+      packagePublished = true;
+      process.stdout.write(
+        `${applyTerminalColor("npm version is already published; synchronizing Git...", "yellow", colorEnabled)}\n`,
+      );
+    } else {
+      process.stdout.write(
+        `${applyTerminalColor("Publishing package to npm...", "magenta", colorEnabled)}\n`,
+      );
+      try {
+        publishResult = publishPackage(repositoryRoot, candidateVersion);
+        packagePublished = true;
+      } catch (error) {
+        if (!isVersionPublished(RELEASE.packageName, candidateVersion, repositoryRoot)) {
+          throw error;
+        }
+        packagePublished = true;
+      }
+    }
+
+    runCommand("git", ["push", "origin", initialContext.branchName], {
+      cwd: repositoryRoot,
+    });
     const existingRemoteTagCommit = readRemoteTagCommit(repositoryRoot, releaseTag);
     if (existingRemoteTagCommit === "") {
-      runCommand("git", ["push", "origin", releaseTag], { cwd: repositoryRoot });
+      runCommand("git", ["push", "origin", releaseTag], {
+        cwd: repositoryRoot,
+      });
     } else if (existingRemoteTagCommit !== releaseCommit) {
       throw new Error(`The origin ${releaseTag} tag points to another commit.`);
     }
-    return publishPreparedRelease(repositoryRoot, [], { skipChecks: true });
+    return publishResult;
   } catch (error) {
-    if (!releaseConfirmed) {
+    if (!packagePublished && !releaseCommitPrepared) {
       restoreReleaseFiles(snapshots);
+    }
+    if (!packagePublished && releaseCommitPrepared) {
+      const message = error instanceof Error ? error.message : "Package publication failed.";
+      throw new Error(`${message}\nLocal release commit and tag were retained for a safe retry.`);
+    }
+    if (packagePublished && !(error instanceof PublishedPackageSyncError)) {
+      const message = error instanceof Error ? error.message : "Git synchronization failed.";
+      throw new PublishedPackageSyncError(message);
     }
     throw error;
   } finally {
@@ -499,7 +602,11 @@ if (isDirectExecution) {
   } catch (error) {
     const message = error instanceof Error ? error.message : "Package publication failed.";
     const colorEnabled = isTerminalColorEnabled(process.stderr);
-    process.stderr.write(`${formatPublishFailure(message, colorEnabled)}\n`);
+    const output =
+      error instanceof PublishedPackageSyncError
+        ? formatPublishedPackageSyncFailure(message, colorEnabled)
+        : formatPublishFailure(message, colorEnabled);
+    process.stderr.write(`${output}\n`);
     process.exitCode = 1;
   }
 }

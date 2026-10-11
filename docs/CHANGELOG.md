@@ -16,6 +16,10 @@ All notable changes to AI-Tidu9 will be documented in this file.
 - 增加明确的 `build:tidu`、版本感知的 `publish:tidu` 包级目标，以及覆盖全部Workspace的 `build` 入口。
 - Make `publish:tidu` prepare versions and changelog entries interactively before explicit release confirmation.
 - 将 `publish:tidu` 改为交互式入口，在明确确认发布前自动准备版本与变更记录。
+- Make `@skillnull/tidu` the single version source and derive the runtime CLI version from its package metadata.
+- 以 `@skillnull/tidu` 作为唯一版本源，并从包元数据派生CLI运行时版本。
+- Synchronize the published package version and release tag to Git only after npm publication succeeds.
+- 仅在npm发布成功后，才将已发布包版本和发布Tag同步到Git远端。
 
 ### Upgrade notes / 升级说明
 
