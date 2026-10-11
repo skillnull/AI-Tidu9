@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { getDistributionTag, validatePublishContext } from "./publish-tidu.mjs";
+import {
+  formatPublishFailure,
+  formatPublishSuccess,
+  getDistributionTag,
+  validatePublishContext,
+} from "./publish-tidu.mjs";
 
 const validContext = Object.freeze({
   branchName: "main",
@@ -20,6 +25,19 @@ test("maps semantic versions to safe npm distribution tags", () => {
   assert.equal(getDistributionTag("1.2.3-alpha.1"), "alpha");
   assert.equal(getDistributionTag("1.2.3-beta.2"), "beta");
   assert.equal(getDistributionTag("1.2.3-rc.3"), "rc");
+});
+
+test("prints unambiguous publish outcomes", () => {
+  assert.match(formatPublishFailure("Missing release tag."), /^✖ PUBLISH BLOCKED/u);
+  assert.equal(formatPublishFailure("Missing release tag.", true).startsWith("\u001b[1;31m"), true);
+  assert.match(
+    formatPublishSuccess({ distributionTag: "alpha", dryRun: true, version: "1.2.3-alpha.1" }),
+    /validated but not published/u,
+  );
+  assert.match(
+    formatPublishSuccess({ distributionTag: "latest", dryRun: false, version: "1.2.3" }),
+    /^✔ PUBLISHED/u,
+  );
 });
 
 test("accepts a clean tagged release context", () => {

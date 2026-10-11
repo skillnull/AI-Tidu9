@@ -8,12 +8,37 @@ const RELEASE = Object.freeze({
   packagePath: "packages/tidu",
   supportedArguments: new Set(["--dry-run"]),
 });
+const TERMINAL_COLOR = Object.freeze({
+  green: "\u001b[1;32m",
+  red: "\u001b[1;31m",
+  reset: "\u001b[0m",
+});
 
 const readJson = (filePath) => JSON.parse(readFileSync(filePath, "utf8"));
 
 export const getDistributionTag = (version) => {
   const prereleaseMatch = version.match(/-(alpha|beta|rc)\.[1-9]\d*$/u);
   return prereleaseMatch?.[1] ?? "latest";
+};
+
+const applyTerminalColor = (message, color, enabled) =>
+  enabled ? `${TERMINAL_COLOR[color]}${message}${TERMINAL_COLOR.reset}` : message;
+
+export const formatPublishFailure = (message, colorEnabled = false) =>
+  applyTerminalColor(
+    `✖ PUBLISH BLOCKED — ${RELEASE.packageName} was not published.\n${message}`,
+    "red",
+    colorEnabled,
+  );
+
+export const formatPublishSuccess = (
+  { distributionTag, dryRun, version },
+  colorEnabled = false,
+) => {
+  const message = dryRun
+    ? `✔ DRY RUN PASSED — ${RELEASE.packageName}@${version} was validated but not published.`
+    : `✔ PUBLISHED — ${RELEASE.packageName}@${version} with npm tag ${distributionTag}.`;
+  return applyTerminalColor(message, "green", colorEnabled);
 };
 
 export const validatePublishContext = (
@@ -160,6 +185,7 @@ const publish = (argumentsList) => {
     ...argumentsList,
   ];
   runCommand("npm", publishArguments, { cwd: repositoryRoot });
+  return { distributionTag, dryRun: isDryRun, version: rootPackage.version };
 };
 
 const entryPath = process.argv[1];
@@ -168,10 +194,13 @@ const isDirectExecution =
 
 if (isDirectExecution) {
   try {
-    publish(process.argv.slice(2));
+    const result = publish(process.argv.slice(2));
+    const colorEnabled = process.env.NO_COLOR === undefined && process.stdout.isTTY === true;
+    process.stdout.write(`${formatPublishSuccess(result, colorEnabled)}\n`);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Package publication failed.";
-    process.stderr.write(`${message}\n`);
+    const colorEnabled = process.env.NO_COLOR === undefined && process.stderr.isTTY === true;
+    process.stderr.write(`${formatPublishFailure(message, colorEnabled)}\n`);
     process.exitCode = 1;
   }
 }
