@@ -14,6 +14,8 @@ All notable changes to AI-Tidu9 will be documented in this file.
 - 将内部Workspace收敛为唯一公开包 `@skillnull/tidu`，同时保留模块边界。
 - Add explicit `build:tidu` and version-aware `publish:tidu` package targets, plus a workspace-wide `build` entry point.
 - 增加明确的 `build:tidu`、版本感知的 `publish:tidu` 包级目标，以及覆盖全部Workspace的 `build` 入口。
+- Make `publish:tidu` prepare versions and changelog entries interactively before explicit release confirmation.
+- 将 `publish:tidu` 改为交互式入口，在明确确认发布前自动准备版本与变更记录。
 
 ### Upgrade notes / 升级说明
 

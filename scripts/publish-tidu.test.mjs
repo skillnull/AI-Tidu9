@@ -5,6 +5,8 @@ import {
   formatPublishFailure,
   formatPublishSuccess,
   getDistributionTag,
+  getNextPrereleaseVersion,
+  prepareChangelog,
   validatePublishContext,
 } from "./publish-tidu.mjs";
 
@@ -25,6 +27,20 @@ test("maps semantic versions to safe npm distribution tags", () => {
   assert.equal(getDistributionTag("1.2.3-alpha.1"), "alpha");
   assert.equal(getDistributionTag("1.2.3-beta.2"), "beta");
   assert.equal(getDistributionTag("1.2.3-rc.3"), "rc");
+});
+
+test("increments prerelease versions without changing their channel", () => {
+  assert.equal(getNextPrereleaseVersion("1.2.3-alpha.9"), "1.2.3-alpha.10");
+  assert.equal(getNextPrereleaseVersion("1.2.3-beta.2"), "1.2.3-beta.3");
+  assert.throws(() => getNextPrereleaseVersion("1.2.3"), /Cannot automatically increment/u);
+});
+
+test("moves unreleased notes under an automatically generated release heading", () => {
+  const changelog = "# Changelog\n\n## Unreleased / 未发布\n\n- Added a release flow.\n";
+  const prepared = prepareChangelog(changelog, "1.2.3-alpha.2", "2026-10-11");
+
+  assert.match(prepared, /## Unreleased \/ 未发布\n\n## 1\.2\.3-alpha\.2 - 2026-10-11/u);
+  assert.equal(prepareChangelog(prepared, "1.2.3-alpha.2", "2026-10-11"), prepared);
 });
 
 test("prints unambiguous publish outcomes", () => {
