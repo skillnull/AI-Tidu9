@@ -10,9 +10,17 @@
   ],
   "scripts": {
     "build": "npm run build --workspace @skillnull/tidu-core && npm run build --workspace @skillnull/tidu-config && npm run build --workspace @skillnull/tidu-protocol && npm run build --workspace tidu",
-    "check": "npm run lint && npm run build && npm run check --workspaces --if-present",
+    "check": "npm run policy:versions && npm run lint && npm run build && npm run check --workspaces --if-present",
     "lint": "biome check --config-path=config/biome.json .",
-    "test": "npm run build && npm run test --workspaces --if-present"
+    "prepare": "node scripts/install-git-hooks.mjs",
+    "policy:branch": "node scripts/project-policy.mjs branch",
+    "policy:commit": "node scripts/project-policy.mjs commit",
+    "policy:owner": "node scripts/project-policy.mjs owner",
+    "policy:pull-request": "node scripts/project-policy.mjs pull-request",
+    "policy:release-lines": "node scripts/project-policy.mjs release-lines",
+    "policy:tag": "node scripts/project-policy.mjs tag",
+    "policy:versions": "node scripts/project-policy.mjs versions",
+    "test": "npm run build && node --test scripts/*.test.mjs && npm run test --workspaces --if-present"
   },
   "engines": {
     "node": ">=18.20.0"

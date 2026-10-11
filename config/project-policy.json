@@ -1,0 +1,24 @@
+{
+  "repository": "skillnull/AI-Tidu9",
+  "owner": "skillnull",
+  "rulesetName": "Protect main — owner only",
+  "primaryBranch": "main",
+  "protectedBranches": ["main"],
+  "workBranchTypes": [
+    "feat",
+    "fix",
+    "docs",
+    "refactor",
+    "perf",
+    "test",
+    "build",
+    "ci",
+    "chore",
+    "security"
+  ],
+  "maintenance": {
+    "branchPrefix": "support",
+    "maxActiveLines": 2,
+    "allowedChangeTypes": ["fix", "security", "docs", "test", "build", "ci", "chore"]
+  }
+}

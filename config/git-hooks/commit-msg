@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+
+npm run policy:commit -- --file "$1"

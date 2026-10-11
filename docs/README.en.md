@@ -34,6 +34,8 @@ The CLI package is named `tidu` and will provide the following command after pub
 npx tidu
 ```
 
+See the [contribution guide](./CONTRIBUTING.md) for branch, commit, pull-request, version, and release rules. Local policy scripts and GitHub Actions enforce these rules.
+
 ## Release plan
 
 See the [release plan](./RELEASE_PLAN.md) for development stages and acceptance status. This temporary file will be removed after final `v1.0.0` acceptance; actual release history will remain in the [changelog](./CHANGELOG.md) and Git tags.

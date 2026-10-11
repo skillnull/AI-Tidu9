@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+npm run policy:branch
+npm run policy:release-lines
+npm run check
+npm test

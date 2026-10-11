@@ -23,6 +23,8 @@ An item is complete only after implementation, automated tests, real-scenario ve
 - [ ] Do not create or push a release tag without explicit confirmation / 未确认不得创建或推送正式 Tag
 - [ ] Keep `docs/CHANGELOG.md` synchronized with every release / 每次发布同步更新 `docs/CHANGELOG.md`
 - [ ] Record real compatibility limits / 如实记录兼容性边界
+- [x] Implement protected-trunk, single-major ownership, maintenance-line, and immutable-tag checks / 实现主干、Major单一所有权、维护线与不可变Tag校验
+- [ ] Activate `Policy` and `Verify` as required remote checks after the confirmed first push / 首次确认推送后将`Policy`和`Verify`设为远端必需检查
 
 ## Stage 0 — Baseline audit / 阶段0：项目基线审计
 
