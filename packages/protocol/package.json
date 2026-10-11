@@ -1,0 +1,21 @@
+{
+  "name": "@skillnull/tidu-protocol",
+  "version": "0.1.0-alpha.1",
+  "description": "AI-Tidu9 canonical Agent protocol",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "!dist/**/*.test.*"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test dist/index.test.js"
+  },
+  "engines": {
+    "node": ">=18.20.0"
+  }
+}

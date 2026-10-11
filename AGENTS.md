@@ -1,42 +1,30 @@
-# My Project Rules
-
-> 这是我的项目
-
-## 编码规范
-
-- 使用 TypeScript
-- 组件命名用 PascalCase
-
-# AI-Tidu9
-
-> [agents.md](https://agents.md/) standard file · place in **project root** to take effect
+# AI-Tidu9 Project Rules
 
 ## Scope
 
-This file is the **AI Rules Pack** (AI-Tidu9) for the project.
-**Rules apply to the entire repository**, not just this folder.
-No matter which path you are editing, you must follow this file and all Skills below.
+These rules apply to the entire repository.
 
-## Mandatory Instructions
+## Product
 
-1. First line: `[AI-TIDU9] Loaded`
-2. Recursively read all `SKILL.md` files under `.ai-tidu9/skills/`
-3. Execute the Step 0→4 workflow based on loaded Skills
-4. Before finishing, check all boxes in the checklist. Last line: `[AI-TIDU9] Done · All checks passed`
+- Name: 九门赛博提督
+- Explanation: 九门赛博提督·智能协作中枢
+- Positioning: 九门赛博提督是面向全领域场景的智能协作中枢，以目标驱动内外部 Agent、模型、工具、知识与专家协同执行，交付可验证的业务结果。
 
-## How It Works
+## Engineering rules
 
-**Skill changes take effect immediately — no rebuild needed.**
+- Use TypeScript for product code.
+- Keep the architecture modular, cohesive, and replaceable at adapter boundaries.
+- Keep personal mode lightweight; enterprise infrastructure must remain optional.
+- Never read or reuse private credentials from Codex, Cursor, browsers, or other clients.
+- Never bypass mandatory policy, quota, approval, or verification gates.
+- Keep public repository content free of personal paths, accounts, company-confidential data, and secrets.
+- Keep Chinese and English public documentation synchronized.
+- Read a target file before editing it and limit changes to the active task.
+- Run relevant checks before reporting completion.
+- Do not commit, tag, publish, or push without explicit user confirmation.
 
-- Add a Skill: create a new folder under `.ai-tidu9/skills/` with a `SKILL.md` file
-- Edit a Skill: modify `.ai-tidu9/skills/<name>/SKILL.md`
-- Remove a Skill: delete its folder
+## Response protocol
 
-On the next conversation, the AI will automatically read the latest `.ai-tidu9/skills/` content.
-
-## Skill Directory
-
-Each subfolder under `.ai-tidu9/skills/` is a Skill, containing a `SKILL.md` file.
-AI reads all `.ai-tidu9/skills/**/SKILL.md` files before responding.
-
----
+- First line: `[AI-TIDU9] Loaded`
+- Use Simplified Chinese for user-facing communication unless requested otherwise.
+- Last line after completed checks: `[AI-TIDU9] Done · All checks passed`

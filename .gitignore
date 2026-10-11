@@ -1,9 +1,13 @@
 .DS_Store
 node_modules
 pnpm-lock.yaml
-package-lock.json
 yarn.lock
 
 # Editor directories and files
 .idea
 .vscode
+
+# Build and test output
+dist
+coverage
+*.tsbuildinfo

@@ -1,35 +1,25 @@
 {
-  "name": "@skillnull/ai-tidu9",
-  "version": "1.0.0",
-  "description": "九门赛博提督 — 专治 AI 跑偏。The Cyber-JiumenTidu for LLMs.",
-  "keywords": [
-    "ai-pack",
-    "agents-md",
-    "skill",
-    "prompt-contract",
-    "cursor",
-    "claude-code",
-    "codex",
-    "chatgpt"
-  ],
-  "homepage": "https://github.com/skillnull/AI-Tidu9#readme",
-  "repository": {
-    "type": "git",
-    "url": "git+ssh://git@github.com:skillnull/AI-Tidu9.git"
-  },
-  "bugs": {
-    "url": "https://github.com/skillnull/AI-Tidu9/issues"
-  },
-  "license": "MIT",
-  "author": "skillnull",
-  "main": ".ai-tidu9/scripts/install.js",
-  "files": [
-    ".ai-tidu9/"
+  "name": "ai-tidu9-workspace",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "description": "九门赛博提督·智能协作中枢",
+  "license": "AGPL-3.0-only",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
   ],
   "scripts": {
-    "postinstall": "node .ai-tidu9/scripts/install.js"
+    "build": "npm run build --workspace @skillnull/tidu-core && npm run build --workspace @skillnull/tidu-config && npm run build --workspace @skillnull/tidu-protocol && npm run build --workspace tidu",
+    "check": "npm run lint && npm run build && npm run check --workspaces --if-present",
+    "lint": "biome check .",
+    "test": "npm run build && npm run test --workspaces --if-present"
   },
   "engines": {
-    "node": ">=16"
+    "node": ">=18.20.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@types/node": "18.19.130",
+    "typescript": "7.0.2"
   }
 }
