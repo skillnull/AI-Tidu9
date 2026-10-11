@@ -25,13 +25,13 @@ The project is being rebuilt from an early AI rules package into an independent 
 npm install
 npm run check
 npm test
-node apps/cli/dist/index.js --help
+node packages/tidu/dist/cli/index.js --help
 ```
 
-The CLI package is named `tidu` and will provide the following command after publication:
+The official npm package is `@skillnull/tidu`; its installed command remains `tidu`:
 
 ```bash
-npx tidu
+npx @skillnull/tidu
 ```
 
 See the [contribution guide](./CONTRIBUTING.md) for branch, commit, pull-request, version, and release rules. Local policy scripts and GitHub Actions enforce these rules.

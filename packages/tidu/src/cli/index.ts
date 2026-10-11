@@ -3,7 +3,7 @@
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-import { PRODUCT, TiduError } from "@skillnull/tidu-core";
+import { PRODUCT, TiduError } from "../core/index.js";
 
 const HELP_TEXT = `${PRODUCT.explanation}
 

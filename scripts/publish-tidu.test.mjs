@@ -1,0 +1,64 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { getDistributionTag, validatePublishContext } from "./publish-tidu.mjs";
+
+const validContext = Object.freeze({
+  branchName: "main",
+  changelog: "## 1.2.3",
+  headCommit: "release-commit",
+  packageName: "@skillnull/tidu",
+  packageVersion: "1.2.3",
+  repositoryVersion: "1.2.3",
+  remoteTagCommit: "release-commit",
+  status: "",
+  tagCommit: "release-commit",
+});
+
+test("maps semantic versions to safe npm distribution tags", () => {
+  assert.equal(getDistributionTag("1.2.3"), "latest");
+  assert.equal(getDistributionTag("1.2.3-alpha.1"), "alpha");
+  assert.equal(getDistributionTag("1.2.3-beta.2"), "beta");
+  assert.equal(getDistributionTag("1.2.3-rc.3"), "rc");
+});
+
+test("accepts a clean tagged release context", () => {
+  assert.deepEqual(validatePublishContext(validContext), []);
+  assert.deepEqual(validatePublishContext({ ...validContext, branchName: "support/1.x" }), []);
+});
+
+test("allows a dry-run before release tags are created", () => {
+  const context = { ...validContext, remoteTagCommit: "", tagCommit: "" };
+
+  assert.deepEqual(validatePublishContext(context, { requireReleaseTag: false }), []);
+});
+
+test("rejects releases from a support branch for another major", () => {
+  const problems = validatePublishContext({ ...validContext, branchName: "support/2.x" });
+
+  assert.deepEqual(problems, ["The support/2.x branch may publish only major 2."]);
+});
+
+test("requires a real changelog version heading", () => {
+  const problems = validatePublishContext({
+    ...validContext,
+    changelog: "## Unreleased\n\nPreparing version 1.2.3.",
+  });
+
+  assert.deepEqual(problems, ["docs/CHANGELOG.md must contain a heading for version 1.2.3."]);
+});
+
+test("rejects dirty, untagged, mismatched, or unrecorded releases", () => {
+  const problems = validatePublishContext({
+    ...validContext,
+    branchName: "feat/release",
+    changelog: "## Unreleased",
+    packageName: "tidu",
+    packageVersion: "1.2.4",
+    remoteTagCommit: "",
+    status: "M package.json",
+    tagCommit: "",
+  });
+
+  assert.equal(problems.length, 7);
+});

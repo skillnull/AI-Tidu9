@@ -25,13 +25,13 @@
 npm install
 npm run check
 npm test
-node apps/cli/dist/index.js --help
+node packages/tidu/dist/cli/index.js --help
 ```
 
-当前CLI包名为 `tidu`，正式发布后提供：
+正式npm包名为 `@skillnull/tidu`，安装后的命令保持为 `tidu`：
 
 ```bash
-npx tidu
+npx @skillnull/tidu
 ```
 
 分支、Commit、PR、版本和发布规则见 [贡献指南](./docs/CONTRIBUTING.md)。规则由本地脚本和GitHub Actions共同校验。

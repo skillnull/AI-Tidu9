@@ -8,10 +8,12 @@ AI-Tidu9 follows a modular-monolith-first architecture with stable adapter bound
 
 | Module | Responsibility | Boundary |
 | --- | --- | --- |
-| `apps/cli` | `tidu` command entry point | Handles interaction and process exit codes, not domain logic |
-| `packages/core` | Product metadata, shared errors, and domain foundations | Independent of clients, model providers, and storage implementations |
-| `packages/config` | Versioned configuration contracts and safe defaults | Managed and expert configurations must remain isolated |
-| `packages/protocol` | Canonical Agent task and event protocol | Evolves through explicit versions without binding to one model |
+| `packages/tidu/src/cli` | `tidu` command entry point | Handles interaction and process exit codes, not domain logic |
+| `packages/tidu/src/core` | Product metadata, shared errors, and domain foundations | Independent of clients, model providers, and storage implementations |
+| `packages/tidu/src/config` | Versioned configuration contracts and safe defaults | Managed and expert configurations must remain isolated |
+| `packages/tidu/src/protocol` | Canonical Agent task and event protocol | Evolves through explicit versions without binding to one model |
+
+These modules belong to the single public package `@skillnull/tidu`. Directories preserve internal code boundaries without becoming separate npm packages. A new public package is extracted only after it has independent consumers, versioning, and a release lifecycle.
 
 ## Design constraints
 

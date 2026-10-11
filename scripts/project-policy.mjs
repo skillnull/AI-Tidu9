@@ -175,7 +175,7 @@ export const validateReleaseTag = (tagName, version) => {
 const readJson = (filePath) => JSON.parse(readFileSync(filePath, "utf8"));
 
 const findWorkspacePackages = (repositoryRoot) => {
-  const workspaceRoots = ["apps", "packages"];
+  const workspaceRoots = ["packages"];
   return workspaceRoots.flatMap((workspaceRoot) => {
     const absoluteRoot = join(repositoryRoot, workspaceRoot);
     return readdirSync(absoluteRoot, { withFileTypes: true })
@@ -209,7 +209,7 @@ export const validateRepositoryVersions = (repositoryRoot) => {
 
     const internalDependencies = Object.entries(workspacePackage.dependencies ?? {}).filter(
       ([dependencyName]) =>
-        dependencyName === "tidu" || dependencyName.startsWith("@skillnull/tidu-"),
+        dependencyName === "@skillnull/tidu" || dependencyName.startsWith("@skillnull/tidu-"),
     );
     for (const [dependencyName, dependencyVersion] of internalDependencies) {
       if (dependencyVersion !== rootPackage.version) {

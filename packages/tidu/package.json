@@ -1,0 +1,43 @@
+{
+  "name": "@skillnull/tidu",
+  "version": "0.1.0-alpha.1",
+  "description": "九门赛博提督·智能协作中枢",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "tidu": "dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/skillnull/AI-Tidu9.git"
+  },
+  "homepage": "https://github.com/skillnull/AI-Tidu9#readme",
+  "bugs": {
+    "url": "https://github.com/skillnull/AI-Tidu9/issues"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build && node ../../scripts/npm-package-assets.mjs prepare",
+    "postpack": "node ../../scripts/npm-package-assets.mjs clean",
+    "test": "npm run build && node --test dist/index.test.js dist/cli/index.test.js dist/config/index.test.js dist/core/index.test.js dist/protocol/index.test.js"
+  },
+  "engines": {
+    "node": ">=18.20.0"
+  }
+}

@@ -5,7 +5,6 @@
 ```bash
 npm install
 npm run check
-npm test
 ```
 
 ## Branches / 分支
@@ -27,7 +26,7 @@ npm test
 - 同一个Major只能由 `main` 或对应 `support` 唯一持有，不能同时存在；最多保留两条活跃维护线。
 - 分支名使用小写且不超过80个字符，工作分支合并后删除。
 
-Validate the current branch with `npm run policy:branch`.
+Validate the current branch with `npm run policy -- branch`.
 
 ## Trunk and maintenance lines / 主干与维护线
 
@@ -58,7 +57,7 @@ Validate the current branch with `npm run policy:branch`.
 - PR必须说明背景、验证、兼容与回滚影响；适用时补齐安全检查和中英文文档。
 - 至少获得一名非作者成员批准，并通过全部必需CI检查。
 
-Validate a message with `npm run policy:commit -- "feat(scope): description"`.
+Validate a message with `npm run policy -- commit "feat(scope): description"`.
 
 ## Versions and releases / 版本与发布
 
@@ -68,11 +67,13 @@ Validate a message with `npm run policy:commit -- "feat(scope): description"`.
 - A release requires a clean quality gate, updated changelog, migration and rollback notes, compatibility limits, and explicit maintainer approval.
 - Publishing, tagging, or pushing a release without explicit confirmation is forbidden.
 - Releases come from immutable `v<version>` tags, not mutable branches. A support line may publish only its own major. Build once and promote the same verified artifact between channels.
+- `npm run publish:tidu -- --dry-run` previews the exact package. `npm run publish:tidu` publishes only from a clean protected release line whose `v<version>` tag points to `HEAD` and whose version is recorded in the changelog.
 
 - 版本遵循语义化版本，预发布标识仅允许 `alpha.N`、`beta.N` 和 `rc.N`，Tag采用 `v<版本号>`。
 - 根工作区、所有发布包、内部依赖和锁文件必须保持同一版本。
 - 发版必须通过质量门禁，并同步变更记录、迁移、回滚和兼容性说明；未经明确确认不得发布、打Tag或推送。
 - 正式版本从不可变 `v<版本号>` Tag发布，不直接部署可变分支。维护线只能发布自己的Major；同一Commit只构建一次，并在各渠道晋级同一份已验证制品。
+- `npm run publish:tidu -- --dry-run` 用于预览真实发布包；`npm run publish:tidu` 只允许从干净的受保护发布线执行，并要求 `v<版本号>` Tag指向当前Commit且变更记录包含该版本。
 
 ## Security and governance / 安全与治理
 
