@@ -12,9 +12,13 @@ const RELEASE = Object.freeze({
   supportedArguments: new Set(["--dry-run"]),
 });
 const TERMINAL_COLOR = Object.freeze({
+  blue: "\u001b[1;34m",
+  cyan: "\u001b[1;36m",
   green: "\u001b[1;32m",
+  magenta: "\u001b[1;35m",
   red: "\u001b[1;31m",
   reset: "\u001b[0m",
+  yellow: "\u001b[1;33m",
 });
 
 const readJson = (filePath) => JSON.parse(readFileSync(filePath, "utf8"));
@@ -53,6 +57,28 @@ export const getDistributionTag = (version) => {
 
 const applyTerminalColor = (message, color, enabled) =>
   enabled ? `${TERMINAL_COLOR[color]}${message}${TERMINAL_COLOR.reset}` : message;
+
+const isTerminalColorEnabled = (stream) =>
+  process.env.NO_COLOR === undefined &&
+  (process.env.FORCE_COLOR === "0"
+    ? false
+    : process.env.FORCE_COLOR !== undefined || stream.isTTY === true);
+
+export const formatReleaseSummary = (
+  { currentVersion, releaseDate, version },
+  colorEnabled = false,
+) =>
+  [
+    "",
+    applyTerminalColor("Release summary", "cyan", colorEnabled),
+    `  ${applyTerminalColor("Package:", "blue", colorEnabled)}   ${RELEASE.packageName}`,
+    `  ${applyTerminalColor("Version:", "blue", colorEnabled)}   ${currentVersion} → ${version}`,
+    `  ${applyTerminalColor("npm tag:", "yellow", colorEnabled)}   ${getDistributionTag(version)}`,
+    `  ${applyTerminalColor("CHANGELOG:", "yellow", colorEnabled)} ${version} (${releaseDate})`,
+    `  ${applyTerminalColor("Files:", "magenta", colorEnabled)}     package.json, package-lock.json, packages/tidu/package.json, docs/CHANGELOG.md`,
+    `  ${applyTerminalColor("Next:", "magenta", colorEnabled)}      commit → tag → push → npm publish`,
+    "",
+  ].join("\n");
 
 export const formatPublishFailure = (message, colorEnabled = false) =>
   applyTerminalColor(
@@ -333,17 +359,22 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
       ? getNextPrereleaseVersion(initialContext.repositoryVersion)
       : initialContext.repositoryVersion;
   let releaseConfirmed = false;
+  const colorEnabled = isTerminalColorEnabled(process.stdout);
   const prompt = createInterface({ input: process.stdin, output: process.stdout });
 
   try {
     synchronizeReleaseFiles(releaseFiles, snapshots, candidateVersion, releaseDate);
     while (!releaseConfirmed) {
       process.stdout.write(
-        `\nRelease candidate: ${RELEASE.packageName}@${candidateVersion}\n` +
-          "Confirmation will commit the release files, create and push the tag, then publish to npm.\n" +
-          "Changes to review:\n",
+        formatReleaseSummary(
+          {
+            currentVersion: initialContext.repositoryVersion,
+            releaseDate,
+            version: candidateVersion,
+          },
+          colorEnabled,
+        ),
       );
-      runCommand("git", ["diff", "--", ...Object.values(releaseFiles)], { cwd: repositoryRoot });
       if (
         !getChangelogVersionPattern(candidateVersion).test(
           readFileSync(releaseFiles.changelog, "utf8"),
@@ -357,10 +388,17 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
       runCommand("npm", ["pack", "--workspace", RELEASE.packageName, "--dry-run"], {
         cwd: repositoryRoot,
       });
+      process.stdout.write(
+        `${applyTerminalColor("✔ Candidate checks passed.", "green", colorEnabled)}\n`,
+      );
 
       const response = (
         await prompt.question(
-          `\nType "${candidateVersion}" to publish, "edit" to modify CHANGELOG, "version" to change the version, or "cancel": `,
+          applyTerminalColor(
+            `\nType "${candidateVersion}" to publish, "edit" to modify CHANGELOG, "version" to change the version, or "cancel": `,
+            "yellow",
+            colorEnabled,
+          ),
         )
       ).trim();
       if (response === "cancel") {
@@ -368,13 +406,23 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
       }
       if (response === "edit") {
         await prompt.question(
-          `Edit ${releaseFiles.changelog} in your editor, then press Enter to review again.`,
+          applyTerminalColor(
+            `Edit ${releaseFiles.changelog} in your editor, then press Enter to review again.`,
+            "cyan",
+            colorEnabled,
+          ),
         );
         continue;
       }
       if (response === "version") {
         const requestedVersion = (
-          await prompt.question(`Enter release version [${candidateVersion}]: `)
+          await prompt.question(
+            applyTerminalColor(
+              `Enter release version [${candidateVersion}]: `,
+              "cyan",
+              colorEnabled,
+            ),
+          )
         ).trim();
         if (requestedVersion !== "") {
           candidateVersion = requestedVersion;
@@ -384,6 +432,10 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
       }
       releaseConfirmed = response === candidateVersion;
     }
+
+    process.stdout.write(
+      `${applyTerminalColor("Publishing confirmed release...", "magenta", colorEnabled)}\n`,
+    );
 
     const releaseChanges = readCommand("git", ["status", "--porcelain"], {
       cwd: repositoryRoot,
@@ -442,11 +494,11 @@ const isDirectExecution =
 if (isDirectExecution) {
   try {
     const result = await publish(process.argv.slice(2));
-    const colorEnabled = process.env.NO_COLOR === undefined && process.stdout.isTTY === true;
+    const colorEnabled = isTerminalColorEnabled(process.stdout);
     process.stdout.write(`${formatPublishSuccess(result, colorEnabled)}\n`);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Package publication failed.";
-    const colorEnabled = process.env.NO_COLOR === undefined && process.stderr.isTTY === true;
+    const colorEnabled = isTerminalColorEnabled(process.stderr);
     process.stderr.write(`${formatPublishFailure(message, colorEnabled)}\n`);
     process.exitCode = 1;
   }

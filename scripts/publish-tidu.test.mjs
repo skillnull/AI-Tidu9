@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   formatPublishFailure,
   formatPublishSuccess,
+  formatReleaseSummary,
   getDistributionTag,
   getNextPrereleaseVersion,
   prepareChangelog,
@@ -54,6 +55,26 @@ test("prints unambiguous publish outcomes", () => {
     formatPublishSuccess({ distributionTag: "latest", dryRun: false, version: "1.2.3" }),
     /^✔ PUBLISHED/u,
   );
+});
+
+test("prints a concise color-aware release summary", () => {
+  const summary = formatReleaseSummary({
+    currentVersion: "1.2.3-alpha.1",
+    releaseDate: "2026-10-11",
+    version: "1.2.3-alpha.2",
+  });
+  const coloredSummary = formatReleaseSummary(
+    {
+      currentVersion: "1.2.3-alpha.1",
+      releaseDate: "2026-10-11",
+      version: "1.2.3-alpha.2",
+    },
+    true,
+  );
+
+  assert.match(summary, /1\.2\.3-alpha\.1 → 1\.2\.3-alpha\.2/u);
+  assert.doesNotMatch(summary, /diff --git/u);
+  assert.equal(coloredSummary.includes("\u001b[1;36mRelease summary"), true);
 });
 
 test("accepts a clean tagged release context", () => {
