@@ -8,7 +8,8 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --workspace @skillnull/tidu",
+    "build": "npm run build --workspaces --if-present",
+    "build:tidu": "npm run build --workspace @skillnull/tidu",
     "check": "npm run policy -- versions && npm run lint && npm test",
     "lint": "biome check --config-path=config/biome.json .",
     "prepare": "node scripts/install-git-hooks.mjs",

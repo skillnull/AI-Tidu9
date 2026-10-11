@@ -12,8 +12,8 @@ All notable changes to AI-Tidu9 will be documented in this file.
 - 建立 `tidu` CLI、TypeScript工作区、版本化配置与协议契约、统一错误模型和自动化质量门禁。
 - Consolidate internal workspaces into the single public package `@skillnull/tidu` while preserving module boundaries.
 - 将内部Workspace收敛为唯一公开包 `@skillnull/tidu`，同时保留模块边界。
-- Add a version-aware `publish:tidu` gate and consolidate repository policy commands.
-- 增加版本感知的 `publish:tidu` 门禁，并合并仓库策略命令。
+- Add explicit `build:tidu` and version-aware `publish:tidu` package targets, plus a workspace-wide `build` entry point.
+- 增加明确的 `build:tidu`、版本感知的 `publish:tidu` 包级目标，以及覆盖全部Workspace的 `build` 入口。
 
 ### Upgrade notes / 升级说明
 
