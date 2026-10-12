@@ -24,8 +24,20 @@ const TERMINAL_COLOR = Object.freeze({
 class PublishedPackageSyncError extends Error {}
 
 const readJson = (filePath) => JSON.parse(readFileSync(filePath, "utf8"));
-const writeJson = (filePath, value) =>
-  writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+
+export const updateJsonVersion = (content, version) => {
+  if (!validateVersion(version)) {
+    throw new Error(`Invalid release version ${version}.`);
+  }
+  const metadata = JSON.parse(content);
+  if (typeof metadata.version !== "string") {
+    throw new Error("Release metadata must contain a string version field.");
+  }
+  return content.replace(
+    /("version"\s*:\s*")[^"]+("\s*[,}])/u,
+    (_matchedVersion, versionPrefix, versionSuffix) => `${versionPrefix}${version}${versionSuffix}`,
+  );
+};
 
 const getChangelogVersionPattern = (version) => {
   const escapedVersion = version.replaceAll(".", "\\.");
@@ -327,17 +339,15 @@ const synchronizeReleaseFiles = (releaseFiles, snapshots, version, releaseDate) 
     throw new Error(`Invalid release version ${version}.`);
   }
 
-  const publishedPackage = JSON.parse(snapshots.get(releaseFiles.package));
-  publishedPackage.version = version;
-
   const connectorManifests = [releaseFiles.codexManifest, releaseFiles.pluginManifest];
   for (const connectorManifest of connectorManifests) {
-    const manifest = JSON.parse(snapshots.get(connectorManifest));
-    manifest.version = version;
-    writeJson(connectorManifest, manifest);
+    writeFileSync(connectorManifest, updateJsonVersion(snapshots.get(connectorManifest), version));
   }
 
-  writeJson(releaseFiles.package, publishedPackage);
+  writeFileSync(
+    releaseFiles.package,
+    updateJsonVersion(snapshots.get(releaseFiles.package), version),
+  );
   writeFileSync(
     releaseFiles.changelog,
     prepareChangelog(snapshots.get(releaseFiles.changelog), version, releaseDate),

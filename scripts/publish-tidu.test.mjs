@@ -11,6 +11,7 @@ import {
   getNextPrereleaseVersion,
   parseGitStatusPaths,
   prepareChangelog,
+  updateJsonVersion,
   validatePublishContext,
 } from "./publish-tidu.mjs";
 
@@ -51,6 +52,16 @@ test("moves unreleased notes under an automatically generated release heading", 
 
   assert.match(prepared, /## Unreleased \/ 未发布\n\n## 1\.2\.3-alpha\.2 - 2026-10-11/u);
   assert.equal(prepareChangelog(prepared, "1.2.3-alpha.2", "2026-10-11"), prepared);
+});
+
+test("updates release versions without reformatting JSON metadata", () => {
+  const metadata =
+    '{\n  "name": "example",\n  "version": "1.0.0",\n  "values": ["one", "two"]\n}\n';
+  assert.equal(
+    updateJsonVersion(metadata, "1.1.0-alpha.1"),
+    '{\n  "name": "example",\n  "version": "1.1.0-alpha.1",\n  "values": ["one", "two"]\n}\n',
+  );
+  assert.throws(() => updateJsonVersion('{"name":"example"}', "1.1.0"), /version field/u);
 });
 
 test("preserves paths from git porcelain status", () => {
