@@ -1,6 +1,6 @@
 {
   "name": "@skillnull/tidu",
-  "version": "0.1.0-alpha.2",
+  "version": "0.2.0-alpha.1",
   "description": "九门赛博提督·智能协作中枢",
   "license": "AGPL-3.0-only",
   "type": "module",
@@ -36,10 +36,10 @@
     "url": "https://github.com/skillnull/AI-Tidu9/issues"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.json && vite build",
-    "prepack": "npm run build && node ../../scripts/npm-package-assets.mjs prepare",
-    "postpack": "node ../../scripts/npm-package-assets.mjs clean",
-    "test": "npm run build && node --test dist/accounts/chatgpt.test.js dist/accounts/codex-host.test.js dist/accounts/cursor-host.test.js dist/accounts/index.test.js dist/index.test.js dist/cli/index.test.js dist/clients/configuration.test.js dist/clients/index.test.js dist/config-center/index.test.js dist/config/index.test.js dist/connectors/*.test.js dist/core/index.test.js dist/lifecycle/index.test.js dist/openai/index.test.js dist/protocol/index.test.js dist/providers/index.test.js dist/runtime/index.test.js dist/storage/index.test.js dist/usage/index.test.js"
+    "build": "sh -c '. \"$(git rev-parse --show-toplevel)/config/git-hooks/use-project-node.sh\" && tsc -p tsconfig.build.json && tsc -p tsconfig.json && vite build'",
+    "prepack": "sh -c '. \"$(git rev-parse --show-toplevel)/config/git-hooks/use-project-node.sh\" && npm run build && node ../../scripts/npm-package-assets.mjs prepare'",
+    "postpack": "sh -c '. \"$(git rev-parse --show-toplevel)/config/git-hooks/use-project-node.sh\" && node ../../scripts/npm-package-assets.mjs clean'",
+    "test": "sh -c '. \"$(git rev-parse --show-toplevel)/config/git-hooks/use-project-node.sh\" && npm run build && node --test dist/accounts/chatgpt.test.js dist/accounts/codex-host.test.js dist/accounts/cursor-host.test.js dist/accounts/index.test.js dist/index.test.js dist/cli/index.test.js dist/clients/configuration.test.js dist/clients/index.test.js dist/config-center/index.test.js dist/config/index.test.js dist/connectors/*.test.js dist/core/index.test.js dist/lifecycle/index.test.js dist/openai/index.test.js dist/protocol/index.test.js dist/providers/index.test.js dist/runtime/index.test.js dist/storage/index.test.js dist/usage/index.test.js'"
   },
   "engines": {
     "node": ">=22.14.0"

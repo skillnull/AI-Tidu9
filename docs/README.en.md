@@ -21,7 +21,7 @@ The project is being rebuilt from an early AI rules package into an independent 
 
 ## Local development
 
-Node.js 22.14 or later is required. The repository includes `.nvmrc`, and Git hooks automatically select the project Node version before running checks. Run `nvm install` once if that version is not installed yet.
+Node.js 22.14 or later is required. The repository includes `.nvmrc`; build, test, check, publish, and Git-hook commands automatically select the project Node version. Run `nvm install` once if that version is not installed yet.
 
 ```bash
 npm install

@@ -21,7 +21,7 @@
 
 ## 本地开发
 
-需要 Node.js 22.14 或更高版本。项目提供 `.nvmrc`，Git Hook 会在检查前自动切换到项目Node版本；首次使用若尚未安装，请运行 `nvm install`。
+需要 Node.js 22.14 或更高版本。项目提供 `.nvmrc`，构建、测试、检查、发布与Git Hook都会自动切换到项目Node版本；首次使用若尚未安装，请运行 `nvm install`。
 
 ```bash
 npm install

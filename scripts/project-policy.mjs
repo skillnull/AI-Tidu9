@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readdirSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -224,6 +224,21 @@ export const validateRepositoryVersions = (repositoryRoot) => {
           `${workspacePackage.name} depends on ${dependencyName}@${dependencyVersion}; expected ${expectedVersion}`,
         );
       }
+    }
+  }
+
+  const tiduVersion = workspaceVersions.get("@skillnull/tidu");
+  const connectorManifests = [
+    "packages/tidu/connectors/codex/ai-tidu9/plugin.json",
+    "packages/tidu/connectors/codex/ai-tidu9/.codex-plugin/plugin.json",
+  ];
+  for (const manifestPath of connectorManifests) {
+    const absoluteManifestPath = join(repositoryRoot, manifestPath);
+    if (
+      existsSync(absoluteManifestPath) &&
+      readJson(absoluteManifestPath).version !== tiduVersion
+    ) {
+      problems.push(`${manifestPath} version must match @skillnull/tidu@${tiduVersion}.`);
     }
   }
 
