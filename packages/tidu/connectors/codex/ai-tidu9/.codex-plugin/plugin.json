@@ -1,0 +1,19 @@
+{
+  "name": "ai-tidu9",
+  "version": "0.1.0-alpha.2",
+  "description": "Connect Codex to 九门赛博提督 through one local MCP boundary.",
+  "author": {
+    "name": "AI-Tidu9 Contributors"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "九门赛博提督",
+    "shortDescription": "Use the local AI-Tidu9 collaboration hub.",
+    "longDescription": "Connect Codex to the local AI-Tidu9 runtime, shared policy, model pool, tools, and verified task routing without copying host credentials.",
+    "developerName": "AI-Tidu9 Contributors",
+    "category": "Productivity",
+    "capabilities": ["Runtime status", "Policy-routed tasks"],
+    "defaultPrompt": "Use 九门赛博提督 to inspect the active runtime before routing a task."
+  },
+  "mcpServers": "./.mcp.json"
+}

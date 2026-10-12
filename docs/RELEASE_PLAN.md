@@ -18,11 +18,11 @@ An item is complete only after implementation, automated tests, real-scenario ve
 
 一个事项只有在实现、自动化测试、真实场景验证、安全检查、中英文文档、已知限制和必要的回滚验证全部完成后才能勾选。
 
-- [ ] Never mark code-only work as complete / 仅完成代码不得勾选
-- [ ] Never include private or company-confidential data / 不记录私人或公司机密
-- [ ] Do not create or push a release tag without explicit confirmation / 未确认不得创建或推送正式 Tag
-- [ ] Keep `docs/CHANGELOG.md` synchronized with every release / 每次发布同步更新 `docs/CHANGELOG.md`
-- [ ] Record real compatibility limits / 如实记录兼容性边界
+- [x] Never mark code-only work as complete / 仅完成代码不得勾选
+- [x] Never include private or company-confidential data / 不记录私人或公司机密
+- [x] Do not create or push a release tag without explicit confirmation / 未确认不得创建或推送正式 Tag
+- [x] Keep `docs/CHANGELOG.md` synchronized with every release / 每次发布同步更新 `docs/CHANGELOG.md`
+- [x] Record real compatibility limits / 如实记录兼容性边界
 - [x] Implement protected-trunk, single-major ownership, maintenance-line, and immutable-tag checks / 实现主干、Major单一所有权、维护线与不可变Tag校验
 - [x] Activate `Policy` and `Verify` as required remote checks after the confirmed first push / 首次确认推送后将`Policy`和`Verify`设为远端必需检查
 
@@ -64,20 +64,30 @@ Audience: owner and invited developers.
 - [x] Support one-command local startup / 支持一条命令本地启动
 - [x] Use a language-neutral SQLite contract with a default Node adapter / 使用语言无关SQLite契约与默认Node适配器
 - [x] Provide local configuration center / 提供本地配置中心
+- [x] Embed version-aware personal setup and troubleshooting guidance / 内置与版本一致的个人安装、使用和排障指南
 - [x] Add isolated normal and expert configuration drafts / 增加隔离的普通与专家配置草稿
-- [ ] Expose OpenAI-compatible virtual-model endpoint / 提供OpenAI兼容虚拟模型端点
-- [ ] Integrate at least two real provider types / 接入至少两类真实供应商
-- [ ] Support streaming responses and baseline tool calls / 支持流式响应和基础工具调用
-- [ ] Detect supported local clients / 自动发现受支持客户端
-- [ ] Back up, write, test, and roll back client configuration / 备份、写入、测试和回滚客户端配置
-- [ ] Implement host-account bridge contract / 实现宿主账号桥协议
-- [ ] Implement official ChatGPT account connection path / 实现ChatGPT官方账号连接路径
-- [ ] Support multiple account profiles and task account snapshots / 支持多账号Profile与任务账号快照
-- [ ] Distinguish provider-authoritative usage from local estimates / 区分官方用量与本地估算
-- [ ] Verify Codex, Cursor, and generic client behavior honestly / 真实验证Codex、Cursor与通用客户端
-- [ ] Publish compatibility matrix and known limits / 发布兼容矩阵与已知限制
-- [ ] Pass release quality gates / 通过发布质量门禁
-- [ ] Receive release confirmation / 获得发布确认
+- [x] Provide equivalent CLI diagnostics and configuration fallback / 提供等价CLI诊断与配置兜底
+- [x] Expose OpenAI-compatible virtual-model endpoint / 提供OpenAI兼容虚拟模型端点
+- [x] Integrate at least two real provider types / 接入至少两类真实供应商
+- [x] Provide recoverable personal uninstall and explicit data purge / 提供可恢复的个人版卸载与显式数据清除
+- [x] Support streaming responses and baseline tool calls / 支持流式响应和基础工具调用
+- [x] Detect supported local clients / 自动发现受支持客户端
+- [x] Provide one `tidu setup` orchestration flow that installs, verifies, repairs, updates, and uninstalls every detected official connector / 提供统一`tidu setup`编排流程，对所有已发现的官方连接器执行安装、验证、修复、更新与卸载
+- [x] Ship verified connectors for Codex app/CLI/IDE, Cursor desktop/CLI, Agent Plugin/MCP or ACP-capable editors, browser entry, and generic OpenAI-compatible clients / 为Codex应用、CLI与IDE、Cursor桌面端与CLI、支持Agent Plugin/MCP或ACP的编辑器、浏览器入口和通用OpenAI兼容客户端交付已验证连接器
+- [x] Make every connector share one runtime, configuration, policy boundary, model pool, and installation identity without duplicating Agent computation / 所有连接器共享同一运行时、配置、策略边界、模型池与安装身份，不重复执行Agent计算
+- [x] Report per-surface capability parity and reject silent downgrade when a host cannot expose its complete Agent interface / 按入口报告能力对等状态；宿主未开放完整Agent接口时禁止静默降级
+- [x] Back up, write, test, and roll back client configuration / 备份、写入、测试和回滚客户端配置
+- [x] Implement host-account bridge contract / 实现宿主账号桥协议
+- [x] Reuse an existing Codex login through official status and app-server delegation without copying tokens; provide explicit re-login and confirmed switching / 通过官方状态与app-server委托复用现有Codex登录且不复制Token；提供显式重新登录和确认式切换
+- [x] Detect a reusable Cursor host login and create an official ACP launch contract without reading or copying credentials / 检测可复用的Cursor宿主登录并建立官方ACP启动契约，不读取或复制凭据
+- [x] Complete Codex app-server and Cursor ACP message adaptation, capability negotiation, cancellation, permission, and session handling; pass a real Codex account turn and verify Cursor's signed-out ACP boundary fails closed / 完成Codex app-server与Cursor ACP消息适配、能力协商、取消、权限和会话；通过Codex真实账号回合，并验证Cursor未登录ACP按安全边界关闭
+- [x] Reuse the official host-owned ChatGPT account path without copying tokens; retain standalone OIDC security primitives as an inactive extension point until protected persistence and explicit user authorization are requested / 不复制Token地复用官方宿主ChatGPT账号；独立OIDC安全基础保留为未启用扩展点，待安全持久化和用户明确授权后启用
+- [x] Support multiple account profiles and task account snapshots / 支持多账号Profile与任务账号快照
+- [x] Distinguish provider-authoritative usage from local estimates / 区分官方用量与本地估算
+- [x] Verify Codex, Cursor, and generic client behavior honestly / 真实验证Codex、Cursor与通用客户端
+- [x] Publish compatibility matrix and known limits / 发布兼容矩阵与已知限制
+- [x] Pass release quality gates / 通过发布质量门禁
+- [x] Receive release confirmation / 获得发布确认
 
 ## v0.3.0-alpha.1 — Independent Agent kernel / 独立Agent内核
 
@@ -137,6 +147,10 @@ Audience: owner and invited developers.
 - [ ] Add tenant, organization, team, project, and user scopes / 增加多层组织作用域
 - [ ] Implement mandatory and advisory policies / 实现强制与辅助策略
 - [ ] Integrate enterprise identity and role controls / 接入企业身份与角色权限
+- [ ] Generate a one-time enterprise administrator access key after initial configuration / 初次配置后生成仅展示一次的公司管理员访问密钥
+- [ ] Persist only salted irreversible key verifiers and lifecycle metadata / 仅持久化带盐不可逆校验值与密钥生命周期元数据
+- [ ] Require the access key for every new administrative session / 每个新管理会话均要求输入访问密钥
+- [ ] Support authenticated key rotation, session revocation, and audited host recovery / 支持重新认证后的密钥轮换、会话撤销与服务器本机审计恢复
 - [ ] Publish centralized internal capability catalog / 提供企业内部能力目录
 - [ ] Support enterprise-purchased and user-owned resources together / 支持企业采购与用户自带资源并存
 - [ ] Implement hierarchical quota pools / 实现分级额度池
@@ -144,6 +158,12 @@ Audience: owner and invited developers.
 - [ ] Implement atomic reservation, settlement, release, and reconciliation / 实现原子预占、结算、释放和对账
 - [ ] Add private artifact storage adapter / 增加私有产物存储适配器
 - [ ] Add enterprise administration views / 增加企业管理视图
+- [ ] Provide guided personal-to-enterprise enrollment with compatibility preflight / 提供带兼容性预检的个人版转公司版引导
+- [ ] Create an encrypted local migration snapshot with staged activation and automatic rollback / 创建加密本地迁移快照，支持分阶段启用与自动回滚
+- [ ] Keep personal and enterprise profiles isolated and restore the personal profile after leaving an organization / 隔离个人与公司Profile，并在退出组织后恢复个人Profile
+- [ ] Generate administrator deployment and access guidance from live configuration / 根据实际配置生成管理员部署与访问指南
+- [ ] Generate company-specific employee onboarding for every enabled client / 为每个启用客户端生成公司专属员工接入手册
+- [ ] Version employee guidance and update it automatically after published changes / 对员工指南进行版本管理并在配置发布后自动更新
 - [ ] Provide Docker single-host deployment / 提供Docker单机部署
 - [ ] Complete small-team noncritical pilot / 完成小团队非关键业务试点
 - [ ] Pass enterprise-pilot quality gates / 通过企业试点质量门禁

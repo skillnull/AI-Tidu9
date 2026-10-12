@@ -1,3 +1,5 @@
+import type { LocalClientDiscovery } from "../clients/index.js";
+import type { ProviderDescriptor } from "../providers/index.js";
 import type { ConfigurationWorkspace } from "../storage/index.js";
 
 export interface ConfigCenterBootstrap {
@@ -16,6 +18,15 @@ export interface ConfigCenterBootstrap {
   runtime: {
     /** Runtime health state. */
     status: "ok";
+    /** Active provider state without credentials or endpoint details. */
+    provider: {
+      /** Whether inference can be routed to a provider. */
+      configured: boolean;
+      /** Selected provider adapter, or null when routing is not configured. */
+      type: ProviderDescriptor["type"] | null;
+      /** Selected upstream model, or null when routing is not configured. */
+      model: string | null;
+    };
   };
   /** Current storage adapter state. */
   storage: {
@@ -33,4 +44,6 @@ export interface ConfigCenterBootstrap {
     /** Persisted active configuration and mode-specific drafts. */
     workspace: ConfigurationWorkspace;
   };
+  /** Metadata-only discovery of supported clients on the runtime device. */
+  clients: LocalClientDiscovery;
 }

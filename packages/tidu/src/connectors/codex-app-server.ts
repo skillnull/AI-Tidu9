@@ -1,0 +1,237 @@
+import {
+  type CodexHostInspectionOptions,
+  createCodexAppServerLaunch,
+} from "../accounts/codex-host.js";
+import { TiduError } from "../core/index.js";
+import {
+  createStdioJsonRpcClient,
+  type JsonRpcClient,
+  type JsonRpcNotification,
+  type JsonRpcServerRequest,
+} from "./json-rpc.js";
+
+export type CodexApprovalDecision = "accept" | "acceptForSession" | "cancel" | "decline";
+
+export interface CodexAgentEvent {
+  /** App-server notification method. */
+  method: string;
+  /** Notification payload returned by Codex. */
+  params: unknown;
+}
+
+export interface CodexAgentOptions extends CodexHostInspectionOptions {
+  /** Working directory used for new Codex threads. */
+  workingDirectory: string;
+  /** Optional model selected through Codex's authoritative model catalog. */
+  model?: string;
+  /** Optional notification observer for streaming UI integration. */
+  onEvent?: (event: CodexAgentEvent) => void;
+  /** Explicit reviewer for command and file-change approval requests. */
+  onApproval?: (request: JsonRpcServerRequest) => Promise<CodexApprovalDecision>;
+}
+
+export interface CodexThread {
+  /** Codex thread identifier used for follow-up turns and cancellation. */
+  id: string;
+  /** Model selected by Codex for this thread. */
+  model: string;
+}
+
+export interface CodexTurnResult {
+  /** Codex thread that owns the completed turn. */
+  threadId: string;
+  /** Codex turn identifier. */
+  turnId: string;
+  /** Terminal turn status. */
+  status: "completed" | "failed" | "interrupted";
+  /** Concatenated assistant message deltas. */
+  text: string;
+}
+
+export interface CodexAgentClient {
+  /** Negotiates protocol capabilities and sends the initialized notification. */
+  initialize: () => Promise<void>;
+  /** Starts a persistent Codex thread under the configured workspace. */
+  startThread: () => Promise<CodexThread>;
+  /** Sends one user turn and resolves only after a terminal notification. */
+  prompt: (threadId: string, text: string, signal?: AbortSignal) => Promise<CodexTurnResult>;
+  /** Interrupts one active turn. */
+  cancel: (threadId: string, turnId: string) => Promise<void>;
+  /** Terminates the delegated app-server process. */
+  close: () => Promise<void>;
+}
+
+interface TurnState {
+  /** Assistant text accumulated from streaming notifications. */
+  text: string;
+  /** Completes the public prompt promise. */
+  resolve: (result: CodexTurnResult) => void;
+  /** Rejects the public prompt promise. */
+  reject: (error: Error) => void;
+  /** Removes cancellation listeners. */
+  cleanup: () => void;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const readString = (value: unknown, key: string): string | undefined =>
+  isRecord(value) && typeof value[key] === "string" ? value[key] : undefined;
+
+const defaultServerRequest = async (
+  request: JsonRpcServerRequest,
+  reviewer: CodexAgentOptions["onApproval"],
+): Promise<unknown> => {
+  if (
+    request.method === "item/commandExecution/requestApproval" ||
+    request.method === "item/fileChange/requestApproval"
+  ) {
+    const decision = reviewer === undefined ? "decline" : await reviewer(request);
+    return { decision };
+  }
+  throw new TiduError(
+    "CONFIGURATION_INVALID",
+    `Unsupported Codex server request requires explicit handling: ${request.method}`,
+  );
+};
+
+export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentClient => {
+  const activeTurns = new Map<string, TurnState>();
+  let initialized = false;
+
+  const onNotification = (notification: JsonRpcNotification): void => {
+    options.onEvent?.(notification);
+    const turnId = readString(notification.params, "turnId");
+    if (notification.method === "item/agentMessage/delta" && turnId !== undefined) {
+      const state = activeTurns.get(turnId);
+      const delta = readString(notification.params, "delta");
+      if (state !== undefined && delta !== undefined) {
+        state.text += delta;
+      }
+      return;
+    }
+    if (notification.method !== "turn/completed" || !isRecord(notification.params)) {
+      return;
+    }
+    const threadId = readString(notification.params, "threadId");
+    const turn = notification.params.turn;
+    if (threadId === undefined || !isRecord(turn)) {
+      return;
+    }
+    const completedTurnId = readString(turn, "id");
+    const status = readString(turn, "status");
+    if (
+      completedTurnId === undefined ||
+      (status !== "completed" && status !== "failed" && status !== "interrupted")
+    ) {
+      return;
+    }
+    const state = activeTurns.get(completedTurnId);
+    if (state === undefined) {
+      return;
+    }
+    activeTurns.delete(completedTurnId);
+    state.cleanup();
+    state.resolve({ threadId, turnId: completedTurnId, status, text: state.text });
+  };
+
+  const launch = createCodexAppServerLaunch(options);
+  const client: JsonRpcClient = createStdioJsonRpcClient(
+    { ...launch, workingDirectory: options.workingDirectory },
+    {
+      onNotification,
+      onRequest: (request) => defaultServerRequest(request, options.onApproval),
+    },
+  );
+
+  const requireInitialized = (): void => {
+    if (!initialized) {
+      throw new TiduError("CONFIGURATION_CONFLICT", "Codex app-server is not initialized.");
+    }
+  };
+
+  return {
+    initialize: async (): Promise<void> => {
+      if (initialized) {
+        return;
+      }
+      await client.request("initialize", {
+        clientInfo: { name: "ai_tidu9", title: "九门赛博提督", version: "0.2.0-alpha.1" },
+        capabilities: {
+          experimentalApi: false,
+          requestAttestation: false,
+          mcpServerOpenaiFormElicitation: false,
+        },
+      });
+      client.notify("initialized");
+      initialized = true;
+    },
+    startThread: async (): Promise<CodexThread> => {
+      requireInitialized();
+      const response = await client.request<Record<string, unknown>>("thread/start", {
+        cwd: options.workingDirectory,
+        model: options.model ?? null,
+        approvalPolicy: "on-request",
+        sandbox: "workspace-write",
+        ephemeral: false,
+      });
+      const thread = response.thread;
+      const id = readString(thread, "id");
+      const model = readString(response, "model");
+      if (id === undefined || model === undefined) {
+        throw new TiduError("INTERNAL_ERROR", "Codex returned an invalid thread response.");
+      }
+      return { id, model };
+    },
+    prompt: async (
+      threadId: string,
+      text: string,
+      signal?: AbortSignal,
+    ): Promise<CodexTurnResult> => {
+      requireInitialized();
+      if (text.trim() === "") {
+        throw new TiduError("CONFIGURATION_INVALID", "Codex prompt cannot be empty.");
+      }
+      const response = await client.request<Record<string, unknown>>(
+        "turn/start",
+        {
+          threadId,
+          input: [{ type: "text", text, text_elements: [] }],
+          approvalPolicy: "on-request",
+        },
+        signal,
+      );
+      const turn = response.turn;
+      const turnId = readString(turn, "id");
+      if (turnId === undefined) {
+        throw new TiduError("INTERNAL_ERROR", "Codex returned an invalid turn response.");
+      }
+      return new Promise<CodexTurnResult>((resolve, reject) => {
+        const abort = (): void => {
+          void client.request("turn/interrupt", { threadId, turnId }).catch(() => undefined);
+          activeTurns.delete(turnId);
+          reject(new TiduError("INTERNAL_ERROR", "Codex turn cancelled."));
+        };
+        signal?.addEventListener("abort", abort, { once: true });
+        activeTurns.set(turnId, {
+          text: "",
+          resolve,
+          reject,
+          cleanup: () => signal?.removeEventListener("abort", abort),
+        });
+      });
+    },
+    cancel: async (threadId: string, turnId: string): Promise<void> => {
+      requireInitialized();
+      await client.request("turn/interrupt", { threadId, turnId });
+    },
+    close: async (): Promise<void> => {
+      for (const state of activeTurns.values()) {
+        state.cleanup();
+        state.reject(new TiduError("INTERNAL_ERROR", "Codex connection closed."));
+      }
+      activeTurns.clear();
+      await client.close();
+    },
+  };
+};

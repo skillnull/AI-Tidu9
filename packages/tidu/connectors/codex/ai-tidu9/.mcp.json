@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ai-tidu9": {
+      "command": "tidu",
+      "args": ["mcp"]
+    }
+  }
+}

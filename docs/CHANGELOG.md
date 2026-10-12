@@ -20,6 +20,46 @@ All notable changes to AI-Tidu9 will be documented in this file.
 - 增加普通与专家隔离草稿、配置校验、乐观并发控制与显式启用，确保错误或未保存输入不会影响当前运行配置。
 - Add project-pinned Node selection for Git hooks so machines whose shell still defaults to Node.js 18 automatically use the required Node.js 22 runtime.
 - 为Git Hook增加项目Node版本自动切换，使终端默认仍为Node.js 18的机器自动使用要求的Node.js 22运行时。
+- Refine the local configuration center into a compact, fine-weight operations interface and define personal, centralized-enterprise, and hybrid-enterprise deployment boundaries.
+- 将本地配置中心调整为紧凑细字重的专业操作界面，并明确个人本地、公司集中与公司混合三类部署边界。
+- Embed personal setup and troubleshooting guidance, plus a clearly marked enterprise-onboarding blueprint that will be generated from live company configuration when enterprise deployment ships.
+- 内置个人安装、使用与排障指南，并提供明确标注的企业接入蓝图；企业部署完成后将根据公司实际配置动态生成。
+- Define the enterprise administrator access-key lifecycle: one-time display, irreversible database verifier, key-gated sessions, authenticated rotation, revocation, and audited host recovery.
+- 定义公司管理员访问密钥生命周期：仅展示一次、数据库保存不可逆校验值、密钥门禁会话、重新认证后轮换、撤销与服务器本机审计恢复。
+- Add `tidu doctor` health diagnostics, a guided `tidu config` fallback, read-only configuration inspection, and advanced API-backed draft updates with optional activation.
+- 增加 `tidu doctor` 健康诊断、引导式 `tidu config` 兜底、只读配置查看，以及基于管理API并可选启用的高级草稿更新。
+- Expose the active virtual model through OpenAI-compatible model discovery, Chat Completions, and Responses endpoints with stable errors, request IDs, and mandatory AI-Tidu9 attribution.
+- 通过OpenAI兼容的模型发现、Chat Completions和Responses端点暴露当前虚拟模型，提供稳定错误、请求ID和强制AI-Tidu9署名。
+- Add real OpenAI-compatible and local Ollama adapters, runtime-only credential handling, safe provider status, and virtual-model response normalization.
+- 增加真实OpenAI兼容与本地Ollama适配器、仅运行时密钥处理、安全供应商状态和虚拟模型响应归一化。
+- Add recoverable personal uninstall, latest-snapshot restore, protected permanent purge, running-runtime checks, and custom-path safeguards.
+- 增加可恢复的个人版卸载、最近快照恢复、受保护的永久清除、运行中检测和自定义路径保护。
+- Add end-to-end SSE streaming, upstream cancellation, virtual-model event rewriting, and baseline function-tool interoperability for OpenAI-compatible services and Ollama.
+- 为OpenAI兼容服务与Ollama增加端到端SSE流式、上游取消、虚拟模型事件改写和基础函数工具互操作。
+- Add metadata-only discovery for local Codex, Cursor, and OpenAI CLI installations through the CLI and configuration center, with honest readiness and limitation states.
+- 在CLI与配置中心增加本机Codex、Cursor和OpenAI CLI的纯元数据发现，并真实展示可配置、受限与未发现状态。
+- Add an explicitly confirmed Codex integration transaction using a dedicated profile, private snapshots, atomic writes, connectivity verification, automatic failure rollback, and manual latest-snapshot restoration.
+- 增加需明确确认的Codex接入事务，使用独立Profile、私有快照、原子写入、连通验证、失败自动回滚与最近快照手动恢复。
+- Add a credential-free host-account bridge contract, multiple account profiles, immutable per-task account snapshots, and strict mismatch rejection without reading host login files.
+- 增加无凭据宿主账号桥协议、多账号Profile、任务级不可变账号快照和严格错配拒绝，不读取宿主登录文件。
+- Add default reuse of an existing Codex login through Codex-owned storage metadata, the official status command, and an app-server launch contract; add explicit re-login and confirmed account switching without reading or copying tokens.
+- 通过Codex自有认证存储元数据、官方状态命令与app-server启动契约默认复用现有登录；增加显式重新登录和确认式账号切换，全程不读取或复制Token。
+- Add current-account reuse discovery, explicit re-login and switching commands, and an official ACP launch contract for Cursor Agent without reading or copying Cursor credentials.
+- 为Cursor Agent增加当前账号复用发现、显式重新登录与切换命令以及官方ACP启动契约，不读取或复制Cursor凭据。
+- Distinguish native Agent bridges from OpenAI-compatible virtual-model fallback so chat-only compatibility is never presented as complete host capability.
+- 区分原生Agent桥与OpenAI兼容虚拟模型回退，禁止把仅聊天兼容宣称为宿主完整能力。
+- Add one `tidu setup` flow for install, verify, repair, update, and uninstall across Codex, Cursor, browser management, and generic OpenAI-compatible entries.
+- 增加统一 `tidu setup` 流程，对Codex、Cursor、浏览器管理和通用OpenAI兼容入口执行安装、验证、修复、更新与卸载。
+- Add bounded stdio JSON-RPC, a packaged MCP server and Agent Plugin, plus complete Codex app-server and Cursor ACP adapters for capability negotiation, sessions, streaming, cancellation, permissions, and fail-closed interactions.
+- 增加有界stdio JSON-RPC、随包MCP服务与Agent Plugin，并完成Codex app-server和Cursor ACP的能力协商、会话、流式、取消、权限及失败关闭交互适配。
+- Add a usage-observation contract that keeps provider-authoritative, host-reported, and locally estimated usage visibly distinct during reconciliation.
+- 增加用量观测契约，在对账时明确区分供应商官方数据、宿主报告与本地估算。
+- Verify the dedicated virtual-model profile through a real Codex CLI turn and add Responses custom, namespace, and web-search tool compatibility discovered during that test.
+- 通过真实Codex CLI对话验证独立虚拟模型Profile，并补齐联调发现的Responses自定义工具、命名空间与网页搜索工具兼容。
+- Make the root TypeScript project own IDE type checking for library, UI, and Vite configuration while keeping emission in one explicit build configuration.
+- 由根TypeScript工程统一负责库、UI与Vite配置的IDE类型检查，同时使用一个明确构建配置保持现有产物路径。
+- Add the security-critical core of the official Sign in with ChatGPT path: dynamic registration and returning-account PKCE requests, constant-time callback state checks, code exchange without a client secret, trusted OpenID discovery, RS256 ID-token validation, and explicit plan-scope verification.
+- 增加ChatGPT官方登录路径的安全核心：动态注册与已有账号PKCE请求、恒定时间Callback State校验、无Client Secret换码、受信OpenID发现、RS256身份令牌校验和明确套餐权限校验。
 
 ## 0.1.0-alpha.2 - 2026-10-11
 

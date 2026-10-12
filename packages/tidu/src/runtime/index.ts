@@ -1,6 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { extname, join } from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import {
   CONFIG_SCHEMA_VERSION,
@@ -9,6 +12,15 @@ import {
 } from "../config/index.js";
 import { createConfigCenterBootstrap } from "../config-center/index.js";
 import { PRODUCT, TiduError } from "../core/index.js";
+import { acquireRuntimeDataLock } from "../lifecycle/index.js";
+import {
+  createOpenAiError,
+  createOpenAiModel,
+  type OpenAiRequestValidation,
+  validateChatCompletionRequest,
+  validateResponsesRequest,
+} from "../openai/index.js";
+import { createProviderFromEnvironment, type ModelProvider } from "../providers/index.js";
 import { openNodeSqliteStorage, type StorageAdapter } from "../storage/index.js";
 
 export const DEFAULT_RUNTIME_HOST = "127.0.0.1";
@@ -28,6 +40,7 @@ const SECURITY_HEADERS = Object.freeze({
   "x-frame-options": "DENY",
 });
 const MAXIMUM_JSON_BODY_BYTES = 64 * 1024;
+const MAXIMUM_INFERENCE_JSON_BODY_BYTES = 4 * 1024 * 1024;
 
 export interface LocalRuntimeOptions {
   /** Loopback host used by the personal runtime. */
@@ -36,6 +49,8 @@ export interface LocalRuntimeOptions {
   port?: number;
   /** SQLite file path; omit it to use the platform default. */
   databasePath?: string;
+  /** Explicit provider adapter; omit it to resolve runtime environment configuration. */
+  provider?: ModelProvider;
 }
 
 export interface LocalRuntime {
@@ -72,11 +87,13 @@ const sendJson = (
   response: import("node:http").ServerResponse,
   statusCode: number,
   body: unknown,
+  additionalHeaders: import("node:http").OutgoingHttpHeaders = {},
 ): void => {
   response.writeHead(statusCode, {
     ...SECURITY_HEADERS,
     "cache-control": "no-store",
     "content-type": "application/json; charset=utf-8",
+    ...additionalHeaders,
   });
   response.end(JSON.stringify(body));
 };
@@ -91,14 +108,17 @@ const resolveStaticFile = (pathname: string): string | undefined => {
   return undefined;
 };
 
-const readJsonBody = async (request: import("node:http").IncomingMessage): Promise<unknown> => {
+const readJsonBody = async (
+  request: import("node:http").IncomingMessage,
+  maximumBytes = MAXIMUM_JSON_BODY_BYTES,
+): Promise<unknown> => {
   const chunks: Buffer[] = [];
   let receivedBytes = 0;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     receivedBytes += buffer.byteLength;
-    if (receivedBytes > MAXIMUM_JSON_BODY_BYTES) {
-      throw new TiduError("CONFIGURATION_INVALID", "Request body exceeds 64 KiB.");
+    if (receivedBytes > maximumBytes) {
+      throw new TiduError("CONFIGURATION_INVALID", `Request body exceeds ${maximumBytes} bytes.`);
     }
     chunks.push(buffer);
   }
@@ -110,6 +130,144 @@ const readJsonBody = async (request: import("node:http").IncomingMessage): Promi
       cause: error,
     });
   }
+};
+
+const sendOpenAiJson = (
+  response: import("node:http").ServerResponse,
+  statusCode: number,
+  body: unknown,
+  requestId: string,
+): void => {
+  sendJson(response, statusCode, body, {
+    "x-ai-tidu9": "true",
+    "x-request-id": requestId,
+  });
+};
+
+const sendOpenAiStream = async (
+  response: import("node:http").ServerResponse,
+  statusCode: number,
+  stream: ReadableStream<Uint8Array>,
+  requestId: string,
+): Promise<void> => {
+  response.writeHead(statusCode, {
+    ...SECURITY_HEADERS,
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "content-type": "text/event-stream; charset=utf-8",
+    "x-accel-buffering": "no",
+    "x-ai-tidu9": "true",
+    "x-request-id": requestId,
+  });
+  await pipeline(
+    Readable.fromWeb(stream as unknown as import("node:stream/web").ReadableStream<Uint8Array>),
+    response,
+  );
+};
+
+const readOpenAiRequest = async (
+  request: import("node:http").IncomingMessage,
+): Promise<unknown> => {
+  if (!request.headers["content-type"]?.toLowerCase().startsWith("application/json")) {
+    throw new TiduError("CONFIGURATION_INVALID", "Content-Type must be application/json.");
+  }
+  return readJsonBody(request, MAXIMUM_INFERENCE_JSON_BODY_BYTES);
+};
+
+const sendOpenAiValidation = (
+  response: import("node:http").ServerResponse,
+  validation: OpenAiRequestValidation,
+  requestId: string,
+): boolean => {
+  if (validation.valid) {
+    return false;
+  }
+  const error =
+    validation.error ??
+    createOpenAiError("invalid_request", "Request is invalid.", "invalid_request_error");
+  const statusCode = error.error.code === "model_not_found" ? 404 : 400;
+  sendOpenAiJson(response, statusCode, error, requestId);
+  return true;
+};
+
+const handleOpenAiInference = async (
+  request: import("node:http").IncomingMessage,
+  response: import("node:http").ServerResponse,
+  storage: StorageAdapter,
+  protocol: "chat-completions" | "responses",
+  provider: ModelProvider | undefined,
+): Promise<void> => {
+  const requestId = randomUUID();
+  let body: unknown;
+  try {
+    body = await readOpenAiRequest(request);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Request body is invalid.";
+    sendOpenAiJson(
+      response,
+      400,
+      createOpenAiError("invalid_request_body", message, "invalid_request_error"),
+      requestId,
+    );
+    return;
+  }
+  const workspace = await storage.configurationStore.loadWorkspace();
+  const activeModelId = workspace.active.configuration.activeProfileId;
+  const validation =
+    protocol === "chat-completions"
+      ? validateChatCompletionRequest(body, activeModelId)
+      : validateResponsesRequest(body, activeModelId);
+  if (sendOpenAiValidation(response, validation, requestId)) {
+    return;
+  }
+  if (provider !== undefined) {
+    const controller = new AbortController();
+    const abortProvider = () => controller.abort();
+    request.once("aborted", abortProvider);
+    response.once("close", abortProvider);
+    try {
+      const result = await provider.execute({
+        protocol,
+        body: body as Record<string, unknown>,
+        virtualModelId: activeModelId,
+        signal: controller.signal,
+      });
+      if (result.kind === "stream") {
+        await sendOpenAiStream(response, result.statusCode, result.stream, requestId);
+      } else {
+        sendOpenAiJson(response, result.statusCode, result.body, requestId);
+      }
+    } catch {
+      if (!response.headersSent) {
+        sendOpenAiJson(
+          response,
+          502,
+          createOpenAiError(
+            "provider_request_failed",
+            "The configured provider could not complete the request.",
+            "server_error",
+          ),
+          requestId,
+        );
+      } else if (!response.writableEnded) {
+        response.end();
+      }
+    } finally {
+      request.off("aborted", abortProvider);
+      response.off("close", abortProvider);
+    }
+    return;
+  }
+  sendOpenAiJson(
+    response,
+    503,
+    createOpenAiError(
+      "model_provider_not_configured",
+      "The virtual model is available, but no model provider is configured yet.",
+      "server_error",
+    ),
+    requestId,
+  );
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -188,6 +346,7 @@ const handleRequest = async (
   request: import("node:http").IncomingMessage,
   response: import("node:http").ServerResponse,
   storage: StorageAdapter,
+  provider: ModelProvider | undefined,
 ): Promise<void> => {
   const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
 
@@ -206,7 +365,47 @@ const handleRequest = async (
   }
 
   if (request.method === "GET" && pathname === "/api/config-center") {
-    sendJson(response, 200, await createConfigCenterBootstrap(storage));
+    sendJson(response, 200, await createConfigCenterBootstrap(storage, provider?.descriptor));
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/v1/models") {
+    const workspace = await storage.configurationStore.loadWorkspace();
+    const model = createOpenAiModel(workspace.active.configuration, workspace.active.updatedAt);
+    sendOpenAiJson(response, 200, { object: "list", data: [model] }, randomUUID());
+    return;
+  }
+
+  const modelRoute = /^\/v1\/models\/([a-z0-9][a-z0-9-]{0,63})$/u.exec(pathname);
+  if (request.method === "GET" && modelRoute !== null) {
+    const requestId = randomUUID();
+    const workspace = await storage.configurationStore.loadWorkspace();
+    const model = createOpenAiModel(workspace.active.configuration, workspace.active.updatedAt);
+    if (modelRoute[1] !== model.id) {
+      sendOpenAiJson(
+        response,
+        404,
+        createOpenAiError(
+          "model_not_found",
+          `The model '${modelRoute[1]}' is not available.`,
+          "invalid_request_error",
+          "model",
+        ),
+        requestId,
+      );
+      return;
+    }
+    sendOpenAiJson(response, 200, model, requestId);
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/v1/chat/completions") {
+    await handleOpenAiInference(request, response, storage, "chat-completions", provider);
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/v1/responses") {
+    await handleOpenAiInference(request, response, storage, "responses", provider);
     return;
   }
 
@@ -224,7 +423,7 @@ const handleRequest = async (
         expectedRevision: readExpectedRevision(body, "expectedRevision"),
         configuration: readDraftConfiguration(body, mode),
       });
-      sendJson(response, 200, await createConfigCenterBootstrap(storage));
+      sendJson(response, 200, await createConfigCenterBootstrap(storage, provider?.descriptor));
     } catch (error) {
       handleConfigurationMutationError(response, error);
     }
@@ -246,7 +445,7 @@ const handleRequest = async (
         mode,
         readExpectedRevision(body, "expectedDraftRevision"),
       );
-      sendJson(response, 200, await createConfigCenterBootstrap(storage));
+      sendJson(response, 200, await createConfigCenterBootstrap(storage, provider?.descriptor));
     } catch (error) {
       handleConfigurationMutationError(response, error);
     }
@@ -279,9 +478,17 @@ export const startLocalRuntime = async (
 ): Promise<LocalRuntime> => {
   const host = options.host ?? DEFAULT_RUNTIME_HOST;
   const port = options.port ?? DEFAULT_RUNTIME_PORT;
+  const provider = options.provider ?? createProviderFromEnvironment();
   const storage = await openNodeSqliteStorage({ databasePath: options.databasePath });
+  let runtimeDataLock: ReturnType<typeof acquireRuntimeDataLock>;
+  try {
+    runtimeDataLock = acquireRuntimeDataLock(storage.location);
+  } catch (error) {
+    storage.close();
+    throw error;
+  }
   const server = createServer((request, response) => {
-    void handleRequest(request, response, storage).catch(() => {
+    void handleRequest(request, response, storage, provider).catch(() => {
       if (!response.headersSent) {
         sendJson(response, 500, { error: "INTERNAL_ERROR" });
       } else {
@@ -294,6 +501,7 @@ export const startLocalRuntime = async (
     await listen(server, host, port);
   } catch (error) {
     storage.close();
+    runtimeDataLock?.release();
     throw error;
   }
   const address = server.address();
@@ -318,6 +526,7 @@ export const startLocalRuntime = async (
         await close(server);
       } finally {
         storage.close();
+        runtimeDataLock?.release();
       }
     },
   };

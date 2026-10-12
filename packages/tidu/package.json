@@ -19,6 +19,7 @@
     "tidu": "dist/cli/index.js"
   },
   "files": [
+    "connectors",
     "dist",
     "storage",
     "!dist/**/*.test.*"
@@ -35,10 +36,10 @@
     "url": "https://github.com/skillnull/AI-Tidu9/issues"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && tsc -p tsconfig.ui.json && vite build",
+    "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.json && vite build",
     "prepack": "npm run build && node ../../scripts/npm-package-assets.mjs prepare",
     "postpack": "node ../../scripts/npm-package-assets.mjs clean",
-    "test": "npm run build && node --test dist/index.test.js dist/cli/index.test.js dist/config-center/index.test.js dist/config/index.test.js dist/core/index.test.js dist/protocol/index.test.js dist/runtime/index.test.js dist/storage/index.test.js"
+    "test": "npm run build && node --test dist/accounts/chatgpt.test.js dist/accounts/codex-host.test.js dist/accounts/cursor-host.test.js dist/accounts/index.test.js dist/index.test.js dist/cli/index.test.js dist/clients/configuration.test.js dist/clients/index.test.js dist/config-center/index.test.js dist/config/index.test.js dist/connectors/*.test.js dist/core/index.test.js dist/lifecycle/index.test.js dist/openai/index.test.js dist/protocol/index.test.js dist/providers/index.test.js dist/runtime/index.test.js dist/storage/index.test.js dist/usage/index.test.js"
   },
   "engines": {
     "node": ">=22.14.0"
