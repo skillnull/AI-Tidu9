@@ -264,7 +264,7 @@ Every public release must provide the applicable artifacts below.
 ## Current status / 当前状态
 
 - Planning / 规划：**complete / 已完成**
-- Active stage / 当前阶段：**Stage 3 — In progress / 阶段3：进行中**
-- Latest planned release / 最近计划版本：`v0.3.0-alpha.1`
-- Latest published release / 最近已发布版本：`v0.2.0-alpha.1`
+- Active stage / 当前阶段：**Stage 4 — Not started / 阶段4：未开始**
+- Latest planned release / 最近计划版本：`v0.4.0-beta.1`
+- Latest published release / 最近已发布版本：`v0.3.0-alpha.1`
 - Remote publishing / 远程发布：**enabled with explicit confirmation / 经明确确认后执行**
