@@ -14,8 +14,12 @@ All notable changes to AI-Tidu9 will be documented in this file.
 - 将SQLite Schema与顺序迁移定义为语言无关契约，把 `node:sqlite` 隔离为当前Node适配器，并为未来Python `sqlite3` 实现保留明确路径。
 - Raise the minimum runtime to Node.js 22.14 and verify the baseline on Node.js 22 in CI.
 - 将最低运行时提升至Node.js 22.14，并在CI中验证Node.js 22基线。
-- Add a lightweight React + Vite local configuration center with a read-only bootstrap API, restrictive browser security headers, and packaged static assets served directly by `tidu start`.
-- 增加轻量React + Vite本地配置中心、只读引导API、严格浏览器安全响应头和随npm包发布的静态资源，由 `tidu start` 直接提供访问。
+- Add a lightweight React + Vite local configuration center with a bootstrap API, restrictive browser security headers, and packaged static assets served directly by `tidu start`.
+- 增加轻量React + Vite本地配置中心、引导API、严格浏览器安全响应头和随npm包发布的静态资源，由 `tidu start` 直接提供访问。
+- Add isolated managed and expert drafts with validation, optimistic concurrency, and explicit activation, keeping invalid or unsaved input away from the active runtime configuration.
+- 增加普通与专家隔离草稿、配置校验、乐观并发控制与显式启用，确保错误或未保存输入不会影响当前运行配置。
+- Add project-pinned Node selection for Git hooks so machines whose shell still defaults to Node.js 18 automatically use the required Node.js 22 runtime.
+- 为Git Hook增加项目Node版本自动切换，使终端默认仍为Node.js 18的机器自动使用要求的Node.js 22运行时。
 
 ## 0.1.0-alpha.2 - 2026-10-11
 

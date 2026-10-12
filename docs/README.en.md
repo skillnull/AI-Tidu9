@@ -21,7 +21,7 @@ The project is being rebuilt from an early AI rules package into an independent 
 
 ## Local development
 
-Node.js 22.14 or later is required.
+Node.js 22.14 or later is required. The repository includes `.nvmrc`, and Git hooks automatically select the project Node version before running checks. Run `nvm install` once if that version is not installed yet.
 
 ```bash
 npm install
@@ -36,7 +36,7 @@ The official npm package is `@skillnull/tidu`; its installed command remains `ti
 npx @skillnull/tidu start
 ```
 
-Open the local URL printed by the command to view the read-only configuration center and inspect runtime, storage, and current configuration status.
+Open the local URL printed by the command to edit managed or expert configuration drafts. The two modes persist independently, and only “Activate this configuration” changes runtime behavior. Invalid or unsaved expert input cannot affect managed mode.
 
 See the [contribution guide](./CONTRIBUTING.md) for branch, commit, pull-request, version, and release rules. Local policy scripts and GitHub Actions enforce these rules.
 

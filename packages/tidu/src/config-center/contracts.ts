@@ -1,4 +1,4 @@
-import type { ConfigurationMode } from "../config/index.js";
+import type { ConfigurationWorkspace } from "../storage/index.js";
 
 export interface ConfigCenterBootstrap {
   /** Public product identity displayed by the local configuration center. */
@@ -26,15 +26,11 @@ export interface ConfigCenterBootstrap {
     /** Storage health state. */
     status: "ok";
   };
-  /** Safe configuration summary available before editing is implemented. */
+  /** Isolated drafts and the explicitly activated runtime configuration. */
   configuration: {
-    /** Active configuration mode. */
-    activeMode: ConfigurationMode;
-    /** Whether configuration editing is available in this release. */
-    editable: false;
-    /** Configuration schema version. */
-    schemaVersion: string;
-    /** Virtual-model display name. */
-    virtualModelName: string;
+    /** Whether validated draft editing is available. */
+    editable: true;
+    /** Persisted active configuration and mode-specific drafts. */
+    workspace: ConfigurationWorkspace;
   };
 }

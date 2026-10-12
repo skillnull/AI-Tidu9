@@ -21,7 +21,7 @@
 
 ## 本地开发
 
-需要 Node.js 22.14 或更高版本。
+需要 Node.js 22.14 或更高版本。项目提供 `.nvmrc`，Git Hook 会在检查前自动切换到项目Node版本；首次使用若尚未安装，请运行 `nvm install`。
 
 ```bash
 npm install
@@ -36,7 +36,7 @@ node packages/tidu/dist/cli/index.js --help
 npx @skillnull/tidu start
 ```
 
-启动后打开终端输出的本地地址，即可进入只读配置中心并查看运行时、存储和当前配置状态。
+启动后打开终端输出的本地地址，即可编辑普通或专家配置草稿。两个模式独立保存，只有点击“启用此配置”才会改变运行配置，错误或未保存的专家输入不会影响普通模式。
 
 分支、Commit、PR、版本和发布规则见 [贡献指南](./docs/CONTRIBUTING.md)。规则由本地脚本和GitHub Actions共同校验。
 

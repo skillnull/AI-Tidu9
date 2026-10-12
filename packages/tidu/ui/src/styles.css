@@ -34,6 +34,12 @@ button:focus-visible {
   outline: none;
 }
 
+button:disabled {
+  border-color: #27384d;
+  color: #657890;
+  cursor: not-allowed;
+}
+
 .shell {
   width: 100%;
   max-width: 1120px;
@@ -82,7 +88,7 @@ h2 {
 .state-panel,
 .overview,
 .card,
-.next-step {
+.configuration-panel {
   border: 1px solid #263c59;
   border-radius: 16px;
   background: #0e1a2b;
@@ -128,28 +134,100 @@ h2 {
 }
 
 .card p:last-child,
-.next-step p:last-child {
+.configuration-heading p:last-child {
   margin-bottom: 0;
   color: #91a4bd;
 }
 
-.next-step {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+.configuration-panel {
   margin-top: 2px;
   padding: 24px;
 }
 
-.read-only-badge {
-  flex: 0 0 auto;
+.configuration-heading,
+.configuration-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.mode-switcher,
+.action-buttons {
+  display: flex;
   margin-left: 20px;
-  padding: 6px 10px;
-  border-radius: 999px;
-  color: #f7d99b;
-  background: #493716;
+}
+
+.mode-switcher {
+  padding: 0;
+  border: 0;
+}
+
+.mode-button + .mode-button,
+.action-buttons button + button {
+  margin-left: 8px;
+}
+
+.mode-button-active,
+.primary-button {
+  border-color: #43bdae;
+  color: #07111f;
+  background: #72d8ca;
+}
+
+.configuration-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 26px;
+}
+
+.configuration-form label {
+  color: #cad6e5;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.configuration-form label + label {
+  margin-left: 18px;
+}
+
+.configuration-form input {
+  width: 100%;
+  margin-top: 8px;
+  padding: 12px 13px;
+  border: 1px solid #365276;
+  border-radius: 10px;
+  outline: none;
+  color: #e8eef8;
+  background: #091525;
+  font: inherit;
+}
+
+.configuration-form input:focus {
+  border-color: #5bd5c5;
+}
+
+.configuration-form small {
+  display: block;
+  margin-top: 7px;
+  color: #7186a0;
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 400;
+}
+
+.configuration-actions {
+  margin-top: 26px;
+  padding-top: 20px;
+  border-top: 1px solid #263c59;
+}
+
+.operation-message {
+  margin: 0;
+  color: #91a4bd;
+  font-size: 13px;
+}
+
+.operation-error {
+  color: #ff9da9;
 }
 
 footer {
@@ -169,7 +247,8 @@ footer {
   }
 
   .overview,
-  .next-step {
+  .configuration-heading,
+  .configuration-actions {
     display: block;
   }
 
@@ -177,8 +256,20 @@ footer {
     margin-top: 14px;
   }
 
-  .read-only-badge {
-    display: inline-block;
+  .mode-switcher,
+  .action-buttons {
     margin: 18px 0 0;
+  }
+
+  .configuration-form {
+    display: block;
+  }
+
+  .configuration-form label {
+    display: block;
+  }
+
+  .configuration-form label + label {
+    margin: 20px 0 0;
   }
 }

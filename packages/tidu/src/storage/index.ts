@@ -5,4 +5,12 @@ export {
   STORAGE_CONTRACT_VERSION,
   STORAGE_SCHEMA_VERSION,
 } from "./node-sqlite.js";
-export type { NodeSqliteStorageOptions, StorageAdapter } from "./types.js";
+export type {
+  ActiveConfiguration,
+  ConfigurationDraft,
+  ConfigurationStore,
+  ConfigurationWorkspace,
+  NodeSqliteStorageOptions,
+  SaveConfigurationDraftInput,
+  StorageAdapter,
+} from "./types.js";

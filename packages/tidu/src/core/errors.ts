@@ -1,5 +1,9 @@
 /** Stable machine-readable error codes shared across AI-Tidu9 boundaries. */
-export type TiduErrorCode = "CONFIGURATION_INVALID" | "INTERNAL_ERROR" | "UNSUPPORTED_COMMAND";
+export type TiduErrorCode =
+  | "CONFIGURATION_CONFLICT"
+  | "CONFIGURATION_INVALID"
+  | "INTERNAL_ERROR"
+  | "UNSUPPORTED_COMMAND";
 
 /** Optional structured context safe to pass between trusted AI-Tidu9 components. */
 export interface TiduErrorOptions {

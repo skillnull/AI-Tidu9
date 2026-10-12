@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createDefaultConfiguration } from "./index.js";
+import { createDefaultConfiguration, validateConfiguration } from "./index.js";
 
 test("creates a safe managed configuration", () => {
   const configuration = createDefaultConfiguration();
@@ -9,4 +9,28 @@ test("creates a safe managed configuration", () => {
   assert.equal(configuration.activeMode, "managed");
   assert.equal(configuration.activeProfileId, "managed-default");
   assert.equal(configuration.virtualModelName, "九门赛博提督");
+});
+
+test("keeps managed and expert defaults isolated", () => {
+  const managedConfiguration = createDefaultConfiguration("managed");
+  const expertConfiguration = createDefaultConfiguration("expert");
+
+  assert.equal(managedConfiguration.activeProfileId, "managed-default");
+  assert.equal(expertConfiguration.activeProfileId, "expert-default");
+  assert.equal(expertConfiguration.activeMode, "expert");
+});
+
+test("rejects invalid or cross-mode configuration", () => {
+  const configuration = {
+    ...createDefaultConfiguration("expert"),
+    activeMode: "managed" as const,
+    virtualModelName: " ",
+  };
+  const result = validateConfiguration(configuration, "expert");
+
+  assert.equal(result.valid, false);
+  assert.deepEqual(
+    result.issues.map((issue) => issue.field),
+    ["activeMode", "virtualModelName"],
+  );
 });

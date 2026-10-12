@@ -13,9 +13,66 @@ export interface TiduConfiguration {
   virtualModelName: string;
 }
 
-export const createDefaultConfiguration = (): TiduConfiguration => ({
+export interface ConfigurationValidationIssue {
+  /** Stable machine-readable validation code. */
+  code: "INVALID_MODE" | "INVALID_PROFILE_ID" | "INVALID_SCHEMA" | "INVALID_VIRTUAL_MODEL_NAME";
+  /** Configuration field that failed validation. */
+  field: keyof TiduConfiguration;
+  /** Human-readable validation message. */
+  message: string;
+}
+
+export interface ConfigurationValidationResult {
+  /** Whether the configuration can be persisted and activated. */
+  valid: boolean;
+  /** Validation failures; empty when valid is true. */
+  issues: readonly ConfigurationValidationIssue[];
+}
+
+export const createDefaultConfiguration = (
+  mode: ConfigurationMode = "managed",
+): TiduConfiguration => ({
   schemaVersion: CONFIG_SCHEMA_VERSION,
-  activeProfileId: "managed-default",
-  activeMode: "managed",
+  activeProfileId: `${mode}-default`,
+  activeMode: mode,
   virtualModelName: "九门赛博提督",
 });
+
+export const validateConfiguration = (
+  configuration: TiduConfiguration,
+  expectedMode: ConfigurationMode = configuration.activeMode,
+): ConfigurationValidationResult => {
+  const issues: ConfigurationValidationIssue[] = [];
+
+  if (configuration.schemaVersion !== CONFIG_SCHEMA_VERSION) {
+    issues.push({
+      code: "INVALID_SCHEMA",
+      field: "schemaVersion",
+      message: `Configuration schema must be ${CONFIG_SCHEMA_VERSION}.`,
+    });
+  }
+  if (configuration.activeMode !== expectedMode) {
+    issues.push({
+      code: "INVALID_MODE",
+      field: "activeMode",
+      message: `Configuration mode must remain ${expectedMode}.`,
+    });
+  }
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/u.test(configuration.activeProfileId)) {
+    issues.push({
+      code: "INVALID_PROFILE_ID",
+      field: "activeProfileId",
+      message: "Profile ID must use 1-64 lowercase letters, numbers, or hyphens.",
+    });
+  }
+  const virtualModelNameLength = [...configuration.virtualModelName.trim()].length;
+  if (virtualModelNameLength < 1 || virtualModelNameLength > 64) {
+    issues.push({
+      code: "INVALID_VIRTUAL_MODEL_NAME",
+      field: "virtualModelName",
+      message: "Virtual-model name must contain 1-64 characters.",
+    });
+  }
+
+  return { valid: issues.length === 0, issues };
+};

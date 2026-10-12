@@ -64,7 +64,7 @@ Audience: owner and invited developers.
 - [x] Support one-command local startup / 支持一条命令本地启动
 - [x] Use a language-neutral SQLite contract with a default Node adapter / 使用语言无关SQLite契约与默认Node适配器
 - [x] Provide local configuration center / 提供本地配置中心
-- [ ] Add isolated normal and expert configuration drafts / 增加隔离的普通与专家配置草稿
+- [x] Add isolated normal and expert configuration drafts / 增加隔离的普通与专家配置草稿
 - [ ] Expose OpenAI-compatible virtual-model endpoint / 提供OpenAI兼容虚拟模型端点
 - [ ] Integrate at least two real provider types / 接入至少两类真实供应商
 - [ ] Support streaming responses and baseline tool calls / 支持流式响应和基础工具调用

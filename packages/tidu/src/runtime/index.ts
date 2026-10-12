@@ -2,9 +2,13 @@ import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-
+import {
+  CONFIG_SCHEMA_VERSION,
+  type ConfigurationMode,
+  type TiduConfiguration,
+} from "../config/index.js";
 import { createConfigCenterBootstrap } from "../config-center/index.js";
-import { PRODUCT } from "../core/index.js";
+import { PRODUCT, TiduError } from "../core/index.js";
 import { openNodeSqliteStorage, type StorageAdapter } from "../storage/index.js";
 
 export const DEFAULT_RUNTIME_HOST = "127.0.0.1";
@@ -23,6 +27,7 @@ const SECURITY_HEADERS = Object.freeze({
   "x-content-type-options": "nosniff",
   "x-frame-options": "DENY",
 });
+const MAXIMUM_JSON_BODY_BYTES = 64 * 1024;
 
 export interface LocalRuntimeOptions {
   /** Loopback host used by the personal runtime. */
@@ -86,6 +91,99 @@ const resolveStaticFile = (pathname: string): string | undefined => {
   return undefined;
 };
 
+const readJsonBody = async (request: import("node:http").IncomingMessage): Promise<unknown> => {
+  const chunks: Buffer[] = [];
+  let receivedBytes = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    receivedBytes += buffer.byteLength;
+    if (receivedBytes > MAXIMUM_JSON_BODY_BYTES) {
+      throw new TiduError("CONFIGURATION_INVALID", "Request body exceeds 64 KiB.");
+    }
+    chunks.push(buffer);
+  }
+
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+  } catch (error) {
+    throw new TiduError("CONFIGURATION_INVALID", "Request body must be valid JSON.", {
+      cause: error,
+    });
+  }
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const readExpectedRevision = (body: Record<string, unknown>, field: string): number => {
+  const revision = body[field];
+  if (!Number.isInteger(revision) || Number(revision) < 1) {
+    throw new TiduError("CONFIGURATION_INVALID", `${field} must be a positive integer.`);
+  }
+  return Number(revision);
+};
+
+const readDraftConfiguration = (
+  body: Record<string, unknown>,
+  mode: ConfigurationMode,
+): TiduConfiguration => {
+  const candidate = body.configuration;
+  if (
+    !isRecord(candidate) ||
+    candidate.schemaVersion !== CONFIG_SCHEMA_VERSION ||
+    candidate.activeMode !== mode ||
+    typeof candidate.activeProfileId !== "string" ||
+    typeof candidate.virtualModelName !== "string"
+  ) {
+    throw new TiduError("CONFIGURATION_INVALID", "Configuration payload is invalid.");
+  }
+
+  return {
+    schemaVersion: CONFIG_SCHEMA_VERSION,
+    activeMode: mode,
+    activeProfileId: candidate.activeProfileId,
+    virtualModelName: candidate.virtualModelName,
+  };
+};
+
+const validateMutationRequest = (request: import("node:http").IncomingMessage): void => {
+  if (!request.headers["content-type"]?.toLowerCase().startsWith("application/json")) {
+    throw new TiduError("CONFIGURATION_INVALID", "Content-Type must be application/json.");
+  }
+
+  const origin = request.headers.origin;
+  if (origin !== undefined) {
+    let originHost: string;
+    try {
+      originHost = new URL(origin).host;
+    } catch (error) {
+      throw new TiduError("CONFIGURATION_INVALID", "Request origin is invalid.", { cause: error });
+    }
+    if (originHost !== request.headers.host) {
+      throw new TiduError("CONFIGURATION_INVALID", "Cross-origin configuration writes are denied.");
+    }
+  }
+};
+
+const handleConfigurationMutationError = (
+  response: import("node:http").ServerResponse,
+  error: unknown,
+): void => {
+  if (error instanceof TiduError && error.code === "CONFIGURATION_CONFLICT") {
+    sendJson(response, 409, { error: error.code, message: error.message });
+    return;
+  }
+  if (error instanceof TiduError && error.code === "CONFIGURATION_INVALID") {
+    sendJson(response, 422, {
+      error: error.code,
+      message: error.message,
+      issues: error.details.issues ?? [],
+    });
+    return;
+  }
+  throw error;
+};
+
 const handleRequest = async (
   request: import("node:http").IncomingMessage,
   response: import("node:http").ServerResponse,
@@ -108,7 +206,50 @@ const handleRequest = async (
   }
 
   if (request.method === "GET" && pathname === "/api/config-center") {
-    sendJson(response, 200, createConfigCenterBootstrap(storage));
+    sendJson(response, 200, await createConfigCenterBootstrap(storage));
+    return;
+  }
+
+  const draftRoute = /^\/api\/configuration\/drafts\/(managed|expert)$/u.exec(pathname);
+  if (request.method === "PUT" && draftRoute !== null) {
+    try {
+      validateMutationRequest(request);
+      const mode = draftRoute[1] as ConfigurationMode;
+      const body = await readJsonBody(request);
+      if (!isRecord(body)) {
+        throw new TiduError("CONFIGURATION_INVALID", "Request body must be an object.");
+      }
+      await storage.configurationStore.saveDraft({
+        mode,
+        expectedRevision: readExpectedRevision(body, "expectedRevision"),
+        configuration: readDraftConfiguration(body, mode),
+      });
+      sendJson(response, 200, await createConfigCenterBootstrap(storage));
+    } catch (error) {
+      handleConfigurationMutationError(response, error);
+    }
+    return;
+  }
+
+  const activationRoute = /^\/api\/configuration\/drafts\/(managed|expert)\/activate$/u.exec(
+    pathname,
+  );
+  if (request.method === "POST" && activationRoute !== null) {
+    try {
+      validateMutationRequest(request);
+      const mode = activationRoute[1] as ConfigurationMode;
+      const body = await readJsonBody(request);
+      if (!isRecord(body)) {
+        throw new TiduError("CONFIGURATION_INVALID", "Request body must be an object.");
+      }
+      await storage.configurationStore.activateDraft(
+        mode,
+        readExpectedRevision(body, "expectedDraftRevision"),
+      );
+      sendJson(response, 200, await createConfigCenterBootstrap(storage));
+    } catch (error) {
+      handleConfigurationMutationError(response, error);
+    }
     return;
   }
 

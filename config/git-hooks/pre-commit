@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+. "$(git rev-parse --show-toplevel)/config/git-hooks/use-project-node.sh"
+
 npm run policy -- branch
 npm run policy -- versions
 npm run policy -- release-lines
