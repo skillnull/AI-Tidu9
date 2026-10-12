@@ -103,7 +103,7 @@ Audience: owner and invited developers.
 - [x] Provide task control view / 提供任务控制视图
 - [x] Verify worker interruption and safe recovery / 验证Worker中断与安全恢复
 - [x] Pass release quality gates / 通过发布质量门禁
-- [ ] Receive release confirmation / 获得发布确认
+- [x] Receive release confirmation / 获得发布确认
 
 ## v0.4.0-beta.1 — Core differentiators / 核心竞争能力公开测试版
 
