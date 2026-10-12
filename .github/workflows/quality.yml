@@ -28,7 +28,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
-          node-version: 18.20.8
+          node-version: 22.14.0
           cache: npm
       - run: npm ci
       - if: github.ref_type == 'branch' || github.event_name == 'pull_request'
@@ -68,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [18.20.8, 22]
+        node-version: [22.14.0, 22]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

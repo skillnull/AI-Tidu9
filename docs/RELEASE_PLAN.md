@@ -55,15 +55,15 @@ Audience: maintainers and internal contributors only.
 - [x] Add build, lint, typecheck, and test foundations / 建立构建、Lint、类型检查和测试基础
 - [x] Add bilingual changelog and upgrade notes / 增加双语变更记录与升级说明
 - [x] Pass release quality gates / 通过发布质量门禁
-- [ ] Receive release confirmation / 获得发布确认
+- [x] Receive release confirmation / 获得发布确认
 
 ## v0.2.0-alpha.1 — Zero-config personal entry / 零配置个人入口
 
 Audience: owner and invited developers.
 
-- [ ] Support one-command local startup / 支持一条命令本地启动
-- [ ] Use SQLite by default / 默认使用SQLite
-- [ ] Provide local configuration center / 提供本地配置中心
+- [x] Support one-command local startup / 支持一条命令本地启动
+- [x] Use a language-neutral SQLite contract with a default Node adapter / 使用语言无关SQLite契约与默认Node适配器
+- [x] Provide local configuration center / 提供本地配置中心
 - [ ] Add isolated normal and expert configuration drafts / 增加隔离的普通与专家配置草稿
 - [ ] Expose OpenAI-compatible virtual-model endpoint / 提供OpenAI兼容虚拟模型端点
 - [ ] Integrate at least two real provider types / 接入至少两类真实供应商
@@ -244,6 +244,7 @@ Every public release must provide the applicable artifacts below.
 ## Current status / 当前状态
 
 - Planning / 规划：**complete / 已完成**
-- Active stage / 当前阶段：**Stage 1 — Awaiting acceptance / 阶段1：等待验收**
-- Latest planned release / 最近计划版本：`v0.1.0-alpha.1`
-- Remote publishing / 远程发布：**not authorized / 未授权**
+- Active stage / 当前阶段：**Stage 2 — In progress / 阶段2：进行中**
+- Latest planned release / 最近计划版本：`v0.2.0-alpha.1`
+- Latest published release / 最近已发布版本：`v0.1.0-alpha.2`
+- Remote publishing / 远程发布：**enabled with explicit confirmation / 经明确确认后执行**

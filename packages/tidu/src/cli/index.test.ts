@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -34,4 +35,38 @@ test("runs as an executable entry point", () => {
   assert.equal(result.status, 0);
   assert.equal(result.stderr, "");
   assert.equal(result.stdout.trim(), packageVersion);
+});
+
+test("starts the local runtime from the executable entry point", async () => {
+  const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
+  const child = spawn(process.execPath, [executablePath, "start"], {
+    env: {
+      ...process.env,
+      TIDU_DATABASE_PATH: ":memory:",
+      TIDU_PORT: "0",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let healthVerified = false;
+
+  try {
+    let output = "";
+    for await (const chunk of child.stdout) {
+      output += chunk.toString();
+      const origin = output.match(/Running at (http:\/\/127\.0\.0\.1:\d+)/u)?.[1];
+      if (origin !== undefined) {
+        const response = await fetch(`${origin}/health`);
+        assert.equal(response.status, 200);
+        healthVerified = true;
+        break;
+      }
+    }
+    assert.equal(healthVerified, true);
+  } finally {
+    if (child.exitCode === null) {
+      const exitPromise = once(child, "exit");
+      child.kill("SIGTERM");
+      await exitPromise;
+    }
+  }
 });

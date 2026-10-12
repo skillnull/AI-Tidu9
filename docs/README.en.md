@@ -8,7 +8,7 @@ AI-Tidu9 is an intelligent collaboration hub for cross-domain scenarios. It coor
 
 ## Status
 
-The project is being rebuilt from an early AI rules package into an independent Super Agent platform. It is currently at the `v0.1.0-alpha.1` engineering-foundation stage and is not ready for production use.
+The project is being rebuilt from an early AI rules package into an independent Super Agent platform. It is currently in the engineering-foundation stage and is not ready for production use.
 
 ## Direction
 
@@ -21,6 +21,8 @@ The project is being rebuilt from an early AI rules package into an independent 
 
 ## Local development
 
+Node.js 22.14 or later is required.
+
 ```bash
 npm install
 npm run check
@@ -31,8 +33,10 @@ node packages/tidu/dist/cli/index.js --help
 The official npm package is `@skillnull/tidu`; its installed command remains `tidu`:
 
 ```bash
-npx @skillnull/tidu
+npx @skillnull/tidu start
 ```
+
+Open the local URL printed by the command to view the read-only configuration center and inspect runtime, storage, and current configuration status.
 
 See the [contribution guide](./CONTRIBUTING.md) for branch, commit, pull-request, version, and release rules. Local policy scripts and GitHub Actions enforce these rules.
 

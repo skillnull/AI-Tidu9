@@ -1,0 +1,10 @@
+{
+  "contractVersion": "1",
+  "schemaVersion": "1",
+  "migrations": [
+    {
+      "version": "1",
+      "file": "migrations/0001-initialize-metadata.sql"
+    }
+  ]
+}

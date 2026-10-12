@@ -6,6 +6,17 @@ All notable changes to AI-Tidu9 will be documented in this file.
 
 ## Unreleased / 未发布
 
+- Add `tidu start` for one-command loopback startup with a verifiable health endpoint and graceful shutdown.
+- 增加 `tidu start` 一条命令启动本地回环运行时，提供可验证健康检查与安全停止能力。
+- Add built-in SQLite persistence for AI-Tidu9 metadata, with automatic initialization, private file permissions, WAL concurrency, schema-version validation, and no third-party database dependency.
+- 增加九门自身元数据的内置SQLite持久化，支持自动初始化、私有文件权限、WAL并发与Schema版本校验，且不引入第三方数据库依赖。
+- Define the SQLite schema and ordered migrations as a language-neutral contract, with `node:sqlite` isolated as the current Node adapter and a clear future path for Python `sqlite3` implementations.
+- 将SQLite Schema与顺序迁移定义为语言无关契约，把 `node:sqlite` 隔离为当前Node适配器，并为未来Python `sqlite3` 实现保留明确路径。
+- Raise the minimum runtime to Node.js 22.14 and verify the baseline on Node.js 22 in CI.
+- 将最低运行时提升至Node.js 22.14，并在CI中验证Node.js 22基线。
+- Add a lightweight React + Vite local configuration center with a read-only bootstrap API, restrictive browser security headers, and packaged static assets served directly by `tidu start`.
+- 增加轻量React + Vite本地配置中心、只读引导API、严格浏览器安全响应头和随npm包发布的静态资源，由 `tidu start` 直接提供访问。
+
 ## 0.1.0-alpha.2 - 2026-10-11
 
 - Rebuild the project from an early AI rules package into the AI-Tidu9 Super Agent platform.

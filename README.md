@@ -8,7 +8,7 @@
 
 ## 当前状态
 
-项目正在从早期AI规则包重构为独立的超级Agent平台，目前处于 `v0.1.0-alpha.1` 工程基础阶段，尚不建议用于生产环境。
+项目正在从早期AI规则包重构为独立的超级Agent平台，目前处于工程基础阶段，尚不建议用于生产环境。
 
 ## 核心方向
 
@@ -21,6 +21,8 @@
 
 ## 本地开发
 
+需要 Node.js 22.14 或更高版本。
+
 ```bash
 npm install
 npm run check
@@ -31,8 +33,10 @@ node packages/tidu/dist/cli/index.js --help
 正式npm包名为 `@skillnull/tidu`，安装后的命令保持为 `tidu`：
 
 ```bash
-npx @skillnull/tidu
+npx @skillnull/tidu start
 ```
+
+启动后打开终端输出的本地地址，即可进入只读配置中心并查看运行时、存储和当前配置状态。
 
 分支、Commit、PR、版本和发布规则见 [贡献指南](./docs/CONTRIBUTING.md)。规则由本地脚本和GitHub Actions共同校验。
 

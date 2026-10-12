@@ -12,12 +12,18 @@
 | `packages/tidu/src/core` | 产品元数据、共享错误和核心领域基础 | 不依赖客户端、模型供应商或存储实现 |
 | `packages/tidu/src/config` | 版本化配置契约和安全默认值 | 普通模式与专家模式必须保持配置隔离 |
 | `packages/tidu/src/protocol` | Agent任务和事件的规范化协议 | 通过显式版本演进，避免绑定具体模型 |
+| `packages/tidu/src/runtime` | 轻量本地HTTP运行时与配置中心静态入口 | 默认仅监听回环地址，不包含模型代理或业务编排 |
+| `packages/tidu/src/config-center` | 本地配置中心引导数据契约 | 当前只提供只读状态，不提前承载配置草稿逻辑 |
+| `packages/tidu/src/storage` | 存储适配器与九门自身元数据持久化 | Schema与SQL迁移保持语言无关，Node运行时默认使用内置SQLite适配器 |
 
 上述模块统一属于公开包 `@skillnull/tidu`。内部目录用于保持代码边界，不形成独立npm包；只有出现独立使用者、版本与发布周期后，才提取新的公开包。
 
 ## 设计约束
 
 - 客户端、模型、Agent、Skill、MCP、工具、知识库和存储均通过后续适配器接入。
+- SQLite契约由npm包公开的 `storage/contract.json` 与顺序SQL迁移定义，不能绑定Node或Python实现。
+- Node主运行时执行同一存储契约；Python SDK通过平台API访问，未来独立Python运行时可使用标准库 `sqlite3` 实现适配器。
+- 同一个SQLite数据库只允许一个运行时拥有写入权，跨语言Agent与Worker不得绕过平台API直接争用数据库。
 - 核心只表达目标、能力、策略、任务、事件和可验证结果，不把领域识别硬编码进平台。
 - 个人部署默认保持低资源占用；PostgreSQL、Redis、队列及分布式 Worker 均为按需能力。
 - 所有模型与工具出口必须经过同一强制策略边界，不能由插件或专家配置绕过。
@@ -25,4 +31,4 @@
 
 ## 当前限制
 
-`v0.1.0-alpha.1` 仅建立工程、协议和配置基础，不包含可用的模型代理、Agent执行循环、图形界面或企业部署能力。
+当前主运行时需要Node.js 22.14或更高版本。`tidu start` 会启动仅监听 `127.0.0.1` 的轻量运行时和React + Vite本地配置中心，通过Node SQLite适配器执行语言无关迁移，并通过 `/health` 验证运行时与存储状态。配置中心当前只读；普通与专家配置草稿、Python SDK、模型代理、Agent执行循环和企业部署能力尚未实现。
