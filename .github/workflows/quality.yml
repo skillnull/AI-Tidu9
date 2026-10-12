@@ -29,8 +29,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22.14.0
-          cache: npm
-      - run: npm ci
+      - run: npm install --no-package-lock
       - if: github.ref_type == 'branch' || github.event_name == 'pull_request'
         run: npm run policy -- branch
         env:
@@ -74,8 +73,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-          cache: npm
-      - run: npm ci
+      - run: npm install --no-package-lock
       - run: npm run check
 
   verify-required:

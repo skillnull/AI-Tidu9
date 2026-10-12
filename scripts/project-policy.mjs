@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const PROJECT_POLICY = JSON.parse(
@@ -187,14 +187,10 @@ const findWorkspacePackages = (repositoryRoot) => {
 export const validateRepositoryVersions = (repositoryRoot) => {
   const rootPackage = readJson(join(repositoryRoot, "package.json"));
   const packageFiles = findWorkspacePackages(repositoryRoot);
-  const lockFile = readJson(join(repositoryRoot, "package-lock.json"));
   const problems = [];
-  const workspacePackages = packageFiles.map((packageFile) => ({
-    file: packageFile,
-    metadata: readJson(packageFile),
-  }));
+  const workspacePackages = packageFiles.map((packageFile) => readJson(packageFile));
   const workspaceVersions = new Map(
-    workspacePackages.map(({ metadata }) => [metadata.name, metadata.version]),
+    workspacePackages.map((workspacePackage) => [workspacePackage.name, workspacePackage.version]),
   );
 
   if (!rootPackage.private) {
@@ -204,14 +200,9 @@ export const validateRepositoryVersions = (repositoryRoot) => {
     problems.push("The private repository root must not declare a release version.");
   }
 
-  for (const { file: packageFile, metadata: workspacePackage } of workspacePackages) {
+  for (const workspacePackage of workspacePackages) {
     if (!validateVersion(workspacePackage.version)) {
       problems.push(`Invalid ${workspacePackage.name} version: ${workspacePackage.version}`);
-    }
-
-    const workspacePath = relative(repositoryRoot, dirname(packageFile)).replaceAll("\\", "/");
-    if (lockFile.packages?.[workspacePath]?.version !== workspacePackage.version) {
-      problems.push(`${workspacePackage.name} version is not synchronized in package-lock.json.`);
     }
 
     const internalDependencies = Object.entries(workspacePackage.dependencies ?? {}).filter(
@@ -240,10 +231,6 @@ export const validateRepositoryVersions = (repositoryRoot) => {
     ) {
       problems.push(`${manifestPath} version must match @skillnull/tidu@${tiduVersion}.`);
     }
-  }
-
-  if (lockFile.version !== undefined || lockFile.packages?.[""]?.version !== undefined) {
-    problems.push("package-lock.json must not declare a private root release version.");
   }
 
   return problems;

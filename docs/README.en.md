@@ -21,10 +21,10 @@ The project is being rebuilt from an early AI rules package into an independent 
 
 ## Local development
 
-Node.js 22.14 or later is required. The repository includes `.nvmrc`; build, test, check, publish, and Git-hook commands automatically select the project Node version. Run `nvm install` once if that version is not installed yet.
+Node.js 22.14 or later is required. The shared Node entry supports the current environment, NVM, Homebrew, fnm, mise, asdf, and Volta. Install, build, test, publish, and Git-hook commands select a compatible runtime automatically and stop before changing dependencies when none is available.
 
 ```bash
-npm install
+npm run setup
 npm run check
 npm test
 node packages/tidu/dist/cli/index.js --help

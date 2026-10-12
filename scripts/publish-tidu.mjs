@@ -87,7 +87,7 @@ export const formatReleaseSummary = (
     `  ${applyTerminalColor("Version:", "blue", colorEnabled)}   ${currentVersion} → ${version}`,
     `  ${applyTerminalColor("npm tags:", "yellow", colorEnabled)}  ${getDistributionTags(version, publishedVersions).join(", ")}`,
     `  ${applyTerminalColor("CHANGELOG:", "yellow", colorEnabled)} ${version} (${releaseDate})`,
-    `  ${applyTerminalColor("Files:", "magenta", colorEnabled)}     package-lock.json, packages/tidu/package.json, docs/CHANGELOG.md`,
+    `  ${applyTerminalColor("Files:", "magenta", colorEnabled)}     packages/tidu/package.json, docs/CHANGELOG.md`,
     `  ${applyTerminalColor("Next:", "magenta", colorEnabled)}      local commit/tag → npm publish → push`,
     "",
   ].join("\n");
@@ -298,7 +298,6 @@ const synchronizeDistributionTags = (repositoryRoot, version, distributionTags) 
 
 const getReleaseFiles = (repositoryRoot) => ({
   changelog: resolve(repositoryRoot, "docs/CHANGELOG.md"),
-  lock: resolve(repositoryRoot, "package-lock.json"),
   package: resolve(repositoryRoot, RELEASE.packagePath, "package.json"),
 });
 
@@ -319,12 +318,9 @@ const synchronizeReleaseFiles = (releaseFiles, snapshots, version, releaseDate) 
   }
 
   const publishedPackage = JSON.parse(snapshots.get(releaseFiles.package));
-  const lockFile = JSON.parse(snapshots.get(releaseFiles.lock));
   publishedPackage.version = version;
-  lockFile.packages[RELEASE.packagePath].version = version;
 
   writeJson(releaseFiles.package, publishedPackage);
-  writeJson(releaseFiles.lock, lockFile);
   writeFileSync(
     releaseFiles.changelog,
     prepareChangelog(snapshots.get(releaseFiles.changelog), version, releaseDate),

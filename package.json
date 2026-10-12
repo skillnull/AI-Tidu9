@@ -7,14 +7,15 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "sh -c '. ./config/git-hooks/use-project-node.sh && npm run build --workspaces --if-present'",
-    "build:tidu": "sh -c '. ./config/git-hooks/use-project-node.sh && npm run build --workspace @skillnull/tidu'",
-    "check": "sh -c '. ./config/git-hooks/use-project-node.sh && npm run policy -- versions && npm run lint && npm test'",
-    "lint": "sh -c '. ./config/git-hooks/use-project-node.sh && biome check --config-path=config/biome.json .'",
-    "prepare": "sh -c '. ./config/git-hooks/use-project-node.sh && node scripts/install-git-hooks.mjs'",
-    "policy": "sh -c '. ./config/git-hooks/use-project-node.sh && node scripts/project-policy.mjs \"$@\"' --",
-    "publish:tidu": "sh -c '. ./config/git-hooks/use-project-node.sh && node scripts/publish-tidu.mjs'",
-    "test": "sh -c '. ./config/git-hooks/use-project-node.sh && node --test scripts/*.test.mjs && npm run test --workspaces --if-present'"
+    "setup": "sh -c '. ./scripts/use-project-node.sh && npm install --no-package-lock'",
+    "build": "sh -c '. ./scripts/use-project-node.sh && npm run build --workspaces --if-present'",
+    "build:tidu": "sh -c '. ./scripts/use-project-node.sh && npm run build --workspace @skillnull/tidu'",
+    "check": "sh -c '. ./scripts/use-project-node.sh && npm run policy -- versions && npm run lint && npm test'",
+    "lint": "sh -c '. ./scripts/use-project-node.sh && biome check --config-path=config/biome.json .'",
+    "prepare": "sh -c '. ./scripts/use-project-node.sh && node scripts/install-git-hooks.mjs'",
+    "policy": "sh -c '. ./scripts/use-project-node.sh && node scripts/project-policy.mjs \"$@\"' --",
+    "publish:tidu": "sh -c '. ./scripts/use-project-node.sh && node scripts/publish-tidu.mjs'",
+    "test": "sh -c '. ./scripts/use-project-node.sh && node --test scripts/*.test.mjs && npm run test --workspaces --if-present'"
   },
   "engines": {
     "node": ">=22.14.0"

@@ -3,7 +3,7 @@
 ## Development / 开发
 
 ```bash
-npm install
+npm run setup
 npm run check
 ```
 
@@ -63,7 +63,7 @@ Validate a message with `npm run policy -- commit "feat(scope): description"`.
 
 - Versions follow Semantic Versioning: `MAJOR.MINOR.PATCH`.
 - Pre-releases are limited to `alpha.N`, `beta.N`, and `rc.N`; tags use `v<version>`.
-- The private root workspace has no release version. Each published package owns its version, which must match its lockfile entry and internal dependency references.
+- The private root workspace has no release version. Each published package owns its version and must keep internal dependency references synchronized. This library workspace intentionally does not commit a dependency lockfile; direct development dependencies stay exact and CI resolves a fresh dependency graph.
 - A release requires a clean quality gate, updated changelog, migration and rollback notes, compatibility limits, and explicit maintainer approval.
 - Publishing, tagging, or pushing a release without explicit confirmation is forbidden.
 - Releases come from immutable `v<version>` tags, not mutable branches. A support line may publish only its own major. Build once and promote the same verified artifact between channels.
@@ -71,7 +71,7 @@ Validate a message with `npm run policy -- commit "feat(scope): description"`.
 - `npm run publish:tidu` is the interactive release entry point. It prepares the next version and changelog, shows a concise release summary, allows edits, and requires the exact version as confirmation. It creates the release commit and tag locally, publishes that exact commit to npm, then pushes the commit and tag to Git only after publication succeeds. `npm run publish:tidu -- --dry-run` only validates an already prepared release and never writes or publishes.
 
 - 版本遵循语义化版本，预发布标识仅允许 `alpha.N`、`beta.N` 和 `rc.N`，Tag采用 `v<版本号>`。
-- 私有根工作区不声明发布版本；每个发布包独立持有版本，并与其锁文件记录及内部依赖引用保持一致。
+- 私有根工作区不声明发布版本；每个发布包独立持有版本，并保持内部依赖引用一致。本库工作区明确不提交依赖锁文件；直接开发依赖使用精确版本，CI每次解析新的依赖树。
 - 发版必须通过质量门禁，并同步变更记录、迁移、回滚和兼容性说明；未经明确确认不得发布、打Tag或推送。
 - 正式版本从不可变 `v<版本号>` Tag发布，不直接部署可变分支。维护线只能发布自己的Major；同一Commit只构建一次，并在各渠道晋级同一份已验证制品。
 - 首个稳定版之前，最新公开预发布版本同时更新所属渠道标签与`latest`；稳定版出现后，预发布版本只更新`alpha`、`beta`或`rc`，只有稳定版本更新`latest`。
@@ -81,7 +81,7 @@ Validate a message with `npm run policy -- commit "feat(scope): description"`.
 
 - Never report vulnerabilities in a public issue. Use the repository's private security advisory channel.
 - Never commit secrets, personal data, private paths, internal domains, generated credentials, or confidential artifacts.
-- Dependency updates must preserve the lock file and pass audit, license, test, and compatibility checks.
+- Dependency updates must keep direct versions exact and pass audit, license, test, and compatibility checks.
 - New dependencies, public APIs, protocol changes, policy bypasses, and data-retention changes require explicit design justification.
 - Generated files must be reproducible. Large binaries and vendored dependencies require maintainer approval.
 - Copyright, license, trademark, and required `Powered by AI-Tidu9` attribution must be preserved.

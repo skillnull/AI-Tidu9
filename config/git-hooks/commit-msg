@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
 
-. "$(git rev-parse --show-toplevel)/config/git-hooks/use-project-node.sh"
+. "$(git rev-parse --show-toplevel)/scripts/use-project-node.sh"
 
 npm run policy -- commit --file "$1"

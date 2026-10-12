@@ -21,10 +21,10 @@
 
 ## 本地开发
 
-需要 Node.js 22.14 或更高版本。项目提供 `.nvmrc`，构建、测试、检查、发布与Git Hook都会自动切换到项目Node版本；首次使用若尚未安装，请运行 `nvm install`。
+需要 Node.js 22.14 或更高版本。统一Node入口支持当前环境、NVM、Homebrew、fnm、mise、asdf和Volta；安装、构建、测试、发布与Git Hook都会自动选择兼容版本，检测不到时会在修改依赖前停止。
 
 ```bash
-npm install
+npm run setup
 npm run check
 npm test
 node packages/tidu/dist/cli/index.js --help
