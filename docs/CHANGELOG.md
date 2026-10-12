@@ -6,6 +6,8 @@ All notable changes to AI-Tidu9 will be documented in this file.
 
 ## Unreleased / 未发布
 
+## 0.3.0-alpha.1 - 2026-10-12
+
 - Adopt a lockfile-free library workspace with exact direct dependencies, fresh CI resolution, and release tooling that no longer couples package versions to `package-lock.json`.
 - 采用无锁文件的库工作区策略，直接依赖保持精确版本，CI每次重新解析依赖，发布工具不再将包版本与 `package-lock.json` 耦合。
 - Unify Node.js selection across installation, development commands, release tooling, and Git hooks, with automatic discovery through NVM, Homebrew, fnm, mise, asdf, and Volta.
