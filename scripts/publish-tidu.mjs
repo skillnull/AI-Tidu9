@@ -87,7 +87,7 @@ export const formatReleaseSummary = (
     `  ${applyTerminalColor("Version:", "blue", colorEnabled)}   ${currentVersion} → ${version}`,
     `  ${applyTerminalColor("npm tags:", "yellow", colorEnabled)}  ${getDistributionTags(version, publishedVersions).join(", ")}`,
     `  ${applyTerminalColor("CHANGELOG:", "yellow", colorEnabled)} ${version} (${releaseDate})`,
-    `  ${applyTerminalColor("Files:", "magenta", colorEnabled)}     packages/tidu/package.json, docs/CHANGELOG.md`,
+    `  ${applyTerminalColor("Files:", "magenta", colorEnabled)}     package and connector manifests, docs/CHANGELOG.md`,
     `  ${applyTerminalColor("Next:", "magenta", colorEnabled)}      local commit/tag → npm publish → push`,
     "",
   ].join("\n");
@@ -298,7 +298,17 @@ const synchronizeDistributionTags = (repositoryRoot, version, distributionTags) 
 
 const getReleaseFiles = (repositoryRoot) => ({
   changelog: resolve(repositoryRoot, "docs/CHANGELOG.md"),
+  codexManifest: resolve(
+    repositoryRoot,
+    RELEASE.packagePath,
+    "connectors/codex/ai-tidu9/.codex-plugin/plugin.json",
+  ),
   package: resolve(repositoryRoot, RELEASE.packagePath, "package.json"),
+  pluginManifest: resolve(
+    repositoryRoot,
+    RELEASE.packagePath,
+    "connectors/codex/ai-tidu9/plugin.json",
+  ),
 });
 
 const captureReleaseFiles = (releaseFiles) =>
@@ -319,6 +329,13 @@ const synchronizeReleaseFiles = (releaseFiles, snapshots, version, releaseDate) 
 
   const publishedPackage = JSON.parse(snapshots.get(releaseFiles.package));
   publishedPackage.version = version;
+
+  const connectorManifests = [releaseFiles.codexManifest, releaseFiles.pluginManifest];
+  for (const connectorManifest of connectorManifests) {
+    const manifest = JSON.parse(snapshots.get(connectorManifest));
+    manifest.version = version;
+    writeJson(connectorManifest, manifest);
+  }
 
   writeJson(releaseFiles.package, publishedPackage);
   writeFileSync(

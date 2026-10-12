@@ -10,6 +10,8 @@ All notable changes to AI-Tidu9 will be documented in this file.
 - 采用无锁文件的库工作区策略，直接依赖保持精确版本，CI每次重新解析依赖，发布工具不再将包版本与 `package-lock.json` 耦合。
 - Unify Node.js selection across installation, development commands, release tooling, and Git hooks, with automatic discovery through NVM, Homebrew, fnm, mise, asdf, and Volta.
 - 统一安装、开发命令、发布工具与Git Hook的Node.js选择，并自动发现NVM、Homebrew、fnm、mise、asdf与Volta中的兼容版本。
+- Synchronize the npm package and bundled Codex connector manifest versions in one atomic release transaction.
+- 在同一原子发布事务中同步npm包与随包交付的Codex连接器清单版本。
 - Keep npm `latest` aligned with the newest public prerelease until the first stable version exists, while preserving independent `alpha`, `beta`, and `rc` channel tags.
 - 在首个稳定版本发布前，让npm `latest` 跟随最新公开预发布版本，同时保留独立的 `alpha`、`beta` 与 `rc` 渠道标签。
 - Add the versioned canonical task aggregate and append-only Agent event envelope with normalized goals, acceptance criteria, lifecycle status, task-local ordering, non-sensitive sources, timestamps, and strict boundary validation.
