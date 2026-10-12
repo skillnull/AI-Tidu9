@@ -1,6 +1,6 @@
 {
   "contractVersion": "1",
-  "schemaVersion": "2",
+  "schemaVersion": "3",
   "migrations": [
     {
       "version": "1",
@@ -9,6 +9,10 @@
     {
       "version": "2",
       "file": "migrations/0002-isolate-configuration-drafts.sql"
+    },
+    {
+      "version": "3",
+      "file": "migrations/0003-add-task-capsules.sql"
     }
   ]
 }

@@ -1,5 +1,6 @@
 import { StrictMode, useCallback, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
+import type { TaskControlView } from "../../src/agent/index.js";
 import type { ConfigurationMode, TiduConfiguration } from "../../src/config/index.js";
 import type { ConfigCenterBootstrap } from "../../src/config-center/contracts.js";
 import "./styles.css";
@@ -21,6 +22,219 @@ interface ConfigurationForm {
   /** User-facing virtual-model name exposed by compatible clients. */
   virtualModelName: string;
 }
+
+interface TaskListResponse {
+  /** Whether the running service has an Agent kernel attached. */
+  available: boolean;
+  /** Bounded task summaries ordered by latest update. */
+  tasks: readonly TaskControlView[];
+}
+
+const taskStatusLabel = (status: TaskControlView["status"]): string =>
+  ({
+    created: "已规划",
+    running: "执行中",
+    waiting_for_approval: "等待审批",
+    paused: "已暂停",
+    completed: "已完成",
+    failed: "执行失败",
+    cancelled: "已取消",
+  })[status];
+
+const TaskControlPanel = () => {
+  const [snapshot, setSnapshot] = useState<TaskListResponse | undefined>();
+  const [message, setMessage] = useState("正在读取任务胶囊…");
+  const [pendingTaskId, setPendingTaskId] = useState<string | undefined>();
+
+  const refreshTasks = useCallback(async () => {
+    try {
+      const response = await fetch("/api/tasks", {
+        headers: { accept: "application/json" },
+      });
+      if (!response.ok) {
+        throw new Error(`任务接口返回 ${response.status}`);
+      }
+      setSnapshot((await response.json()) as TaskListResponse);
+      setMessage("");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "无法读取任务状态");
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshTasks();
+  }, [refreshTasks]);
+
+  const mutateTask = async (
+    task: TaskControlView,
+    action: "approve" | "cancel" | "deny" | "pause" | "resume",
+  ): Promise<void> => {
+    setPendingTaskId(task.taskId);
+    setMessage("正在提交控制指令…");
+    try {
+      const isApproval = action === "approve" || action === "deny";
+      const response = await fetch(
+        `/api/tasks/${encodeURIComponent(task.taskId)}/${isApproval ? "approval" : "control"}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(
+            isApproval
+              ? {
+                  stepId: task.pendingApprovalStepId,
+                  approved: action === "approve",
+                }
+              : { action },
+          ),
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`任务控制返回 ${response.status}`);
+      }
+      await refreshTasks();
+      setMessage("控制指令已生效。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "任务控制失败");
+    } finally {
+      setPendingTaskId(undefined);
+    }
+  };
+
+  return (
+    <section className="task-panel">
+      <div className="configuration-heading">
+        <div>
+          <p className="card-label">BOUNDED AGENT TASKS</p>
+          <h2>任务控制</h2>
+          <p>查看计划进度、预算与信任等级；暂停、恢复、取消和审批都经过内核状态机。</p>
+        </div>
+        <button
+          type="button"
+          onClick={() => void refreshTasks()}
+          disabled={pendingTaskId !== undefined}
+        >
+          刷新任务
+        </button>
+      </div>
+      {snapshot?.available === false ? (
+        <div className="task-empty">
+          当前运行时未配置真实模型供应商或未注入专用规划器与执行器。持久化任务仍可查看，
+          但执行控制只在真实 Agent 内核可用后启用。
+        </div>
+      ) : null}
+      {snapshot?.available === true && snapshot.tasks.length === 0 ? (
+        <div className="task-empty">暂无任务。Agent SDK 创建的任务会在此显示。</div>
+      ) : (
+        <div className="task-list">
+          {snapshot?.tasks.map((task) => {
+            const progress = task.totalSteps === 0 ? 0 : task.completedSteps / task.totalSteps;
+            const isPending = pendingTaskId === task.taskId;
+            return (
+              <article className="task-card" key={task.taskId}>
+                <div className="task-card-heading">
+                  <div>
+                    <p className="task-id">{task.taskId}</p>
+                    <h3>{task.objective}</h3>
+                  </div>
+                  <span className={`task-status task-status-${task.status}`}>
+                    {taskStatusLabel(task.status)}
+                  </span>
+                </div>
+                <div
+                  className="task-progress"
+                  role="progressbar"
+                  aria-label="任务进度"
+                  aria-valuemin={0}
+                  aria-valuemax={task.totalSteps}
+                  aria-valuenow={task.completedSteps}
+                >
+                  <span style={{ width: `${Math.round(progress * 100)}%` }} />
+                </div>
+                <dl className="task-metrics">
+                  <div>
+                    <dt>步骤</dt>
+                    <dd>
+                      {task.completedSteps}/{task.totalSteps}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>工具</dt>
+                    <dd>
+                      {task.budget.usage.toolCalls}/{task.budget.limits.maxToolCalls}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>重规划</dt>
+                    <dd>
+                      {task.budget.usage.replans}/{task.budget.limits.maxReplans}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>可信度</dt>
+                    <dd>{task.trustLevel}</dd>
+                  </div>
+                </dl>
+                {snapshot.available ? (
+                  <div className="task-actions">
+                    {task.status === "running" ? (
+                      <button
+                        type="button"
+                        disabled={isPending}
+                        onClick={() => void mutateTask(task, "pause")}
+                      >
+                        暂停
+                      </button>
+                    ) : null}
+                    {["created", "failed", "paused"].includes(task.status) ? (
+                      <button
+                        type="button"
+                        disabled={isPending}
+                        onClick={() => void mutateTask(task, "resume")}
+                      >
+                        恢复执行
+                      </button>
+                    ) : null}
+                    {task.status === "waiting_for_approval" && task.pendingApprovalStepId ? (
+                      <>
+                        <button
+                          className="primary-button"
+                          type="button"
+                          disabled={isPending}
+                          onClick={() => void mutateTask(task, "approve")}
+                        >
+                          批准
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isPending}
+                          onClick={() => void mutateTask(task, "deny")}
+                        >
+                          拒绝
+                        </button>
+                      </>
+                    ) : null}
+                    {!["completed", "cancelled"].includes(task.status) ? (
+                      <button
+                        type="button"
+                        disabled={isPending}
+                        onClick={() => void mutateTask(task, "cancel")}
+                      >
+                        取消
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+              </article>
+            );
+          })}
+        </div>
+      )}
+      <p className="operation-message" aria-live="polite">
+        {message}
+      </p>
+    </section>
+  );
+};
 
 const requestBootstrap = async (
   path = "/api/config-center",
@@ -159,7 +373,7 @@ const GuideCenter = () => {
             </article>
           </div>
           <p className="guide-note">
-            当前版本支持OpenAI兼容服务或本地Ollama的非流式、SSE流式与基础函数工具协议；已支持客户端无凭据发现，安全写入配置和Agent自主执行尚未开放。
+            当前版本支持OpenAI兼容服务或本地Ollama的非流式、SSE流式与基础函数工具协议；配置真实供应商后会自动启用Agent目标理解、规划、审批、恢复和结果验证，也可通过SDK注入专用适配器。
           </p>
         </div>
       ) : (
@@ -240,9 +454,9 @@ const App = () => {
   const [loadingState, setLoadingState] = useState<LoadingState>({
     status: "loading",
   });
-  const [activeSection, setActiveSection] = useState<"clients" | "configuration" | "guide">(
-    "configuration",
-  );
+  const [activeSection, setActiveSection] = useState<
+    "clients" | "configuration" | "guide" | "tasks"
+  >("configuration");
   const [selectedMode, setSelectedMode] = useState<ConfigurationMode>("managed");
   const [form, setForm] = useState<ConfigurationForm>({
     activeProfileId: "managed-default",
@@ -380,6 +594,16 @@ const App = () => {
       </header>
 
       <nav className="section-navigation" aria-label="配置中心栏目">
+        <button
+          className={
+            activeSection === "tasks" ? "section-button section-button-active" : "section-button"
+          }
+          type="button"
+          aria-current={activeSection === "tasks" ? "page" : undefined}
+          onClick={() => setActiveSection("tasks")}
+        >
+          任务
+        </button>
         <button
           className={
             activeSection === "configuration"
@@ -619,6 +843,8 @@ const App = () => {
             ACP等官方原生Agent协议；OpenAI兼容虚拟模型是通用客户端的兼容入口，不能冒充宿主完整能力。Ollama属于上游模型供应商，不是客户端。
           </p>
         </section>
+      ) : activeSection === "tasks" ? (
+        <TaskControlPanel />
       ) : (
         <GuideCenter />
       )}

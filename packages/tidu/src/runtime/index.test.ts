@@ -3,12 +3,79 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { createAgentKernel, createInMemoryTaskCapsuleStore } from "../agent/index.js";
 import { CONFIG_SCHEMA_VERSION } from "../config/index.js";
 import type { ConfigCenterBootstrap } from "../config-center/index.js";
 import { PRODUCT } from "../core/index.js";
 import type { ModelProvider } from "../providers/index.js";
 import { IN_MEMORY_DATABASE_PATH, STORAGE_SCHEMA_VERSION } from "../storage/index.js";
 import { startLocalRuntime } from "./index.js";
+
+test("exposes bounded Agent task creation and control through the local API", async () => {
+  const agentKernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    planner: {
+      understand: async (task) => ({
+        objective: task.goal.objective,
+        acceptanceCriteria: [...task.goal.acceptanceCriteria],
+        constraints: [],
+        assumptions: [],
+        requiredCapabilities: [],
+      }),
+      plan: async () => ({
+        revision: 1,
+        steps: [{ id: "deliver", title: "Deliver", kind: "reason" }],
+      }),
+    },
+    worker: { execute: async () => ({ summary: "Delivered" }) },
+  });
+  const runtime = await startLocalRuntime({
+    agentKernel,
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    port: 0,
+  });
+
+  try {
+    const createResponse = await fetch(`${runtime.origin}/api/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ goal: "Complete a controlled task" }),
+    });
+    assert.equal(createResponse.status, 201);
+    const created = (await createResponse.json()) as {
+      task: { taskId: string; status: string };
+    };
+    assert.equal(created.task.status, "created");
+
+    const listResponse = await fetch(`${runtime.origin}/api/tasks`);
+    assert.equal(listResponse.status, 200);
+    const list = (await listResponse.json()) as {
+      available: boolean;
+      tasks: Array<{ taskId: string }>;
+    };
+    assert.equal(list.available, true);
+    assert.deepEqual(
+      list.tasks.map((task) => task.taskId),
+      [created.task.taskId],
+    );
+
+    const resumeResponse = await fetch(
+      `${runtime.origin}/api/tasks/${created.task.taskId}/control`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "resume" }),
+      },
+    );
+    assert.equal(resumeResponse.status, 200);
+    assert.equal(
+      ((await resumeResponse.json()) as { task: { status: string } }).task.status,
+      "completed",
+    );
+  } finally {
+    await runtime.close();
+  }
+});
 
 test("starts a loopback runtime with a verifiable health endpoint", async () => {
   const runtime = await startLocalRuntime({
@@ -98,7 +165,11 @@ test("serves the local configuration center and its bootstrap API", async () => 
 });
 
 test("routes validated inference through an injected real provider adapter", async () => {
-  const requests: Array<{ protocol: string; model: unknown; virtualModelId: string }> = [];
+  const requests: Array<{
+    protocol: string;
+    model: unknown;
+    virtualModelId: string;
+  }> = [];
   const provider: ModelProvider = {
     descriptor: { type: "openai-compatible", model: "upstream-test-model" },
     execute: async (request) => {
@@ -245,7 +316,9 @@ test("cancels upstream streaming work when the client disconnects", async () => 
   const provider: ModelProvider = {
     descriptor: { type: "openai-compatible", model: "upstream-test-model" },
     execute: async (request) => {
-      request.signal?.addEventListener("abort", () => resolveAbort?.(), { once: true });
+      request.signal?.addEventListener("abort", () => resolveAbort?.(), {
+        once: true,
+      });
       return {
         kind: "stream",
         statusCode: 200,
@@ -384,7 +457,12 @@ test("exposes the active virtual model through OpenAI-compatible discovery", asy
     assert.notEqual(modelsResponse.headers.get("x-request-id"), null);
     const models = (await modelsResponse.json()) as {
       object: string;
-      data: Array<{ id: string; object: string; owned_by: string; created: number }>;
+      data: Array<{
+        id: string;
+        object: string;
+        owned_by: string;
+        created: number;
+      }>;
     };
     assert.equal(models.object, "list");
     assert.equal(models.data.length, 1);

@@ -79,7 +79,13 @@ TIDU_PROVIDER_MODEL=qwen3:8b \
 npx @skillnull/tidu start
 ```
 
-The current adapters support both non-streaming JSON and streaming SSE, including baseline function definitions, tool selection, model-issued tool calls, and client-supplied tool results. OpenAI-compatible services retain their native protocol, while Ollama is translated between NDJSON and Chat Completions or Responses events. AI-Tidu9 currently owns protocol and invocation boundaries only; the host client executes tools. Autonomous tool execution belongs to the later Agent kernel.
+The current adapters support both non-streaming JSON and streaming SSE, including baseline function definitions, tool selection, model-issued tool calls, and client-supplied tool results. OpenAI-compatible services retain their native protocol, while Ollama is translated between NDJSON and Chat Completions or Responses events. Host clients may still execute host-owned tools; independent Agent tasks run tools inside the AI-Tidu9 kernel's own budget, approval, and recovery boundaries.
+
+## Independent Agent kernel
+
+After a real model provider is configured, the runtime automatically enables goal understanding, dynamic planning, replanning, non-tool step execution, and independent result verification. Tools are registered explicitly through the public SDK. Write and external tools require human approval by default, and non-idempotent tools are not replayed automatically after interruption. The configuration center's Tasks view and `/api/tasks` management API expose progress, budgets, trust, pause, resume, cancellation, and approvals.
+
+Task state persists as a lightweight capsule capped at 256 KB, containing checkpoints, bounded summaries, minimal evidence, and budget usage. It does not store full conversations, raw model responses, or large tool output. Without a real provider, the task view remains read-only and task creation returns `AGENT_KERNEL_NOT_CONFIGURED` instead of fabricating autonomous results. The public SDK can inject custom planners, workers, verifiers, and tools; see the [architecture baseline](./architecture.en.md) for exact boundaries.
 
 `tidu clients` and the configuration center's Clients view discover local Codex, Cursor, and OpenAI CLI installations. Discovery checks only whether known commands, applications, and configuration files exist; it never reads configuration contents, accounts, credentials, or history. Integration has two levels: official native Agent protocols such as Codex app-server and Cursor ACP preserve host modes, tools, permissions, sessions, and MCP capabilities; the OpenAI-compatible virtual model supports generic clients without a native Agent protocol. The latter is a compatibility entry and must never be presented as the host's complete capability set. Ollama is an upstream model provider, not a host client.
 

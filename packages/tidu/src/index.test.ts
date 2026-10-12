@@ -6,16 +6,19 @@ import {
   CONFIG_SCHEMA_VERSION,
   configureCodexClient,
   createAgentEvent,
+  createAgentKernel,
   createDefaultConfiguration,
   createHostAccountRegistry,
   createOpenAiModel,
   createProviderFromEnvironment,
+  createTask,
   DEFAULT_RUNTIME_HOST,
   discoverLocalClients,
   IN_MEMORY_DATABASE_PATH,
   openNodeSqliteStorage,
   PRODUCT,
   selectAuthoritativeUsage,
+  TASK_CONTRACT_VERSION,
   TiduError,
   USAGE_CONTRACT_VERSION,
 } from "./index.js";
@@ -23,6 +26,7 @@ import {
 test("exposes the supported public API from one package", async () => {
   assert.equal(PRODUCT.name, "九门赛博提督");
   assert.equal(typeof configureCodexClient, "function");
+  assert.equal(typeof createAgentKernel, "function");
   assert.equal(createDefaultConfiguration().schemaVersion, CONFIG_SCHEMA_VERSION);
   assert.equal(
     createAgentEvent({
@@ -32,6 +36,10 @@ test("exposes the supported public API from one package", async () => {
       payload: null,
     }).protocolVersion,
     AGENT_PROTOCOL_VERSION,
+  );
+  assert.equal(
+    createTask({ taskId: "task-public-api", goal: "verify public task contract" }).contractVersion,
+    TASK_CONTRACT_VERSION,
   );
   assert.deepEqual(
     createProviderFromEnvironment({

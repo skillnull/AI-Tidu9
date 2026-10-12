@@ -91,18 +91,18 @@ Audience: owner and invited developers.
 
 ## v0.3.0-alpha.1 — Independent Agent kernel / 独立Agent内核
 
-- [ ] Define canonical task and event models / 定义统一任务与事件模型
-- [ ] Implement goal understanding and dynamic planning / 实现目标理解与动态规划
-- [ ] Implement bounded Agent execution loop / 实现有界Agent执行循环
-- [ ] Implement tool execution and human approval / 实现工具执行与人工确认
-- [ ] Implement lightweight task capsule / 实现轻量任务胶囊
-- [ ] Implement checkpoints, pause, resume, and cancellation / 实现检查点、暂停、恢复和取消
-- [ ] Enforce per-task resource budgets / 强制执行任务资源预算
-- [ ] Implement result acceptance criteria / 实现结果验收条件
-- [ ] Implement minimal evidence package and trust level / 实现最小证据包与可信等级
-- [ ] Provide task control view / 提供任务控制视图
-- [ ] Verify worker interruption and safe recovery / 验证Worker中断与安全恢复
-- [ ] Pass release quality gates / 通过发布质量门禁
+- [x] Define canonical task and event models / 定义统一任务与事件模型
+- [x] Implement goal understanding and dynamic planning / 实现目标理解与动态规划
+- [x] Implement bounded Agent execution loop / 实现有界Agent执行循环
+- [x] Implement tool execution and human approval / 实现工具执行与人工确认
+- [x] Implement lightweight task capsule / 实现轻量任务胶囊
+- [x] Implement checkpoints, pause, resume, and cancellation / 实现检查点、暂停、恢复和取消
+- [x] Enforce per-task resource budgets / 强制执行任务资源预算
+- [x] Implement result acceptance criteria / 实现结果验收条件
+- [x] Implement minimal evidence package and trust level / 实现最小证据包与可信等级
+- [x] Provide task control view / 提供任务控制视图
+- [x] Verify worker interruption and safe recovery / 验证Worker中断与安全恢复
+- [x] Pass release quality gates / 通过发布质量门禁
 - [ ] Receive release confirmation / 获得发布确认
 
 ## v0.4.0-beta.1 — Core differentiators / 核心竞争能力公开测试版
@@ -264,7 +264,7 @@ Every public release must provide the applicable artifacts below.
 ## Current status / 当前状态
 
 - Planning / 规划：**complete / 已完成**
-- Active stage / 当前阶段：**Stage 2 — In progress / 阶段2：进行中**
-- Latest planned release / 最近计划版本：`v0.2.0-alpha.1`
-- Latest published release / 最近已发布版本：`v0.1.0-alpha.2`
+- Active stage / 当前阶段：**Stage 3 — In progress / 阶段3：进行中**
+- Latest planned release / 最近计划版本：`v0.3.0-alpha.1`
+- Latest published release / 最近已发布版本：`v0.2.0-alpha.1`
 - Remote publishing / 远程发布：**enabled with explicit confirmation / 经明确确认后执行**

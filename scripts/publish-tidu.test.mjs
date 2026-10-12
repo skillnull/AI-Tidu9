@@ -7,6 +7,7 @@ import {
   formatPublishSuccess,
   formatReleaseSummary,
   getDistributionTag,
+  getDistributionTags,
   getNextPrereleaseVersion,
   parseGitStatusPaths,
   prepareChangelog,
@@ -30,6 +31,12 @@ test("maps semantic versions to safe npm distribution tags", () => {
   assert.equal(getDistributionTag("1.2.3-alpha.1"), "alpha");
   assert.equal(getDistributionTag("1.2.3-beta.2"), "beta");
   assert.equal(getDistributionTag("1.2.3-rc.3"), "rc");
+});
+
+test("promotes prereleases to latest only before the first stable release", () => {
+  assert.deepEqual(getDistributionTags("0.2.0-alpha.1", ["0.1.0-alpha.2"]), ["alpha", "latest"]);
+  assert.deepEqual(getDistributionTags("1.1.0-beta.1", ["1.0.0"]), ["beta"]);
+  assert.deepEqual(getDistributionTags("1.1.0", ["1.0.0"]), ["latest"]);
 });
 
 test("increments prerelease versions without changing their channel", () => {
@@ -76,7 +83,16 @@ test("prints unambiguous publish outcomes", () => {
   );
   assert.match(
     formatPublishedPackageSyncFailure("Push rejected."),
-    /^✖ REMOTE SYNC FAILED.*is published/u,
+    /^✖ RELEASE SYNC FAILED.*is published/u,
+  );
+  assert.match(
+    formatPublishSuccess({
+      distributionTag: "alpha",
+      distributionTags: ["alpha", "latest"],
+      dryRun: false,
+      version: "0.2.0-alpha.1",
+    }),
+    /npm tags alpha, latest/u,
   );
 });
 
@@ -96,6 +112,7 @@ test("prints a concise color-aware release summary", () => {
   );
 
   assert.match(summary, /1\.2\.3-alpha\.1 → 1\.2\.3-alpha\.2/u);
+  assert.match(summary, /npm tags:\s+alpha, latest/u);
   assert.match(summary, /local commit\/tag → npm publish → push/u);
   assert.doesNotMatch(summary, /diff --git/u);
   assert.equal(coloredSummary.includes("\u001b[1;36mRelease summary"), true);

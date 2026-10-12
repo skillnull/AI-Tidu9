@@ -107,7 +107,8 @@ h2 {
 .card,
 .configuration-panel,
 .guide-panel,
-.client-panel {
+.client-panel,
+.task-panel {
   border: 1px solid #202832;
   border-radius: 10px;
   background: rgba(16, 21, 28, 0.94);
@@ -205,6 +206,124 @@ h2 {
 .client-panel {
   margin-top: 10px;
   padding: 18px;
+}
+
+.task-panel {
+  margin-top: 10px;
+  padding: 18px;
+}
+
+.task-empty {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px dashed #2a333e;
+  border-radius: 8px;
+  color: #758292;
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+.task-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.task-card {
+  padding: 14px;
+  border: 1px solid #202832;
+  border-radius: 8px;
+  background: #0d131a;
+}
+
+.task-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.task-card h3 {
+  margin: 3px 0 0;
+  font-size: 13px;
+  font-weight: 400;
+}
+
+.task-id {
+  max-width: 360px;
+  overflow: hidden;
+  margin-bottom: 0;
+  color: #657180;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-status {
+  flex: 0 0 auto;
+  margin-left: 10px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  color: #9ea9b5;
+  background: rgba(104, 117, 132, 0.14);
+  font-size: 9px;
+}
+
+.task-status-completed {
+  color: #8fe0b8;
+  background: rgba(65, 156, 112, 0.15);
+}
+
+.task-status-waiting_for_approval {
+  color: #e2c681;
+  background: rgba(176, 130, 46, 0.15);
+}
+
+.task-status-failed,
+.task-status-cancelled {
+  color: #ff9da9;
+  background: rgba(127, 63, 77, 0.18);
+}
+
+.task-progress {
+  height: 3px;
+  margin-top: 13px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #1b242e;
+}
+
+.task-progress span {
+  display: block;
+  height: 100%;
+  background: #69c8ba;
+}
+
+.task-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 12px 0 0;
+}
+
+.task-metrics dt {
+  color: #657180;
+  font-size: 9px;
+}
+
+.task-metrics dd {
+  margin: 3px 0 0;
+  color: #bec7d1;
+  font-size: 11px;
+}
+
+.task-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 12px;
+  padding-top: 11px;
+  border-top: 1px solid #202832;
 }
 
 .configuration-heading,
@@ -556,6 +675,14 @@ footer {
 
   .guide-grid {
     display: block;
+  }
+
+  .task-list {
+    display: block;
+  }
+
+  .task-card + .task-card {
+    margin-top: 10px;
   }
 
   .client-grid,

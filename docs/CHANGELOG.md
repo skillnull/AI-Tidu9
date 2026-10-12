@@ -6,6 +6,17 @@ All notable changes to AI-Tidu9 will be documented in this file.
 
 ## Unreleased / 未发布
 
+- Keep npm `latest` aligned with the newest public prerelease until the first stable version exists, while preserving independent `alpha`, `beta`, and `rc` channel tags.
+- 在首个稳定版本发布前，让npm `latest` 跟随最新公开预发布版本，同时保留独立的 `alpha`、`beta` 与 `rc` 渠道标签。
+- Add the versioned canonical task aggregate and append-only Agent event envelope with normalized goals, acceptance criteria, lifecycle status, task-local ordering, non-sensitive sources, timestamps, and strict boundary validation.
+- 增加版本化统一任务聚合与追加式Agent事件包络，支持规范化目标、验收条件、生命周期状态、任务内顺序、非敏感来源、时间信息和严格边界校验。
+- Add the independent bounded Agent kernel with model-driven understanding, planning and replanning, deterministic execution budgets, tool approval gates, pause/resume/cancel controls, independent acceptance verification, minimal evidence, and derived trust levels.
+- 增加独立有界Agent内核，支持模型驱动的目标理解、规划与重规划、确定性执行预算、工具审批门禁、暂停/恢复/取消、独立结果验收、最小证据包与可信等级。
+- Persist restart-safe task capsules through the language-neutral SQLite schema while limiting each capsule to 256 KB and excluding full conversations, raw model responses, and large tool output.
+- 通过语言无关SQLite Schema持久化可恢复任务胶囊，单胶囊限制为256 KB，并排除完整对话、原始模型响应与大块工具输出。
+- Add a provider-backed Agent adapter for configured OpenAI-compatible or Ollama models, plus local task APIs and a compact task-control view for progress, budgets, approvals, recovery, and cancellation.
+- 为已配置的OpenAI兼容或Ollama模型增加Agent适配器，并提供本地任务API与紧凑任务控制视图，用于进度、预算、审批、恢复和取消操作。
+
 ## 0.2.0-alpha.1 - 2026-10-12
 
 - Add `tidu start` for one-command loopback startup with a verifiable health endpoint and graceful shutdown.

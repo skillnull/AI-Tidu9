@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { createSqliteConfigurationStore } from "./sqlite-configuration-store.js";
+import { createSqliteTaskCapsuleStore } from "./sqlite-task-capsule-store.js";
 import type { NodeSqliteStorageOptions, StorageAdapter } from "./types.js";
 
 interface StorageMigrationContract {
@@ -156,10 +157,12 @@ export const openNodeSqliteStorage = async (
   try {
     const schemaVersion = applyMigrations(database);
     const configurationStore = createSqliteConfigurationStore(database);
+    const taskCapsuleStore = createSqliteTaskCapsuleStore(database);
     let isClosed = false;
 
     return {
       configurationStore,
+      taskCapsuleStore,
       provider: "sqlite",
       location: databasePath,
       schemaVersion,

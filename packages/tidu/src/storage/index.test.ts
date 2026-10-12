@@ -13,7 +13,9 @@ import {
 } from "./index.js";
 
 test("initializes isolated in-memory storage", async () => {
-  const storage = await openNodeSqliteStorage({ databasePath: IN_MEMORY_DATABASE_PATH });
+  const storage = await openNodeSqliteStorage({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+  });
 
   try {
     assert.equal(STORAGE_CONTRACT_VERSION, "1");
@@ -46,7 +48,9 @@ test("creates and reopens a persistent SQLite database", async () => {
 });
 
 test("isolates drafts from each other and from the active configuration", async () => {
-  const storage = await openNodeSqliteStorage({ databasePath: IN_MEMORY_DATABASE_PATH });
+  const storage = await openNodeSqliteStorage({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+  });
 
   try {
     const initialWorkspace = await storage.configurationStore.loadWorkspace();
@@ -80,7 +84,9 @@ test("isolates drafts from each other and from the active configuration", async 
 });
 
 test("rejects invalid drafts and stale revisions without changing persisted state", async () => {
-  const storage = await openNodeSqliteStorage({ databasePath: IN_MEMORY_DATABASE_PATH });
+  const storage = await openNodeSqliteStorage({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+  });
 
   try {
     const initialWorkspace = await storage.configurationStore.loadWorkspace();
@@ -121,7 +127,7 @@ test("rejects a database created by a newer schema", async () => {
 
     const { DatabaseSync } = await import("node:sqlite");
     const database = new DatabaseSync(databasePath);
-    database.prepare("UPDATE tidu_metadata SET value = ? WHERE key = ?").run("3", "schema_version");
+    database.prepare("UPDATE tidu_metadata SET value = ? WHERE key = ?").run("4", "schema_version");
     database.close();
 
     await assert.rejects(openNodeSqliteStorage({ databasePath }), /not supported/u);

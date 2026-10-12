@@ -6,6 +6,13 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import {
+  type AgentKernel,
+  type CreateAgentTaskInput,
+  createAgentKernel,
+  createTaskControlView,
+} from "../agent/index.js";
+import { createModelProviderAgentAdapters } from "../agent/model-provider.js";
+import {
   CONFIG_SCHEMA_VERSION,
   type ConfigurationMode,
   type TiduConfiguration,
@@ -51,6 +58,8 @@ export interface LocalRuntimeOptions {
   databasePath?: string;
   /** Explicit provider adapter; omit it to resolve runtime environment configuration. */
   provider?: ModelProvider;
+  /** Optional autonomous Agent kernel exposed through the local task-control API. */
+  agentKernel?: AgentKernel;
 }
 
 export interface LocalRuntime {
@@ -273,6 +282,14 @@ const handleOpenAiInference = async (
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
+const readRouteIdentifier = (match: RegExpExecArray): string => {
+  const identifier = match[1];
+  if (identifier === undefined) {
+    throw new Error("Matched route does not contain its required identifier.");
+  }
+  return identifier;
+};
+
 const readExpectedRevision = (body: Record<string, unknown>, field: string): number => {
   const revision = body[field];
   if (!Number.isInteger(revision) || Number(revision) < 1) {
@@ -347,6 +364,7 @@ const handleRequest = async (
   response: import("node:http").ServerResponse,
   storage: StorageAdapter,
   provider: ModelProvider | undefined,
+  agentKernel: AgentKernel | undefined,
 ): Promise<void> => {
   const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
 
@@ -366,6 +384,120 @@ const handleRequest = async (
 
   if (request.method === "GET" && pathname === "/api/config-center") {
     sendJson(response, 200, await createConfigCenterBootstrap(storage, provider?.descriptor));
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/api/tasks") {
+    const tasks = agentKernel
+      ? await agentKernel.listTasks(100)
+      : (await storage.taskCapsuleStore.list(100)).map(createTaskControlView);
+    sendJson(response, 200, { available: agentKernel !== undefined, tasks });
+    return;
+  }
+
+  const taskRoute = /^\/api\/tasks\/([a-zA-Z0-9][a-zA-Z0-9._:-]{0,127})$/u.exec(pathname);
+  if (request.method === "GET" && taskRoute !== null) {
+    const taskId = readRouteIdentifier(taskRoute);
+    const capsule = agentKernel
+      ? await agentKernel.getTask(taskId)
+      : await storage.taskCapsuleStore.load(taskId);
+    sendJson(response, capsule === undefined ? 404 : 200, capsule ?? { error: "TASK_NOT_FOUND" });
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/tasks") {
+    try {
+      validateMutationRequest(request);
+      if (agentKernel === undefined) {
+        sendJson(response, 503, { error: "AGENT_KERNEL_NOT_CONFIGURED" });
+        return;
+      }
+      const body = await readJsonBody(request);
+      if (
+        !isRecord(body) ||
+        typeof body.goal !== "string" ||
+        body.goal.trim() === "" ||
+        (body.acceptanceCriteria !== undefined &&
+          (!Array.isArray(body.acceptanceCriteria) ||
+            body.acceptanceCriteria.some((item) => typeof item !== "string")))
+      ) {
+        throw new TiduError("CONFIGURATION_INVALID", "goal must be a non-empty string.");
+      }
+      const input: CreateAgentTaskInput = {
+        goal: {
+          objective: body.goal,
+          acceptanceCriteria: Array.isArray(body.acceptanceCriteria)
+            ? (body.acceptanceCriteria as string[])
+            : [],
+        },
+      };
+      const created = await agentKernel.createTask(input);
+      const capsule = body.run === true ? await agentKernel.runTask(created.task.taskId) : created;
+      sendJson(response, 201, capsule);
+    } catch (error) {
+      handleConfigurationMutationError(response, error);
+    }
+    return;
+  }
+
+  const taskControlRoute = /^\/api\/tasks\/([a-zA-Z0-9][a-zA-Z0-9._:-]{0,127})\/control$/u.exec(
+    pathname,
+  );
+  if (request.method === "POST" && taskControlRoute !== null) {
+    try {
+      validateMutationRequest(request);
+      if (agentKernel === undefined) {
+        sendJson(response, 503, { error: "AGENT_KERNEL_NOT_CONFIGURED" });
+        return;
+      }
+      const body = await readJsonBody(request);
+      if (!isRecord(body) || !["cancel", "pause", "resume"].includes(String(body.action))) {
+        throw new TiduError("CONFIGURATION_INVALID", "Unsupported task-control action.");
+      }
+      const taskId = readRouteIdentifier(taskControlRoute);
+      const capsule =
+        body.action === "pause"
+          ? await agentKernel.pauseTask(taskId)
+          : body.action === "cancel"
+            ? await agentKernel.cancelTask(taskId)
+            : await agentKernel.resumeTask(taskId);
+      sendJson(response, 200, capsule);
+    } catch (error) {
+      handleConfigurationMutationError(response, error);
+    }
+    return;
+  }
+
+  const taskApprovalRoute = /^\/api\/tasks\/([a-zA-Z0-9][a-zA-Z0-9._:-]{0,127})\/approval$/u.exec(
+    pathname,
+  );
+  if (request.method === "POST" && taskApprovalRoute !== null) {
+    try {
+      validateMutationRequest(request);
+      if (agentKernel === undefined) {
+        sendJson(response, 503, { error: "AGENT_KERNEL_NOT_CONFIGURED" });
+        return;
+      }
+      const body = await readJsonBody(request);
+      if (
+        !isRecord(body) ||
+        typeof body.stepId !== "string" ||
+        typeof body.approved !== "boolean"
+      ) {
+        throw new TiduError("CONFIGURATION_INVALID", "Approval decision is invalid.");
+      }
+      sendJson(
+        response,
+        200,
+        await agentKernel.resolveApproval(
+          readRouteIdentifier(taskApprovalRoute),
+          body.stepId,
+          body.approved,
+        ),
+      );
+    } catch (error) {
+      handleConfigurationMutationError(response, error);
+    }
     return;
   }
 
@@ -479,7 +611,22 @@ export const startLocalRuntime = async (
   const host = options.host ?? DEFAULT_RUNTIME_HOST;
   const port = options.port ?? DEFAULT_RUNTIME_PORT;
   const provider = options.provider ?? createProviderFromEnvironment();
-  const storage = await openNodeSqliteStorage({ databasePath: options.databasePath });
+  const storage = await openNodeSqliteStorage({
+    databasePath: options.databasePath,
+  });
+  const agentKernel =
+    options.agentKernel ??
+    (provider === undefined
+      ? undefined
+      : createAgentKernel({
+          store: storage.taskCapsuleStore,
+          ...createModelProviderAgentAdapters(
+            provider,
+            async () =>
+              (await storage.configurationStore.loadWorkspace()).active.configuration
+                .activeProfileId,
+          ),
+        }));
   let runtimeDataLock: ReturnType<typeof acquireRuntimeDataLock>;
   try {
     runtimeDataLock = acquireRuntimeDataLock(storage.location);
@@ -488,7 +635,7 @@ export const startLocalRuntime = async (
     throw error;
   }
   const server = createServer((request, response) => {
-    void handleRequest(request, response, storage, provider).catch(() => {
+    void handleRequest(request, response, storage, provider, agentKernel).catch(() => {
       if (!response.headersSent) {
         sendJson(response, 500, { error: "INTERNAL_ERROR" });
       } else {

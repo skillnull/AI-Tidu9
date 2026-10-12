@@ -1,3 +1,4 @@
+import type { TaskCapsuleStore } from "../agent/index.js";
 import type { ConfigurationMode, TiduConfiguration } from "../config/index.js";
 
 export interface ConfigurationDraft {
@@ -57,6 +58,8 @@ export interface StorageAdapter {
   schemaVersion: string;
   /** Configuration persistence isolated behind the storage adapter. */
   configurationStore: ConfigurationStore;
+  /** Bounded Agent task capsules used for recovery without storing full conversations. */
+  taskCapsuleStore: TaskCapsuleStore;
   /** Releases resources owned by the adapter. */
   close: () => void;
 }

@@ -57,6 +57,16 @@ export const getDistributionTag = (version) => {
   return prereleaseMatch?.[1] ?? "latest";
 };
 
+const STABLE_VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
+
+export const getDistributionTags = (version, publishedVersions = []) => {
+  const primaryTag = getDistributionTag(version);
+  const hasStableRelease = publishedVersions.some((publishedVersion) =>
+    STABLE_VERSION_PATTERN.test(publishedVersion),
+  );
+  return primaryTag === "latest" || hasStableRelease ? [primaryTag] : [primaryTag, "latest"];
+};
+
 const applyTerminalColor = (message, color, enabled) =>
   enabled ? `${TERMINAL_COLOR[color]}${message}${TERMINAL_COLOR.reset}` : message;
 
@@ -67,7 +77,7 @@ const isTerminalColorEnabled = (stream) =>
     : process.env.FORCE_COLOR !== undefined || stream.isTTY === true);
 
 export const formatReleaseSummary = (
-  { currentVersion, releaseDate, version },
+  { currentVersion, publishedVersions = [], releaseDate, version },
   colorEnabled = false,
 ) =>
   [
@@ -75,7 +85,7 @@ export const formatReleaseSummary = (
     applyTerminalColor("Release summary", "cyan", colorEnabled),
     `  ${applyTerminalColor("Package:", "blue", colorEnabled)}   ${RELEASE.packageName}`,
     `  ${applyTerminalColor("Version:", "blue", colorEnabled)}   ${currentVersion} → ${version}`,
-    `  ${applyTerminalColor("npm tag:", "yellow", colorEnabled)}   ${getDistributionTag(version)}`,
+    `  ${applyTerminalColor("npm tags:", "yellow", colorEnabled)}  ${getDistributionTags(version, publishedVersions).join(", ")}`,
     `  ${applyTerminalColor("CHANGELOG:", "yellow", colorEnabled)} ${version} (${releaseDate})`,
     `  ${applyTerminalColor("Files:", "magenta", colorEnabled)}     package-lock.json, packages/tidu/package.json, docs/CHANGELOG.md`,
     `  ${applyTerminalColor("Next:", "magenta", colorEnabled)}      local commit/tag → npm publish → push`,
@@ -91,18 +101,19 @@ export const formatPublishFailure = (message, colorEnabled = false) =>
 
 export const formatPublishedPackageSyncFailure = (message, colorEnabled = false) =>
   applyTerminalColor(
-    `✖ REMOTE SYNC FAILED — ${RELEASE.packageName} is published, but Git is not fully synchronized.\n${message}`,
+    `✖ RELEASE SYNC FAILED — ${RELEASE.packageName} is published, but npm tags or Git are not fully synchronized.\n${message}`,
     "red",
     colorEnabled,
   );
 
 export const formatPublishSuccess = (
-  { distributionTag, dryRun, version },
+  { distributionTag, distributionTags, dryRun, version },
   colorEnabled = false,
 ) => {
+  const synchronizedTags = distributionTags ?? [distributionTag];
   const message = dryRun
     ? `✔ DRY RUN PASSED — ${RELEASE.packageName}@${version} was validated but not published.`
-    : `✔ PUBLISHED — ${RELEASE.packageName}@${version} with npm tag ${distributionTag}.`;
+    : `✔ PUBLISHED — ${RELEASE.packageName}@${version} with npm tags ${synchronizedTags.join(", ")}.`;
   return applyTerminalColor(message, "green", colorEnabled);
 };
 
@@ -210,6 +221,21 @@ const isCommitAncestor = (repositoryRoot, ancestorCommit, descendantCommit) =>
     cwd: repositoryRoot,
   }).status === 0;
 
+const readPublishedVersions = (packageName, repositoryRoot) => {
+  const result = spawnSync("npm", ["view", packageName, "versions", "--json"], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+  });
+  if (result.status === 0) {
+    const parsedVersions = JSON.parse(result.stdout);
+    return Array.isArray(parsedVersions) ? parsedVersions : [parsedVersions];
+  }
+  if (`${result.stdout}\n${result.stderr}`.includes("E404")) {
+    return [];
+  }
+  throw new Error("Unable to read published npm versions.");
+};
+
 const isVersionPublished = (packageName, version, repositoryRoot) => {
   const result = spawnSync("npm", ["view", `${packageName}@${version}`, "version", "--json"], {
     cwd: repositoryRoot,
@@ -232,8 +258,14 @@ const assertVersionIsUnpublished = (packageName, version, repositoryRoot) => {
   }
 };
 
-const publishPackage = (repositoryRoot, version, argumentsList = []) => {
-  const distributionTag = getDistributionTag(version);
+const publishPackage = (
+  repositoryRoot,
+  version,
+  argumentsList = [],
+  publishedVersions = readPublishedVersions(RELEASE.packageName, repositoryRoot),
+) => {
+  const distributionTags = getDistributionTags(version, publishedVersions);
+  const [distributionTag] = distributionTags;
   runCommand(
     "npm",
     [
@@ -250,9 +282,18 @@ const publishPackage = (repositoryRoot, version, argumentsList = []) => {
   );
   return {
     distributionTag,
+    distributionTags,
     dryRun: argumentsList.includes("--dry-run"),
     version,
   };
+};
+
+const synchronizeDistributionTags = (repositoryRoot, version, distributionTags) => {
+  for (const distributionTag of distributionTags) {
+    runCommand("npm", ["dist-tag", "add", `${RELEASE.packageName}@${version}`, distributionTag], {
+      cwd: repositoryRoot,
+    });
+  }
 };
 
 const getReleaseFiles = (repositoryRoot) => ({
@@ -389,6 +430,7 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
   const releaseFiles = getReleaseFiles(repositoryRoot);
   const snapshots = captureReleaseFiles(releaseFiles);
   const releaseDate = new Date().toISOString().slice(0, 10);
+  const publishedVersions = readPublishedVersions(RELEASE.packageName, repositoryRoot);
   const versionAlreadyTagged =
     initialContext.tagCommit !== "" || initialContext.remoteTagCommit !== "";
   const versionAlreadyPublished = isVersionPublished(
@@ -423,6 +465,7 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
         formatReleaseSummary(
           {
             currentVersion: initialContext.repositoryVersion,
+            publishedVersions,
             releaseDate,
             version: candidateVersion,
           },
@@ -523,20 +566,21 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
       remoteSyncPending && candidateVersion === initialContext.repositoryVersion;
     let publishResult = {
       distributionTag: getDistributionTag(candidateVersion),
+      distributionTags: getDistributionTags(candidateVersion, publishedVersions),
       dryRun: false,
       version: candidateVersion,
     };
     if (synchronizingPublishedVersion) {
       packagePublished = true;
       process.stdout.write(
-        `${applyTerminalColor("npm version is already published; synchronizing Git...", "yellow", colorEnabled)}\n`,
+        `${applyTerminalColor("npm version is already published; synchronizing npm tags and Git...", "yellow", colorEnabled)}\n`,
       );
     } else {
       process.stdout.write(
         `${applyTerminalColor("Publishing package to npm...", "magenta", colorEnabled)}\n`,
       );
       try {
-        publishResult = publishPackage(repositoryRoot, candidateVersion);
+        publishResult = publishPackage(repositoryRoot, candidateVersion, [], publishedVersions);
         packagePublished = true;
       } catch (error) {
         if (!isVersionPublished(RELEASE.packageName, candidateVersion, repositoryRoot)) {
@@ -545,6 +589,8 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
         packagePublished = true;
       }
     }
+
+    synchronizeDistributionTags(repositoryRoot, candidateVersion, publishResult.distributionTags);
 
     runCommand("git", ["push", "origin", initialContext.branchName], {
       cwd: repositoryRoot,
