@@ -6,6 +6,8 @@ All notable changes to AI-Tidu9 will be documented in this file.
 
 ## Unreleased / 未发布
 
+## 0.2.0-alpha.1 - 2026-10-12
+
 - Add `tidu start` for one-command loopback startup with a verifiable health endpoint and graceful shutdown.
 - 增加 `tidu start` 一条命令启动本地回环运行时，提供可验证健康检查与安全停止能力。
 - Add built-in SQLite persistence for AI-Tidu9 metadata, with automatic initialization, private file permissions, WAL concurrency, schema-version validation, and no third-party database dependency.
