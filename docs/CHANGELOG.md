@@ -6,6 +6,8 @@ All notable changes to AI-Tidu9 will be documented in this file.
 
 ## Unreleased / 未发布
 
+## 0.5.0-beta.1 - 2026-10-13
+
 - Complete the Stage 5 personal-experience implementation with one-click Chinese/English and Normal/Expert UI switching, isolated drafts, impact simulation, explicit activation, known-good history, automatic health rollback, and manual recovery.
 - 完成Stage 5个人体验实现，支持中英文与普通/专家界面一键切换、隔离草稿、影响模拟、明确启用、健康版本历史、健康检查失败自动回滚及手动恢复。
 - Add host, bounded portable, and incognito history policies; personal budget views; immutable account-snapshot attribution; loopback local-model setup; and validated Agent/Skill/MCP/tool extension installation.
