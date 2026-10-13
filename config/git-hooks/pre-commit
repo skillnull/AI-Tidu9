@@ -3,6 +3,7 @@ set -eu
 
 . "$(git rev-parse --show-toplevel)/scripts/use-project-node.sh"
 
+node scripts/sync-package-versions.mjs
 npm run policy -- branch
 npm run policy -- versions
 npm run policy -- release-lines

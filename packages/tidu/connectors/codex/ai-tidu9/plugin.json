@@ -1,6 +1,6 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "ai-tidu9",
-  "version": "0.5.0-beta.1",
+  "version": "0.6.0-beta.1",
   "description": "Connect Agent hosts to 九门赛博提督 through one local policy and MCP boundary."
 }

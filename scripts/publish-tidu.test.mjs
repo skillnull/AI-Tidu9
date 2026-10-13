@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -15,6 +19,7 @@ import {
   updateJsonVersion,
   validatePublishContext,
 } from "./publish-tidu.mjs";
+import { synchronizeStagedPackageVersions } from "./sync-package-versions.mjs";
 
 const validContext = Object.freeze({
   branchName: "main",
@@ -63,6 +68,41 @@ test("updates release versions without reformatting JSON metadata", () => {
     '{\n  "name": "example",\n  "version": "1.1.0-alpha.1",\n  "values": ["one", "two"]\n}\n',
   );
   assert.throws(() => updateJsonVersion('{"name":"example"}', "1.1.0"), /version field/u);
+});
+
+test("synchronizes staged package versions into both connector manifests", () => {
+  const repositoryRoot = mkdtempSync(join(tmpdir(), "tidu-version-sync-"));
+  const packagePath = join(repositoryRoot, "packages/tidu/package.json");
+  const manifestPaths = [
+    join(repositoryRoot, "packages/tidu/connectors/codex/ai-tidu9/plugin.json"),
+    join(repositoryRoot, "packages/tidu/connectors/codex/ai-tidu9/.codex-plugin/plugin.json"),
+  ];
+  try {
+    for (const filePath of [packagePath, ...manifestPaths]) {
+      mkdirSync(dirname(filePath), { recursive: true });
+      writeFileSync(filePath, '{\n  "version": "0.5.0-beta.1"\n}\n');
+    }
+    execFileSync("git", ["init", "--quiet"], { cwd: repositoryRoot });
+    execFileSync("git", ["add", "."], { cwd: repositoryRoot });
+    writeFileSync(packagePath, '{\n  "version": "0.6.0-beta.1"\n}\n');
+    execFileSync("git", ["add", "packages/tidu/package.json"], { cwd: repositoryRoot });
+
+    const result = synchronizeStagedPackageVersions(repositoryRoot);
+
+    assert.equal(result.packageVersion, "0.6.0-beta.1");
+    assert.equal(result.synchronizedPaths.length, 2);
+    for (const manifestPath of manifestPaths) {
+      assert.equal(JSON.parse(readFileSync(manifestPath, "utf8")).version, "0.6.0-beta.1");
+      const relativePath = manifestPath.slice(repositoryRoot.length + 1);
+      const stagedManifest = execFileSync("git", ["show", `:${relativePath}`], {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+      });
+      assert.equal(JSON.parse(stagedManifest).version, "0.6.0-beta.1");
+    }
+  } finally {
+    rmSync(repositoryRoot, { recursive: true, force: true });
+  }
 });
 
 test("preserves paths from git porcelain status", () => {
