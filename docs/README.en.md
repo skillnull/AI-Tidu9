@@ -149,6 +149,8 @@ See the [release plan](./RELEASE_PLAN.md) for development stages and acceptance 
 
 See the [architecture baseline](./architecture.en.md) for module boundaries and current limitations.
 
+See [Core Routing and Secret Gate](./core-differentiators.md#english) for dynamic routing, capability completion, capability assembly, runtime secret protection, and the reproducible cost case.
+
 ## License
 
 This project is licensed under the [GNU Affero General Public License v3.0 only](../LICENSE). See the [trademark policy](./TRADEMARKS.md) and [NOTICE](../NOTICE) for branding and attribution terms.

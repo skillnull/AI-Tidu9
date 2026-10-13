@@ -107,20 +107,20 @@ Audience: owner and invited developers.
 
 ## v0.4.0-beta.1 — Core differentiators / 核心竞争能力公开测试版
 
-- [ ] Implement configurable dynamic model routing / 实现可配置动态模型路由
-- [ ] Implement opt-in capability-completion pool / 实现可选能力补全池
-- [ ] Coordinate main and specialist models / 实现主模型与专家模型协作
-- [ ] Score cost, capability, privacy, latency, and availability / 联合评估成本、能力、隐私、延迟和可用性
-- [ ] Fall back after quota exhaustion / 实现额度耗尽回退
-- [ ] Support free and local models / 支持免费模型与本地模型
-- [ ] Assemble Agent, Skill, MCP, tool, and knowledge capabilities on demand / 按需组装能力资产
-- [ ] Implement runtime Secret Gate auto-detection / 实现运行时Secret Gate自动识别
-- [ ] Implement explicit blocking rules / 实现指定拦截规则
-- [ ] Implement local placeholder recovery and concurrency isolation / 实现本地替换恢复与并发隔离
-- [ ] Ensure every model and tool egress crosses mandatory policy gates / 保证所有模型与工具出口经过门禁
-- [ ] Complete verifiable result loop / 完成可验证结果闭环
-- [ ] Publish real cost and capability-completion case / 发布真实成本与能力补全案例
-- [ ] Pass public-beta quality gates / 通过公开Beta质量门禁
+- [x] Implement configurable dynamic model routing / 实现可配置动态模型路由
+- [x] Implement opt-in capability-completion pool / 实现可选能力补全池
+- [x] Coordinate main and specialist models / 实现主模型与专家模型协作
+- [x] Score cost, capability, privacy, latency, and availability / 联合评估成本、能力、隐私、延迟和可用性
+- [x] Fall back after quota exhaustion / 实现额度耗尽回退
+- [x] Support free and local models / 支持免费模型与本地模型
+- [x] Assemble Agent, Skill, MCP, tool, and knowledge capabilities on demand / 按需组装能力资产
+- [x] Implement runtime Secret Gate auto-detection / 实现运行时Secret Gate自动识别
+- [x] Implement explicit blocking rules / 实现指定拦截规则
+- [x] Implement local placeholder recovery and concurrency isolation / 实现本地替换恢复与并发隔离
+- [x] Ensure every model and tool egress crosses mandatory policy gates / 保证所有模型与工具出口经过门禁
+- [x] Complete verifiable result loop / 完成可验证结果闭环
+- [x] Publish real cost and capability-completion case / 发布真实成本与能力补全案例
+- [x] Pass public-beta quality gates / 通过公开Beta质量门禁
 - [ ] Receive release confirmation / 获得发布确认
 
 ## v0.5.0-beta.1 — Complete personal experience / 完整个人体验公开测试版

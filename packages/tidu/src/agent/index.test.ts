@@ -3,8 +3,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-
+import { createCapabilityRegistry } from "../capabilities/index.js";
 import type { ModelProvider } from "../providers/index.js";
+import { createSecretGate } from "../security/index.js";
 import { openNodeSqliteStorage } from "../storage/index.js";
 import {
   type AgentPlan,
@@ -180,6 +181,129 @@ test("completes a bounded task only after independent acceptance verification", 
   assert.equal(completed.result?.accepted, true);
   assert.equal(completed.result?.trustLevel, "high");
   assert.equal(completed.usage.toolCalls, 1);
+});
+
+test("assembles heterogeneous capabilities before planning and fails closed when missing", async () => {
+  let plannedAssets: readonly { id: string }[] = [];
+  const registry = createCapabilityRegistry([
+    {
+      id: "internal-knowledge",
+      kind: "knowledge",
+      description: "Bounded internal reference",
+      capabilities: ["domain-context"],
+      enabled: true,
+      privacy: "private",
+      cost: 0,
+    },
+    {
+      id: "analysis-skill",
+      kind: "skill",
+      description: "Analysis method",
+      capabilities: ["analysis"],
+      enabled: true,
+      privacy: "local",
+      cost: 0,
+    },
+  ]);
+  const kernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    capabilityRegistry: registry,
+    capabilityPrivacy: "private",
+    planner: {
+      understand: async (task) => ({
+        ...understanding,
+        objective: task.goal.objective,
+        requiredCapabilities: ["analysis", "domain-context"],
+      }),
+      plan: async ({ assets }) => {
+        plannedAssets = assets;
+        return { revision: 1, steps: [{ id: "analyze", title: "Analyze", kind: "reason" }] };
+      },
+    },
+    worker: successfulWorker,
+  });
+  const created = await kernel.createTask({ goal: "Analyze the domain" });
+  assert.deepEqual(
+    plannedAssets.map((asset) => asset.id),
+    ["analysis-skill", "internal-knowledge"],
+  );
+  assert.equal(created.capabilityAssembly?.missingCapabilities.length, 0);
+
+  const unavailableKernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    capabilityRegistry: registry,
+    capabilityPrivacy: "local",
+    planner: {
+      understand: async (task) => ({
+        ...understanding,
+        objective: task.goal.objective,
+        requiredCapabilities: ["domain-context"],
+      }),
+      plan: async () => ({ revision: 1, steps: [] }),
+    },
+    worker: successfulWorker,
+  });
+  await assert.rejects(
+    () => unavailableKernel.createTask({ goal: "Private analysis" }),
+    /unavailable/u,
+  );
+});
+
+test("keeps task secrets out of persistence and external tools while restoring local execution", async () => {
+  const secret = "Bearer stage-four-private-token-123456";
+  const observed: { external?: unknown; local?: unknown } = {};
+  const createSecretPlanner = (toolName: string): TaskPlanner => ({
+    understand: async (task) => ({
+      ...understanding,
+      objective: task.goal.objective,
+    }),
+    plan: async ({ task }) => ({
+      revision: 1,
+      steps: [
+        {
+          id: "use-secret",
+          title: "Use protected input",
+          kind: "tool",
+          toolName,
+          input: task.goal.objective,
+        },
+      ],
+    }),
+  });
+  const createTool = (name: string, executionLocation: "external" | "local"): AgentTool => ({
+    name,
+    description: "Observe protected input",
+    risk: "read",
+    idempotent: true,
+    executionLocation,
+    execute: async ({ input }) => {
+      observed[executionLocation] = input;
+      return { summary: "Observed" };
+    },
+  });
+  const gate = createSecretGate();
+  const externalKernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    planner: createSecretPlanner("external-observer"),
+    worker: successfulWorker,
+    secretGate: gate,
+    tools: [createTool("external-observer", "external")],
+  });
+  const externalTask = await externalKernel.createTask({ goal: `Run curl with ${secret}` });
+  assert.doesNotMatch(JSON.stringify(externalTask), /stage-four-private-token/u);
+  await externalKernel.runTask(externalTask.task.taskId);
+  assert.doesNotMatch(JSON.stringify(observed.external), /stage-four-private-token/u);
+
+  const localKernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    planner: createSecretPlanner("local-observer"),
+    worker: successfulWorker,
+    secretGate: gate,
+    tools: [createTool("local-observer", "local")],
+  });
+  const localTask = await localKernel.createTask({ goal: `Run curl with ${secret}` });
+  await localKernel.runTask(localTask.task.taskId);
+  assert.match(String(observed.local), /stage-four-private-token/u);
 });
 
 test("waits for approval before a side-effecting tool and resumes explicitly", async () => {

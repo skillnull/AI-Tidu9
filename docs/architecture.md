@@ -15,10 +15,13 @@
 | `packages/tidu/src/clients` | 本机客户端发现与事务化接入适配器 | 不读取账号或凭据；只写九门专属文件并提供快照、验证与回滚 |
 | `packages/tidu/src/protocol` | Agent任务和事件的规范化协议 | 通过显式版本演进，避免绑定具体模型 |
 | `packages/tidu/src/agent` | 目标理解、动态规划、有界执行、人工确认、恢复与结果验证 | 模型负责理解与规划，内核负责校验、预算、状态和证据边界 |
+| `packages/tidu/src/capabilities` | Agent、Skill、MCP、工具和知识的统一能力注册与按需装配 | 只保存非敏感元数据，按能力、成本和隐私边界选择有界最小集合 |
 | `packages/tidu/src/runtime` | 轻量本地HTTP运行时、虚拟模型与配置中心入口 | 默认仅监听回环地址，只协调适配器，不包含供应商实现或业务编排 |
 | `packages/tidu/src/config-center` | 本地配置中心引导数据契约 | 对外提供生效配置与隔离草稿的状态，不直接操作数据库 |
 | `packages/tidu/src/openai` | OpenAI兼容虚拟模型、错误与请求校验契约 | 不绑定供应商，不记录请求内容，不伪造推理结果 |
 | `packages/tidu/src/providers` | OpenAI兼容与Ollama真实供应商适配器 | 只处理协议转换与调用；不持久化密钥、会话或业务配置 |
+| `packages/tidu/src/routing` | 动态模型评分、能力补全、额度回退和主/专家模型协作 | 专家池必须显式启用且调用数有界；路由价格是估算，不替代供应商账单 |
+| `packages/tidu/src/security` | 模型与工具出口的运行时Secret Gate | 真实值仅保存在隔离的短期内存作用域，外部出口只接收占位符 |
 | `packages/tidu/src/storage` | 存储适配器与九门自身元数据持久化 | Schema与SQL迁移保持语言无关；任务只保存有界胶囊，不保存完整会话 |
 | `packages/tidu/src/usage` | 官方、宿主和估算用量的统一观测契约 | 供应商官方用量优先，估算值永远明确标记，不能伪装成官方额度 |
 

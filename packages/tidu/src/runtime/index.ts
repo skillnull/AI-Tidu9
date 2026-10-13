@@ -28,6 +28,7 @@ import {
   validateResponsesRequest,
 } from "../openai/index.js";
 import { createProviderFromEnvironment, type ModelProvider } from "../providers/index.js";
+import { createSecretGate, guardModelProvider, type SecretGate } from "../security/index.js";
 import { openNodeSqliteStorage, type StorageAdapter } from "../storage/index.js";
 
 export const DEFAULT_RUNTIME_HOST = "127.0.0.1";
@@ -60,6 +61,8 @@ export interface LocalRuntimeOptions {
   provider?: ModelProvider;
   /** Optional autonomous Agent kernel exposed through the local task-control API. */
   agentKernel?: AgentKernel;
+  /** Runtime Secret Gate; defaults to automatic detection and isolated placeholder storage. */
+  secretGate?: SecretGate;
 }
 
 export interface LocalRuntime {
@@ -610,7 +613,12 @@ export const startLocalRuntime = async (
 ): Promise<LocalRuntime> => {
   const host = options.host ?? DEFAULT_RUNTIME_HOST;
   const port = options.port ?? DEFAULT_RUNTIME_PORT;
-  const provider = options.provider ?? createProviderFromEnvironment();
+  const secretGate = options.secretGate ?? createSecretGate();
+  const configuredProvider = options.provider ?? createProviderFromEnvironment();
+  const provider =
+    configuredProvider === undefined
+      ? undefined
+      : guardModelProvider(configuredProvider, secretGate);
   const storage = await openNodeSqliteStorage({
     databasePath: options.databasePath,
   });
@@ -620,6 +628,7 @@ export const startLocalRuntime = async (
       ? undefined
       : createAgentKernel({
           store: storage.taskCapsuleStore,
+          secretGate,
           ...createModelProviderAgentAdapters(
             provider,
             async () =>

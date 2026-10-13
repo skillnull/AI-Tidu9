@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
 
+import type {
+  CapabilityAssembly,
+  CapabilityAsset,
+  CapabilityAssetPrivacy,
+  CapabilityRegistry,
+} from "../capabilities/index.js";
 import {
   type AgentEvent,
   type AgentEventType,
@@ -9,6 +15,7 @@ import {
   createTask,
   type TaskStatus,
 } from "../protocol/index.js";
+import { createSecretGate, type SecretGate } from "../security/index.js";
 
 export const TASK_CAPSULE_VERSION = "tidu-task-capsule/1" as const;
 
@@ -161,6 +168,8 @@ export interface TaskCapsule {
   task: CanonicalTask;
   /** Model-produced goal interpretation. */
   understanding?: TaskUnderstanding;
+  /** Bounded heterogeneous capabilities selected for this task. */
+  capabilityAssembly?: CapabilityAssembly;
   /** Current validated execution plan. */
   plan?: AgentPlan;
   /** Latest bounded recovery checkpoint. */
@@ -208,6 +217,8 @@ export interface TaskPlanningInput {
   understanding: TaskUnderstanding;
   /** Non-secret tool capabilities available to the planner. */
   tools: readonly AgentToolDescriptor[];
+  /** Agent, Skill, MCP, tool, and knowledge assets assembled for this task. */
+  assets: readonly CapabilityAsset[];
 }
 
 export interface TaskReplanningInput extends TaskPlanningInput {
@@ -232,6 +243,8 @@ export interface AgentToolDescriptor {
   risk: AgentToolRisk;
   /** Whether retrying with the same idempotency key is safe. */
   idempotent: boolean;
+  /** Execution boundary; only local tools may recover protected placeholders. */
+  executionLocation?: "external" | "local";
 }
 
 export interface AgentTool extends AgentToolDescriptor {
@@ -376,6 +389,14 @@ export interface AgentKernelOptions {
   approvalHandler?: TaskApprovalHandler;
   /** Default limits applied to new tasks. */
   defaultBudget?: Partial<TaskBudgetLimits>;
+  /** Optional heterogeneous capability registry used during planning. */
+  capabilityRegistry?: CapabilityRegistry;
+  /** Maximum capability assets assembled for one task. */
+  maximumCapabilityAssets?: number;
+  /** Most permissive capability privacy boundary allowed for new tasks. */
+  capabilityPrivacy?: CapabilityAssetPrivacy;
+  /** Mandatory runtime policy gate shared by model and tool boundaries. */
+  secretGate?: SecretGate;
 }
 
 const DEFAULT_TASK_BUDGET: TaskBudgetLimits = Object.freeze({
@@ -614,6 +635,7 @@ export const createInMemoryTaskCapsuleStore = (): TaskCapsuleStore => {
 };
 
 export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
+  const secretGate = options.secretGate ?? createSecretGate();
   const toolList = options.tools ?? [];
   const tools = new Map<string, AgentTool>();
   const toolDescriptors: AgentToolDescriptor[] = [];
@@ -631,6 +653,7 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
       description: boundedSummary(tool.description),
       risk: tool.risk,
       idempotent: tool.idempotent,
+      executionLocation: tool.executionLocation ?? "external",
     };
     tools.set(tool.name, { ...tool, ...descriptor });
     toolDescriptors.push(descriptor);
@@ -641,8 +664,13 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
   >();
   const verifier = options.verifier ?? defaultVerifier;
 
-  const persist = (capsule: TaskCapsule): Promise<TaskCapsule> =>
-    options.store.save(capsule, capsule.revision);
+  const persist = async (capsule: TaskCapsule): Promise<TaskCapsule> => {
+    const saved = await options.store.save(capsule, capsule.revision);
+    if (TERMINAL_STATUSES.has(saved.task.status)) {
+      secretGate.closeScope(saved.task.taskId);
+    }
+    return saved;
+  };
 
   const requireCapsule = async (taskId: string): Promise<TaskCapsule> => {
     const capsule = await options.store.load(taskId);
@@ -653,9 +681,15 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
   };
 
   const createPlannedTask = async (input: CreateAgentTaskInput): Promise<TaskCapsule> => {
+    const taskId = input.taskId ?? `task-${randomUUID()}`;
+    const protectedGoal = secretGate.protect(input.goal, {
+      scopeId: taskId,
+      destination: "model",
+    }).value;
     const task = createTask({
       ...input,
-      taskId: input.taskId ?? `task-${randomUUID()}`,
+      goal: protectedGoal,
+      taskId,
     });
     const budget = normalizeBudget(options.defaultBudget, input.budget);
     const createdAt = task.createdAt;
@@ -692,15 +726,25 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
         task,
         await options.planner.understand(task, controller.signal),
       );
+      const capabilityAssembly = options.capabilityRegistry?.assemble({
+        requiredCapabilities: understanding.requiredCapabilities,
+        maximumAssets: options.maximumCapabilityAssets,
+        privacy: options.capabilityPrivacy,
+      });
+      if ((capabilityAssembly?.missingCapabilities.length ?? 0) > 0) {
+        throw new Error(
+          `Required capabilities are unavailable: ${capabilityAssembly?.missingCapabilities.join(", ")}`,
+        );
+      }
       const plan = validatePlan(
         await options.planner.plan(
-          { task, understanding, tools: toolDescriptors },
+          { task, understanding, tools: toolDescriptors, assets: capabilityAssembly?.assets ?? [] },
           controller.signal,
         ),
         tools,
       );
       capsule = appendEvent(
-        { ...capsule, understanding, plan },
+        { ...capsule, understanding, capabilityAssembly, plan },
         "plan.created",
         { revision: plan.revision, steps: plan.steps.length },
         { kind: "planner" },
@@ -875,7 +919,13 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
                   signal: controller.signal,
                 })
               : await tool.execute({
-                  input: step.input,
+                  input:
+                    tool.executionLocation === "local"
+                      ? secretGate.recover(step.input, taskId)
+                      : secretGate.protect(step.input, {
+                          scopeId: taskId,
+                          destination: "tool",
+                        }).value,
                   idempotencyKey,
                   signal: controller.signal,
                 });
@@ -972,6 +1022,7 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
                   task: capsule.task,
                   understanding,
                   tools: toolDescriptors,
+                  assets: capsule.capabilityAssembly?.assets ?? [],
                   previousPlan: plan,
                   failedStep: step,
                   failure: error instanceof Error ? error.message : "Step failed.",

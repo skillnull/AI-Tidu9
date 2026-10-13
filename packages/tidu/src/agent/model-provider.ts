@@ -66,6 +66,7 @@ export const createModelProviderAgentAdapters = (
     role: string,
     payload: unknown,
     signal: AbortSignal,
+    securityScopeId: string,
   ): Promise<TValue> => {
     const resolvedVirtualModelId =
       typeof virtualModelId === "string" ? virtualModelId : await virtualModelId();
@@ -73,6 +74,7 @@ export const createModelProviderAgentAdapters = (
       protocol: "chat-completions",
       virtualModelId: resolvedVirtualModelId,
       signal,
+      routing: { role: "worker", securityScopeId },
       body: {
         model: resolvedVirtualModelId,
         stream: false,
@@ -103,6 +105,7 @@ export const createModelProviderAgentAdapters = (
           goal: task.goal,
         },
         signal,
+        task.taskId,
       ),
     plan: async (input, signal) =>
       executeJson<AgentPlan>(
@@ -113,8 +116,10 @@ export const createModelProviderAgentAdapters = (
           goal: input.task.goal,
           understanding: input.understanding,
           tools: input.tools,
+          assets: input.assets,
         },
         signal,
+        input.task.taskId,
       ),
     replan: async (input, signal) =>
       executeJson<AgentPlan>(
@@ -125,12 +130,14 @@ export const createModelProviderAgentAdapters = (
           goal: input.task.goal,
           understanding: input.understanding,
           tools: input.tools,
+          assets: input.assets,
           previousPlan: input.previousPlan,
           failedStep: input.failedStep,
           failure: input.failure,
           completedStepIds: input.completedStepIds,
         },
         signal,
+        input.task.taskId,
       ),
   };
 
@@ -147,6 +154,7 @@ export const createModelProviderAgentAdapters = (
           previousResults: input.previousResults,
         },
         input.signal,
+        input.task.taskId,
       ),
   };
 
@@ -162,6 +170,7 @@ export const createModelProviderAgentAdapters = (
           evidence: input.evidence,
         },
         signal,
+        input.task.taskId,
       ),
   };
 

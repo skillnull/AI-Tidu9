@@ -107,6 +107,15 @@ export {
   type ModelProviderAgentAdapters,
 } from "./agent/model-provider.js";
 export {
+  type CapabilityAssembly,
+  type CapabilityAssemblyRequest,
+  type CapabilityAsset,
+  type CapabilityAssetKind,
+  type CapabilityAssetPrivacy,
+  type CapabilityRegistry,
+  createCapabilityRegistry,
+} from "./capabilities/index.js";
+export {
   type CodexClientConfigurationOptions,
   type CodexClientConfigurationResult,
   type CodexClientRollbackOptions,
@@ -223,10 +232,22 @@ export {
   type ProviderExecutionRequest,
   type ProviderExecutionResult,
   type ProviderJsonExecutionResult,
+  type ProviderPrivacy,
   type ProviderProtocol,
+  type ProviderRoutingContext,
   type ProviderStreamExecutionResult,
   type ProviderType,
 } from "./providers/index.js";
+export {
+  type CapabilityCompletionPolicy,
+  createDynamicModelRouter,
+  type DynamicModelRouter,
+  type DynamicRoutingPolicy,
+  type ModelRouteProfile,
+  type RoutableModel,
+  type RoutingDecision,
+  type RoutingMetricWeights,
+} from "./routing/index.js";
 export {
   DEFAULT_RUNTIME_HOST,
   DEFAULT_RUNTIME_PORT,
@@ -234,6 +255,18 @@ export {
   type LocalRuntimeOptions,
   startLocalRuntime,
 } from "./runtime/index.js";
+export {
+  createSecretGate,
+  guardModelProvider,
+  type SecretGate,
+  type SecretGateAction,
+  type SecretGateContext,
+  type SecretGateDestination,
+  type SecretGateFinding,
+  type SecretGateOptions,
+  type SecretGateResult,
+  type SecretGateRule,
+} from "./security/index.js";
 export {
   IN_MEMORY_DATABASE_PATH,
   type NodeSqliteStorageOptions,

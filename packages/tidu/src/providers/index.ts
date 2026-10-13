@@ -8,8 +8,20 @@ import {
   rewriteOpenAiSseStream,
 } from "./streaming.js";
 
-export type ProviderType = "ollama" | "openai-compatible";
+export type ProviderType = "ollama" | "openai-compatible" | "tidu-router";
 export type ProviderProtocol = "chat-completions" | "responses";
+export type ProviderPrivacy = "external" | "local" | "private";
+
+export interface ProviderRoutingContext {
+  /** Capabilities required by the caller in addition to those inferred from the request. */
+  requiredCapabilities?: readonly string[];
+  /** Most permissive data boundary allowed for this request. */
+  privacy?: ProviderPrivacy;
+  /** Semantic role used when coordinating main and specialist models. */
+  role?: "main" | "planning" | "specialist" | "verification" | "worker";
+  /** Secret Gate scope shared across one durable Agent task. */
+  securityScopeId?: string;
+}
 
 export interface ProviderDescriptor {
   /** Provider adapter selected for the active runtime. */
@@ -27,6 +39,8 @@ export interface ProviderExecutionRequest {
   virtualModelId: string;
   /** Optional cancellation signal propagated from the client connection. */
   signal?: AbortSignal;
+  /** Optional routing and security constraints that never leave the local runtime. */
+  routing?: ProviderRoutingContext;
 }
 
 export interface ProviderJsonExecutionResult {

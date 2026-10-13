@@ -15,10 +15,13 @@ AI-Tidu9 follows a modular-monolith-first architecture with stable adapter bound
 | `packages/tidu/src/clients` | Local-client discovery and transactional integration adapters | Never reads accounts or credentials; writes only dedicated AI-Tidu9 files with snapshots, verification, and rollback |
 | `packages/tidu/src/protocol` | Canonical Agent task and event protocol | Evolves through explicit versions without binding to one model |
 | `packages/tidu/src/agent` | Goal understanding, dynamic planning, bounded execution, approval, recovery, and result verification | Models understand and plan; the kernel owns validation, budgets, state, and evidence boundaries |
+| `packages/tidu/src/capabilities` | Unified registration and on-demand assembly for Agents, Skills, MCP servers, tools, and knowledge | Stores only non-sensitive metadata and selects a bounded minimal set by capability, cost, and privacy |
 | `packages/tidu/src/runtime` | Lightweight local HTTP runtime, virtual-model, and configuration-center entry | Listens on loopback by default and coordinates adapters without provider implementations or business orchestration |
 | `packages/tidu/src/config-center` | Bootstrap-data contract for the local configuration center | Exposes active and isolated-draft state without direct database access |
 | `packages/tidu/src/openai` | OpenAI-compatible virtual-model, error, and request-validation contracts | Provider-neutral, does not log request content, and never fabricates inference output |
 | `packages/tidu/src/providers` | Real OpenAI-compatible and Ollama provider adapters | Protocol translation and invocation only; never persists credentials, conversations, or business configuration |
+| `packages/tidu/src/routing` | Dynamic model scoring, capability completion, quota fallback, and main/specialist coordination | Specialist pools are explicit and bounded; configured price estimates never replace provider billing |
+| `packages/tidu/src/security` | Runtime Secret Gate for model and tool egress | Raw values remain only in isolated short-lived memory scopes; external boundaries receive placeholders |
 | `packages/tidu/src/storage` | Storage adapters and persistence for AI-Tidu9 metadata | Keeps schema and SQL migrations language-neutral; tasks persist only bounded capsules, not full conversations |
 | `packages/tidu/src/usage` | Unified observations for provider, host, and estimated usage | Provider-authoritative data wins; estimates always remain visibly labeled and never impersonate official quota data |
 
