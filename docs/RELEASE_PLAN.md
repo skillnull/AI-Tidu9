@@ -139,34 +139,34 @@ Audience: owner and invited developers.
 - [x] Support secure configuration import/export / 支持安全配置导入导出
 - [x] Complete Chinese and English UI / 完成中英文界面
 - [x] Pass personal-product quality gates / 通过个人产品质量门禁
-- [ ] Receive release confirmation / 获得发布确认
+- [x] Receive release confirmation / 获得发布确认
 
 ## v0.6.0-beta.1 — Team and enterprise pilot / 团队与企业试点版
 
-- [ ] Add PostgreSQL production persistence / 增加PostgreSQL生产存储
-- [ ] Add tenant, organization, team, project, and user scopes / 增加多层组织作用域
-- [ ] Implement mandatory and advisory policies / 实现强制与辅助策略
-- [ ] Integrate enterprise identity and role controls / 接入企业身份与角色权限
-- [ ] Generate a one-time enterprise administrator access key after initial configuration / 初次配置后生成仅展示一次的公司管理员访问密钥
-- [ ] Persist only salted irreversible key verifiers and lifecycle metadata / 仅持久化带盐不可逆校验值与密钥生命周期元数据
-- [ ] Require the access key for every new administrative session / 每个新管理会话均要求输入访问密钥
-- [ ] Support authenticated key rotation, session revocation, and audited host recovery / 支持重新认证后的密钥轮换、会话撤销与服务器本机审计恢复
-- [ ] Publish centralized internal capability catalog / 提供企业内部能力目录
-- [ ] Support enterprise-purchased and user-owned resources together / 支持企业采购与用户自带资源并存
-- [ ] Implement hierarchical quota pools / 实现分级额度池
-- [ ] Implement end-of-cycle balance sharing / 实现周期末余额共享
-- [ ] Implement atomic reservation, settlement, release, and reconciliation / 实现原子预占、结算、释放和对账
-- [ ] Add private artifact storage adapter / 增加私有产物存储适配器
-- [ ] Add enterprise administration views / 增加企业管理视图
-- [ ] Provide guided personal-to-enterprise enrollment with compatibility preflight / 提供带兼容性预检的个人版转公司版引导
-- [ ] Create an encrypted local migration snapshot with staged activation and automatic rollback / 创建加密本地迁移快照，支持分阶段启用与自动回滚
-- [ ] Keep personal and enterprise profiles isolated and restore the personal profile after leaving an organization / 隔离个人与公司Profile，并在退出组织后恢复个人Profile
-- [ ] Generate administrator deployment and access guidance from live configuration / 根据实际配置生成管理员部署与访问指南
-- [ ] Generate company-specific employee onboarding for every enabled client / 为每个启用客户端生成公司专属员工接入手册
-- [ ] Version employee guidance and update it automatically after published changes / 对员工指南进行版本管理并在配置发布后自动更新
-- [ ] Provide Docker single-host deployment / 提供Docker单机部署
+- [x] Add PostgreSQL production persistence / 增加PostgreSQL生产存储
+- [x] Add tenant, organization, team, project, and user scopes / 增加多层组织作用域
+- [x] Implement mandatory and advisory policies / 实现强制与辅助策略
+- [x] Integrate enterprise identity and role controls / 接入企业身份与角色权限
+- [x] Generate a one-time enterprise administrator access key after initial configuration / 初次配置后生成仅展示一次的公司管理员访问密钥
+- [x] Persist only salted irreversible key verifiers and lifecycle metadata / 仅持久化带盐不可逆校验值与密钥生命周期元数据
+- [x] Require the access key for every new administrative session / 每个新管理会话均要求输入访问密钥
+- [x] Support authenticated key rotation, session revocation, and audited host recovery / 支持重新认证后的密钥轮换、会话撤销与服务器本机审计恢复
+- [x] Publish centralized internal capability catalog / 提供企业内部能力目录
+- [x] Support enterprise-purchased and user-owned resources together / 支持企业采购与用户自带资源并存
+- [x] Implement hierarchical quota pools / 实现分级额度池
+- [x] Implement end-of-cycle balance sharing / 实现周期末余额共享
+- [x] Implement atomic reservation, settlement, release, and reconciliation / 实现原子预占、结算、释放和对账
+- [x] Add private artifact storage adapter / 增加私有产物存储适配器
+- [x] Add enterprise administration views / 增加企业管理视图
+- [x] Provide guided personal-to-enterprise enrollment with compatibility preflight / 提供带兼容性预检的个人版转公司版引导
+- [x] Create an encrypted local migration snapshot with staged activation and automatic rollback / 创建加密本地迁移快照，支持分阶段启用与自动回滚
+- [x] Keep personal and enterprise profiles isolated and restore the personal profile after leaving an organization / 隔离个人与公司Profile，并在退出组织后恢复个人Profile
+- [x] Generate administrator deployment and access guidance from live configuration / 根据实际配置生成管理员部署与访问指南
+- [x] Generate company-specific employee onboarding for every enabled client / 为每个启用客户端生成公司专属员工接入手册
+- [x] Version employee guidance and update it automatically after published changes / 对员工指南进行版本管理并在配置发布后自动更新
+- [x] Provide Docker single-host deployment / 提供Docker单机部署
 - [ ] Complete small-team noncritical pilot / 完成小团队非关键业务试点
-- [ ] Pass enterprise-pilot quality gates / 通过企业试点质量门禁
+- [x] Pass enterprise-pilot quality gates / 通过企业试点质量门禁
 - [ ] Receive release confirmation / 获得发布确认
 
 ## v0.7.0-beta.1 → v0.7.0-rc.1 — Production scaling / 高并发生产候选
@@ -264,7 +264,7 @@ Every public release must provide the applicable artifacts below.
 ## Current status / 当前状态
 
 - Planning / 规划：**complete / 已完成**
-- Active stage / 当前阶段：**Stage 5 — Implementation complete, release confirmation pending / 阶段5：实现完成，等待发布确认**
-- Latest planned release / 最近计划版本：`v0.5.0-beta.1`
-- Latest published release / 最近已发布版本：`v0.4.0-beta.1`
+- Active stage / 当前阶段：**Stage 6 — Engineering complete, small-team pilot and release confirmation pending / 阶段6：工程完成，等待小团队试点与发布确认**
+- Latest planned release / 最近计划版本：`v0.6.0-beta.1`
+- Latest published release / 最近已发布版本：`v0.5.0-beta.1`
 - Remote publishing / 远程发布：**enabled with explicit confirmation / 经明确确认后执行**

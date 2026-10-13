@@ -1,0 +1,35 @@
+services:
+  tidu:
+    build:
+      context: ../..
+      dockerfile: config/docker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      TIDU_POSTGRES_URL: postgresql://tidu:${TIDU_POSTGRES_PASSWORD:?set TIDU_POSTGRES_PASSWORD}@postgres:5432/tidu
+      TIDU_POSTGRES_SSL: disable
+    ports:
+      - "127.0.0.1:${TIDU_PORT:-9639}:9639"
+    volumes:
+      - tidu-data:/var/lib/ai-tidu9
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tidu
+      POSTGRES_USER: tidu
+      POSTGRES_PASSWORD: ${TIDU_POSTGRES_PASSWORD:?set TIDU_POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tidu -d tidu"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  postgres-data:
+  tidu-data:

@@ -19,6 +19,8 @@ import {
 } from "../config/index.js";
 import { createConfigCenterBootstrap } from "../config-center/index.js";
 import { PRODUCT, TiduError } from "../core/index.js";
+import type { EnterpriseControlPlane } from "../enterprise/index.js";
+import { createEnterpriseRuntimeFromEnvironment } from "../enterprise/runtime.js";
 import { acquireRuntimeDataLock } from "../lifecycle/index.js";
 import {
   createOpenAiError,
@@ -64,6 +66,8 @@ export interface LocalRuntimeOptions {
   agentKernel?: AgentKernel;
   /** Runtime Secret Gate; defaults to automatic detection and isolated placeholder storage. */
   secretGate?: SecretGate;
+  /** Optional enterprise control plane for centralized policy, quota, and administration. */
+  enterpriseControlPlane?: EnterpriseControlPlane;
 }
 
 export interface LocalRuntime {
@@ -369,6 +373,7 @@ const handleRequest = async (
   storage: StorageAdapter,
   provider: ModelProvider | undefined,
   agentKernel: AgentKernel | undefined,
+  enterprise: EnterpriseControlPlane | undefined,
 ): Promise<void> => {
   const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
 
@@ -387,7 +392,93 @@ const handleRequest = async (
   }
 
   if (request.method === "GET" && pathname === "/api/config-center") {
-    sendJson(response, 200, await createConfigCenterBootstrap(storage, provider?.descriptor));
+    sendJson(
+      response,
+      200,
+      await createConfigCenterBootstrap(storage, provider?.descriptor, undefined, enterprise),
+    );
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/api/enterprise") {
+    if (enterprise === undefined) {
+      sendJson(response, 404, { error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED" });
+      return;
+    }
+    const state = await enterprise.snapshot();
+    sendJson(response, 200, {
+      revision: state.revision,
+      administratorInitialized: state.administratorKey !== null,
+      policyCount: state.policies.length,
+      capabilityCount: state.capabilities.length,
+      resourceCount: state.resources.length,
+      quotaPoolCount: state.quotaPools.length,
+      guidance: await enterprise.generateGuidance(),
+    });
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/enterprise/admin/initialize") {
+    validateMutationRequest(request);
+    await readJsonBody(request);
+    if (enterprise === undefined) {
+      sendJson(response, 404, { error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED" });
+      return;
+    }
+    let generated: Awaited<ReturnType<EnterpriseControlPlane["initializeAdministratorKey"]>>;
+    try {
+      generated = await enterprise.initializeAdministratorKey();
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("already initialized")) {
+        sendJson(response, 409, { error: "ADMINISTRATOR_KEY_ALREADY_INITIALIZED" });
+        return;
+      }
+      throw error;
+    }
+    sendJson(response, 201, {
+      key: generated.key,
+      keyId: generated.record.id,
+      message: "Save this administrator key now. It cannot be retrieved again.",
+    });
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/enterprise/admin/session") {
+    validateMutationRequest(request);
+    if (enterprise === undefined) {
+      sendJson(response, 404, { error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED" });
+      return;
+    }
+    const body = await readJsonBody(request);
+    if (!isRecord(body) || typeof body.key !== "string") {
+      throw new TiduError("CONFIGURATION_INVALID", "Administrator key is required.");
+    }
+    try {
+      sendJson(response, 201, await enterprise.authenticateAdministrator(body.key));
+    } catch {
+      sendJson(response, 401, { error: "ADMINISTRATOR_AUTHENTICATION_FAILED" });
+    }
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/enterprise/admin/rotate") {
+    validateMutationRequest(request);
+    await readJsonBody(request);
+    if (enterprise === undefined) {
+      sendJson(response, 404, { error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED" });
+      return;
+    }
+    const sessionId = request.headers["x-tidu-admin-session"];
+    if (typeof sessionId !== "string" || !enterprise.validateAdministratorSession(sessionId)) {
+      sendJson(response, 401, { error: "ADMINISTRATOR_SESSION_REQUIRED" });
+      return;
+    }
+    const generated = await enterprise.rotateAdministratorKey();
+    sendJson(response, 201, {
+      key: generated.key,
+      keyId: generated.record.id,
+      message: "Save this replacement administrator key now. Earlier sessions were revoked.",
+    });
     return;
   }
 
@@ -559,7 +650,11 @@ const handleRequest = async (
         expectedRevision: readExpectedRevision(body, "expectedRevision"),
         configuration: readDraftConfiguration(body, mode),
       });
-      sendJson(response, 200, await createConfigCenterBootstrap(storage, provider?.descriptor));
+      sendJson(
+        response,
+        200,
+        await createConfigCenterBootstrap(storage, provider?.descriptor, undefined, enterprise),
+      );
     } catch (error) {
       handleConfigurationMutationError(response, error);
     }
@@ -591,7 +686,11 @@ const handleRequest = async (
         });
         return;
       }
-      sendJson(response, 200, await createConfigCenterBootstrap(storage, provider?.descriptor));
+      sendJson(
+        response,
+        200,
+        await createConfigCenterBootstrap(storage, provider?.descriptor, undefined, enterprise),
+      );
     } catch (error) {
       handleConfigurationMutationError(response, error);
     }
@@ -627,7 +726,11 @@ const handleRequest = async (
       validateMutationRequest(request);
       await readJsonBody(request);
       await storage.configurationStore.rollbackActive();
-      sendJson(response, 200, await createConfigCenterBootstrap(storage, provider?.descriptor));
+      sendJson(
+        response,
+        200,
+        await createConfigCenterBootstrap(storage, provider?.descriptor, undefined, enterprise),
+      );
     } catch (error) {
       handleConfigurationMutationError(response, error);
     }
@@ -666,6 +769,12 @@ export const startLocalRuntime = async (
     configuredProvider === undefined
       ? undefined
       : guardModelProvider(configuredProvider, secretGate);
+  const environmentEnterpriseRuntime =
+    options.enterpriseControlPlane === undefined
+      ? await createEnterpriseRuntimeFromEnvironment()
+      : undefined;
+  const enterpriseControlPlane =
+    options.enterpriseControlPlane ?? environmentEnterpriseRuntime?.controlPlane;
   const storage = await openNodeSqliteStorage({
     databasePath: options.databasePath,
   });
@@ -688,10 +797,18 @@ export const startLocalRuntime = async (
     runtimeDataLock = acquireRuntimeDataLock(storage.location);
   } catch (error) {
     storage.close();
+    await environmentEnterpriseRuntime?.close();
     throw error;
   }
   const server = createServer((request, response) => {
-    void handleRequest(request, response, storage, provider, agentKernel).catch(() => {
+    void handleRequest(
+      request,
+      response,
+      storage,
+      provider,
+      agentKernel,
+      enterpriseControlPlane,
+    ).catch(() => {
       if (!response.headersSent) {
         sendJson(response, 500, { error: "INTERNAL_ERROR" });
       } else {
@@ -705,12 +822,14 @@ export const startLocalRuntime = async (
   } catch (error) {
     storage.close();
     runtimeDataLock?.release();
+    await environmentEnterpriseRuntime?.close();
     throw error;
   }
   const address = server.address();
   if (address === null || typeof address === "string") {
     await close(server);
     storage.close();
+    await environmentEnterpriseRuntime?.close();
     throw new Error("Local runtime did not expose a TCP address.");
   }
 
@@ -730,6 +849,7 @@ export const startLocalRuntime = async (
       } finally {
         storage.close();
         runtimeDataLock?.release();
+        await environmentEnterpriseRuntime?.close();
       }
     },
   };

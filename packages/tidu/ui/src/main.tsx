@@ -489,8 +489,8 @@ const GuideCenter = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
       ) : (
         <div className="guide-content">
           <div className="guide-summary">
-            <span className="availability availability-planned">企业版规划</span>
-            <p>以下流程将在企业部署能力完成后，由实际公司配置自动生成。</p>
+            <span className="availability availability-ready">企业试点可用</span>
+            <p>管理员与员工指南由当前已发布的公司配置自动生成，并随配置修订更新。</p>
           </div>
           <div className="guide-grid">
             <article className="guide-card">
@@ -637,12 +637,98 @@ const PersonalExperiencePanel = ({
   );
 };
 
+const EnterprisePilotPanel = ({
+  enterprise,
+  locale,
+}: {
+  enterprise: ConfigCenterBootstrap["enterprise"];
+  locale: "en-US" | "zh-CN";
+}) => {
+  const english = locale === "en-US";
+  return (
+    <section className="configuration-panel">
+      <div className="configuration-heading">
+        <div>
+          <p className="card-label">ENTERPRISE PILOT</p>
+          <h2>{english ? "Enterprise control plane" : "企业控制平面"}</h2>
+          <p>
+            {enterprise.enabled
+              ? english
+                ? `Published revision ${enterprise.revision}. Mandatory policy and quota controls are active.`
+                : `已发布修订 ${enterprise.revision}，强制策略与额度控制已经接入。`
+              : english
+                ? "This runtime is personal-only. Attach an enterprise control plane to enable centralized policy and quota."
+                : "当前为纯个人运行时。挂载企业控制平面后启用集中策略与额度。"}
+          </p>
+        </div>
+        <span
+          className={`availability ${enterprise.enabled ? "availability-ready" : "availability-planned"}`}
+        >
+          {enterprise.enabled ? (english ? "ACTIVE" : "已启用") : english ? "PERSONAL" : "个人版"}
+        </span>
+      </div>
+      <div className="personal-grid">
+        <article className="personal-card">
+          <p className="card-label">POLICY</p>
+          <h3>{enterprise.policyCount}</h3>
+          <p>{english ? "Mandatory and advisory policies" : "强制策略与辅助策略"}</p>
+        </article>
+        <article className="personal-card">
+          <p className="card-label">CAPABILITY CATALOG</p>
+          <h3>{enterprise.capabilityCount}</h3>
+          <p>{english ? "Published private capabilities" : "已发布内部能力"}</p>
+        </article>
+        <article className="personal-card">
+          <p className="card-label">MODEL RESOURCES</p>
+          <h3>{enterprise.resourceCount}</h3>
+          <p>{english ? "Enterprise and user-owned resources" : "企业采购与用户自带资源"}</p>
+        </article>
+        <article className="personal-card">
+          <p className="card-label">ADMIN ACCESS</p>
+          <h3>
+            {enterprise.administratorInitialized
+              ? english
+                ? "Initialized"
+                : "已初始化"
+              : english
+                ? "Not initialized"
+                : "未初始化"}
+          </h3>
+          <p>{english ? "One-time key with irreversible verifier" : "一次性密钥与不可逆校验值"}</p>
+        </article>
+      </div>
+      {enterprise.guidance ? (
+        <div className="guide-grid">
+          <article className="guide-card">
+            <p className="guide-index">ADMIN · v{enterprise.guidance.version}</p>
+            <h3>{english ? "Deployment guidance" : "管理员部署指南"}</h3>
+            <ol>
+              {enterprise.guidance.administrator.map((step) => (
+                <li key={step}>{step}</li>
+              ))}
+            </ol>
+          </article>
+          <article className="guide-card">
+            <p className="guide-index">EMPLOYEE · v{enterprise.guidance.version}</p>
+            <h3>{english ? "Employee onboarding" : "员工接入指南"}</h3>
+            <ol>
+              {enterprise.guidance.employee.map((step) => (
+                <li key={step}>{step}</li>
+              ))}
+            </ol>
+          </article>
+        </div>
+      ) : null}
+    </section>
+  );
+};
+
 const App = () => {
   const [loadingState, setLoadingState] = useState<LoadingState>({
     status: "loading",
   });
   const [activeSection, setActiveSection] = useState<
-    "clients" | "configuration" | "guide" | "personal" | "tasks"
+    "clients" | "configuration" | "enterprise" | "guide" | "personal" | "tasks"
   >("configuration");
   const [locale, setLocale] = useState<"en-US" | "zh-CN">("zh-CN");
   const [selectedMode, setSelectedMode] = useState<ConfigurationMode>("managed");
@@ -846,6 +932,18 @@ const App = () => {
             ? "智能协作中枢 · 本地配置中心"
             : "Intelligent Collaboration Hub · Local Control Center"}
         </p>
+        <button
+          className={
+            activeSection === "enterprise"
+              ? "section-button section-button-active"
+              : "section-button"
+          }
+          type="button"
+          aria-current={activeSection === "enterprise" ? "page" : undefined}
+          onClick={() => setActiveSection("enterprise")}
+        >
+          {locale === "zh-CN" ? "企业" : "Enterprise"}
+        </button>
         <button
           className="locale-button"
           type="button"
@@ -1121,6 +1219,8 @@ const App = () => {
           providerConfigured={bootstrap.runtime.provider.configured}
           providerType={bootstrap.runtime.provider.type}
         />
+      ) : activeSection === "enterprise" ? (
+        <EnterprisePilotPanel enterprise={bootstrap.enterprise} locale={locale} />
       ) : activeSection === "clients" ? (
         <section className="client-panel">
           <div className="configuration-heading">

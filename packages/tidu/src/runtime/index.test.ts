@@ -7,6 +7,10 @@ import { createAgentKernel, createInMemoryTaskCapsuleStore } from "../agent/inde
 import { CONFIG_SCHEMA_VERSION } from "../config/index.js";
 import type { ConfigCenterBootstrap } from "../config-center/index.js";
 import { PRODUCT } from "../core/index.js";
+import {
+  createEnterpriseControlPlane,
+  createInMemoryEnterpriseStateRepository,
+} from "../enterprise/index.js";
 import type { ModelProvider } from "../providers/index.js";
 import { IN_MEMORY_DATABASE_PATH, STORAGE_SCHEMA_VERSION } from "../storage/index.js";
 import { startLocalRuntime } from "./index.js";
@@ -540,6 +544,51 @@ test("does not expose undefined routes", async () => {
     const response = await fetch(`${runtime.origin}/unknown`);
     assert.equal(response.status, 404);
     assert.deepEqual(await response.json(), { error: "NOT_FOUND" });
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("exposes an enterprise pilot and one-time administrator key lifecycle", async () => {
+  const enterpriseControlPlane = createEnterpriseControlPlane(
+    createInMemoryEnterpriseStateRepository(),
+  );
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    enterpriseControlPlane,
+    port: 0,
+  });
+
+  try {
+    const bootstrap = (await (
+      await fetch(`${runtime.origin}/api/config-center`)
+    ).json()) as ConfigCenterBootstrap;
+    assert.equal(bootstrap.enterprise.enabled, true);
+    assert.equal(bootstrap.enterprise.administratorInitialized, false);
+
+    const initializeResponse = await fetch(`${runtime.origin}/api/enterprise/admin/initialize`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(initializeResponse.status, 201);
+    const initialized = (await initializeResponse.json()) as { key: string };
+    assert.match(initialized.key, /^tidu_admin_/u);
+
+    const repeatedResponse = await fetch(`${runtime.origin}/api/enterprise/admin/initialize`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(repeatedResponse.status, 409);
+
+    const sessionResponse = await fetch(`${runtime.origin}/api/enterprise/admin/session`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key: initialized.key }),
+    });
+    assert.equal(sessionResponse.status, 201);
+    assert.equal(typeof ((await sessionResponse.json()) as { id: string }).id, "string");
   } finally {
     await runtime.close();
   }

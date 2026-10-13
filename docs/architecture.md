@@ -49,7 +49,7 @@ SQLite只持久化恢复所需的轻量任务胶囊：目标、计划、检查�
 
 ## 当前限制
 
-当前主运行时需要Node.js 22.14或更高版本。`tidu start` 会启动仅监听 `127.0.0.1` 的轻量运行时和React + Vite本地配置中心，通过Node SQLite适配器执行语言无关迁移，并通过 `/health` 验证运行时与存储状态。配置中心已支持普通与专家隔离草稿、服务端校验、并发修订保护、显式启用和任务控制视图；`tidu doctor` 与 `tidu config` 通过同一管理API提供页面故障时的诊断和配置兜底。OpenAI兼容入口支持模型发现、Chat Completions和Responses，可通过运行时环境选择OpenAI兼容API或本地Ollama，并提供非流式JSON、流式SSE以及函数、自定义、命名空间和网页搜索工具的协议互操作。`tidu setup` 统一安装、验证、修复、更新和卸载Codex、Cursor、浏览器管理及通用OpenAI兼容入口；包内同时交付Agent Plugin与MCP清单。Codex app-server和Cursor ACP适配器已覆盖能力协商、会话、流式消息、取消、权限和失败关闭交互。供应商密钥不进入SQLite、配置中心响应或日志。Agent内核已经作为公开SDK交付；配置真实供应商时，`tidu start` 会自动建立模型规划器、Worker与验证器，专用工具仍须通过SDK显式注册；没有真实适配器时不会用占位模型伪造自治能力。Python SDK、跨进程Worker调度和企业部署能力尚未实现。
+当前主运行时需要Node.js 22.14或更高版本。个人版默认启动仅监听 `127.0.0.1` 的轻量运行时、SQLite和React + Vite配置中心。设置 `TIDU_POSTGRES_URL` 后，同一运行时会附加PostgreSQL企业控制平面，提供组织作用域、身份角色、强制/辅助策略、能力目录、混合模型资源、分级额度池、管理员密钥和动态接入指南。Docker单机配置默认仍只映射服务器回环地址；跨设备访问必须增加HTTPS反向代理与企业身份认证。OpenAI兼容入口、Agent内核、Codex app-server、Cursor ACP、Secret Gate和个人配置隔离继续复用相同边界。Python SDK、跨进程Worker调度、无状态水平扩容和真实小团队试点尚未完成。
 
 ## 客户端兼容矩阵
 

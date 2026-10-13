@@ -1,4 +1,5 @@
 import type { LocalClientDiscovery } from "../clients/index.js";
+import type { EnterpriseGuidance } from "../enterprise/index.js";
 import type { ProviderDescriptor } from "../providers/index.js";
 import type { ConfigurationWorkspace } from "../storage/index.js";
 
@@ -46,4 +47,21 @@ export interface ConfigCenterBootstrap {
   };
   /** Metadata-only discovery of supported clients on the runtime device. */
   clients: LocalClientDiscovery;
+  /** Enterprise-pilot state; disabled for a personal-only runtime. */
+  enterprise: {
+    /** Whether an enterprise control plane is attached. */
+    enabled: boolean;
+    /** Published enterprise-state revision. */
+    revision: number;
+    /** Whether the one-time administrator key has been initialized. */
+    administratorInitialized: boolean;
+    /** Number of published mandatory and advisory policies. */
+    policyCount: number;
+    /** Number of discoverable internal capabilities. */
+    capabilityCount: number;
+    /** Number of configured enterprise and user-owned model resources. */
+    resourceCount: number;
+    /** Generated administrator and employee guidance, or null when disabled. */
+    guidance: EnterpriseGuidance | null;
+  };
 }

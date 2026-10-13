@@ -64,6 +64,8 @@ Commands:
   config set             Update a draft with advanced command options
   uninstall              Archive local data for a recoverable uninstall
   restore                Restore the latest uninstall snapshot
+  enterprise recover-admin --reason <text>
+                         Recover the administrator key on the server host
   help, --help, -h       Show help
   version, --version, -v Show version
 
@@ -83,6 +85,7 @@ Examples:
   tidu config set --mode expert --name "Expert entry" --activate
   tidu uninstall
   tidu restore
+  tidu enterprise recover-admin --reason "Approved incident recovery"
 
 Remote management:
   Add --endpoint https://tidu.example.com or set TIDU_ENDPOINT.`;
@@ -469,6 +472,7 @@ if (isDirectExecution) {
 
       const runtime = await startLocalRuntime({
         databasePath: process.env.TIDU_DATABASE_PATH,
+        host: process.env.TIDU_HOST,
         port,
       });
       process.stdout.write(
@@ -484,6 +488,34 @@ if (isDirectExecution) {
     } else if (argumentsList[0] === "mcp") {
       const server = startTiduMcpServer({ endpoint: resolveEndpoint(argumentsList) });
       await server.completed;
+    } else if (argumentsList[0] === "enterprise" && argumentsList[1] === "recover-admin") {
+      const reasonIndex = argumentsList.indexOf("--reason");
+      const reason = reasonIndex === -1 ? undefined : argumentsList[reasonIndex + 1];
+      if (reason === undefined) {
+        throw new TiduError(
+          "CONFIGURATION_INVALID",
+          "Host recovery requires --reason with a non-secret audit explanation.",
+        );
+      }
+      const { createEnterpriseRuntimeFromEnvironment } = await import("../enterprise/runtime.js");
+      const enterpriseRuntime = await createEnterpriseRuntimeFromEnvironment();
+      if (enterpriseRuntime === undefined) {
+        throw new TiduError(
+          "CONFIGURATION_INVALID",
+          "TIDU_POSTGRES_URL is required for enterprise host recovery.",
+        );
+      }
+      try {
+        const recovered = await enterpriseRuntime.controlPlane.recoverAdministratorKey(
+          true,
+          reason,
+        );
+        process.stdout.write(
+          `Administrator key recovered. Save it now; it cannot be retrieved again.\n${recovered.key}\n`,
+        );
+      } finally {
+        await enterpriseRuntime.close();
+      }
     } else if (argumentsList[0] === "setup") {
       process.stdout.write(`${runSetup(argumentsList)}\n`);
     } else if (argumentsList[0] === "doctor") {

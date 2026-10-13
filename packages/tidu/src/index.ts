@@ -194,6 +194,46 @@ export {
   type TiduErrorOptions,
 } from "./core/index.js";
 export {
+  createEmptyEnterpriseState,
+  createEnterpriseControlPlane,
+  createInMemoryEnterpriseStateRepository,
+  ENTERPRISE_CONTRACT_VERSION,
+  type EnterpriseAdminKeyRecord,
+  type EnterpriseAdminSession,
+  type EnterpriseCapability,
+  type EnterpriseControlPlane,
+  type EnterpriseEnrollmentPlan,
+  type EnterpriseGuidance,
+  type EnterpriseIdentity,
+  type EnterpriseModelResource,
+  type EnterprisePolicy,
+  type EnterprisePolicyDecision,
+  type EnterprisePolicyMode,
+  type EnterprisePrivateArtifactStore,
+  type EnterpriseQuotaAllocation,
+  type EnterpriseQuotaPool,
+  type EnterpriseQuotaReservation,
+  type EnterpriseResourceOwnership,
+  type EnterpriseRole,
+  type EnterpriseScope,
+  type EnterpriseScopeType,
+  type EnterpriseSecurityAuditEvent,
+  type EnterpriseState,
+  type EnterpriseStateRepository,
+  planPersonalToEnterpriseEnrollment,
+} from "./enterprise/index.js";
+export {
+  createPostgresqlEnterpriseStateRepository,
+  initializePostgresqlEnterpriseStorage,
+  type PostgresqlClient,
+  type PostgresqlQueryResult,
+} from "./enterprise/postgresql.js";
+export { createPrivateFileArtifactStore } from "./enterprise/private-artifacts.js";
+export {
+  createEnterpriseRuntimeFromEnvironment,
+  type EnterpriseRuntime,
+} from "./enterprise/runtime.js";
+export {
   createOpenAiError,
   createOpenAiModel,
   type OpenAiErrorBody,
