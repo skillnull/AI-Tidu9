@@ -18,6 +18,7 @@ import { TiduError } from "../core/index.js";
 export type ConnectorSetupAction = "install" | "repair" | "uninstall" | "update" | "verify";
 export type ConnectorSetupStatus =
   | "configured"
+  | "failed"
   | "missing"
   | "removed"
   | "unavailable"
@@ -201,7 +202,7 @@ const configureCodex = (
     return {
       id: "codex",
       capability: "mcp-tools",
-      status: configured && removed ? "removed" : "missing",
+      status: !configured ? "missing" : removed ? "removed" : "failed",
       detail: removed
         ? "Codex MCP connector removed."
         : "Codex MCP connector could not be removed.",
@@ -310,7 +311,7 @@ export const setupConnectors = (options: ConnectorSetupOptions = {}): ConnectorS
 export const formatConnectorSetupReport = (report: ConnectorSetupReport): string => {
   const lines = report.connectors.map(
     (item) =>
-      `${item.status === "missing" ? "✖" : item.status === "unavailable" ? "○" : "✓"} ${item.id} [${item.capability}]: ${item.detail}`,
+      `${item.status === "failed" || item.status === "missing" ? "✖" : item.status === "unavailable" ? "○" : "✓"} ${item.id} [${item.capability}]: ${item.detail}`,
   );
   return [`Connector setup: ${report.action}`, ...lines].join("\n");
 };

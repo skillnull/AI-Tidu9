@@ -229,6 +229,66 @@ test("refuses to remove a custom database path", () => {
   }
 });
 
+test("completely removes owned connectors, profiles, data, and snapshots", () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-cli-complete-uninstall-"));
+  const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
+  const binaryDirectory = join(temporaryDirectory, "bin");
+  const cursorCommand = join(binaryDirectory, "cursor");
+  const cursorConfiguration = join(temporaryDirectory, ".cursor", "mcp.json");
+  const dataDirectory =
+    process.platform === "darwin"
+      ? join(temporaryDirectory, "Library", "Application Support", "AI-Tidu9")
+      : process.platform === "win32"
+        ? join(temporaryDirectory, "AppData", "Local", "AI-Tidu9")
+        : join(temporaryDirectory, "data", "ai-tidu9");
+  const snapshotDirectory = `${dataDirectory}.snapshot.test`;
+
+  try {
+    mkdirSync(binaryDirectory, { recursive: true });
+    writeFileSync(cursorCommand, "", { mode: 0o700 });
+    mkdirSync(join(temporaryDirectory, ".cursor"), { recursive: true });
+    writeFileSync(
+      cursorConfiguration,
+      JSON.stringify({
+        mcpServers: {
+          "ai-tidu9": { command: "node", args: ["tidu", "mcp"] },
+          preserved: { command: "preserved" },
+        },
+      }),
+      { mode: 0o600 },
+    );
+    mkdirSync(dataDirectory, { recursive: true });
+    mkdirSync(snapshotDirectory, { recursive: true });
+    writeFileSync(join(dataDirectory, "tidu.db"), "test", { mode: 0o600 });
+
+    const result = spawnSync(
+      process.execPath,
+      [executablePath, "uninstall", "--complete", "--confirm", "DELETE"],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CODEX_HOME: join(temporaryDirectory, ".codex"),
+          HOME: temporaryDirectory,
+          LOCALAPPDATA: join(temporaryDirectory, "AppData", "Local"),
+          PATH: binaryDirectory,
+          TIDU_PORT: "0",
+          XDG_DATA_HOME: join(temporaryDirectory, "data"),
+        },
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Complete AI-Tidu9 cleanup finished/u);
+    assert.equal(existsSync(dataDirectory), false);
+    assert.equal(existsSync(snapshotDirectory), false);
+    assert.deepEqual(JSON.parse(readFileSync(cursorConfiguration, "utf8")), {
+      mcpServers: { preserved: { command: "preserved" } },
+    });
+  } finally {
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
 test("starts the local runtime from the executable entry point", async () => {
   const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
   const child = spawn(process.execPath, [executablePath, "start"], {

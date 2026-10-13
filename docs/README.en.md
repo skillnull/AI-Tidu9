@@ -140,9 +140,13 @@ The default operation atomically moves AI-Tidu9-owned data into a local snapshot
 tidu restore
 ```
 
-To permanently delete current data and every AI-Tidu9 uninstall snapshot, run `tidu uninstall --purge` and enter the full confirmation word. Automation may use `--purge --confirm DELETE`. This cannot be recovered. A custom `TIDU_DATABASE_PATH` is never moved or deleted automatically.
+To delete only current data and every AI-Tidu9 uninstall snapshot, run `tidu uninstall --purge`. To remove all AI-Tidu9-owned state, run:
 
-An ephemeral `npx` run has no npm package to remove. After archiving data, a global installation can be removed with `npm uninstall -g @skillnull/tidu`; project dependencies should be removed through the project's existing package manager.
+```bash
+tidu uninstall --complete
+```
+
+Complete uninstall removes AI-Tidu9-owned Codex and Cursor connectors, the dedicated Codex profile and backups, local data, and every uninstall snapshot after one confirmation. A global npm installation is removed automatically; an ephemeral `npx` run has no fixed package; project dependencies remain owned by the project's package manager. Permanent operations require the full confirmation word, and automation may add `--confirm DELETE`. Host accounts, conversations, unrelated plugins, unrelated configuration, and custom `TIDU_DATABASE_PATH` values are always preserved.
 
 ## Documentation
 

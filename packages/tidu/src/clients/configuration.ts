@@ -64,6 +64,15 @@ export interface CodexClientRollbackResult {
   backupId: string | null;
 }
 
+export interface CodexClientRemovalResult {
+  /** Whether AI-Tidu9-owned Codex artifacts were absent or removed. */
+  status: "missing" | "removed";
+  /** Client whose dedicated configuration was removed. */
+  client: "codex";
+  /** Number of AI-Tidu9-owned files or directories removed. */
+  removedArtifactCount: number;
+}
+
 interface CodexProfileState {
   /** State-contract version. */
   schemaVersion: 1;
@@ -446,4 +455,46 @@ export const rollbackCodexClientConfiguration = (
   }
   restoreSnapshot(paths, backupId, true);
   return { status: "restored", client: "codex", profile: CODEX_PROFILE_NAME, backupId };
+};
+
+export const removeCodexClientConfiguration = (
+  options: CodexClientRollbackOptions = {},
+): CodexClientRemovalResult => {
+  const paths = resolveCodexPaths(options.codexHomeDirectory);
+  assertSafeRegularFile(paths.profile);
+  assertSafeRegularFile(paths.state);
+  const profileExists = existsSync(paths.profile);
+  const stateExists = existsSync(paths.state);
+  if (profileExists !== stateExists) {
+    throw new TiduError(
+      "CONFIGURATION_CONFLICT",
+      "The ai-tidu9 Codex profile is incomplete or unmanaged; complete uninstall refused to remove it.",
+    );
+  }
+  if (stateExists) {
+    readManagedState(paths.state);
+  }
+
+  let removedArtifactCount = 0;
+  if (profileExists) {
+    rmSync(paths.profile);
+    rmSync(paths.state);
+    removedArtifactCount += 2;
+  }
+  if (existsSync(paths.backups)) {
+    const backupStatus = lstatSync(paths.backups);
+    if (!backupStatus.isDirectory() || backupStatus.isSymbolicLink()) {
+      throw new TiduError(
+        "CONFIGURATION_CONFLICT",
+        "AI-Tidu9 Codex backups must be a real directory before removal.",
+      );
+    }
+    rmSync(paths.backups, { recursive: true });
+    removedArtifactCount += 1;
+  }
+  return {
+    status: removedArtifactCount === 0 ? "missing" : "removed",
+    client: "codex",
+    removedArtifactCount,
+  };
 };

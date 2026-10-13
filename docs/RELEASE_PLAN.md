@@ -69,7 +69,7 @@ Audience: owner and invited developers.
 - [x] Provide equivalent CLI diagnostics and configuration fallback / 提供等价CLI诊断与配置兜底
 - [x] Expose OpenAI-compatible virtual-model endpoint / 提供OpenAI兼容虚拟模型端点
 - [x] Integrate at least two real provider types / 接入至少两类真实供应商
-- [x] Provide recoverable personal uninstall and explicit data purge / 提供可恢复的个人版卸载与显式数据清除
+- [x] Provide recoverable uninstall, explicit data purge, and ownership-safe complete cleanup / 提供可恢复卸载、显式数据清除和所有权安全的完整清理
 - [x] Support streaming responses and baseline tool calls / 支持流式响应和基础工具调用
 - [x] Detect supported local clients / 自动发现受支持客户端
 - [x] Provide one `tidu setup` orchestration flow that installs, verifies, repairs, updates, and uninstalls every detected official connector / 提供统一`tidu setup`编排流程，对所有已发现的官方连接器执行安装、验证、修复、更新与卸载

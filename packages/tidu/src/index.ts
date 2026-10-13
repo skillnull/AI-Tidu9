@@ -118,9 +118,11 @@ export {
 export {
   type CodexClientConfigurationOptions,
   type CodexClientConfigurationResult,
+  type CodexClientRemovalResult,
   type CodexClientRollbackOptions,
   type CodexClientRollbackResult,
   configureCodexClient,
+  removeCodexClientConfiguration,
   rollbackCodexClientConfiguration,
 } from "./clients/configuration.js";
 export {

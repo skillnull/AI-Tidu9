@@ -5,7 +5,11 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { startLocalRuntime } from "../runtime/index.js";
-import { configureCodexClient, rollbackCodexClientConfiguration } from "./configuration.js";
+import {
+  configureCodexClient,
+  removeCodexClientConfiguration,
+  rollbackCodexClientConfiguration,
+} from "./configuration.js";
 
 test("writes a dedicated Codex profile and rolls it back without touching default configuration", async () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-config-"));
@@ -60,6 +64,30 @@ test("backs up and restores an earlier managed Codex profile", async () => {
     assert.equal(readFileSync(profilePath, "utf8"), originalProfile);
     assert.equal(rollbackCodexClientConfiguration({ codexHomeDirectory }).status, "restored");
     assert.equal(existsSync(profilePath), false);
+  } finally {
+    await runtime.close();
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
+test("removes only AI-Tidu9-owned Codex profile artifacts", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-remove-"));
+  const codexHomeDirectory = join(temporaryDirectory, ".codex");
+  const unrelatedFile = join(codexHomeDirectory, "config.toml");
+  const runtime = await startLocalRuntime({ databasePath: ":memory:", port: 0 });
+
+  try {
+    mkdirSync(codexHomeDirectory, { mode: 0o700, recursive: true });
+    writeFileSync(unrelatedFile, "preserve = true\n", { mode: 0o600 });
+    await configureCodexClient({ endpoint: runtime.origin, codexHomeDirectory });
+    const result = removeCodexClientConfiguration({ codexHomeDirectory });
+    assert.equal(result.status, "removed");
+    assert.equal(result.removedArtifactCount, 3);
+    assert.equal(existsSync(join(codexHomeDirectory, "ai-tidu9.config.toml")), false);
+    assert.equal(existsSync(join(codexHomeDirectory, ".ai-tidu9-profile-state.json")), false);
+    assert.equal(existsSync(join(codexHomeDirectory, ".ai-tidu9-backups")), false);
+    assert.equal(readFileSync(unrelatedFile, "utf8"), "preserve = true\n");
+    assert.equal(removeCodexClientConfiguration({ codexHomeDirectory }).status, "missing");
   } finally {
     await runtime.close();
     rmSync(temporaryDirectory, { force: true, recursive: true });

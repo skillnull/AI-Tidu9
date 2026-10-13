@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
+import { spawnSync } from "node:child_process";
 import { realpathSync } from "node:fs";
+import { isAbsolute, join, relative } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 import {
@@ -17,6 +19,7 @@ import {
 } from "../accounts/cursor-host.js";
 import {
   configureCodexClient,
+  removeCodexClientConfiguration,
   rollbackCodexClientConfiguration,
 } from "../clients/configuration.js";
 import { discoverLocalClients, formatLocalClientDiscovery } from "../clients/index.js";
@@ -62,7 +65,7 @@ Commands:
   config                 Open the simple interactive configuration wizard
   config show            Show active configuration and isolated drafts
   config set             Update a draft with advanced command options
-  uninstall              Archive local data for a recoverable uninstall
+  uninstall              Archive data, purge data, or completely uninstall AI-Tidu9
   restore                Restore the latest uninstall snapshot
   enterprise recover-admin --reason <text>
                          Recover the administrator key on the server host
@@ -84,6 +87,7 @@ Examples:
   tidu config show
   tidu config set --mode expert --name "Expert entry" --activate
   tidu uninstall
+  tidu uninstall --complete
   tidu restore
   tidu enterprise recover-admin --reason "Approved incident recovery"
 
@@ -375,10 +379,81 @@ const runAccount = async (argumentsList: readonly string[]): Promise<string> => 
   throw new TiduError("UNSUPPORTED_COMMAND", `Unknown account action: ${action}`);
 };
 
+const removeGlobalNpmPackage = (): string => {
+  const entryPath = process.argv[1];
+  if (entryPath === undefined) {
+    return "Package removal: no installed CLI entry was detected.";
+  }
+  const resolvedEntry = realpathSync(entryPath);
+  if (resolvedEntry.includes(`${join(".npm", "_npx")}`)) {
+    return "Package removal: this npx run has no persistent package installation.";
+  }
+  const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+  const rootResult = spawnSync(npmCommand, ["root", "--global"], {
+    encoding: "utf8",
+    env: process.env,
+    timeout: 15_000,
+  });
+  const globalRoot = rootResult.status === 0 ? rootResult.stdout.trim() : "";
+  if (globalRoot === "") {
+    return "Package removal: npm ownership could not be determined; use the original package manager.";
+  }
+  const globalPackageRoot = join(realpathSync(globalRoot), "@skillnull", "tidu");
+  const relativeEntry = relative(globalPackageRoot, resolvedEntry);
+  const globallyInstalled =
+    relativeEntry === "" || (!relativeEntry.startsWith("..") && !isAbsolute(relativeEntry));
+  if (!globallyInstalled) {
+    return "Package removal: source checkouts and project dependencies remain owned by their project package manager.";
+  }
+  const uninstallResult = spawnSync(npmCommand, ["uninstall", "--global", "@skillnull/tidu"], {
+    encoding: "utf8",
+    env: process.env,
+    timeout: 60_000,
+  });
+  if (uninstallResult.status !== 0) {
+    process.exitCode = 1;
+    return "Package removal: global npm uninstall failed; all other AI-Tidu9-owned state was removed.";
+  }
+  return "Package removal: global @skillnull/tidu installation removed.";
+};
+
 const runPersonalUninstall = async (argumentsList: readonly string[]): Promise<string> => {
   assertDefaultLifecycleStorage();
   await assertPersonalRuntimeStopped();
   const dataDirectory = resolvePersonalDataDirectory();
+  const complete = argumentsList.includes("--complete");
+  if (complete) {
+    const confirmed =
+      readOption(argumentsList, "--confirm") === "DELETE" ||
+      (await confirmLifecycleAction(
+        `Remove all AI-Tidu9 connectors, managed client files, data, and snapshots at ${dataDirectory}? Type DELETE: `,
+        "DELETE",
+      ));
+    if (!confirmed) {
+      return `${style("Cancelled.", "yellow")} No data was changed.`;
+    }
+    const connectorReport = setupConnectors({
+      action: "uninstall",
+      endpoint: resolveEndpoint(argumentsList),
+    });
+    if (!connectorReport.healthy) {
+      throw new TiduError(
+        "CONFIGURATION_CONFLICT",
+        `Complete uninstall stopped because a connector could not be removed.\n${formatConnectorSetupReport(connectorReport)}`,
+      );
+    }
+    const codexRemoval = removeCodexClientConfiguration();
+    const dataRemoval = purgePersonalData(dataDirectory);
+    const packageRemoval = removeGlobalNpmPackage();
+    return [
+      `${style("✓", "green")} Complete AI-Tidu9 cleanup finished.`,
+      formatConnectorSetupReport(connectorReport),
+      `Codex managed artifacts removed: ${codexRemoval.removedArtifactCount}`,
+      `Data directories removed: ${dataRemoval.removedDirectoryCount}`,
+      packageRemoval,
+      "Host accounts, conversations, unrelated plugins, and custom database paths were preserved.",
+    ].join("\n");
+  }
   const purge = argumentsList.includes("--purge");
   if (purge) {
     const confirmed =

@@ -19,6 +19,7 @@ import {
   IN_MEMORY_DATABASE_PATH,
   openNodeSqliteStorage,
   PRODUCT,
+  removeCodexClientConfiguration,
   selectAuthoritativeUsage,
   TASK_CONTRACT_VERSION,
   TiduError,
@@ -28,6 +29,7 @@ import {
 test("exposes the supported public API from one package", async () => {
   assert.equal(PRODUCT.name, "九门赛博提督");
   assert.equal(typeof configureCodexClient, "function");
+  assert.equal(typeof removeCodexClientConfiguration, "function");
   assert.equal(typeof createAgentKernel, "function");
   assert.equal(typeof createScalingControlPlane, "function");
   assert.equal(typeof assessReleaseCandidate, "function");

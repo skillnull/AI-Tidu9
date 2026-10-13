@@ -140,9 +140,13 @@ tidu uninstall
 tidu restore
 ```
 
-需要彻底删除当前数据和全部九门卸载快照时，执行 `tidu uninstall --purge` 并按提示输入完整确认词。自动化场景可使用 `--purge --confirm DELETE`。该操作不可恢复。自定义 `TIDU_DATABASE_PATH` 不会被自动移动或删除。
+只需要彻底删除当前数据和全部九门卸载快照时，执行 `tidu uninstall --purge`。需要完全清理九门时，执行：
 
-通过 `npx` 临时运行无需移除npm包。全局安装在数据归档后执行 `npm uninstall -g @skillnull/tidu`；项目依赖使用项目原有包管理器卸载。
+```bash
+tidu uninstall --complete
+```
+
+完整卸载会在一次确认后移除九门自有的Codex、Cursor连接器，九门专属Codex Profile及备份，本地数据和全部卸载快照。全局npm安装会自动移除；`npx` 临时运行没有固定包体；项目依赖仍由项目原有包管理器管理。所有永久操作都要求输入完整确认词，自动化场景可增加 `--confirm DELETE`。宿主账号、会话、其他插件、其他配置和自定义 `TIDU_DATABASE_PATH` 始终保留。
 
 ## 文档
 
