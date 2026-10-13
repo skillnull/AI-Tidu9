@@ -9,6 +9,8 @@ This file records user-visible changes in every public AI-Tidu9 release. Compati
 
 ## Unreleased
 
+## 1.0.0 - 2026-10-13
+
 - Rebuild the public documentation system with separate language files, semantic icons and outcome-oriented primary headings, real tertiary headings for procedural steps, a clear installation and first-run path, role-based navigation, synchronized diagrams, explicit trust and failure semantics, task-oriented CLI and SDK guidance, and a reviewable contribution flow.
 - Add verified end-to-end examples for local Ollama, OpenAI-compatible providers, generic clients, Codex and Cursor connectors, enterprise Docker pilots, Provider SDKs, Python invocation, and Secret Gate integration.
 - Add side-effect-free `--help` coverage for every CLI command group, a complete bilingual CLI reference, a five-step web setup wizard, and `tidu start --cli` guided terminal setup.
