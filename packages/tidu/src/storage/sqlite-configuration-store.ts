@@ -176,16 +176,66 @@ export const createSqliteConfigurationStore = (database: DatabaseSync): Configur
       mode,
     );
     const activatedAt = new Date().toISOString();
-    database
-      .prepare(`
+    database.exec("BEGIN IMMEDIATE;");
+    try {
+      database
+        .prepare(`
+        INSERT INTO tidu_configuration_history
+          (mode, revision, payload_json, activated_at)
+        SELECT mode, revision, payload_json, updated_at
+        FROM tidu_active_configuration
+        WHERE singleton = 1
+      `)
+        .run();
+      database
+        .prepare(`
         UPDATE tidu_active_configuration
         SET mode = ?, revision = revision + 1, payload_json = ?, updated_at = ?
         WHERE singleton = 1
       `)
-      .run(mode, JSON.stringify(configuration), activatedAt);
+        .run(mode, JSON.stringify(configuration), activatedAt);
+      database.exec("COMMIT;");
+    } catch (error) {
+      database.exec("ROLLBACK;");
+      throw error;
+    }
+    return loadWorkspace();
+  };
+
+  const rollbackActive = async (): Promise<ConfigurationWorkspace> => {
+    const previousRow = database
+      .prepare(`
+      SELECT history_id, mode, revision, payload_json, activated_at AS updated_at
+      FROM tidu_configuration_history
+      ORDER BY history_id DESC
+      LIMIT 1
+    `)
+      .get() as (ConfigurationRow & { history_id: number }) | undefined;
+    if (previousRow === undefined) {
+      throw new TiduError("CONFIGURATION_CONFLICT", "No known-good configuration is available.");
+    }
+    const configuration = parseConfiguration(previousRow.payload_json, previousRow.mode);
+    const restoredAt = new Date().toISOString();
+    database.exec("BEGIN IMMEDIATE;");
+    try {
+      database
+        .prepare(`
+        UPDATE tidu_active_configuration
+        SET mode = ?, revision = revision + 1, payload_json = ?, updated_at = ?
+        WHERE singleton = 1
+      `)
+        .run(previousRow.mode, JSON.stringify(configuration), restoredAt);
+      database
+        .prepare("DELETE FROM tidu_configuration_history WHERE history_id = ?")
+        .run(previousRow.history_id);
+      database.exec("COMMIT;");
+    } catch (error) {
+      database.exec("ROLLBACK;");
+      throw error;
+    }
     return loadWorkspace();
   };
 
   initialize();
-  return { activateDraft, loadWorkspace, saveDraft };
+  return { activateDraft, loadWorkspace, rollbackActive, saveDraft };
 };

@@ -8,7 +8,7 @@ AI-Tidu9 is an intelligent collaboration hub for cross-domain scenarios. It coor
 
 ## Status
 
-The project is being rebuilt from an early AI rules package into an independent Super Agent platform. It is currently in the engineering-foundation stage and is not ready for production use.
+The project is being rebuilt from an early AI rules package into an independent Super Agent platform. It has entered the personal-experience beta stage and is not recommended for production-critical work.
 
 ## Direction
 
@@ -37,6 +37,10 @@ npx @skillnull/tidu start
 ```
 
 Open the local URL printed by the command to edit managed or expert configuration drafts. The two modes persist independently, and only “Activate this configuration” changes runtime behavior. Invalid or unsaved expert input cannot affect managed mode.
+
+The control center switches between Chinese and English in one click. Every activation requires an impact simulation and preserves the previous known-good version. A failed health probe rolls back automatically, while manual rollback remains available. Personal history supports host, portable, and incognito policies: host mode leaves full conversations with the current client; portable mode applies byte and age bounds; incognito mode retains no conversation history. Usage is attributed through immutable task account snapshots, so switching accounts cannot move charges from running tasks.
+
+The public SDK also provides personal budget aggregation, diagnostics for local Ollama or loopback-compatible models, pre-install checks for Agent/Skill/MCP/tool extensions, and authenticated AES-256-GCM configuration import and export. Exports contain only non-secret configuration, history policy, and extension metadata—never credentials or conversation content.
 
 Use the equivalent CLI when the page is unavailable:
 

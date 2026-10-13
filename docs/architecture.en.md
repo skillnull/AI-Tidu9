@@ -113,3 +113,11 @@ Moving from personal to enterprise is profile enrollment, not an overwrite. The 
 - Every new administrative session starts with key entry on an HTTPS page. The server uses constant-time verification, failure throttling, and security auditing, then issues only a short-lived HttpOnly, Secure, SameSite session.
 - An administrator may rotate the key after reauthentication. The new key is also shown once. After storage is confirmed, the old key is revoked immediately and existing administrative sessions may be revoked by policy.
 - A lost key cannot be recovered in plaintext from the database. An authorized operation on the server host must reset it and create an immutable security-audit event. Enterprise SSO and roles identify individual administrators but do not replace this deployment-level key gate.
+
+## Personal-experience safety boundary
+
+- Normal and Expert own isolated drafts; switching the editor never changes runtime behavior. Activation requires validation and impact simulation, preserves the previous known-good version, and rolls back automatically after a failed probe.
+- Full conversations may remain with the host, use byte- and age-bounded portable local retention, or use incognito mode with no retained conversation. The AI-Tidu9 service keeps only its own task capsules and does not copy host history.
+- Personal usage is attributed to the immutable account snapshot captured when a task starts. Account switching affects only new tasks and cannot move charges from running work.
+- Personal local-model endpoints are restricted to loopback networking. Extension installation validates identity, semantic version, and declared permissions first.
+- Configuration portability uses authenticated AES-256-GCM encryption with a scrypt-derived key. Exports exclude keys, tokens, passwords, and conversation content; imports update the two isolated drafts without activating either one.

@@ -1,6 +1,6 @@
 {
   "contractVersion": "1",
-  "schemaVersion": "3",
+  "schemaVersion": "4",
   "migrations": [
     {
       "version": "1",
@@ -13,6 +13,10 @@
     {
       "version": "3",
       "file": "migrations/0003-add-task-capsules.sql"
+    },
+    {
+      "version": "4",
+      "file": "migrations/0004-add-configuration-history.sql"
     }
   ]
 }

@@ -78,6 +78,13 @@ test("isolates drafts from each other and from the active configuration", async 
     );
     assert.equal(activatedWorkspace.active.configuration.activeMode, "expert");
     assert.equal(activatedWorkspace.active.configuration.virtualModelName, "九门专家入口");
+
+    const rolledBackWorkspace = await storage.configurationStore.rollbackActive();
+    assert.equal(rolledBackWorkspace.active.configuration.activeMode, "managed");
+    assert.equal(
+      rolledBackWorkspace.active.configuration.virtualModelName,
+      initialWorkspace.active.configuration.virtualModelName,
+    );
   } finally {
     storage.close();
   }
@@ -127,7 +134,7 @@ test("rejects a database created by a newer schema", async () => {
 
     const { DatabaseSync } = await import("node:sqlite");
     const database = new DatabaseSync(databasePath);
-    database.prepare("UPDATE tidu_metadata SET value = ? WHERE key = ?").run("4", "schema_version");
+    database.prepare("UPDATE tidu_metadata SET value = ? WHERE key = ?").run("5", "schema_version");
     database.close();
 
     await assert.rejects(openNodeSqliteStorage({ databasePath }), /not supported/u);

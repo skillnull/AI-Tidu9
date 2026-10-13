@@ -47,6 +47,8 @@ export interface ConfigurationStore {
     mode: ConfigurationMode,
     expectedDraftRevision: number,
   ) => Promise<ConfigurationWorkspace>;
+  /** Restores the most recent known-good active configuration. */
+  rollbackActive: () => Promise<ConfigurationWorkspace>;
 }
 
 export interface StorageAdapter {

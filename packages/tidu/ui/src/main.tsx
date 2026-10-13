@@ -12,7 +12,7 @@ type LoadingState =
 
 type OperationState =
   | { status: "idle" }
-  | { status: "pending"; action: "activate" | "save" }
+  | { status: "pending"; action: "activate" | "rollback" | "save" | "simulate" }
   | { status: "success"; message: string }
   | { status: "error"; message: string };
 
@@ -30,20 +30,40 @@ interface TaskListResponse {
   tasks: readonly TaskControlView[];
 }
 
-const taskStatusLabel = (status: TaskControlView["status"]): string =>
-  ({
-    created: "已规划",
-    running: "执行中",
-    waiting_for_approval: "等待审批",
-    paused: "已暂停",
-    completed: "已完成",
-    failed: "执行失败",
-    cancelled: "已取消",
-  })[status];
+interface ConfigurationImpactPreview {
+  /** Whether the configuration passed validation. */
+  valid: boolean;
+  /** Configuration fields changed by activation. */
+  changes: readonly string[];
+  /** Activation risk classification. */
+  risk: "low" | "medium";
+}
 
-const TaskControlPanel = () => {
+const taskStatusLabel = (status: TaskControlView["status"], locale: "en-US" | "zh-CN"): string =>
+  (locale === "zh-CN"
+    ? {
+        created: "已规划",
+        running: "执行中",
+        waiting_for_approval: "等待审批",
+        paused: "已暂停",
+        completed: "已完成",
+        failed: "执行失败",
+        cancelled: "已取消",
+      }
+    : {
+        created: "Planned",
+        running: "Running",
+        waiting_for_approval: "Approval required",
+        paused: "Paused",
+        completed: "Completed",
+        failed: "Failed",
+        cancelled: "Cancelled",
+      })[status];
+
+const TaskControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
+  const english = locale === "en-US";
   const [snapshot, setSnapshot] = useState<TaskListResponse | undefined>();
-  const [message, setMessage] = useState("正在读取任务胶囊…");
+  const [message, setMessage] = useState(english ? "Loading task capsules…" : "正在读取任务胶囊…");
   const [pendingTaskId, setPendingTaskId] = useState<string | undefined>();
 
   const refreshTasks = useCallback(async () => {
@@ -52,12 +72,20 @@ const TaskControlPanel = () => {
         headers: { accept: "application/json" },
       });
       if (!response.ok) {
-        throw new Error(`任务接口返回 ${response.status}`);
+        throw new Error(
+          english ? `Task API returned ${response.status}` : `任务接口返回 ${response.status}`,
+        );
       }
       setSnapshot((await response.json()) as TaskListResponse);
       setMessage("");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "无法读取任务状态");
+      setMessage(
+        error instanceof Error
+          ? error.message
+          : english
+            ? "Unable to load tasks"
+            : "无法读取任务状态",
+      );
     }
   }, []);
 
@@ -70,7 +98,7 @@ const TaskControlPanel = () => {
     action: "approve" | "cancel" | "deny" | "pause" | "resume",
   ): Promise<void> => {
     setPendingTaskId(task.taskId);
-    setMessage("正在提交控制指令…");
+    setMessage(english ? "Submitting control action…" : "正在提交控制指令…");
     try {
       const isApproval = action === "approve" || action === "deny";
       const response = await fetch(
@@ -89,12 +117,16 @@ const TaskControlPanel = () => {
         },
       );
       if (!response.ok) {
-        throw new Error(`任务控制返回 ${response.status}`);
+        throw new Error(
+          english ? `Task control returned ${response.status}` : `任务控制返回 ${response.status}`,
+        );
       }
       await refreshTasks();
-      setMessage("控制指令已生效。");
+      setMessage(english ? "Control action applied." : "控制指令已生效。");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "任务控制失败");
+      setMessage(
+        error instanceof Error ? error.message : english ? "Task control failed" : "任务控制失败",
+      );
     } finally {
       setPendingTaskId(undefined);
     }
@@ -105,25 +137,34 @@ const TaskControlPanel = () => {
       <div className="configuration-heading">
         <div>
           <p className="card-label">BOUNDED AGENT TASKS</p>
-          <h2>任务控制</h2>
-          <p>查看计划进度、预算与信任等级；暂停、恢复、取消和审批都经过内核状态机。</p>
+          <h2>{english ? "Task control" : "任务控制"}</h2>
+          <p>
+            {english
+              ? "Inspect progress, budgets, and trust. Every control action passes through the Agent state machine."
+              : "查看计划进度、预算与信任等级；暂停、恢复、取消和审批都经过内核状态机。"}
+          </p>
         </div>
         <button
           type="button"
           onClick={() => void refreshTasks()}
           disabled={pendingTaskId !== undefined}
         >
-          刷新任务
+          {english ? "Refresh tasks" : "刷新任务"}
         </button>
       </div>
       {snapshot?.available === false ? (
         <div className="task-empty">
-          当前运行时未配置真实模型供应商或未注入专用规划器与执行器。持久化任务仍可查看，
-          但执行控制只在真实 Agent 内核可用后启用。
+          {english
+            ? "The runtime has no real provider or dedicated planner and worker. Persisted tasks remain visible, but execution controls require an active Agent kernel."
+            : "当前运行时未配置真实模型供应商或未注入专用规划器与执行器。持久化任务仍可查看，但执行控制只在真实 Agent 内核可用后启用。"}
         </div>
       ) : null}
       {snapshot?.available === true && snapshot.tasks.length === 0 ? (
-        <div className="task-empty">暂无任务。Agent SDK 创建的任务会在此显示。</div>
+        <div className="task-empty">
+          {english
+            ? "No tasks yet. Tasks created through the Agent SDK appear here."
+            : "暂无任务。Agent SDK 创建的任务会在此显示。"}
+        </div>
       ) : (
         <div className="task-list">
           {snapshot?.tasks.map((task) => {
@@ -137,7 +178,7 @@ const TaskControlPanel = () => {
                     <h3>{task.objective}</h3>
                   </div>
                   <span className={`task-status task-status-${task.status}`}>
-                    {taskStatusLabel(task.status)}
+                    {taskStatusLabel(task.status, locale)}
                   </span>
                 </div>
                 <div
@@ -152,25 +193,25 @@ const TaskControlPanel = () => {
                 </div>
                 <dl className="task-metrics">
                   <div>
-                    <dt>步骤</dt>
+                    <dt>{english ? "Steps" : "步骤"}</dt>
                     <dd>
                       {task.completedSteps}/{task.totalSteps}
                     </dd>
                   </div>
                   <div>
-                    <dt>工具</dt>
+                    <dt>{english ? "Tools" : "工具"}</dt>
                     <dd>
                       {task.budget.usage.toolCalls}/{task.budget.limits.maxToolCalls}
                     </dd>
                   </div>
                   <div>
-                    <dt>重规划</dt>
+                    <dt>{english ? "Replans" : "重规划"}</dt>
                     <dd>
                       {task.budget.usage.replans}/{task.budget.limits.maxReplans}
                     </dd>
                   </div>
                   <div>
-                    <dt>可信度</dt>
+                    <dt>{english ? "Trust" : "可信度"}</dt>
                     <dd>{task.trustLevel}</dd>
                   </div>
                 </dl>
@@ -182,7 +223,7 @@ const TaskControlPanel = () => {
                         disabled={isPending}
                         onClick={() => void mutateTask(task, "pause")}
                       >
-                        暂停
+                        {english ? "Pause" : "暂停"}
                       </button>
                     ) : null}
                     {["created", "failed", "paused"].includes(task.status) ? (
@@ -191,7 +232,7 @@ const TaskControlPanel = () => {
                         disabled={isPending}
                         onClick={() => void mutateTask(task, "resume")}
                       >
-                        恢复执行
+                        {english ? "Resume" : "恢复执行"}
                       </button>
                     ) : null}
                     {task.status === "waiting_for_approval" && task.pendingApprovalStepId ? (
@@ -202,14 +243,14 @@ const TaskControlPanel = () => {
                           disabled={isPending}
                           onClick={() => void mutateTask(task, "approve")}
                         >
-                          批准
+                          {english ? "Approve" : "批准"}
                         </button>
                         <button
                           type="button"
                           disabled={isPending}
                           onClick={() => void mutateTask(task, "deny")}
                         >
-                          拒绝
+                          {english ? "Deny" : "拒绝"}
                         </button>
                       </>
                     ) : null}
@@ -219,7 +260,7 @@ const TaskControlPanel = () => {
                         disabled={isPending}
                         onClick={() => void mutateTask(task, "cancel")}
                       >
-                        取消
+                        {english ? "Cancel" : "取消"}
                       </button>
                     ) : null}
                   </div>
@@ -258,44 +299,113 @@ const toForm = (configuration: TiduConfiguration): ConfigurationForm => ({
   virtualModelName: configuration.virtualModelName,
 });
 
-const modeLabel = (mode: ConfigurationMode): string =>
-  mode === "managed" ? "普通模式" : "专家模式";
+const modeLabel = (mode: ConfigurationMode, locale: "en-US" | "zh-CN" = "zh-CN"): string =>
+  locale === "zh-CN"
+    ? mode === "managed"
+      ? "普通模式"
+      : "专家模式"
+    : mode === "managed"
+      ? "Normal"
+      : "Expert";
 
 const clientReadinessLabel = (
   readiness: ConfigCenterBootstrap["clients"]["clients"][number]["readiness"],
+  locale: "en-US" | "zh-CN",
 ): string => {
   if (readiness === "configurable") {
-    return "已发现 · 可配置";
+    return locale === "zh-CN" ? "已发现 · 可配置" : "Detected · configurable";
   }
   if (readiness === "limited") {
-    return "已发现 · 能力有限";
+    return locale === "zh-CN" ? "已发现 · 能力有限" : "Detected · limited";
   }
-  return "未发现";
+  return locale === "zh-CN" ? "未发现" : "Not detected";
 };
 
 const clientLimitationLabel = (
   limitation: ConfigCenterBootstrap["clients"]["clients"][number]["limitation"],
+  locale: "en-US" | "zh-CN",
 ): string | null => {
   if (limitation === "cursor-standard-chat-only") {
-    return "仅发现Cursor桌面端时只能使用聊天兼容入口；这不等同于完整Agent能力。";
+    return locale === "zh-CN"
+      ? "仅发现Cursor桌面端时只能使用聊天兼容入口；这不等同于完整Agent能力。"
+      : "Cursor Desktop alone exposes only the chat-compatible entry, not the full Agent interface.";
   }
   return null;
 };
 
 const clientIntegrationLabel = (
   integrationMode: ConfigCenterBootstrap["clients"]["clients"][number]["integrationMode"],
+  locale: "en-US" | "zh-CN",
 ): string => {
   if (integrationMode === "native-agent") {
-    return "原生Agent桥接";
+    return locale === "zh-CN" ? "原生Agent桥接" : "Native Agent bridge";
   }
   if (integrationMode === "virtual-model") {
-    return "虚拟模型兼容";
+    return locale === "zh-CN" ? "虚拟模型兼容" : "Virtual-model compatibility";
   }
-  return "等待安装";
+  return locale === "zh-CN" ? "等待安装" : "Awaiting installation";
 };
 
-const GuideCenter = () => {
+const GuideCenter = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
   const [audience, setAudience] = useState<"company" | "personal">("personal");
+
+  if (locale === "en-US") {
+    return (
+      <section className="guide-panel">
+        <div className="configuration-heading">
+          <div>
+            <p className="card-label">BUILT-IN GUIDE</p>
+            <h2>Install and operate</h2>
+            <p>Guidance is versioned with the running package.</p>
+          </div>
+        </div>
+        <div className="guide-content">
+          <div className="guide-grid">
+            <article className="guide-card">
+              <p className="guide-index">01 · START</p>
+              <h3>Open the personal control center</h3>
+              <code>npx @skillnull/tidu start</code>
+              <ol>
+                <li>Keep the runtime terminal open.</li>
+                <li>Open the printed loopback address.</li>
+                <li>Run `tidu doctor` when the page is unavailable.</li>
+              </ol>
+            </article>
+            <article className="guide-card">
+              <p className="guide-index">02 · CONFIGURE</p>
+              <h3>Select a model path</h3>
+              <ol>
+                <li>Use an OpenAI-compatible provider or local Ollama.</li>
+                <li>Edit Normal or Expert without changing the active profile.</li>
+                <li>Preview impact, save, then explicitly activate.</li>
+                <li>Rollback restores the previous known-good version.</li>
+              </ol>
+            </article>
+            <article className="guide-card">
+              <p className="guide-index">03 · PRIVACY</p>
+              <h3>Choose a history mode</h3>
+              <ol>
+                <li>Host mode keeps full history in the current client.</li>
+                <li>Portable mode uses bounded local retention.</li>
+                <li>Incognito mode stores no conversation history.</li>
+                <li>Encrypted export excludes credentials and conversation content.</li>
+              </ol>
+            </article>
+            <article className="guide-card">
+              <p className="guide-index">04 · REMOVE</p>
+              <h3>Recoverable uninstall</h3>
+              <code>tidu uninstall</code>
+              <ol>
+                <li>Stop the personal runtime first.</li>
+                <li>The default uninstall keeps a restorable snapshot.</li>
+                <li>`--purge` permanently removes owned local data.</li>
+              </ol>
+            </article>
+          </div>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="guide-panel">
@@ -450,13 +560,91 @@ const GuideCenter = () => {
   );
 };
 
+const PersonalExperiencePanel = ({
+  locale,
+  providerConfigured,
+  providerType,
+}: {
+  locale: "en-US" | "zh-CN";
+  providerConfigured: boolean;
+  providerType: string | null;
+}) => {
+  const english = locale === "en-US";
+  return (
+    <section className="configuration-panel">
+      <div className="configuration-heading">
+        <div>
+          <p className="card-label">PERSONAL EXPERIENCE</p>
+          <h2>{english ? "Personal controls" : "个人中心"}</h2>
+          <p>
+            {english
+              ? "Privacy, budget, local models, extensions, and portable configuration remain independently controlled."
+              : "历史、预算、本地模型、扩展与配置迁移均保持独立可控。"}
+          </p>
+        </div>
+      </div>
+      <div className="personal-grid">
+        <article className="personal-card">
+          <p className="card-label">HISTORY</p>
+          <h3>{english ? "Host mode" : "宿主历史"}</h3>
+          <p>
+            {english
+              ? "Full history stays in the current client."
+              : "完整会话保留在当前客户端，九门仅保存任务胶囊。"}
+          </p>
+          <code>
+            {english ? "Portable: bounded · Incognito: none" : "可移植：有界清理 · 无痕：不保存"}
+          </code>
+        </article>
+        <article className="personal-card">
+          <p className="card-label">BUDGET & ACCOUNTS</p>
+          <h3>{english ? "Snapshot attribution" : "账号快照记账"}</h3>
+          <p>
+            {english
+              ? "Running tasks keep their account snapshot after a switch."
+              : "账号切换后，运行中任务仍按原账号快照记账。"}
+          </p>
+          <code>{english ? "Provider truth first" : "供应商官方用量优先"}</code>
+        </article>
+        <article className="personal-card">
+          <p className="card-label">LOCAL MODEL</p>
+          <h3>
+            {providerType === "ollama" ? "Ollama" : english ? "Ready to configure" : "可配置"}
+          </h3>
+          <p>
+            {providerConfigured
+              ? english
+                ? "Provider detected."
+                : "已发现模型供应商。"
+              : english
+                ? "Use the guided Ollama or compatible endpoint setup."
+                : "可按引导配置 Ollama 或兼容本地端点。"}
+          </p>
+          <code>http://127.0.0.1:11434</code>
+        </article>
+        <article className="personal-card">
+          <p className="card-label">EXTENSIONS & PORTABILITY</p>
+          <h3>{english ? "Diagnose before enable" : "启用前诊断"}</h3>
+          <p>
+            {english
+              ? "Agent, Skill, MCP, and tool permissions are checked before activation."
+              : "Agent、Skill、MCP 与工具在启用前检查版本和权限。"}
+          </p>
+          <code>{english ? "AES-256-GCM configuration export" : "AES-256-GCM 加密配置导出"}</code>
+        </article>
+      </div>
+    </section>
+  );
+};
+
 const App = () => {
   const [loadingState, setLoadingState] = useState<LoadingState>({
     status: "loading",
   });
   const [activeSection, setActiveSection] = useState<
-    "clients" | "configuration" | "guide" | "tasks"
+    "clients" | "configuration" | "guide" | "personal" | "tasks"
   >("configuration");
+  const [locale, setLocale] = useState<"en-US" | "zh-CN">("zh-CN");
   const [selectedMode, setSelectedMode] = useState<ConfigurationMode>("managed");
   const [form, setForm] = useState<ConfigurationForm>({
     activeProfileId: "managed-default",
@@ -465,6 +653,7 @@ const App = () => {
   const [operation, setOperation] = useState<OperationState>({
     status: "idle",
   });
+  const [impactPreview, setImpactPreview] = useState<ConfigurationImpactPreview | undefined>();
 
   const acceptBootstrap = useCallback(
     (bootstrap: ConfigCenterBootstrap, mode: ConfigurationMode = selectedMode) => {
@@ -529,6 +718,7 @@ const App = () => {
     setSelectedMode(mode);
     setForm(toForm(workspace.drafts[mode].configuration));
     setOperation({ status: "idle" });
+    setImpactPreview(undefined);
   };
 
   const saveDraft = async (): Promise<void> => {
@@ -547,6 +737,7 @@ const App = () => {
         }),
       });
       acceptBootstrap(nextBootstrap, selectedMode);
+      setImpactPreview(undefined);
       setOperation({
         status: "success",
         message: `${modeLabel(selectedMode)}草稿已保存，尚未启用。`,
@@ -555,6 +746,66 @@ const App = () => {
       setOperation({
         status: "error",
         message: error instanceof Error ? error.message : "保存失败",
+      });
+    }
+  };
+
+  const simulateDraft = async (): Promise<void> => {
+    setOperation({ status: "pending", action: "simulate" });
+    try {
+      const response = await fetch(`/api/configuration/drafts/${selectedMode}/simulate`, {
+        method: "POST",
+        headers: { accept: "application/json", "content-type": "application/json" },
+        body: JSON.stringify({
+          configuration: {
+            schemaVersion: selectedDraft.configuration.schemaVersion,
+            activeMode: selectedMode,
+            ...form,
+          },
+        }),
+      });
+      const preview = (await response.json()) as ConfigurationImpactPreview & { message?: string };
+      if (!response.ok) {
+        throw new Error(preview.message ?? `Simulation returned ${response.status}`);
+      }
+      setImpactPreview(preview);
+      setOperation({
+        status: "success",
+        message:
+          locale === "zh-CN"
+            ? `模拟通过：${preview.changes.length} 项变化，${preview.risk === "low" ? "低" : "中"}风险。`
+            : `Simulation passed: ${preview.changes.length} changes, ${preview.risk} risk.`,
+      });
+    } catch (error) {
+      setImpactPreview(undefined);
+      setOperation({
+        status: "error",
+        message: error instanceof Error ? error.message : "Simulation failed",
+      });
+    }
+  };
+
+  const rollbackConfiguration = async (): Promise<void> => {
+    setOperation({ status: "pending", action: "rollback" });
+    try {
+      const nextBootstrap = await requestBootstrap("/api/configuration/rollback", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      acceptBootstrap(nextBootstrap, selectedMode);
+      setImpactPreview(undefined);
+      setOperation({
+        status: "success",
+        message:
+          locale === "zh-CN"
+            ? "已恢复上一健康配置。"
+            : "Previous known-good configuration restored.",
+      });
+    } catch (error) {
+      setOperation({
+        status: "error",
+        message: error instanceof Error ? error.message : "Rollback failed",
       });
     }
   };
@@ -590,10 +841,24 @@ const App = () => {
       <header className="hero">
         <p className="eyebrow">AI-Tidu9 · LOCAL CONTROL</p>
         <h1>九门赛博提督</h1>
-        <p className="explanation">智能协作中枢 · 本地配置中心</p>
+        <p className="explanation">
+          {locale === "zh-CN"
+            ? "智能协作中枢 · 本地配置中心"
+            : "Intelligent Collaboration Hub · Local Control Center"}
+        </p>
+        <button
+          className="locale-button"
+          type="button"
+          onClick={() => setLocale((current) => (current === "zh-CN" ? "en-US" : "zh-CN"))}
+        >
+          {locale === "zh-CN" ? "EN" : "中文"}
+        </button>
       </header>
 
-      <nav className="section-navigation" aria-label="配置中心栏目">
+      <nav
+        className="section-navigation"
+        aria-label={locale === "zh-CN" ? "配置中心栏目" : "Control center sections"}
+      >
         <button
           className={
             activeSection === "tasks" ? "section-button section-button-active" : "section-button"
@@ -602,7 +867,7 @@ const App = () => {
           aria-current={activeSection === "tasks" ? "page" : undefined}
           onClick={() => setActiveSection("tasks")}
         >
-          任务
+          {locale === "zh-CN" ? "任务" : "Tasks"}
         </button>
         <button
           className={
@@ -614,7 +879,7 @@ const App = () => {
           aria-current={activeSection === "configuration" ? "page" : undefined}
           onClick={() => setActiveSection("configuration")}
         >
-          配置
+          {locale === "zh-CN" ? "配置" : "Configuration"}
         </button>
         <button
           className={
@@ -624,7 +889,17 @@ const App = () => {
           aria-current={activeSection === "clients" ? "page" : undefined}
           onClick={() => setActiveSection("clients")}
         >
-          客户端
+          {locale === "zh-CN" ? "客户端" : "Clients"}
+        </button>
+        <button
+          className={
+            activeSection === "personal" ? "section-button section-button-active" : "section-button"
+          }
+          type="button"
+          aria-current={activeSection === "personal" ? "page" : undefined}
+          onClick={() => setActiveSection("personal")}
+        >
+          {locale === "zh-CN" ? "个人中心" : "Personal"}
         </button>
         <button
           className={
@@ -634,48 +909,63 @@ const App = () => {
           aria-current={activeSection === "guide" ? "page" : undefined}
           onClick={() => setActiveSection("guide")}
         >
-          使用指南
+          {locale === "zh-CN" ? "使用指南" : "Guide"}
         </button>
       </nav>
 
       <section className="overview">
         <div>
           <span className="status-dot" aria-hidden="true" />
-          <span>本地运行时正常</span>
+          <span>{locale === "zh-CN" ? "本地运行时正常" : "Local runtime healthy"}</span>
         </div>
         <button type="button" onClick={() => void refresh()} disabled={isPending}>
-          刷新状态
+          {locale === "zh-CN" ? "刷新状态" : "Refresh"}
         </button>
       </section>
 
       {activeSection === "configuration" ? (
         <>
-          <section className="cards" aria-label="运行状态">
+          <section
+            className="cards"
+            aria-label={locale === "zh-CN" ? "运行状态" : "Runtime status"}
+          >
             <article className="card">
-              <p className="card-label">当前生效配置</p>
+              <p className="card-label">
+                {locale === "zh-CN" ? "当前生效配置" : "ACTIVE CONFIGURATION"}
+              </p>
               <h2>{workspace.active.configuration.virtualModelName}</h2>
               <p>
-                {modeLabel(workspace.active.configuration.activeMode)} ·{" "}
+                {modeLabel(workspace.active.configuration.activeMode, locale)} ·{" "}
                 {workspace.active.configuration.activeProfileId}
               </p>
             </article>
             <article className="card">
-              <p className="card-label">本地存储</p>
+              <p className="card-label">{locale === "zh-CN" ? "本地存储" : "LOCAL STORAGE"}</p>
               <h2>{bootstrap.storage.provider.toUpperCase()}</h2>
-              <p>Schema {bootstrap.storage.schemaVersion} · 状态正常</p>
+              <p>
+                Schema {bootstrap.storage.schemaVersion} ·{" "}
+                {locale === "zh-CN" ? "状态正常" : "healthy"}
+              </p>
             </article>
             <article className="card">
-              <p className="card-label">运行版本</p>
+              <p className="card-label">{locale === "zh-CN" ? "运行版本" : "RUNTIME VERSION"}</p>
               <h2>v{bootstrap.product.version}</h2>
-              <p>配置契约 {selectedDraft.configuration.schemaVersion}</p>
+              <p>
+                {locale === "zh-CN" ? "配置契约" : "Configuration contract"}{" "}
+                {selectedDraft.configuration.schemaVersion}
+              </p>
             </article>
             <article className="card">
-              <p className="card-label">虚拟模型协议</p>
+              <p className="card-label">
+                {locale === "zh-CN" ? "虚拟模型协议" : "VIRTUAL MODEL API"}
+              </p>
               <h2>/v1</h2>
               <p>
                 {bootstrap.runtime.provider.configured
                   ? `${bootstrap.runtime.provider.type} · ${bootstrap.runtime.provider.model}`
-                  : "模型发现可用 · 供应商待配置"}
+                  : locale === "zh-CN"
+                    ? "模型发现可用 · 供应商待配置"
+                    : "Model discovery ready · provider not configured"}
               </p>
               <p>JSON + SSE · Function tools</p>
             </article>
@@ -685,10 +975,17 @@ const App = () => {
             <div className="configuration-heading">
               <div>
                 <p className="card-label">CONFIGURATION DRAFTS</p>
-                <h2>配置模式</h2>
-                <p>两个模式独立保存；切换只查看草稿，不会改变当前运行配置。</p>
+                <h2>{locale === "zh-CN" ? "配置模式" : "Configuration modes"}</h2>
+                <p>
+                  {locale === "zh-CN"
+                    ? "两个模式独立保存；切换只查看草稿，不会改变当前运行配置。"
+                    : "Normal and Expert drafts are isolated. Switching the editor never changes the active runtime profile."}
+                </p>
               </div>
-              <fieldset className="mode-switcher" aria-label="配置模式">
+              <fieldset
+                className="mode-switcher"
+                aria-label={locale === "zh-CN" ? "配置模式" : "Configuration mode"}
+              >
                 {(["managed", "expert"] as const).map((mode) => (
                   <button
                     className={
@@ -700,7 +997,7 @@ const App = () => {
                     disabled={isPending}
                     key={mode}
                   >
-                    {modeLabel(mode)}
+                    {modeLabel(mode, locale)}
                   </button>
                 ))}
               </fieldset>
@@ -708,7 +1005,7 @@ const App = () => {
 
             <div className="configuration-form">
               <label>
-                配置标识
+                {locale === "zh-CN" ? "配置标识" : "Profile ID"}
                 <input
                   value={form.activeProfileId}
                   onChange={(event) =>
@@ -721,10 +1018,14 @@ const App = () => {
                   placeholder={`${selectedMode}-default`}
                   disabled={isPending}
                 />
-                <small>仅支持小写字母、数字和连字符，最长 64 位。</small>
+                <small>
+                  {locale === "zh-CN"
+                    ? "仅支持小写字母、数字和连字符，最长 64 位。"
+                    : "Use up to 64 lowercase letters, numbers, or hyphens."}
+                </small>
               </label>
               <label>
-                虚拟模型名称
+                {locale === "zh-CN" ? "虚拟模型名称" : "Virtual model name"}
                 <input
                   value={form.virtualModelName}
                   onChange={(event) =>
@@ -737,7 +1038,11 @@ const App = () => {
                   placeholder="九门赛博提督"
                   disabled={isPending}
                 />
-                <small>对兼容客户端显示的名称；AI-Tidu9 标识不会因此移除。</small>
+                <small>
+                  {locale === "zh-CN"
+                    ? "对兼容客户端显示的名称；AI-Tidu9 标识不会因此移除。"
+                    : "Displayed by compatible clients; AI-Tidu9 attribution remains."}
+                </small>
               </label>
             </div>
 
@@ -752,12 +1057,28 @@ const App = () => {
               >
                 {operation.status === "idle"
                   ? isDirty
-                    ? "存在未保存修改。切换模式会放弃这些输入。"
-                    : `草稿修订 ${selectedDraft.revision}，尚未产生新的修改。`
+                    ? locale === "zh-CN"
+                      ? "存在未保存修改。切换模式会放弃这些输入。"
+                      : "Unsaved changes will be discarded when switching modes."
+                    : locale === "zh-CN"
+                      ? `草稿修订 ${selectedDraft.revision}，尚未产生新的修改。`
+                      : `Draft revision ${selectedDraft.revision}; no new changes.`
                   : operation.status === "pending"
                     ? operation.action === "save"
-                      ? "正在验证并保存…"
-                      : "正在启用…"
+                      ? locale === "zh-CN"
+                        ? "正在验证并保存…"
+                        : "Validating and saving…"
+                      : operation.action === "simulate"
+                        ? locale === "zh-CN"
+                          ? "正在模拟…"
+                          : "Simulating…"
+                        : operation.action === "rollback"
+                          ? locale === "zh-CN"
+                            ? "正在回滚…"
+                            : "Rolling back…"
+                          : locale === "zh-CN"
+                            ? "正在启用…"
+                            : "Activating…"
                     : operation.message}
               </p>
               <div className="action-buttons">
@@ -766,27 +1087,51 @@ const App = () => {
                   onClick={() => void saveDraft()}
                   disabled={!isDirty || isPending}
                 >
-                  保存草稿
+                  {locale === "zh-CN" ? "保存草稿" : "Save draft"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void simulateDraft()}
+                  disabled={isDirty || isPending}
+                >
+                  {locale === "zh-CN" ? "模拟影响" : "Preview impact"}
                 </button>
                 <button
                   className="primary-button"
                   type="button"
                   onClick={() => void activateDraft()}
-                  disabled={isDirty || isPending}
+                  disabled={isDirty || isPending || impactPreview?.valid !== true}
                 >
-                  启用此配置
+                  {locale === "zh-CN" ? "启用此配置" : "Activate"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void rollbackConfiguration()}
+                  disabled={isPending}
+                >
+                  {locale === "zh-CN" ? "回滚" : "Rollback"}
                 </button>
               </div>
             </div>
           </section>
         </>
+      ) : activeSection === "personal" ? (
+        <PersonalExperiencePanel
+          locale={locale}
+          providerConfigured={bootstrap.runtime.provider.configured}
+          providerType={bootstrap.runtime.provider.type}
+        />
       ) : activeSection === "clients" ? (
         <section className="client-panel">
           <div className="configuration-heading">
             <div>
               <p className="card-label">LOCAL CLIENT DISCOVERY</p>
-              <h2>本机客户端</h2>
-              <p>只检查命令、应用和配置文件是否存在，不读取配置正文与账号数据。</p>
+              <h2>{locale === "zh-CN" ? "本机客户端" : "Local clients"}</h2>
+              <p>
+                {locale === "zh-CN"
+                  ? "只检查命令、应用和配置文件是否存在，不读取配置正文与账号数据。"
+                  : "Discovery checks metadata only and never reads configuration bodies or account data."}
+              </p>
             </div>
             <span className="client-privacy">METADATA ONLY</span>
           </div>
@@ -796,41 +1141,81 @@ const App = () => {
                 <div className="client-card-heading">
                   <div>
                     <p className="client-protocol">
-                      {clientIntegrationLabel(client.integrationMode)} · {client.protocol}
+                      {clientIntegrationLabel(client.integrationMode, locale)} · {client.protocol}
                     </p>
                     <h3>{client.name}</h3>
                   </div>
                   <span className={`client-state client-state-${client.readiness}`}>
-                    {clientReadinessLabel(client.readiness)}
+                    {clientReadinessLabel(client.readiness, locale)}
                   </span>
                 </div>
                 <dl className="client-signals">
                   <div>
-                    <dt>命令</dt>
-                    <dd>{client.signals.command ? "已发现" : "未发现"}</dd>
+                    <dt>{locale === "zh-CN" ? "命令" : "Command"}</dt>
+                    <dd>
+                      {client.signals.command
+                        ? locale === "zh-CN"
+                          ? "已发现"
+                          : "Detected"
+                        : locale === "zh-CN"
+                          ? "未发现"
+                          : "Missing"}
+                    </dd>
                   </div>
                   <div>
-                    <dt>应用</dt>
-                    <dd>{client.signals.application ? "已发现" : "未发现"}</dd>
+                    <dt>{locale === "zh-CN" ? "应用" : "Application"}</dt>
+                    <dd>
+                      {client.signals.application
+                        ? locale === "zh-CN"
+                          ? "已发现"
+                          : "Detected"
+                        : locale === "zh-CN"
+                          ? "未发现"
+                          : "Missing"}
+                    </dd>
                   </div>
                   <div>
-                    <dt>配置</dt>
-                    <dd>{client.signals.configuration ? "已存在" : "未发现"}</dd>
+                    <dt>{locale === "zh-CN" ? "配置" : "Configuration"}</dt>
+                    <dd>
+                      {client.signals.configuration
+                        ? locale === "zh-CN"
+                          ? "已存在"
+                          : "Present"
+                        : locale === "zh-CN"
+                          ? "未发现"
+                          : "Missing"}
+                    </dd>
                   </div>
                   <div>
-                    <dt>原生协议</dt>
-                    <dd>{client.signals.agentProtocol ? "已发现" : "未发现"}</dd>
+                    <dt>{locale === "zh-CN" ? "原生协议" : "Native protocol"}</dt>
+                    <dd>
+                      {client.signals.agentProtocol
+                        ? locale === "zh-CN"
+                          ? "已发现"
+                          : "Detected"
+                        : locale === "zh-CN"
+                          ? "未发现"
+                          : "Missing"}
+                    </dd>
                   </div>
                 </dl>
                 <p className="client-limitation">
-                  {clientLimitationLabel(client.limitation) ??
+                  {clientLimitationLabel(client.limitation, locale) ??
                     (client.detected
                       ? client.id === "codex"
-                        ? "优先通过app-server复用当前Codex账户；虚拟模型Profile仅作兼容入口。"
+                        ? locale === "zh-CN"
+                          ? "优先通过app-server复用当前Codex账户；虚拟模型Profile仅作兼容入口。"
+                          : "Prefer app-server delegation for the current Codex account; the virtual-model profile is a compatibility entry."
                         : client.id === "cursor" && client.signals.agentProtocol
-                          ? "通过官方ACP复用当前Cursor账户，不读取或复制登录凭据。"
-                          : "当前不自动写入此客户端的配置。"
-                      : "安装客户端后刷新即可重新检测。")}
+                          ? locale === "zh-CN"
+                            ? "通过官方ACP复用当前Cursor账户，不读取或复制登录凭据。"
+                            : "Reuse the current Cursor account through official ACP without reading or copying credentials."
+                          : locale === "zh-CN"
+                            ? "当前不自动写入此客户端的配置。"
+                            : "This client is not modified automatically."
+                      : locale === "zh-CN"
+                        ? "安装客户端后刷新即可重新检测。"
+                        : "Install the client and refresh to detect it.")}
                 </p>
                 {client.id === "codex" && client.detected ? (
                   <code className="client-command">tidu clients connect codex</code>
@@ -839,17 +1224,22 @@ const App = () => {
             ))}
           </div>
           <p className="guide-note">
-            全能力接入优先使用Codex app-server、Cursor
-            ACP等官方原生Agent协议；OpenAI兼容虚拟模型是通用客户端的兼容入口，不能冒充宿主完整能力。Ollama属于上游模型供应商，不是客户端。
+            {locale === "zh-CN"
+              ? "全能力接入优先使用Codex app-server、Cursor ACP等官方原生Agent协议；OpenAI兼容虚拟模型是通用客户端的兼容入口，不能冒充宿主完整能力。Ollama属于上游模型供应商，不是客户端。"
+              : "Full-capability integration prefers official native Agent protocols such as Codex app-server and Cursor ACP. The OpenAI-compatible virtual model is a generic compatibility entry and never impersonates the host's complete capabilities. Ollama is an upstream model provider, not a client."}
           </p>
         </section>
       ) : activeSection === "tasks" ? (
-        <TaskControlPanel />
+        <TaskControlPanel locale={locale} />
       ) : (
-        <GuideCenter />
+        <GuideCenter locale={locale} />
       )}
 
-      <footer>仅监听本机回环地址 · 数据默认保留在本地 · 保存不等于启用</footer>
+      <footer>
+        {locale === "zh-CN"
+          ? "仅监听本机回环地址 · 数据默认保留在本地 · 保存不等于启用"
+          : "Loopback only · data stays local by default · saving is not activation"}
+      </footer>
     </main>
   );
 };

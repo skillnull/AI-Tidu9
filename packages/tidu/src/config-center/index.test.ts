@@ -30,6 +30,9 @@ test("creates a configuration-center bootstrap with isolated drafts", async () =
           },
         },
       }),
+      rollbackActive: async () => {
+        throw new Error("not used");
+      },
       saveDraft: async () => {
         throw new Error("not used");
       },
@@ -76,6 +79,9 @@ test("exposes provider status without credentials or endpoint details", async ()
             },
           },
         }),
+        rollbackActive: async () => {
+          throw new Error("not used");
+        },
         saveDraft: async () => {
           throw new Error("not used");
         },

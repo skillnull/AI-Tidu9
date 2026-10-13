@@ -27,6 +27,7 @@ import {
   validateChatCompletionRequest,
   validateResponsesRequest,
 } from "../openai/index.js";
+import { activateConfigurationSafely, previewConfigurationImpact } from "../personal/index.js";
 import { createProviderFromEnvironment, type ModelProvider } from "../providers/index.js";
 import { createSecretGate, guardModelProvider, type SecretGate } from "../security/index.js";
 import { openNodeSqliteStorage, type StorageAdapter } from "../storage/index.js";
@@ -576,10 +577,56 @@ const handleRequest = async (
       if (!isRecord(body)) {
         throw new TiduError("CONFIGURATION_INVALID", "Request body must be an object.");
       }
-      await storage.configurationStore.activateDraft(
+      const activation = await activateConfigurationSafely(
+        storage.configurationStore,
         mode,
         readExpectedRevision(body, "expectedDraftRevision"),
+        async (configuration) =>
+          configuration.activeMode === mode && configuration.activeProfileId.trim() !== "",
       );
+      if (activation.rolledBack) {
+        sendJson(response, 422, {
+          error: "CONFIGURATION_HEALTH_CHECK_FAILED",
+          message: "Configuration failed its health probe and the known-good version was restored.",
+        });
+        return;
+      }
+      sendJson(response, 200, await createConfigCenterBootstrap(storage, provider?.descriptor));
+    } catch (error) {
+      handleConfigurationMutationError(response, error);
+    }
+    return;
+  }
+
+  const simulationRoute = /^\/api\/configuration\/drafts\/(managed|expert)\/simulate$/u.exec(
+    pathname,
+  );
+  if (request.method === "POST" && simulationRoute !== null) {
+    try {
+      validateMutationRequest(request);
+      const mode = simulationRoute[1] as ConfigurationMode;
+      const body = await readJsonBody(request);
+      if (!isRecord(body)) {
+        throw new TiduError("CONFIGURATION_INVALID", "Request body must be an object.");
+      }
+      const workspace = await storage.configurationStore.loadWorkspace();
+      const configuration = readDraftConfiguration(body, mode);
+      sendJson(
+        response,
+        200,
+        previewConfigurationImpact(workspace.active.configuration, configuration),
+      );
+    } catch (error) {
+      handleConfigurationMutationError(response, error);
+    }
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/configuration/rollback") {
+    try {
+      validateMutationRequest(request);
+      await readJsonBody(request);
+      await storage.configurationStore.rollbackActive();
       sendJson(response, 200, await createConfigCenterBootstrap(storage, provider?.descriptor));
     } catch (error) {
       handleConfigurationMutationError(response, error);

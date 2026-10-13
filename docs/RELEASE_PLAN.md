@@ -125,20 +125,20 @@ Audience: owner and invited developers.
 
 ## v0.5.0-beta.1 — Complete personal experience / 完整个人体验公开测试版
 
-- [ ] Provide one-click normal/expert UI switching / 提供普通与专家界面一键切换
-- [ ] Keep UI mode independent from active runtime profile / 界面模式与运行配置解耦
-- [ ] Isolate normal-managed and expert-custom profiles / 隔离普通托管与专家自定义配置
-- [ ] Add draft validation, simulation, impact preview, and explicit activation / 增加草稿验证、模拟、影响预览和明确启用
-- [ ] Keep last-known-good configuration and automatic rollback / 保留健康版本并支持自动回滚
-- [ ] Support host, portable, and incognito history modes / 支持宿主、可移植与无痕历史模式
-- [ ] Add bounded local storage and automatic cleanup / 增加有界本地存储与自动清理
-- [ ] Add personal budget and account-usage views / 增加个人预算和账号用量视图
-- [ ] Support account-profile switching without cross-account charging / 支持不串账的账号切换
-- [ ] Support local model setup / 支持本地模型配置
-- [ ] Support extension installation and diagnostics / 支持扩展安装与诊断
-- [ ] Support secure configuration import/export / 支持安全配置导入导出
-- [ ] Complete Chinese and English UI / 完成中英文界面
-- [ ] Pass personal-product quality gates / 通过个人产品质量门禁
+- [x] Provide one-click normal/expert UI switching / 提供普通与专家界面一键切换
+- [x] Keep UI mode independent from active runtime profile / 界面模式与运行配置解耦
+- [x] Isolate normal-managed and expert-custom profiles / 隔离普通托管与专家自定义配置
+- [x] Add draft validation, simulation, impact preview, and explicit activation / 增加草稿验证、模拟、影响预览和明确启用
+- [x] Keep last-known-good configuration and automatic rollback / 保留健康版本并支持自动回滚
+- [x] Support host, portable, and incognito history modes / 支持宿主、可移植与无痕历史模式
+- [x] Add bounded local storage and automatic cleanup / 增加有界本地存储与自动清理
+- [x] Add personal budget and account-usage views / 增加个人预算和账号用量视图
+- [x] Support account-profile switching without cross-account charging / 支持不串账的账号切换
+- [x] Support local model setup / 支持本地模型配置
+- [x] Support extension installation and diagnostics / 支持扩展安装与诊断
+- [x] Support secure configuration import/export / 支持安全配置导入导出
+- [x] Complete Chinese and English UI / 完成中英文界面
+- [x] Pass personal-product quality gates / 通过个人产品质量门禁
 - [ ] Receive release confirmation / 获得发布确认
 
 ## v0.6.0-beta.1 — Team and enterprise pilot / 团队与企业试点版
@@ -264,7 +264,7 @@ Every public release must provide the applicable artifacts below.
 ## Current status / 当前状态
 
 - Planning / 规划：**complete / 已完成**
-- Active stage / 当前阶段：**Stage 4 — Not started / 阶段4：未开始**
+- Active stage / 当前阶段：**Stage 5 — Implementation complete, release confirmation pending / 阶段5：实现完成，等待发布确认**
 - Latest planned release / 最近计划版本：`v0.5.0-beta.1`
 - Latest published release / 最近已发布版本：`v0.4.0-beta.1`
 - Remote publishing / 远程发布：**enabled with explicit confirmation / 经明确确认后执行**

@@ -61,8 +61,15 @@ button:disabled {
 }
 
 .hero {
+  position: relative;
   max-width: 760px;
   padding-bottom: 22px;
+}
+
+.locale-button {
+  position: absolute;
+  top: 0;
+  right: 0;
 }
 
 .eyebrow,
@@ -196,6 +203,38 @@ h2 {
 .configuration-panel {
   margin-top: 0;
   padding: 18px;
+}
+
+.personal-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.personal-card {
+  padding: 14px;
+  border: 1px solid #202832;
+  border-radius: 8px;
+  background: #0d131a;
+}
+
+.personal-card h3 {
+  margin: 0 0 7px;
+  font-size: 14px;
+  font-weight: 450;
+}
+
+.personal-card p:not(.card-label) {
+  min-height: 34px;
+  color: #758292;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.personal-card code {
+  color: #69c8ba;
+  font-size: 10px;
 }
 
 .guide-panel {
