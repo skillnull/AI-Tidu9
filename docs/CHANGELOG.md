@@ -6,6 +6,8 @@ All notable changes to AI-Tidu9 will be documented in this file.
 
 ## Unreleased / 未发布
 
+## 0.9.0-rc.1 - 2026-10-13
+
 - Add a fail-closed `tidu uninstall --complete` flow that removes AI-Tidu9-owned connectors, managed client artifacts, data, snapshots, and global npm installation while preserving all unrelated host state.
 - 增加默认拒绝不明目标的 `tidu uninstall --complete` 完整卸载流程，清理九门自有连接器、客户端产物、数据、快照和全局npm安装，同时保留全部无关宿主状态。
 - Add a versioned integrated release-candidate qualification contract that separates automated evidence from reviewed dogfooding, pilot, and local-sharing evidence and fails closed on missing gates.
