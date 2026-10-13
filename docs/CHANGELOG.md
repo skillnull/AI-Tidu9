@@ -6,6 +6,8 @@ All notable changes to AI-Tidu9 will be documented in this file.
 
 ## Unreleased / 未发布
 
+## 0.6.0-beta.1 - 2026-10-13
+
 - Add the Stage 6 enterprise pilot control plane with PostgreSQL CAS persistence, tenant-to-user scopes, inherited mandatory/advisory policy, identity roles, a private capability catalog, mixed enterprise/user model resources, and generated administrator and employee guidance.
 - 增加Stage 6企业试点控制平面，支持PostgreSQL CAS持久化、租户到用户多层作用域、继承式强制/辅助策略、身份角色、私有能力目录、企业/个人混合模型资源及动态管理员与员工指南。
 - Add hierarchical quota pools with idempotent atomic reservation, settlement, release, reconciliation, and end-of-cycle allocation sharing; add bounded private artifact storage and staged personal-to-enterprise enrollment preflight.
