@@ -121,7 +121,7 @@ Audience: owner and invited developers.
 - [x] Complete verifiable result loop / 完成可验证结果闭环
 - [x] Publish real cost and capability-completion case / 发布真实成本与能力补全案例
 - [x] Pass public-beta quality gates / 通过公开Beta质量门禁
-- [ ] Receive release confirmation / 获得发布确认
+- [x] Receive release confirmation / 获得发布确认
 
 ## v0.5.0-beta.1 — Complete personal experience / 完整个人体验公开测试版
 
@@ -265,6 +265,6 @@ Every public release must provide the applicable artifacts below.
 
 - Planning / 规划：**complete / 已完成**
 - Active stage / 当前阶段：**Stage 4 — Not started / 阶段4：未开始**
-- Latest planned release / 最近计划版本：`v0.4.0-beta.1`
-- Latest published release / 最近已发布版本：`v0.3.0-alpha.1`
+- Latest planned release / 最近计划版本：`v0.5.0-beta.1`
+- Latest published release / 最近已发布版本：`v0.4.0-beta.1`
 - Remote publishing / 远程发布：**enabled with explicit confirmation / 经明确确认后执行**

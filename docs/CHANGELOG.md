@@ -8,6 +8,17 @@ All notable changes to AI-Tidu9 will be documented in this file.
 
 ## 0.4.0-beta.1 - 2026-10-13
 
+- Add configurable dynamic model routing across capability, cost, privacy, latency, availability, quota, and enabled-state signals, including bounded specialist-model capability completion and `429` fallback.
+- 增加可配置动态模型路由，联合评估能力、成本、隐私、延迟、可用性、额度与启用状态，并支持有界专家模型能力补全和`429`回退。
+- Add one capability registry that assembles Agent, Skill, MCP, tool, and knowledge assets before planning and fails closed when required capabilities are unavailable.
+- 增加统一能力注册表，在规划前按需装配Agent、Skill、MCP、工具和知识；必要能力缺失时失败关闭。
+- Enable the Runtime Secret Gate by default for standard model and Agent tool boundaries, with automatic detection, explicit block/redact rules, isolated in-memory placeholders, and local-only recovery.
+- 为标准模型与Agent工具出口默认启用Runtime Secret Gate，支持自动识别、指定阻断/替换规则、隔离内存占位及仅本地恢复。
+- Publish bilingual architecture guidance, security limitations, and a reproducible cheap-main plus specialist cost and capability-completion case.
+- 发布双语架构说明、安全边界，以及可复现的低成本主模型与专家模型成本和能力补全案例。
+- Expand the package suite to 104 passing tests and keep the npm artifact below 1 MB unpacked without adding runtime dependencies.
+- 将包测试扩展到104项全部通过，并在不增加运行时依赖的前提下保持npm解包体积低于1 MB。
+
 ## 0.3.0-alpha.1 - 2026-10-12
 
 - Adopt a lockfile-free library workspace with exact direct dependencies, fresh CI resolution, and release tooling that no longer couples package versions to `package-lock.json`.
