@@ -12,6 +12,7 @@ import {
   createInMemoryEnterpriseStateRepository,
 } from "../enterprise/index.js";
 import type { ModelProvider } from "../providers/index.js";
+import { createScalingControlPlane } from "../scaling/index.js";
 import { IN_MEMORY_DATABASE_PATH, STORAGE_SCHEMA_VERSION } from "../storage/index.js";
 import { startLocalRuntime } from "./index.js";
 
@@ -92,6 +93,7 @@ test("starts a loopback runtime with a verifiable health endpoint", async () => 
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), {
       product: PRODUCT.name,
+      scaling: { status: "disabled" },
       status: "ok",
       storage: {
         provider: "sqlite",
@@ -589,6 +591,50 @@ test("exposes an enterprise pilot and one-time administrator key lifecycle", asy
     });
     assert.equal(sessionResponse.status, 201);
     assert.equal(typeof ((await sessionResponse.json()) as { id: string }).id, "string");
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("exposes stateless scaling admission and production health summaries", async () => {
+  const scalingControlPlane = createScalingControlPlane();
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    scalingControlPlane,
+    port: 0,
+  });
+
+  try {
+    const createResponse = await fetch(`${runtime.origin}/api/scaling/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "runtime-scaling-task",
+        tenantId: "tenant-runtime",
+        resourceGroup: "general",
+        priority: 50,
+        maxAttempts: 3,
+        memoryBytes: 1024,
+        scratchBytes: 2048,
+        payloadBytes: 128,
+        payloadReference: "private://tenant-runtime/runtime-scaling-task",
+      }),
+    });
+    assert.equal(createResponse.status, 202);
+
+    const scalingResponse = await fetch(`${runtime.origin}/api/scaling`);
+    assert.equal(scalingResponse.status, 200);
+    const scaling = (await scalingResponse.json()) as {
+      health: { queuedTaskCount: number };
+      metrics: { counters: Record<string, number> };
+    };
+    assert.equal(scaling.health.queuedTaskCount, 1);
+    assert.equal(scaling.metrics.counters["tasks.accepted"], 1);
+
+    const healthResponse = await fetch(`${runtime.origin}/health`);
+    assert.equal(healthResponse.status, 503);
+    const health = (await healthResponse.json()) as { scaling: { status: string } };
+    assert.equal(health.scaling.status, "unavailable");
   } finally {
     await runtime.close();
   }

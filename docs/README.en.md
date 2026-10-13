@@ -8,7 +8,7 @@ AI-Tidu9 is an intelligent collaboration hub for cross-domain scenarios. It coor
 
 ## Status
 
-The project is being rebuilt from an early AI rules package into an independent Super Agent platform. It has entered the team and enterprise pilot stage and is not recommended for production-critical work.
+The project is being rebuilt from an early AI rules package into an independent Super Agent platform. Its production-scaling candidate baseline is now implemented, but production-critical use should wait for Scheduler high availability, target-environment load testing, and real team acceptance.
 
 ## Direction
 

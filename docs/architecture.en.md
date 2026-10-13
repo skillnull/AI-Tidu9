@@ -22,6 +22,7 @@ AI-Tidu9 follows a modular-monolith-first architecture with stable adapter bound
 | `packages/tidu/src/providers` | Real OpenAI-compatible and Ollama provider adapters | Protocol translation and invocation only; never persists credentials, conversations, or business configuration |
 | `packages/tidu/src/routing` | Dynamic model scoring, capability completion, quota fallback, and main/specialist coordination | Specialist pools are explicit and bounded; configured price estimates never replace provider billing |
 | `packages/tidu/src/security` | Runtime Secret Gate for model and tool egress | Raw values remain only in isolated short-lived memory scopes; external boundaries receive placeholders |
+| `packages/tidu/src/scaling` | Production admission, fair scheduling, worker leases, checkpoint recovery, and scaling telemetry | Gateways are stateless; replaceable stores persist task state; workers never own global scheduling state |
 | `packages/tidu/src/storage` | Storage adapters and persistence for AI-Tidu9 metadata | Keeps schema and SQL migrations language-neutral; tasks persist only bounded capsules, not full conversations |
 | `packages/tidu/src/usage` | Unified observations for provider, host, and estimated usage | Provider-authoritative data wins; estimates always remain visibly labeled and never impersonate official quota data |
 
@@ -47,9 +48,17 @@ The Agent kernel delegates goal understanding, planning, and replanning to model
 
 SQLite persists only the lightweight capsule required for recovery: the goal, plan, checkpoint, bounded step summaries, minimal evidence, budget usage, and final result. A capsule is limited to 256 KB, each plan-step input to 16 KB, and each summary to 2,048 characters. Full conversations, raw model responses, and large tool outputs are not stored there. Credentials, tokens, and passwords remain prohibited in tasks, plans, and events.
 
+## Production scaling baseline
+
+Stage 7 separates task ingress into stateless Gateways, one logical Scheduler, and horizontally scalable Workers. Gateways only submit and query tasks. The Scheduler owns tenant-safe idempotent admission, global and tenant backpressure, fair scheduling, resource-group matching, leases, and checkpoint recovery. Workers register, heartbeat, claim, complete, or fail work through a bounded protocol. Production task state uses revision-based compare-and-swap persistence in PostgreSQL; workers re-register after a Scheduler restart. Personal deployments retain an in-memory implementation and do not require distributed infrastructure.
+
+Every task has hard payload, memory, and scratch-space limits. Large files and tool output move through bounded chunks. Provider execution supports circuit breaking, cooldown, and candidate failover. Rolling upgrades drain old workers before replacement and can restore the previous version. Default telemetry exposes counters, capacities, worker counts, and sampled content-free diagnostics without retaining prompts, credentials, or tool bodies. Runtime health reports queue pressure and queued work without an active worker.
+
+The automated baseline completes 1,000 concurrent tasks across 10 tenants and 10 workers without loss, and injects lease expiry, worker disappearance, checkpoint retry, provider failure, and rolling-upgrade rollback. This is a functional regression test, not a throughput SLA; production capacity claims require tests on the target hardware, database, and network.
+
 ## Current limitations
 
-The primary runtime requires Node.js 22.14 or later. Personal mode defaults to a lightweight `127.0.0.1` service with SQLite and the React + Vite control center. Setting `TIDU_POSTGRES_URL` attaches the PostgreSQL enterprise control plane to the same runtime, adding organization scopes, identity roles, mandatory/advisory policy, a capability catalog, mixed model resources, hierarchical quota pools, administrator keys, and generated onboarding guidance. The single-host Docker profile still binds to server loopback by default; cross-device access requires an HTTPS reverse proxy and enterprise identity control. The OpenAI-compatible entry, Agent kernel, Codex app-server, Cursor ACP, Secret Gate, and isolated personal configuration keep their existing boundaries. The Python SDK, cross-process worker scheduling, stateless horizontal scaling, and a real small-team pilot are not complete yet.
+The primary runtime requires Node.js 22.14 or later. Personal mode defaults to a lightweight `127.0.0.1` service with SQLite and the React + Vite control center. Setting `TIDU_POSTGRES_URL` attaches the PostgreSQL enterprise control plane and durable production task queue to the same runtime. The single-host Docker profile still binds to server loopback by default; cross-device access requires an HTTPS reverse proxy and enterprise identity control. Stateless Gateways and horizontal Workers are implemented, but the Scheduler remains one logical writer. Scheduler high availability, leader election, real multi-host capacity validation, and a real small-team pilot remain incomplete. The Python SDK is planned for the open-ecosystem stage.
 
 ## Client compatibility matrix
 

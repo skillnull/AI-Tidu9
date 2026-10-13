@@ -39,6 +39,7 @@ export interface RuntimeDataLock {
 const SNAPSHOT_MARKER = ".snapshot.";
 const RUNTIME_LOCK_FILE_NAME = ".runtime.lock";
 const INCOMPLETE_LOCK_GRACE_MILLISECONDS = 30_000;
+const activeRuntimeLockTokens = new Set<string>();
 
 export const resolvePersonalDataDirectory = (): string => dirname(resolveDefaultDatabasePath());
 
@@ -73,14 +74,37 @@ const isProcessActive = (processId: number): boolean => {
   }
 };
 
-const readRuntimeLock = (lockPath: string): { processId: number; token: string } | undefined => {
+const readProcessIdentity = (processId: number): string | undefined => {
+  try {
+    const processStat = readFileSync(`/proc/${processId}/stat`, "utf8");
+    const commandEnd = processStat.lastIndexOf(")");
+    const fieldsAfterCommand = processStat
+      .slice(commandEnd + 2)
+      .trim()
+      .split(/\s+/u);
+    const startTime = fieldsAfterCommand[19];
+    return startTime === undefined ? undefined : `${processId}:${startTime}`;
+  } catch {
+    return undefined;
+  }
+};
+
+const readRuntimeLock = (
+  lockPath: string,
+): { processId: number; processIdentity?: string; token: string } | undefined => {
   try {
     const value = JSON.parse(readFileSync(lockPath, "utf8")) as {
       processId?: unknown;
+      processIdentity?: unknown;
       token?: unknown;
     };
     if (Number.isInteger(value.processId) && typeof value.token === "string") {
-      return { processId: Number(value.processId), token: value.token };
+      return {
+        processId: Number(value.processId),
+        processIdentity:
+          typeof value.processIdentity === "string" ? value.processIdentity : undefined,
+        token: value.token,
+      };
     }
   } catch {
     return undefined;
@@ -102,7 +126,12 @@ const assertDataDirectoryUnlocked = (dataDirectory: string): void => {
     rmSync(lockPath, { force: true });
     return;
   }
-  if (isProcessActive(lock.processId)) {
+  const currentIdentity = readProcessIdentity(lock.processId);
+  const identityMatches =
+    lock.processIdentity === undefined || currentIdentity === undefined
+      ? lock.processId !== process.pid || activeRuntimeLockTokens.has(lock.token)
+      : lock.processIdentity === currentIdentity;
+  if (isProcessActive(lock.processId) && identityMatches) {
     throw new TiduError(
       "CONFIGURATION_CONFLICT",
       "Stop the running personal runtime before changing its data.",
@@ -128,7 +157,16 @@ export const acquireRuntimeDataLock = (databasePath: string): RuntimeDataLock | 
     });
   }
   try {
-    writeFileSync(lockFile, JSON.stringify({ processId: process.pid, token }), "utf8");
+    writeFileSync(
+      lockFile,
+      JSON.stringify({
+        processId: process.pid,
+        processIdentity: readProcessIdentity(process.pid),
+        token,
+      }),
+      "utf8",
+    );
+    activeRuntimeLockTokens.add(token);
   } catch (error) {
     closeSync(lockFile);
     rmSync(lockPath, { force: true });
@@ -143,6 +181,7 @@ export const acquireRuntimeDataLock = (databasePath: string): RuntimeDataLock | 
         return;
       }
       released = true;
+      activeRuntimeLockTokens.delete(token);
       if (readRuntimeLock(lockPath)?.token === token) {
         rmSync(lockPath, { force: true });
       }

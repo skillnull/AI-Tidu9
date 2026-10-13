@@ -171,21 +171,21 @@ Audience: owner and invited developers.
 
 ## v0.7.0-beta.1 → v0.7.0-rc.1 — Production scaling / 高并发生产候选
 
-- [ ] Separate stateless gateway, scheduler, and workers / 分离无状态网关、调度器和Worker
-- [ ] Add horizontal worker scaling / 支持Worker水平扩展
-- [ ] Add queueing, backpressure, fairness, and admission control / 增加队列、背压、公平调度和准入控制
-- [ ] Add Redis or compatible optional infrastructure / 增加Redis或兼容可选基础设施
-- [ ] Enforce bounded per-task memory and scratch storage / 强制单任务内存与临时空间上限
-- [ ] Stream large files and tool outputs / 流式处理大文件和工具输出
-- [ ] Add multi-tenant resource isolation / 增加多租户资源隔离
-- [ ] Add circuit breakers, provider failover, and checkpoint recovery / 增加熔断、供应商切换与恢复
-- [ ] Add metrics-first observability and sampled diagnostics / 增加指标优先观测与采样诊断
-- [ ] Add health checks and alerting / 增加健康检查与告警
-- [ ] Verify rolling upgrades and rollback / 验证滚动升级与回滚
-- [ ] Complete documented load tests / 完成有文档的压力测试
-- [ ] Complete fault-injection tests / 完成故障注入测试
-- [ ] Verify offline and isolated deployment / 验证离线与隔离部署
-- [ ] Pass release-candidate gates / 通过RC门禁
+- [x] Separate stateless gateway, scheduler, and workers / 分离无状态网关、调度器和Worker
+- [x] Add horizontal worker scaling / 支持Worker水平扩展
+- [x] Add queueing, backpressure, fairness, and admission control / 增加队列、背压、公平调度和准入控制
+- [x] Add Redis or compatible optional infrastructure / 增加Redis或兼容可选基础设施
+- [x] Enforce bounded per-task memory and scratch storage / 强制单任务内存与临时空间上限
+- [x] Stream large files and tool outputs / 流式处理大文件和工具输出
+- [x] Add multi-tenant resource isolation / 增加多租户资源隔离
+- [x] Add circuit breakers, provider failover, and checkpoint recovery / 增加熔断、供应商切换与恢复
+- [x] Add metrics-first observability and sampled diagnostics / 增加指标优先观测与采样诊断
+- [x] Add health checks and alerting / 增加健康检查与告警
+- [x] Verify rolling upgrades and rollback / 验证滚动升级与回滚
+- [x] Complete documented load tests / 完成有文档的压力测试
+- [x] Complete fault-injection tests / 完成故障注入测试
+- [x] Verify offline and isolated deployment / 验证离线与隔离部署
+- [x] Pass release-candidate gates / 通过RC门禁
 - [ ] Receive release confirmation / 获得发布确认
 
 ## v0.8.0-beta.1 — Open capability ecosystem / 开放能力生态预览版
@@ -264,7 +264,7 @@ Every public release must provide the applicable artifacts below.
 ## Current status / 当前状态
 
 - Planning / 规划：**complete / 已完成**
-- Active stage / 当前阶段：**Stage 6 — Engineering complete, small-team pilot and release confirmation pending / 阶段6：工程完成，等待小团队试点与发布确认**
-- Latest planned release / 最近计划版本：`v0.6.0-beta.1`
-- Latest published release / 最近已发布版本：`v0.5.0-beta.1`
+- Active stage / 当前阶段：**Stage 7 — Engineering complete, release confirmation pending / 阶段7：工程完成，等待发布确认**
+- Latest planned release / 最近计划版本：`v0.7.0-rc.1`
+- Latest published release / 最近已发布版本：`v0.6.0-beta.1`
 - Remote publishing / 远程发布：**enabled with explicit confirmation / 经明确确认后执行**

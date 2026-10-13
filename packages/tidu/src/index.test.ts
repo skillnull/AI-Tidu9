@@ -11,6 +11,7 @@ import {
   createHostAccountRegistry,
   createOpenAiModel,
   createProviderFromEnvironment,
+  createScalingControlPlane,
   createTask,
   DEFAULT_RUNTIME_HOST,
   discoverLocalClients,
@@ -27,6 +28,7 @@ test("exposes the supported public API from one package", async () => {
   assert.equal(PRODUCT.name, "九门赛博提督");
   assert.equal(typeof configureCodexClient, "function");
   assert.equal(typeof createAgentKernel, "function");
+  assert.equal(typeof createScalingControlPlane, "function");
   assert.equal(createDefaultConfiguration().schemaVersion, CONFIG_SCHEMA_VERSION);
   assert.equal(
     createAgentEvent({

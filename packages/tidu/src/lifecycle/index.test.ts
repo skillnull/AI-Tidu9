@@ -35,6 +35,26 @@ test("blocks lifecycle changes while a runtime owns the data directory", () => {
   }
 });
 
+test("recovers a stale lock after a container restarts with the same process id", () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-lifecycle-stale-lock-"));
+  const dataDirectory = join(temporaryDirectory, "AI-Tidu9");
+  const databasePath = join(dataDirectory, "tidu.db");
+  mkdirSync(dataDirectory, { recursive: true });
+  writeFileSync(
+    join(dataDirectory, ".runtime.lock"),
+    JSON.stringify({ processId: process.pid, token: "previous-container" }),
+    { mode: 0o600 },
+  );
+
+  try {
+    const lock = acquireRuntimeDataLock(databasePath);
+    assert.notEqual(lock, undefined);
+    lock?.release();
+  } finally {
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
 test("archives personal data and restores the latest snapshot without data loss", () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-lifecycle-"));
   const dataDirectory = join(temporaryDirectory, "AI-Tidu9");

@@ -1,5 +1,9 @@
 import { Pool } from "pg";
-
+import { createScalingControlPlane, type ScalingControlPlane } from "../scaling/index.js";
+import {
+  createPostgresqlScalingTaskStore,
+  initializePostgresqlScalingStorage,
+} from "../scaling/postgresql.js";
 import { createEnterpriseControlPlane, type EnterpriseControlPlane } from "./index.js";
 import {
   createPostgresqlEnterpriseStateRepository,
@@ -9,6 +13,8 @@ import {
 export interface EnterpriseRuntime {
   /** PostgreSQL-backed enterprise control plane. */
   controlPlane: EnterpriseControlPlane;
+  /** PostgreSQL-backed production scaling control plane. */
+  scalingControlPlane: ScalingControlPlane;
   /** Releases the PostgreSQL connection pool. */
   close: () => Promise<void>;
 }
@@ -28,9 +34,15 @@ export const createEnterpriseRuntimeFromEnvironment = async (
     ssl: environment.TIDU_POSTGRES_SSL === "require" ? { rejectUnauthorized: true } : undefined,
   });
   try {
-    await initializePostgresqlEnterpriseStorage(pool);
+    await Promise.all([
+      initializePostgresqlEnterpriseStorage(pool),
+      initializePostgresqlScalingStorage(pool),
+    ]);
     return {
       controlPlane: createEnterpriseControlPlane(createPostgresqlEnterpriseStateRepository(pool)),
+      scalingControlPlane: createScalingControlPlane({
+        store: createPostgresqlScalingTaskStore(pool),
+      }),
       close: async () => pool.end(),
     };
   } catch (error) {

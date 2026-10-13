@@ -1,9 +1,16 @@
 services:
   tidu:
+    image: ${TIDU_IMAGE:-ai-tidu9:local}
     build:
       context: ../..
       dockerfile: config/docker/Dockerfile
     restart: unless-stopped
+    read_only: true
+    mem_limit: ${TIDU_MEMORY_LIMIT:-768m}
+    cpus: ${TIDU_CPU_LIMIT:-2}
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
     depends_on:
       postgres:
         condition: service_healthy
@@ -14,10 +21,20 @@ services:
       - "127.0.0.1:${TIDU_PORT:-9639}:9639"
     volumes:
       - tidu-data:/var/lib/ai-tidu9
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks:
+      - edge
+      - backend
 
   postgres:
-    image: postgres:17-alpine
+    image: ${TIDU_POSTGRES_IMAGE:-postgres:17-alpine}
     restart: unless-stopped
+    mem_limit: ${TIDU_POSTGRES_MEMORY_LIMIT:-1g}
+    cpus: ${TIDU_POSTGRES_CPU_LIMIT:-2}
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
     environment:
       POSTGRES_DB: tidu
       POSTGRES_USER: tidu
@@ -29,7 +46,14 @@ services:
       retries: 12
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    networks:
+      - backend
 
 volumes:
   postgres-data:
   tidu-data:
+
+networks:
+  edge:
+  backend:
+    internal: true

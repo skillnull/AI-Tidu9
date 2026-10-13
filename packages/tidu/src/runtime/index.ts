@@ -31,6 +31,7 @@ import {
 } from "../openai/index.js";
 import { activateConfigurationSafely, previewConfigurationImpact } from "../personal/index.js";
 import { createProviderFromEnvironment, type ModelProvider } from "../providers/index.js";
+import type { ScalingControlPlane, ScalingTaskRequest } from "../scaling/index.js";
 import { createSecretGate, guardModelProvider, type SecretGate } from "../security/index.js";
 import { openNodeSqliteStorage, type StorageAdapter } from "../storage/index.js";
 
@@ -68,6 +69,8 @@ export interface LocalRuntimeOptions {
   secretGate?: SecretGate;
   /** Optional enterprise control plane for centralized policy, quota, and administration. */
   enterpriseControlPlane?: EnterpriseControlPlane;
+  /** Optional production scheduler used by the stateless gateway endpoints. */
+  scalingControlPlane?: ScalingControlPlane;
 }
 
 export interface LocalRuntime {
@@ -374,13 +377,16 @@ const handleRequest = async (
   provider: ModelProvider | undefined,
   agentKernel: AgentKernel | undefined,
   enterprise: EnterpriseControlPlane | undefined,
+  scaling: ScalingControlPlane | undefined,
 ): Promise<void> => {
   const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
 
   if (request.method === "GET" && pathname === "/health") {
-    sendJson(response, 200, {
+    const scalingHealth = await scaling?.health();
+    sendJson(response, scalingHealth?.status === "unavailable" ? 503 : 200, {
       product: PRODUCT.name,
-      status: "ok",
+      status: scalingHealth?.status === "unavailable" ? "unavailable" : "ok",
+      scaling: scalingHealth ?? { status: "disabled" },
       storage: {
         provider: storage.provider,
         schemaVersion: storage.schemaVersion,
@@ -388,6 +394,52 @@ const handleRequest = async (
       },
       version: PRODUCT.version,
     });
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/api/scaling") {
+    if (scaling === undefined) {
+      sendJson(response, 404, { error: "SCALING_CONTROL_PLANE_NOT_CONFIGURED" });
+      return;
+    }
+    const metrics = scaling.metrics();
+    sendJson(response, 200, {
+      health: await scaling.health(),
+      metrics: { counters: metrics.counters, gauges: metrics.gauges },
+    });
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/scaling/tasks") {
+    validateMutationRequest(request);
+    if (scaling === undefined) {
+      sendJson(response, 404, { error: "SCALING_CONTROL_PLANE_NOT_CONFIGURED" });
+      return;
+    }
+    try {
+      const body = await readJsonBody(request);
+      if (!isRecord(body)) {
+        throw new TiduError("CONFIGURATION_INVALID", "Scaling task must be an object.");
+      }
+      const requiredStrings = ["id", "tenantId", "resourceGroup", "payloadReference"] as const;
+      const requiredNumbers = [
+        "priority",
+        "maxAttempts",
+        "memoryBytes",
+        "scratchBytes",
+        "payloadBytes",
+      ] as const;
+      if (
+        requiredStrings.some((field) => typeof body[field] !== "string") ||
+        requiredNumbers.some((field) => typeof body[field] !== "number")
+      ) {
+        throw new TiduError("CONFIGURATION_INVALID", "Scaling task fields are invalid.");
+      }
+      const result = await scaling.submit(body as unknown as ScalingTaskRequest);
+      sendJson(response, result.accepted ? 202 : 429, result);
+    } catch (error) {
+      handleConfigurationMutationError(response, error);
+    }
     return;
   }
 
@@ -775,6 +827,8 @@ export const startLocalRuntime = async (
       : undefined;
   const enterpriseControlPlane =
     options.enterpriseControlPlane ?? environmentEnterpriseRuntime?.controlPlane;
+  const scalingControlPlane =
+    options.scalingControlPlane ?? environmentEnterpriseRuntime?.scalingControlPlane;
   const storage = await openNodeSqliteStorage({
     databasePath: options.databasePath,
   });
@@ -808,6 +862,7 @@ export const startLocalRuntime = async (
       provider,
       agentKernel,
       enterpriseControlPlane,
+      scalingControlPlane,
     ).catch(() => {
       if (!response.headersSent) {
         sendJson(response, 500, { error: "INTERNAL_ERROR" });
