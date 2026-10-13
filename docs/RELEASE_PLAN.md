@@ -220,7 +220,7 @@ Audience: owner and invited developers.
 - [x] Publish final compatibility and limitation matrix / 发布最终兼容与限制矩阵
 - [x] Freeze large features / 冻结大型新功能
 - [ ] Pass final release-candidate gates / 通过最终RC门禁
-- [ ] Receive release confirmation / 获得发布确认
+- [x] Receive release confirmation for `v0.9.0-rc.1` pre-test publication / 获得 `v0.9.0-rc.1` 测试前候选版发布确认
 
 ## v1.0.0 — Stable / 正式稳定版
 
@@ -266,5 +266,5 @@ Every public release must provide the applicable artifacts below.
 - Planning / 规划：**complete / 已完成**
 - Active stage / 当前阶段：**Stage 9 — Integrated release candidate / 阶段9：完整发布候选**
 - Latest planned release / 最近计划版本：`v0.9.0-rc.N`
-- Latest published release / 最近已发布版本：`v0.8.0-beta.1`
+- Latest published release / 最近已发布版本：`v0.9.0-rc.1`（pre-test release candidate / 测试前候选版）
 - Remote publishing / 远程发布：**enabled with explicit confirmation / 经明确确认后执行**
