@@ -74,13 +74,12 @@ export const getNextPrereleaseVersion = (version) => {
   return `${major}.${minor}.${patch}-${channel}.${Number(sequence) + 1}`;
 };
 
-export const prepareChangelog = (changelog, version, releaseDate) => {
+export const prepareChangelog = (changelog, version, releaseDate, marker = "## Unreleased") => {
   if (getChangelogVersionPattern(version).test(changelog)) {
     return changelog;
   }
-  const marker = "## Unreleased / 未发布";
   if (!changelog.includes(marker)) {
-    throw new Error(`docs/CHANGELOG.md must contain ${marker}.`);
+    throw new Error(`Changelog must contain ${marker}.`);
   }
   return changelog.replace(marker, `${marker}\n\n## ${version} - ${releaseDate}`);
 };
@@ -119,8 +118,8 @@ export const formatReleaseSummary = (
     `  ${applyTerminalColor("Package:", "blue", colorEnabled)}   ${RELEASE.packageName}`,
     `  ${applyTerminalColor("Version:", "blue", colorEnabled)}   ${currentVersion} → ${version}`,
     `  ${applyTerminalColor("npm tags:", "yellow", colorEnabled)}  ${getDistributionTags(version, publishedVersions).join(", ")}`,
-    `  ${applyTerminalColor("CHANGELOG:", "yellow", colorEnabled)} ${version} (${releaseDate})`,
-    `  ${applyTerminalColor("Files:", "magenta", colorEnabled)}     npm, Python, connector metadata, CHANGELOG`,
+    `  ${applyTerminalColor("Changelogs:", "yellow", colorEnabled)} ${version} (${releaseDate})`,
+    `  ${applyTerminalColor("Files:", "magenta", colorEnabled)}      npm, Python, connector metadata, Chinese and English changelogs`,
     `  ${applyTerminalColor("Next:", "magenta", colorEnabled)}      local commit/tag → npm publish → push`,
     "",
   ].join("\n");
@@ -154,6 +153,7 @@ export const validatePublishContext = (
   {
     branchName,
     changelog,
+    changelogEnglish,
     headCommit,
     packageName,
     packageVersion,
@@ -198,6 +198,9 @@ export const validatePublishContext = (
   }
   if (!changelogVersionHeading.test(changelog)) {
     problems.push(`docs/CHANGELOG.md must contain a heading for version ${repositoryVersion}.`);
+  }
+  if (!changelogVersionHeading.test(changelogEnglish)) {
+    problems.push(`docs/CHANGELOG.EN.md must contain a heading for version ${repositoryVersion}.`);
   }
 
   return problems;
@@ -331,6 +334,7 @@ const synchronizeDistributionTags = (repositoryRoot, version, distributionTags) 
 
 const getReleaseFiles = (repositoryRoot) => ({
   changelog: resolve(repositoryRoot, "docs/CHANGELOG.md"),
+  changelogEnglish: resolve(repositoryRoot, "docs/CHANGELOG.EN.md"),
   codexManifest: resolve(
     repositoryRoot,
     RELEASE.packagePath,
@@ -404,10 +408,23 @@ const synchronizeReleaseFiles = (releaseFiles, snapshots, version, releaseDate) 
   if (
     writeReleaseFileIfChanged(
       releaseFiles.changelog,
-      prepareChangelog(snapshots.get(releaseFiles.changelog), version, releaseDate),
+      prepareChangelog(snapshots.get(releaseFiles.changelog), version, releaseDate, "## 未发布"),
     )
   ) {
     changedFiles.push(releaseFiles.changelog);
+  }
+  if (
+    writeReleaseFileIfChanged(
+      releaseFiles.changelogEnglish,
+      prepareChangelog(
+        snapshots.get(releaseFiles.changelogEnglish),
+        version,
+        releaseDate,
+        "## Unreleased",
+      ),
+    )
+  ) {
+    changedFiles.push(releaseFiles.changelogEnglish);
   }
   return changedFiles;
 };
@@ -420,6 +437,7 @@ const readPublishContext = (repositoryRoot) => {
       cwd: repositoryRoot,
     }),
     changelog: readFileSync(resolve(repositoryRoot, "docs/CHANGELOG.md"), "utf8"),
+    changelogEnglish: readFileSync(resolve(repositoryRoot, "docs/CHANGELOG.EN.md"), "utf8"),
     headCommit: readCommand("git", ["rev-parse", "HEAD"], {
       cwd: repositoryRoot,
     }),
@@ -496,11 +514,12 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
     ["rev-parse", `origin/${initialContext.branchName}`],
     { cwd: repositoryRoot },
   );
-  const currentChangelogPrepared = getChangelogVersionPattern(
-    initialContext.repositoryVersion,
-  ).test(initialContext.changelog);
+  const currentChangelogPrepared = getChangelogVersionPattern(initialContext.repositoryVersion);
+  const currentChangelogsPrepared =
+    currentChangelogPrepared.test(initialContext.changelog) &&
+    currentChangelogPrepared.test(initialContext.changelogEnglish);
   const localReleasePrepared =
-    currentChangelogPrepared && initialContext.tagCommit === initialContext.headCommit;
+    currentChangelogsPrepared && initialContext.tagCommit === initialContext.headCommit;
   const localReleaseAhead =
     remoteBranchCommit !== initialContext.headCommit &&
     isCommitAncestor(repositoryRoot, remoteBranchCommit, initialContext.headCommit);
@@ -521,7 +540,7 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
     initialContext.repositoryVersion,
     repositoryRoot,
   );
-  const changelogAlreadyPrepared = currentChangelogPrepared;
+  const changelogAlreadyPrepared = currentChangelogsPrepared;
   const remoteSyncPending =
     versionAlreadyPublished &&
     localReleasePrepared &&
@@ -568,12 +587,12 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
           colorEnabled,
         ),
       );
+      const candidateHeading = getChangelogVersionPattern(candidateVersion);
       if (
-        !getChangelogVersionPattern(candidateVersion).test(
-          readFileSync(releaseFiles.changelog, "utf8"),
-        )
+        !candidateHeading.test(readFileSync(releaseFiles.changelog, "utf8")) ||
+        !candidateHeading.test(readFileSync(releaseFiles.changelogEnglish, "utf8"))
       ) {
-        throw new Error(`CHANGELOG must contain a heading for ${candidateVersion}.`);
+        throw new Error(`Both changelog files must contain a heading for ${candidateVersion}.`);
       }
       ensureReleaseFilesAreIsolated(repositoryRoot, releaseFiles);
       const synchronizingPublishedVersion =
@@ -592,7 +611,7 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
       const response = (
         await prompt.question(
           applyTerminalColor(
-            `\nType "${candidateVersion}" to publish, "edit" to modify CHANGELOG, "version" to change the version, or "cancel": `,
+            `\nType "${candidateVersion}" to publish, "edit" to modify the changelogs, "version" to change the version, or "cancel": `,
             "yellow",
             colorEnabled,
           ),
@@ -604,7 +623,7 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
       if (response === "edit") {
         await prompt.question(
           applyTerminalColor(
-            `Edit ${releaseFiles.changelog} in your editor, then press Enter to review again.`,
+            `Edit ${releaseFiles.changelog} and ${releaseFiles.changelogEnglish}, then press Enter to review again.`,
             "cyan",
             colorEnabled,
           ),

@@ -1,7 +1,34 @@
-# Trademark policy / 商标政策
+# 商标与署名政策
 
-AI-Tidu9 and 九门赛博提督 identify this open-source project and its original distribution.
+[README](../README.md) · [贡献指南](./CONTRIBUTING.md) · [English](./TRADEMARKS.EN.md)
 
-You may make truthful references to compatibility, origin, and unmodified distributions. Modified distributions must not imply endorsement or official status. If a product is renamed for internal or commercial use, its administration or about view must retain a reasonable `Powered by AI-Tidu9` attribution without injecting branding into every generated response.
+`AI-Tidu9` 与“九门赛博提督”用于识别本开源项目及其原始发行版本。本政策的目标很简单：**允许真实、清晰地使用项目，同时避免让用户误认为修改版获得了官方背书。**
 
-AI-Tidu9 与九门赛博提督用于识别本开源项目及其原始发行版本。可以如实说明兼容关系、来源和未修改发行版。修改后的发行版不得暗示获得官方背书。内部或商业部署可以修改虚拟模型显示名称，但应在管理界面或关于信息中保留合理的 `Powered by AI-Tidu9` 署名，无需污染每一条模型输出。
+## ✅ 允许的使用方式
+
+| 场景 | 合理表达 |
+| --- | --- |
+| 兼容性说明 | “兼容 AI-Tidu9 Capability Provider Protocol” |
+| 来源说明 | “基于 AI-Tidu9 构建” |
+| 未修改发行版 | 使用原项目名称，并准确标注版本与来源 |
+| 内部或商业部署 | 修改虚拟模型显示名称，同时在管理界面或关于页面保留署名 |
+
+## ⛔ 禁止的使用方式
+
+- 暗示修改版、分叉版、托管服务或商业产品获得官方认证、合作或背书；
+- 使用容易与官方发行版混淆的名称、图形或发布页面；
+- 删除许可证、版权、NOTICE 或本政策要求保留的来源信息；
+- 把 `Powered by AI-Tidu9` 强行注入每一条模型回答，干扰用户内容或泄露部署结构。
+
+## 🏷️ 改名、白标与强制署名
+
+你可以为内部或商业部署修改入口名称、虚拟模型名称和界面品牌。管理界面、关于页面或其他合理可发现位置应保留：
+
+```text
+Powered by AI-Tidu9
+```
+
+署名用于说明技术来源，不代表官方认可该部署。它不需要出现在每条生成内容、每次工具调用或最终业务结果中。
+
+> [!NOTE]
+> 开源许可证规范代码使用和分发；商标政策规范名称与来源表达。二者承担不同责任。

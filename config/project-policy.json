@@ -20,8 +20,5 @@
     "branchPrefix": "support",
     "maxActiveLines": 2,
     "allowedChangeTypes": ["fix", "security", "docs", "test", "build", "ci", "chore"]
-  },
-  "releaseCandidate": {
-    "featureFreeze": true
   }
 }

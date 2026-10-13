@@ -723,6 +723,286 @@ const EnterprisePilotPanel = ({
   );
 };
 
+interface QuickStartWizardProps {
+  /** Current language. */
+  locale: "en-US" | "zh-CN";
+  /** Whether enterprise services are attached. */
+  enterpriseEnabled: boolean;
+  /** Whether a real model provider is ready. */
+  providerConfigured: boolean;
+  /** Sanitized active provider name. */
+  providerType: string | null;
+  /** Currently selected isolated draft. */
+  selectedMode: ConfigurationMode;
+  /** Editable entry identity. */
+  form: ConfigurationForm;
+  /** Whether the form differs from the saved draft. */
+  isDirty: boolean;
+  /** Whether an operation is running. */
+  isPending: boolean;
+  /** Whether the impact preview passed. */
+  impactValid: boolean;
+  /** Whether this form is the active runtime configuration. */
+  isActive: boolean;
+  /** Select an isolated draft. */
+  onSelectMode: (mode: ConfigurationMode) => void;
+  /** Update the entry identity form. */
+  onFormChange: (form: ConfigurationForm) => void;
+  /** Save the current draft. */
+  onSave: () => Promise<void>;
+  /** Simulate activation impact. */
+  onSimulate: () => Promise<void>;
+  /** Activate the verified draft. */
+  onActivate: () => Promise<void>;
+  /** Open client connection guidance. */
+  onOpenClients: () => void;
+}
+
+const QuickStartWizard = ({
+  locale,
+  enterpriseEnabled,
+  providerConfigured,
+  providerType,
+  selectedMode,
+  form,
+  isDirty,
+  isPending,
+  impactValid,
+  isActive,
+  onSelectMode,
+  onFormChange,
+  onSave,
+  onSimulate,
+  onActivate,
+  onOpenClients,
+}: QuickStartWizardProps) => {
+  const english = locale === "en-US";
+  const [step, setStep] = useState(0);
+  const [providerChoice, setProviderChoice] = useState<"compatible" | "ollama">("ollama");
+  const stepLabels = english
+    ? ["Deployment", "Entry", "Model", "Activate", "Clients"]
+    : ["部署", "入口", "模型", "启用", "客户端"];
+
+  return (
+    <section className="onboarding-panel">
+      <div className="configuration-heading">
+        <div>
+          <p className="card-label">GUIDED SETUP</p>
+          <h2>{english ? "Finish setup step by step" : "按步骤完成首次配置"}</h2>
+          <p>
+            {english
+              ? "Each step reuses the same drafts, safety preview, and activation flow as Expert mode."
+              : "向导复用正式草稿、影响模拟和启用流程，不创建第二套配置。"}
+          </p>
+        </div>
+        <span className="onboarding-counter">
+          {step + 1} / {stepLabels.length}
+        </span>
+      </div>
+
+      <nav className="onboarding-steps" aria-label={english ? "Setup progress" : "配置进度"}>
+        {stepLabels.map((label, stepIndex) => (
+          <button
+            className={
+              stepIndex === step ? "onboarding-step onboarding-step-active" : "onboarding-step"
+            }
+            type="button"
+            onClick={() => setStep(stepIndex)}
+            key={label}
+          >
+            <span>{String(stepIndex + 1).padStart(2, "0")}</span>
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      <div className="onboarding-content">
+        {step === 0 ? (
+          <>
+            <p className="onboarding-kicker">
+              {english ? "Detected deployment" : "已识别部署方式"}
+            </p>
+            <h3>
+              {enterpriseEnabled
+                ? english
+                  ? "Enterprise attached"
+                  : "已接入企业控制平面"
+                : english
+                  ? "Personal local"
+                  : "个人本地版"}
+            </h3>
+            <p>
+              {enterpriseEnabled
+                ? english
+                  ? "Organization policy and quota are active. This wizard edits your permitted entry profile."
+                  : "组织策略与额度已经生效；向导只编辑你被允许配置的入口。"
+                : english
+                  ? "SQLite and the local control center are ready. No external database is required."
+                  : "SQLite与本地配置中心已就绪，不需要外部数据库。"}
+            </p>
+          </>
+        ) : step === 1 ? (
+          <>
+            <div className="onboarding-choice-row">
+              {(["managed", "expert"] as const).map((mode) => (
+                <button
+                  className={
+                    selectedMode === mode ? "mode-button mode-button-active" : "mode-button"
+                  }
+                  type="button"
+                  onClick={() => onSelectMode(mode)}
+                  disabled={isPending}
+                  key={mode}
+                >
+                  {modeLabel(mode, locale)}
+                </button>
+              ))}
+            </div>
+            <div className="configuration-form onboarding-form">
+              <label>
+                {english ? "Profile ID" : "配置标识"}
+                <input
+                  value={form.activeProfileId}
+                  onChange={(event) =>
+                    onFormChange({ ...form, activeProfileId: event.target.value })
+                  }
+                  maxLength={64}
+                  disabled={isPending}
+                />
+              </label>
+              <label>
+                {english ? "Virtual model name" : "虚拟模型名称"}
+                <input
+                  value={form.virtualModelName}
+                  onChange={(event) =>
+                    onFormChange({ ...form, virtualModelName: event.target.value })
+                  }
+                  maxLength={64}
+                  disabled={isPending}
+                />
+              </label>
+            </div>
+          </>
+        ) : step === 2 ? (
+          <>
+            <p className="onboarding-kicker">
+              {providerConfigured
+                ? english
+                  ? "Provider ready"
+                  : "模型供应商已就绪"
+                : english
+                  ? "Choose a provider path"
+                  : "选择模型接入方式"}
+            </p>
+            {providerConfigured ? (
+              <h3>{providerType}</h3>
+            ) : (
+              <>
+                <div className="onboarding-choice-row">
+                  <button
+                    className={
+                      providerChoice === "ollama" ? "mode-button mode-button-active" : "mode-button"
+                    }
+                    type="button"
+                    onClick={() => setProviderChoice("ollama")}
+                  >
+                    Ollama
+                  </button>
+                  <button
+                    className={
+                      providerChoice === "compatible"
+                        ? "mode-button mode-button-active"
+                        : "mode-button"
+                    }
+                    type="button"
+                    onClick={() => setProviderChoice("compatible")}
+                  >
+                    OpenAI compatible
+                  </button>
+                </div>
+                <code className="onboarding-command">
+                  {providerChoice === "ollama"
+                    ? "TIDU_PROVIDER=ollama TIDU_PROVIDER_MODEL=<model> tidu start"
+                    : "TIDU_PROVIDER=openai-compatible TIDU_PROVIDER_MODEL=<model> TIDU_PROVIDER_API_KEY=<runtime-key> tidu start"}
+                </code>
+                <p>
+                  {english
+                    ? "Restart with these process variables. Secrets are never saved by this page."
+                    : "使用上述进程变量重启；本页面不会保存密钥。"}
+                </p>
+              </>
+            )}
+          </>
+        ) : step === 3 ? (
+          <>
+            <p className="onboarding-kicker">{english ? "Safe activation" : "安全启用"}</p>
+            <h3>{english ? "Save → preview → activate" : "保存 → 模拟 → 启用"}</h3>
+            <div className="onboarding-choice-row">
+              <button type="button" onClick={() => void onSave()} disabled={!isDirty || isPending}>
+                {english ? "1. Save" : "1. 保存草稿"}
+              </button>
+              <button
+                type="button"
+                onClick={() => void onSimulate()}
+                disabled={isDirty || isPending}
+              >
+                {english ? "2. Preview" : "2. 模拟影响"}
+              </button>
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => void onActivate()}
+                disabled={isDirty || isPending || !impactValid}
+              >
+                {english ? "3. Activate" : "3. 启用配置"}
+              </button>
+            </div>
+            <p>
+              {isActive
+                ? english
+                  ? "This entry is active."
+                  : "当前入口已经生效。"
+                : english
+                  ? "Activation remains blocked until the preview passes."
+                  : "影响模拟通过前不会允许启用。"}
+            </p>
+          </>
+        ) : (
+          <>
+            <p className="onboarding-kicker">{english ? "Connect your tools" : "连接日常工具"}</p>
+            <h3>{english ? "One core, every supported surface" : "一个核心，接入所有支持入口"}</h3>
+            <p>
+              {english
+                ? "Review detected Codex, Cursor, CLI, and generic-client entries, then install only AI-Tidu9-owned connectors."
+                : "检查已发现的Codex、Cursor、CLI与通用客户端，再安装九门自有连接器。"}
+            </p>
+            <button className="primary-button" type="button" onClick={onOpenClients}>
+              {english ? "Open client setup" : "进入客户端接入"}
+            </button>
+          </>
+        )}
+      </div>
+
+      <div className="onboarding-navigation">
+        <button
+          type="button"
+          onClick={() => setStep((current) => Math.max(0, current - 1))}
+          disabled={step === 0}
+        >
+          {english ? "Back" : "上一步"}
+        </button>
+        <button
+          type="button"
+          onClick={() => setStep((current) => Math.min(stepLabels.length - 1, current + 1))}
+          disabled={step === stepLabels.length - 1}
+        >
+          {english ? "Next" : "下一步"}
+        </button>
+      </div>
+    </section>
+  );
+};
+
 const App = () => {
   const [loadingState, setLoadingState] = useState<LoadingState>({
     status: "loading",
@@ -799,6 +1079,10 @@ const App = () => {
     form.activeProfileId !== savedForm.activeProfileId ||
     form.virtualModelName !== savedForm.virtualModelName;
   const isPending = operation.status === "pending";
+  const isSelectedDraftActive =
+    workspace.active.configuration.activeMode === selectedMode &&
+    workspace.active.configuration.activeProfileId === form.activeProfileId &&
+    workspace.active.configuration.virtualModelName === form.virtualModelName;
 
   const selectMode = (mode: ConfigurationMode): void => {
     setSelectedMode(mode);
@@ -1023,6 +1307,24 @@ const App = () => {
 
       {activeSection === "configuration" ? (
         <>
+          <QuickStartWizard
+            locale={locale}
+            enterpriseEnabled={bootstrap.enterprise.enabled}
+            providerConfigured={bootstrap.runtime.provider.configured}
+            providerType={bootstrap.runtime.provider.type}
+            selectedMode={selectedMode}
+            form={form}
+            isDirty={isDirty}
+            isPending={isPending}
+            impactValid={impactPreview?.valid === true}
+            isActive={isSelectedDraftActive}
+            onSelectMode={selectMode}
+            onFormChange={setForm}
+            onSave={saveDraft}
+            onSimulate={simulateDraft}
+            onActivate={activateDraft}
+            onOpenClients={() => setActiveSection("clients")}
+          />
           <section
             className="cards"
             aria-label={locale === "zh-CN" ? "运行状态" : "Runtime status"}

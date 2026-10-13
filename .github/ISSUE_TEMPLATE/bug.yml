@@ -1,0 +1,52 @@
+name: Bug report / 缺陷反馈
+description: Report a reproducible problem without secrets or private data / 反馈可复现问题，请勿包含秘密或隐私数据
+title: "fix: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Run `tidu doctor --json` and review the output before attaching it. Never include tokens, passwords, prompts, conversations, personal paths, internal domains, or company-confidential data.
+
+        请先运行 `tidu doctor --json` 并审查输出。禁止提交Token、密码、Prompt、会话、私人路径、内部域名或公司机密。
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / 问题
+      description: What happened, and what did you expect? / 实际发生了什么，预期是什么？
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction / 最小复现步骤
+      description: Use placeholders for all sensitive values. / 所有敏感值必须使用占位符。
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostic
+    attributes:
+      label: Safe diagnostic report / 隐私安全诊断报告
+      description: Paste the reviewed output of `tidu doctor --json`. / 粘贴已审查的 `tidu doctor --json` 输出。
+      render: json
+    validations:
+      required: true
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact / 影响
+      options:
+        - Blocks all use / 完全无法使用
+        - Blocks one workflow / 某个流程无法使用
+        - Degraded but usable / 可使用但有明显影响
+        - Cosmetic or documentation / 界面或文档问题
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check / 安全确认
+      options:
+        - label: I removed secrets, personal data, private paths, prompts, and conversation content. / 我已删除秘密、个人数据、私人路径、Prompt和会话内容。
+          required: true

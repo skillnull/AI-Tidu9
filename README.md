@@ -1,80 +1,128 @@
-# 九门赛博提督
+<div align="center">
+  <h1>九门赛博提督</h1>
+  <p><strong>面向全领域场景的智能协作中枢</strong></p>
+  <p>用一个目标，调度模型、Agent、Skill、MCP、工具、知识与专家，交付可验证结果。</p>
+  <p>
+    <a href="https://www.npmjs.com/package/@skillnull/tidu"><img alt="npm version" src="https://img.shields.io/npm/v/%40skillnull%2Ftidu?label=npm&color=0f766e"></a>
+    <a href="https://github.com/skillnull/AI-Tidu9/actions/workflows/quality.yml"><img alt="quality" src="https://github.com/skillnull/AI-Tidu9/actions/workflows/quality.yml/badge.svg"></a>
+    <img alt="Node.js" src="https://img.shields.io/badge/Node.js-%E2%89%A522.14-3c873a">
+    <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-AGPL--3.0--only-2563eb"></a>
+  </p>
+  <p>
+    <a href="#getting-started">安装与启动</a> ·
+    <a href="./docs/EXAMPLES.md">使用实例</a> ·
+    <a href="./docs/ARCHITECTURE.md">系统架构</a> ·
+    <a href="./docs/CORE-DIFFERENTIATORS.md">核心机制</a> ·
+    <a href="./docs/CLI-REFERENCE.md">CLI 参考</a> ·
+    <a href="./docs/README.EN.md">English</a>
+  </p>
+</div>
 
-**九门赛博提督·智能协作中枢**
+---
 
-九门赛博提督，是面向全领域场景的智能协作中枢，以目标驱动内外部 Agent、模型、工具、知识与专家协同执行，交付可验证的业务结果。
+## 🎯 产品定位
 
-[English](./docs/README.en.md)
+九门赛博提督是面向全领域场景的智能协作中枢，以目标驱动内外部 Agent、模型、工具、知识与专家协同执行，交付可验证的业务结果。平台位于用户目标与 AI 能力之间，负责能力组织、执行约束、故障恢复与结果验证。
 
-## 当前状态
+| 业务问题 | 平台能力 |
+| --- | --- |
+| 模型额度耗尽，换模型却丢失能力 | 动态回退，必要时仅调用专家模型补齐缺口 |
+| Agent、Skill、MCP 和知识分散在不同宿主 | 一个核心、多个入口，按目标装配最小能力集 |
+| 自动执行快，但费用、风险和结果不可控 | 预算、审批、策略、检查点和验收条件共同限制执行 |
+| 企业想统一治理，个人又需要自主选择 | 强制策略与辅助策略分层，企业和个人资源可并存 |
+| 完整会话和工具输出导致存储失控 | 完整历史留在宿主，核心只保留最大 256 KB 的恢复胶囊 |
 
-当前版本处于集成发布候选阶段，已具备个人入口、独立Agent内核、动态模型调度、企业治理和开放能力生态。Scheduler高可用、目标环境压测、长期本机试用和真实团队验收尚未完成，因此暂不建议用于生产关键任务。
+<a id="getting-started"></a>
+## 🚀 安装与首次启动
 
-## 核心方向
-
-- 作为虚拟模型接入Codex、Cursor、CLI及其他客户端。
-- 独立运行Agent任务，不受宿主呈现能力限制。
-- 在质量、成本、隐私、额度和可用性之间动态调度模型。
-- 通过能力补全组合低成本模型与专家模型。
-- 在运行时保护密钥和敏感内容。
-- 同时服务个人、团队和企业，不限制使用者继续探索AI能力。
-
-## 安装与使用
-
-需要 Node.js 22.14 或更高版本。正式npm包名为 `@skillnull/tidu`，安装后的命令保持为 `tidu`：
+**需要 Node.js 22.14 或更高版本。** 无需全局安装：
 
 ```bash
 npx @skillnull/tidu start
 ```
 
-启动后打开终端输出的本地地址，即可编辑普通或专家配置草稿。两个模式独立保存，只有点击“启用此配置”才会改变运行配置，错误或未保存的专家输入不会影响普通模式。
+打开终端输出的配置中心。页面会引导完成部署识别、入口命名、模型接入、影响模拟、启用和客户端接入。
 
-配置中心支持中英文一键切换。配置启用前必须先进行影响模拟；启用会保留上一健康版本，健康检查失败时自动回滚，也可手动恢复。个人历史支持宿主、可移植和无痕三种策略：宿主模式由当前客户端保留完整会话；可移植模式采用容量与时间双上限清理；无痕模式不保留会话。账号用量按任务开始时的不可变账号快照归属，切换账号不会让运行中任务串账。
-
-公开SDK同时提供个人预算聚合、本地Ollama或回环兼容模型诊断、Agent/Skill/MCP/工具扩展安装前检查，以及AES-256-GCM认证加密的配置导入导出。导出只包含非敏感配置、历史策略和扩展元数据，不包含凭据与会话正文。
-
-企业试点提供PostgreSQL状态持久化、多层组织作用域、强制/辅助策略、身份角色、内部能力目录、企业采购与个人资源并存、分级额度池、周期末共享、原子预占结算、私有产物适配器及动态管理员/员工指南。单机Docker入口位于 `config/docker/compose.yml`：
+服务器无法打开页面时，使用同一套终端向导：
 
 ```bash
-TIDU_POSTGRES_PASSWORD='your-private-password' docker compose -f config/docker/compose.yml up --build
+npx @skillnull/tidu start --cli
 ```
 
-容器端口默认只映射到服务器回环地址。跨设备使用时必须在前方配置HTTPS反向代理和企业身份认证，不能直接暴露管理端口。
-
-页面不可用时使用等价CLI诊断和配置：
+已启动后，用两个命令确认状态：
 
 ```bash
-npx @skillnull/tidu doctor
-npx @skillnull/tidu clients
-npx @skillnull/tidu config
-npx @skillnull/tidu config show
+tidu doctor             # 检查运行时、配置 API 和页面
+tidu setup verify       # 验证连接器，不修改配置
 ```
 
-远程管理可增加 `--endpoint https://tidu.example.com`，或设置 `TIDU_ENDPOINT`。CLI通过同一管理API操作，不直接写SQLite。
+> [!TIP]
+> 所有高级命令都支持 `--help`。完整参数见 [CLI 命令参考](./docs/CLI-REFERENCE.md)。
 
-当前运行时已提供OpenAI兼容的虚拟模型发现与请求入口：
+## 🔄 从目标到可验证结果
 
-```text
-GET  /v1/models
-GET  /v1/models/{model}
-POST /v1/chat/completions
-POST /v1/responses
+```mermaid
+flowchart LR
+  Goal["🎯 用户目标"] --> Entry["Codex · Cursor · CLI · 浏览器"]
+  Entry --> Gate["🛡️ 策略 · 额度 · 审批 · Secret Gate"]
+  Gate --> Kernel["AI-Tidu9 Agent 内核"]
+  Kernel --> Pool["模型 · Agent · Skill · MCP · 工具 · 知识"]
+  Pool --> Verify["✅ 独立验证"]
+  Verify --> Result["📦 可验证结果"]
+  Verify -. 未通过 .-> Kernel
 ```
 
-模型标识使用当前生效配置的Profile ID，并通过 `owned_by: AI-Tidu9` 保留项目署名。当前支持两类真实执行端：OpenAI兼容API和本地Ollama。未配置供应商时会返回标准 `model_provider_not_configured` 错误，不会生成模拟回答。
+这条链路有三个不可替换的责任：
 
-连接OpenAI或兼容中转服务（外部地址必须使用HTTPS）：
+- **模型做推理**：理解目标、生成计划、评估结果。
+- **内核管边界**：执行预算、风险审批、状态转移、失败恢复。
+- **证据决定是否完成**：测试通过不代表业务目标已达成，验收条件必须独立判定。
+
+## 🧩 五个核心机制
+
+| 机制 | 作用 | 最重要的边界 |
+| --- | --- | --- |
+| **多入口、单核心** | Codex、Cursor、CLI 和 OpenAI 兼容客户端共享策略与能力池 | 不读取或复制宿主私有 Token |
+| **动态路由** | 按能力、成本、隐私、延迟、可用性和额度选择模型 | 估算成本不冒充供应商账单 |
+| **能力补全** | 低成本主模型仅在缺失能力时调用专家模型 | 专家池、次数、费用和隐私边界均必须显式配置 |
+| **Runtime Secret Gate** | 出站前识别、阻断或替换敏感信息 | 真实值只在当前任务的私有内存作用域恢复 |
+| **可恢复执行** | 任务胶囊、检查点和已验证配置支持恢复与回滚 | 结果不确定时，非幂等操作不自动重放 |
+
+实现细节与可复现案例见 [核心调度与门禁](./docs/CORE-DIFFERENTIATORS.md)。
+
+## 🧭 选择适合你的使用路径
+
+| 我想要…… | 从这里开始 | 数据层 |
+| --- | --- | --- |
+| 在本机统一个人模型、Skill 和 MCP | `npx @skillnull/tidu start` | SQLite，默认只监听回环地址 |
+| 在服务器集中管理策略、额度和能力 | Docker 部署 + PostgreSQL | 企业控制平面 |
+| 保留 IDE 本地能力，同时经过企业出口 | 企业网关 + 员工设备连接器 | 服务端状态 + 本地私有边界 |
+| 开发模型、Agent、存储或历史 Provider | `@skillnull/tidu/ecosystem` 或 Python SDK | 通过平台 API 访问，不复制控制平面 |
+
+<details>
+<summary><strong>企业单机试点：最小 Docker 启动命令</strong></summary>
+
+```bash
+TIDU_POSTGRES_PASSWORD='<private-password>' \
+docker compose -f config/docker/compose.yml up --build
+```
+
+容器默认只映射到服务器回环地址。跨设备访问必须在前方配置 HTTPS 反向代理与企业身份认证，不得直接暴露管理端口。
+
+</details>
+
+### 配置模型来源
+
+OpenAI 兼容服务：
 
 ```bash
 TIDU_PROVIDER=openai-compatible \
 TIDU_PROVIDER_MODEL=gpt-4.1-mini \
-TIDU_PROVIDER_API_KEY=your-runtime-key \
+TIDU_PROVIDER_API_KEY='<runtime-key>' \
 npx @skillnull/tidu start
 ```
 
-官方OpenAI地址默认为 `https://api.openai.com/v1`。兼容服务可增加 `TIDU_PROVIDER_BASE_URL=https://provider.example.com/v1`。密钥仅从当前进程环境读取，不写入SQLite、不通过配置中心返回，也不记录到日志。
-
-连接本机Ollama（默认地址 `http://127.0.0.1:11434`）：
+本机 Ollama：
 
 ```bash
 TIDU_PROVIDER=ollama \
@@ -82,93 +130,58 @@ TIDU_PROVIDER_MODEL=qwen3:8b \
 npx @skillnull/tidu start
 ```
 
-当前适配器支持非流式JSON与流式SSE，并支持基础函数工具定义、工具选择、模型返回工具调用以及客户端回传工具结果。OpenAI兼容服务直接保持协议；Ollama会在NDJSON与Chat Completions/Responses之间转换。宿主客户端仍可自行执行宿主工具；独立Agent任务则由九门内核在自己的预算、审批和恢复边界内执行。
+> [!IMPORTANT]
+> 密钥只从当前进程环境读取，不进入 SQLite、页面返回或日志。未配置供应商时，配置功能仍可使用，推理会明确返回 `model_provider_not_configured`。
 
-## 独立 Agent 内核
-
-配置真实模型供应商后，运行时会自动接入目标理解、动态规划、重规划、非工具步骤执行和独立结果验收。工具通过公开SDK显式注册；写入与外部工具默认要求人工确认，非幂等工具在中断后不会自动重放。配置中心“任务”页以及 `/api/tasks` 管理API可查看进度、预算、可信等级，并执行暂停、恢复、取消和审批。
-
-任务状态只保存为最大256 KB的轻量胶囊，包含检查点、有界摘要、最小证据和预算，不保存完整对话、原始模型响应或大块工具输出。没有配置真实供应商时，任务页保持只读且创建接口返回明确的 `AGENT_KERNEL_NOT_CONFIGURED`，不会伪造自治结果。公开SDK可注入自定义规划器、Worker、验证器和工具，具体边界见[架构基线](./docs/architecture.md)。
-
-`tidu clients` 与配置中心“客户端”页会自动发现本机Codex、Cursor和OpenAI CLI。发现过程只检查命令、应用与配置文件是否存在，不读取配置正文、账号、密钥或历史。接入分为两级：Codex app-server、Cursor ACP等官方原生Agent协议用于保留宿主的模式、工具、权限、会话与MCP能力；OpenAI兼容虚拟模型用于没有原生Agent协议的通用客户端。后者只是兼容入口，不能宣称具备宿主全部能力。Ollama属于可调度的上游模型供应商，不是宿主客户端。
-
-一条 `tidu setup` 会安装一个九门核心并配置已发现的官方入口。Codex应用、CLI与IDE共享同一个MCP注册；Cursor桌面端与CLI共享同一个用户级MCP注册；浏览器使用配置中心；其他客户端使用OpenAI兼容地址或包内的Agent Plugin/MCP清单。所有入口指向同一运行时、配置、策略和模型池，不重复运行Agent核心。
+## 🛠️ 运行、诊断与彻底移除
 
 ```bash
-tidu setup             # 安装已发现的连接器
-tidu setup verify      # 只验证，不修改
-tidu setup repair      # 重建九门自有连接器
-tidu setup update      # 更新连接器启动信息
-tidu setup uninstall   # 仅移除连接器，保留九门数据
+tidu setup                 # 安装已发现的宿主连接器
+tidu clients               # 查看本机客户端兼容情况
+tidu account               # 查看可复用的宿主登录状态
+tidu doctor --json         # 生成不含私密数据的诊断摘要
+tidu uninstall             # 可恢复归档
+tidu uninstall --complete  # 清理全部 AI-Tidu9 自有内容
 ```
 
-配置结果会明确显示每个入口是原生Agent桥、MCP工具入口、浏览器管理入口还是OpenAI兼容入口；缺少宿主能力时不会静默伪装成全能力。连接器使用当前Node与已安装CLI的绝对路径，避免Shell、IDE和桌面应用之间PATH不一致。
+完整卸载会保留宿主账号、会话、无关插件、无关配置和自定义数据库路径。
 
-Codex可通过确认式命令创建九门专属Profile：
+通用客户端通过同一基址使用 `/v1/models`、`/v1/chat/completions` 和 `/v1/responses`；Codex 与 Cursor 等宿主优先使用各自的原生 Agent 或 MCP 连接器，以保留宿主能力边界。
 
-```bash
-tidu clients connect codex
-codex --profile ai-tidu9
-tidu clients rollback codex
-```
+## 🛡️ 信任边界与安全承诺
 
-该兼容流程不修改Codex默认 `config.toml`，只管理独立的 `ai-tidu9.config.toml`。写入前创建私有快照，写入后重新验证运行时与虚拟模型；验证失败立即自动回滚。日常安装优先使用 `tidu setup` 注册共享MCP。Cursor配置只增删九门拥有的 `ai-tidu9` 项，保留其他MCP；OpenAI CLI可使用其官方 `OPENAI_BASE_URL` 或 `--base-url` 连接。
+- 普通草稿、专家草稿和生效快照相互隔离；保存不会自动启用。
+- 写入和外部工具默认需要确认；必须策略不能被插件或专家模式绕过。
+- 不可信扩展没有外部隔离执行器时默认拒绝；Node `vm` 和普通 Worker 不属于安全沙箱。
+- 企业跨设备访问必须使用 HTTPS 反向代理和身份控制，不得直接暴露管理端口。
 
-安装后可直接检查Codex与Cursor宿主登录状态；存在可复用的官方会话时无需重复授权：
+> [!WARNING]
+> 项目已进入实际使用与持续维护。生产关键任务仍应先在目标环境完成容量、权限、安全、升级和回滚验证。
 
-```bash
-tidu account
-tidu account relogin codex
-tidu account switch codex
-tidu account relogin cursor
-tidu account switch cursor
-```
+## 📚 文档与学习路径
 
-Codex通过官方 `codex login status` 与 `codex app-server` 委托当前账户；Cursor在Agent CLI已授权时通过官方状态命令与 `agent acp` 委托该CLI账户。两套适配器已覆盖协议协商、会话、流式消息、取消和默认拒绝权限；未知交互必须由调用方显式处理。九门会移除可能覆盖宿主登录的进程级API Key环境变量，但不读取认证文件正文，不复制、落库或输出Token。`relogin` 只在用户主动执行时调用官方登录流程；`switch` 会先明确确认，再调用官方退出与登录命令。Cursor桌面端与Agent CLI的授权边界由Cursor管理，九门不会读取桌面私有凭据来伪造免登录。
+| 文档 | 回答的问题 |
+| --- | --- |
+| [系统架构](./docs/ARCHITECTURE.md) | 一次任务如何流动，模块、数据和部署边界在哪里？ |
+| [核心调度与门禁](./docs/CORE-DIFFERENTIATORS.md) | 动态路由、能力补全和 Secret Gate 如何工作？ |
+| [CLI 命令参考](./docs/CLI-REFERENCE.md) | 如何安装、配置、诊断、恢复和卸载？ |
+| [使用实例](./docs/EXAMPLES.md) | 如何完成本地模型、客户端、企业部署和 Provider 接入？ |
+| [开放能力生态](./docs/ECOSYSTEM-SDK.md) | 如何安全地接入 Provider 和第三方 Agent？ |
+| [Python SDK](./sdk/python/README.md) | 如何从 Python 调用 AI-Tidu9 Provider API？ |
+| [贡献指南](./docs/CONTRIBUTING.md) | 分支、提交、版本、维护线和发布规则是什么？ |
+| [商标与署名](./docs/TRADEMARKS.md) | 修改名称或商业部署时，如何正确说明来源？ |
+| [变更记录](./docs/CHANGELOG.md) | 每个已发布版本实际改变了什么？ |
 
-## 卸载与恢复
-
-停止正在运行的个人版后执行：
-
-```bash
-tidu uninstall
-```
-
-默认操作会把九门自有数据目录原子移动为本地快照，不会删除个人配置。重新安装后可一条命令恢复最近快照：
-
-```bash
-tidu restore
-```
-
-只需要彻底删除当前数据和全部九门卸载快照时，执行 `tidu uninstall --purge`。需要完全清理九门时，执行：
-
-```bash
-tidu uninstall --complete
-```
-
-完整卸载会在一次确认后移除九门自有的Codex、Cursor连接器，九门专属Codex Profile及备份，本地数据和全部卸载快照。全局npm安装会自动移除；`npx` 临时运行没有固定包体；项目依赖仍由项目原有包管理器管理。所有永久操作都要求输入完整确认词，自动化场景可增加 `--confirm DELETE`。宿主账号、会话、其他插件、其他配置和自定义 `TIDU_DATABASE_PATH` 始终保留。
-
-## 文档
-
-- [架构基线](./docs/architecture.md)：模块边界、数据契约、部署方式、客户端兼容性和当前限制。
-- [核心调度与门禁](./docs/core-differentiators.md)：动态模型路由、能力补全、能力资产装配、Secret Gate及成本案例。
-- [开放能力生态](./docs/ecosystem-sdk.md)：Capability Provider Protocol、TypeScript与Python SDK、权限、签名、隔离和第三方Agent委派。
-- [集成发布候选](./docs/release-candidate.md)：统一门禁、升级与回滚、安全隐私检查、兼容矩阵和已知限制。
-- [发版计划](./docs/RELEASE_PLAN.md)：当前开发阶段和验收状态；`v1.0.0` 最终验收后删除。
-- [变更记录](./docs/CHANGELOG.md)：永久保留的版本历史。
-
-## 参与开发
-
-统一Node入口支持当前环境、NVM、Homebrew、fnm、mise、asdf和Volta；安装、构建、测试、发布与Git Hook都会自动选择兼容版本，检测不到时会在修改依赖前停止。
+## 🤝 参与开发与反馈
 
 ```bash
 npm run setup
 npm run check
-node packages/tidu/dist/cli/index.js --help
 ```
 
-分支、Commit、PR、版本和发布规则见 [贡献指南](./docs/CONTRIBUTING.md)。规则由本地脚本和GitHub Actions共同校验。
+问题反馈请附上经审查的 `tidu doctor --json` 输出：
 
-## 开源协议
+- [提交 Bug 或产品反馈](https://github.com/skillnull/AI-Tidu9/issues/new/choose)
+- [私密报告安全漏洞](https://github.com/skillnull/AI-Tidu9/security/advisories/new)
 
-本项目使用 [GNU Affero General Public License v3.0 only](./LICENSE)。品牌和署名规则见 [商标政策](./docs/TRADEMARKS.md) 与 [NOTICE](./NOTICE)。
+项目使用 [GNU AGPL-3.0-only](./LICENSE)。品牌与署名规则见 [商标政策](./docs/TRADEMARKS.md) 和 [NOTICE](./NOTICE)。

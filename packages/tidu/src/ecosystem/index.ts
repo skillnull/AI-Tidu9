@@ -25,7 +25,7 @@ export interface CapabilityProviderDependency {
 }
 
 export interface CapabilityProviderSignature {
-  /** Signature algorithm; Stage 8 accepts Ed25519 only. */
+  /** Signature algorithm accepted by the current protocol. */
   algorithm: "ed25519";
   /** Administrator-managed identifier for the signing public key. */
   keyId: string;

@@ -112,6 +112,7 @@ h2 {
 .state-panel,
 .overview,
 .card,
+.onboarding-panel,
 .configuration-panel,
 .guide-panel,
 .client-panel,
@@ -203,6 +204,118 @@ h2 {
 .configuration-panel {
   margin-top: 0;
   padding: 18px;
+}
+
+.onboarding-panel {
+  margin-top: 12px;
+  padding: 18px;
+}
+
+.onboarding-counter {
+  flex: 0 0 auto;
+  margin-left: 16px;
+  color: #69c8ba;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+}
+
+.onboarding-steps {
+  display: flex;
+  margin-top: 16px;
+  overflow-x: auto;
+  border-bottom: 1px solid #202832;
+}
+
+.onboarding-step {
+  flex: 1 0 auto;
+  padding: 8px 6px;
+  border: 0;
+  border-bottom: 1px solid transparent;
+  border-radius: 0;
+  color: #657180;
+  background: transparent;
+}
+
+.onboarding-step + .onboarding-step {
+  margin-left: 12px;
+}
+
+.onboarding-step span {
+  margin-right: 5px;
+  color: #4f5b68;
+  font-size: 9px;
+}
+
+.onboarding-step:hover,
+.onboarding-step:focus-visible {
+  background: transparent;
+}
+
+.onboarding-step-active {
+  border-bottom-color: #69c8ba;
+  color: #dce4ea;
+}
+
+.onboarding-content {
+  min-height: 164px;
+  padding: 22px 2px 12px;
+}
+
+.onboarding-content h3 {
+  margin: 0 0 8px;
+  font-size: 18px;
+  font-weight: 420;
+}
+
+.onboarding-content > p:not(.onboarding-kicker) {
+  max-width: 720px;
+  color: #758292;
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.onboarding-kicker {
+  margin-bottom: 7px;
+  color: #69c8ba;
+  font-size: 10px;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+}
+
+.onboarding-choice-row {
+  display: flex;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+
+.onboarding-choice-row button + button {
+  margin-left: 8px;
+}
+
+.onboarding-form {
+  max-width: 760px;
+  margin-top: 16px;
+}
+
+.onboarding-command {
+  display: block;
+  max-width: 840px;
+  margin-top: 14px;
+  padding: 11px 12px;
+  overflow-x: auto;
+  border: 1px solid #26323d;
+  border-radius: 7px;
+  color: #9dd9d0;
+  background: #0a1016;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.onboarding-navigation {
+  display: flex;
+  justify-content: space-between;
+  padding-top: 12px;
+  border-top: 1px solid #202832;
 }
 
 .personal-grid {
@@ -710,6 +823,18 @@ footer {
 
   .configuration-form {
     display: block;
+  }
+
+  .onboarding-content {
+    min-height: 210px;
+  }
+
+  .onboarding-choice-row button {
+    margin-bottom: 8px;
+  }
+
+  .onboarding-choice-row button + button {
+    margin-left: 6px;
   }
 
   .guide-grid {

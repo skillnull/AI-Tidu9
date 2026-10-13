@@ -39,6 +39,7 @@ import {
 } from "../lifecycle/index.js";
 import { resolveDefaultDatabasePath } from "../storage/index.js";
 import {
+  createSafeDiagnosticReport,
   diagnoseEndpoint,
   formatConfiguration,
   loadConfiguration,
@@ -48,51 +49,221 @@ import {
 
 const HELP_TEXT = `${PRODUCT.explanation}
 
-Usage:
-  tidu [command]
+Usage / 用法:
+  tidu <command> [options]
+  tidu help <command>
 
-Commands:
-  start                  Start the local runtime
-  setup [action]         Install, verify, repair, update, or uninstall connectors
-  mcp                    Run the stdio MCP connector for Agent hosts
-  doctor                 Diagnose runtime, configuration API, and page
-  clients                Detect supported local clients without reading credentials
-  clients connect codex  Back up, write, and verify a dedicated Codex profile
-  clients rollback codex Restore the most recent Codex profile snapshot
-  account                Show reusable Codex and Cursor host accounts
-  account relogin [host] Explicitly run the host's official login flow
-  account switch [host]  Confirm, sign out, and choose another host account
-  config                 Open the simple interactive configuration wizard
-  config show            Show active configuration and isolated drafts
-  config set             Update a draft with advanced command options
-  uninstall              Archive data, purge data, or completely uninstall AI-Tidu9
-  restore                Restore the latest uninstall snapshot
-  enterprise recover-admin --reason <text>
-                         Recover the administrator key on the server host
-  help, --help, -h       Show help
-  version, --version, -v Show version
+Commands / 命令:
+  tidu start        Start the runtime / 启动运行时
+  tidu setup        Manage host connectors / 管理宿主连接器
+  tidu mcp          Run the MCP connector / 运行MCP连接器
+  tidu doctor       Diagnose the service / 诊断服务
+  tidu clients      Discover or configure clients / 发现或配置客户端
+  tidu account      Inspect or change host login / 检查或切换宿主账号
+  tidu config       View or edit configuration / 查看或编辑配置
+  tidu uninstall    Archive or remove AI-Tidu9 / 归档或卸载九门赛博提督
+  tidu restore      Restore personal data / 恢复个人数据
+  tidu enterprise   Enterprise host operations / 企业服务器操作
+  tidu version      Show package version / 显示版本
 
-Examples:
-  tidu start
-  tidu setup
-  tidu setup verify
-  tidu doctor
-  tidu clients
-  tidu clients connect codex
-  tidu clients rollback codex
+Help / 帮助:
+  tidu <command> --help
+  tidu help <command>
+
+Remote / 远程管理:
+  Add --endpoint <url> or set TIDU_ENDPOINT.`;
+
+const COMMAND_HELP = Object.freeze<Record<string, string>>({
+  account: `Account / 宿主账号
+
+Usage / 用法:
   tidu account
-  tidu account relogin cursor
-  tidu account switch codex
-  tidu config
-  tidu config show
-  tidu config set --mode expert --name "Expert entry" --activate
-  tidu uninstall
-  tidu uninstall --complete
-  tidu restore
-  tidu enterprise recover-admin --reason "Approved incident recovery"
+  tidu account status [codex|cursor]
+  tidu account relogin [codex|cursor]
+  tidu account switch [codex|cursor] [--yes]
 
-Remote management:
-  Add --endpoint https://tidu.example.com or set TIDU_ENDPOINT.`;
+Notes / 说明:
+  Status reads only sanitized official CLI output. Relogin and switch invoke the host's official flow.
+  状态检查只读取官方CLI的脱敏输出；重新登录与切换均调用宿主官方流程。`,
+  "account relogin": `Account relogin / 重新登录宿主账号
+
+Usage / 用法:
+  tidu account relogin [codex|cursor]
+
+The default host is codex. This explicitly starts the official login flow.
+默认宿主为codex；该命令会显式启动官方登录流程。`,
+  "account status": `Account status / 宿主账号状态
+
+Usage / 用法:
+  tidu account status [codex|cursor]
+
+Without a host, both Codex and Cursor are inspected without exposing credentials.
+不指定宿主时同时检查Codex与Cursor，且不会输出凭据。`,
+  "account switch": `Account switch / 切换宿主账号
+
+Usage / 用法:
+  tidu account switch [codex|cursor] [--yes]
+
+Options / 选项:
+  --yes  Skip the interactive confirmation / 跳过交互确认`,
+  clients: `Clients / 客户端
+
+Usage / 用法:
+  tidu clients
+  tidu clients connect codex [--yes] [--endpoint <url>]
+  tidu clients rollback codex [--yes]
+
+Discovery checks presence only and never reads credential contents.
+发现过程只检查是否存在，不读取凭据正文。`,
+  "clients connect": `Clients connect / 接入客户端
+
+Usage / 用法:
+  tidu clients connect codex [--yes] [--endpoint <url>]
+
+Creates and verifies only the dedicated ai-tidu9 Codex profile, with a private rollback snapshot.
+仅创建并验证九门专属Codex Profile，同时保留私有回滚快照。`,
+  "clients rollback": `Clients rollback / 回滚客户端配置
+
+Usage / 用法:
+  tidu clients rollback codex [--yes]
+
+Restores the latest AI-Tidu9-owned Codex profile snapshot.
+恢复最近一次由九门管理的Codex Profile快照。`,
+  config: `Config / 配置
+
+Usage / 用法:
+  tidu config [--endpoint <url>]
+  tidu config show [--endpoint <url>]
+  tidu config set --mode <managed|expert> [--profile <id>] [--name <text>] [--activate] [--endpoint <url>]
+
+Running without an action opens the guided wizard. Drafts do not affect the runtime until activated.
+不带动作时进入引导式配置；草稿只有启用后才影响运行时。`,
+  "config set": `Config set / 修改配置草稿
+
+Usage / 用法:
+  tidu config set --mode <managed|expert> [--profile <id>] [--name <text>] [--activate] [--endpoint <url>]
+
+Options / 选项:
+  --mode       Required isolated draft / 必填，指定独立草稿
+  --profile    Active profile ID / Profile标识
+  --name       Virtual-model display name / 虚拟模型显示名
+  --activate   Activate after saving / 保存后启用
+  --endpoint   Management service URL / 管理服务地址`,
+  "config show": `Config show / 查看配置
+
+Usage / 用法:
+  tidu config show [--endpoint <url>]
+
+Shows the active snapshot and both isolated drafts.
+显示当前生效快照以及普通、专家两个隔离草稿。`,
+  doctor: `Doctor / 诊断
+
+Usage / 用法:
+  tidu doctor [--json] [--endpoint <url>]
+
+Options / 选项:
+  --json  Print a privacy-safe report for issue submission / 输出可用于提交问题的隐私安全报告
+
+Checks the runtime health endpoint, configuration API, and management page without changing configuration.
+检查运行时、配置API和管理页面，不修改任何配置。JSON报告不包含端点主机名、凭据、路径或会话内容。`,
+  enterprise: `Enterprise / 企业服务器操作
+
+Usage / 用法:
+  tidu enterprise recover-admin --reason <text>
+
+Enterprise commands run on the trusted server host and require TIDU_POSTGRES_URL.
+企业命令必须在可信服务器执行，并配置TIDU_POSTGRES_URL。`,
+  "enterprise recover-admin": `Enterprise recover-admin / 恢复管理员密钥
+
+Usage / 用法:
+  tidu enterprise recover-admin --reason <non-secret-text>
+
+Creates a new one-time administrator key and writes a security audit event. Never place secrets in --reason.
+生成新的单次展示管理员密钥并记录安全审计；--reason中不得包含秘密。`,
+  mcp: `MCP connector / MCP连接器
+
+Usage / 用法:
+  tidu mcp [--endpoint <url>]
+
+Runs the stdio MCP bridge for supported Agent hosts. It is normally launched by tidu setup.
+为支持的Agent宿主运行stdio MCP桥，通常由tidu setup自动启动。`,
+  restore: `Restore / 恢复
+
+Usage / 用法:
+  tidu restore [--yes]
+
+Restores the latest recoverable personal-data snapshot without overwriting an existing data directory.
+恢复最近的个人数据快照，不覆盖已有数据目录。`,
+  setup: `Setup / 连接器安装
+
+Usage / 用法:
+  tidu setup [install|verify|repair|update|uninstall] [--endpoint <url>]
+
+Actions / 动作:
+  install     Install detected connectors; default / 安装已发现连接器，默认动作
+  verify      Verify without changes / 只验证，不修改
+  repair      Recreate owned registrations / 重建九门自有注册
+  update      Refresh launch metadata / 更新启动信息
+  uninstall   Remove connectors, keep data / 移除连接器，保留数据`,
+  start: `Start / 启动
+
+Usage / 用法:
+  tidu start [--cli]
+
+Options / 选项:
+  --cli  Start and run the guided terminal setup / 启动后进入终端分步配置
+
+Environment / 环境变量:
+  TIDU_HOST, TIDU_PORT, TIDU_DATABASE_PATH
+  TIDU_PROVIDER, TIDU_PROVIDER_MODEL, TIDU_PROVIDER_API_KEY, TIDU_PROVIDER_BASE_URL
+  TIDU_POSTGRES_URL
+
+Starts the runtime and prints the management URL. Secrets are read from the process environment only.
+启动运行时并输出管理地址；密钥只从当前进程环境读取。`,
+  uninstall: `Uninstall / 卸载
+
+Usage / 用法:
+  tidu uninstall [--yes]
+  tidu uninstall --purge [--confirm DELETE]
+  tidu uninstall --complete [--confirm DELETE] [--endpoint <url>]
+
+Modes / 模式:
+  default     Archive personal data for restore / 归档个人数据，可恢复
+  --purge     Permanently remove owned data and snapshots / 永久删除自有数据和快照
+  --complete  Also remove owned connectors, profiles, and global npm install / 同时清理自有连接器、Profile和全局npm安装`,
+  version: `Version / 版本
+
+Usage / 用法:
+  tidu version
+  tidu --version
+  tidu -v`,
+});
+
+const HELP_FLAGS = new Set(["--help", "-h"]);
+
+const resolveHelpText = (argumentsList: readonly string[]): string | undefined => {
+  const helpRequested =
+    argumentsList.length === 0 ||
+    argumentsList[0] === "help" ||
+    argumentsList.some((argument) => HELP_FLAGS.has(argument));
+  if (!helpRequested) {
+    return undefined;
+  }
+
+  const topicArguments = (
+    argumentsList[0] === "help" ? argumentsList.slice(1) : argumentsList
+  ).filter((argument) => !HELP_FLAGS.has(argument));
+  if (topicArguments.length === 0) {
+    return HELP_TEXT;
+  }
+  const detailedTopic = topicArguments.slice(0, 2).join(" ");
+  const topLevelTopic = topicArguments[0] ?? "";
+  const helpText = COMMAND_HELP[detailedTopic] ?? COMMAND_HELP[topLevelTopic];
+  if (helpText === undefined) {
+    throw new TiduError("UNSUPPORTED_COMMAND", `Unknown help topic: ${topLevelTopic}`);
+  }
+  return helpText;
+};
 
 const TERMINAL_STYLE = Object.freeze({
   cyan: "\u001B[36m",
@@ -132,6 +303,9 @@ const readMode = (value: string | undefined): ConfigurationMode => {
 const runDoctor = async (argumentsList: readonly string[]): Promise<string> => {
   const endpoint = resolveEndpoint(argumentsList);
   const report = await diagnoseEndpoint(endpoint);
+  if (argumentsList.includes("--json")) {
+    return JSON.stringify(createSafeDiagnosticReport(report, PRODUCT.version), null, 2);
+  }
   const checkLabels = {
     configuration: "Configuration API",
     page: "Management page",
@@ -152,15 +326,24 @@ const runInteractiveConfiguration = async (endpoint: string): Promise<string> =>
   const activeMode = bootstrap.configuration.workspace.active.configuration.activeMode;
   const readline = createInterface({ input: process.stdin, output: process.stdout });
   try {
+    process.stdout.write(`\n[1/5] Runtime / 运行环境\n${endpoint}\n`);
+    process.stdout.write(
+      bootstrap.runtime.provider.configured
+        ? `Provider ready / 模型已就绪: ${String(bootstrap.runtime.provider.type)} · ${String(bootstrap.runtime.provider.model)}\n`
+        : "Provider pending / 模型待配置: restart with TIDU_PROVIDER and TIDU_PROVIDER_MODEL when inference is required.\n",
+    );
+    process.stdout.write("\n[2/5] Mode / 配置模式\n");
     const modeAnswer = (await readline.question(`Mode [managed/expert] (${activeMode}): `)).trim();
     const mode = modeAnswer === "" ? activeMode : readMode(modeAnswer);
     const draft = bootstrap.configuration.workspace.drafts[mode].configuration;
+    process.stdout.write("\n[3/5] Entry / 统一入口\n");
     const profileAnswer = (
       await readline.question(`Profile ID (${draft.activeProfileId}): `)
     ).trim();
     const nameAnswer = (
       await readline.question(`Virtual model name (${draft.virtualModelName}): `)
     ).trim();
+    process.stdout.write("\n[4/5] Activation / 保存与启用\n");
     const activateAnswer = (await readline.question("Activate after saving? [y/N]: "))
       .trim()
       .toLowerCase();
@@ -170,7 +353,19 @@ const runInteractiveConfiguration = async (endpoint: string): Promise<string> =>
       virtualModelName: nameAnswer || draft.virtualModelName,
       activate: activateAnswer === "y" || activateAnswer === "yes",
     });
-    return `${style("✓", "green")} Configuration saved${activateAnswer === "y" || activateAnswer === "yes" ? " and activated" : " as a draft"}.\n${formatConfiguration(updated)}`;
+    process.stdout.write("\n[5/5] Clients / 客户端接入\n");
+    const setupAnswer = (await readline.question("Configure detected clients now? [Y/n]: "))
+      .trim()
+      .toLowerCase();
+    const setupRequested = setupAnswer === "" || setupAnswer === "y" || setupAnswer === "yes";
+    const setupReport = setupRequested
+      ? formatConnectorSetupReport(setupConnectors({ action: "install", endpoint }))
+      : "Connector setup skipped. Run: tidu setup";
+    return [
+      `${style("✓", "green")} Configuration saved${activateAnswer === "y" || activateAnswer === "yes" ? " and activated" : " as a draft"}.`,
+      formatConfiguration(updated),
+      setupReport,
+    ].join("\n");
   } finally {
     readline.close();
   }
@@ -509,13 +704,13 @@ const runPersonalRestore = async (argumentsList: readonly string[]): Promise<str
 
 export const runCli = (argumentsList: readonly string[]): string => {
   const [command = "help"] = argumentsList;
+  const helpText = resolveHelpText(argumentsList);
+  if (helpText !== undefined) {
+    return helpText;
+  }
 
   if (command === "version" || command === "--version" || command === "-v") {
     return PRODUCT.version;
-  }
-
-  if (command === "help" || command === "--help" || command === "-h") {
-    return HELP_TEXT;
   }
 
   if (command === "clients") {
@@ -534,7 +729,10 @@ const isDirectExecution =
 if (isDirectExecution) {
   try {
     const argumentsList = process.argv.slice(2);
-    if (argumentsList[0] === "start") {
+    const helpText = resolveHelpText(argumentsList);
+    if (helpText !== undefined) {
+      process.stdout.write(`${helpText}\n`);
+    } else if (argumentsList[0] === "start") {
       const { startLocalRuntime } = await import("../runtime/index.js");
       const configuredPort = process.env.TIDU_PORT;
       const port = configuredPort === undefined ? undefined : Number(configuredPort);
@@ -553,6 +751,14 @@ if (isDirectExecution) {
       process.stdout.write(
         `${PRODUCT.explanation}\nRunning at ${runtime.origin}\nConfiguration center: ${runtime.origin}\n`,
       );
+
+      if (argumentsList.includes("--cli")) {
+        process.stdout.write(`${await runInteractiveConfiguration(runtime.origin)}\n`);
+      } else {
+        process.stdout.write(
+          "Guided setup: open the configuration center. Terminal setup: tidu start --cli\n",
+        );
+      }
 
       const stopRuntime = async () => {
         await runtime.close();

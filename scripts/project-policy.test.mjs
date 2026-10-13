@@ -41,16 +41,10 @@ test("accepts conventional commit headers", () => {
   for (const commitMessage of [
     "fix!: isolate runtime credentials",
     "docs: 更新贡献规范",
-    "test(release): verify candidate qualification",
+    "test(release): verify package publication",
   ]) {
     assert.equal(validateCommitMessage(commitMessage).valid, true, commitMessage);
   }
-});
-
-test("rejects new feature commits while the release candidate is frozen", () => {
-  const result = validateCommitMessage("feat(router): add another routing mode");
-  assert.equal(result.valid, false);
-  assert.match(result.reason, /features are frozen/u);
 });
 
 test("rejects nonconforming commit headers", () => {

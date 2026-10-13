@@ -26,6 +26,7 @@ import { synchronizeStagedPackageVersions } from "./sync-package-versions.mjs";
 const validContext = Object.freeze({
   branchName: "main",
   changelog: "## 1.2.3",
+  changelogEnglish: "## 1.2.3",
   headCommit: "release-commit",
   packageName: "@skillnull/tidu",
   packageVersion: "1.2.3",
@@ -55,11 +56,17 @@ test("increments prerelease versions without changing their channel", () => {
 });
 
 test("moves unreleased notes under an automatically generated release heading", () => {
-  const changelog = "# Changelog\n\n## Unreleased / 未发布\n\n- Added a release flow.\n";
+  const changelog = "# Changelog\n\n## Unreleased\n\n- Added a release flow.\n";
   const prepared = prepareChangelog(changelog, "1.2.3-alpha.2", "2026-10-11");
 
-  assert.match(prepared, /## Unreleased \/ 未发布\n\n## 1\.2\.3-alpha\.2 - 2026-10-11/u);
+  assert.match(prepared, /## Unreleased\n\n## 1\.2\.3-alpha\.2 - 2026-10-11/u);
   assert.equal(prepareChangelog(prepared, "1.2.3-alpha.2", "2026-10-11"), prepared);
+
+  const chinese = "# 变更记录\n\n## 未发布\n\n- 增加发布流程。\n";
+  assert.match(
+    prepareChangelog(chinese, "1.2.3-alpha.2", "2026-10-11", "## 未发布"),
+    /## 未发布\n\n## 1\.2\.3-alpha\.2 - 2026-10-11/u,
+  );
 });
 
 test("updates release versions without reformatting JSON metadata", () => {
@@ -144,6 +151,7 @@ test("preserves paths from git porcelain status", () => {
 test("allows partial release metadata while rejecting unrelated working changes", () => {
   const allowedPaths = [
     "docs/CHANGELOG.md",
+    "docs/CHANGELOG.EN.md",
     "packages/tidu/package.json",
     "packages/tidu/connectors/codex/ai-tidu9/plugin.json",
   ];
@@ -247,6 +255,15 @@ test("requires a real changelog version heading", () => {
   });
 
   assert.deepEqual(problems, ["docs/CHANGELOG.md must contain a heading for version 1.2.3."]);
+});
+
+test("requires synchronized English changelog headings", () => {
+  const problems = validatePublishContext({
+    ...validContext,
+    changelogEnglish: "## Unreleased\n\nPreparing version 1.2.3.",
+  });
+
+  assert.deepEqual(problems, ["docs/CHANGELOG.EN.md must contain a heading for version 1.2.3."]);
 });
 
 test("rejects dirty, untagged, mismatched, or unrecorded releases", () => {

@@ -1,19 +1,49 @@
-## Summary / 变更摘要
+## 交付结果
 
-<!-- Explain the problem, the solution, and the user-visible impact. / 说明问题、方案和用户影响。 -->
+<!-- 用一到两句话说明用户最终获得了什么。 -->
 
-## Verification / 验证
+## 背景与边界
 
-<!-- List commands and real scenarios that were verified. / 列出已执行的命令和真实场景。 -->
+<!--
+- 解决什么问题或目标？
+- 为什么应在当前层处理？
+- 哪些内容明确不在本次范围内？
+-->
 
-## Checklist / 检查清单
+关联事项：
 
-- [ ] PR title follows `type(scope)!: description`.
-- [ ] The change is focused and contains relevant tests.
-- [ ] Public Chinese and English documentation is synchronized.
-- [ ] Compatibility, migration, rollback, security, privacy, and resource impact were assessed.
-- [ ] The target release line is correct; changes still applicable to the future architecture are present on `main`.
-- [ ] A `support/<major>.x` target contains no feature or architecture work and identifies its backport or forward-port origin.
-- [ ] No secret, personal path, account identifier, internal domain, or confidential data is included.
-- [ ] `npm run check` and `npm test` pass.
-- [ ] I understand that only repository owner `@skillnull` may merge or otherwise update `main` and `support/*`.
+## 验证证据
+
+| 检查项 | 结果 |
+| --- | --- |
+| 自动化 | `npm run check` |
+| 真实场景 | |
+| 失败或回滚 | |
+
+## 影响评估
+
+| 领域 | 影响或`无` |
+| --- | --- |
+| 兼容性与公开 API | |
+| 数据与迁移 | |
+| 安全与隐私 | |
+| 成本与资源 | |
+| 回滚 | |
+
+## 发布线判断
+
+- 目标分支：
+- 回迁或前迁来源：
+
+<!-- support/<major>.x 只接受维护变更；受保护发布线不能相互合并。 -->
+
+## 最终检查
+
+- [ ] PR 标题遵循 `type(scope)!: description`。
+- [ ] 变更聚焦，并包含相关测试。
+- [ ] 面向用户的中英文文档已经同步。
+- [ ] 已明确兼容、迁移、回滚、安全、隐私、成本和资源影响。
+- [ ] 发布线选择正确；`support/<major>.x` 不包含功能或架构开发。
+- [ ] 不包含凭据、个人路径、账号标识、内部域名、会话正文或机密数据。
+- [ ] `npm run check` 已通过。
+- [ ] 我理解只有仓库所有者 `@skillnull` 可以合并或更新 `main` 与 `support/*`。

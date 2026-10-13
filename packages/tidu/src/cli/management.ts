@@ -26,6 +26,27 @@ export interface DiagnosticReport {
   checks: readonly DiagnosticCheck[];
 }
 
+export interface SafeDiagnosticReport {
+  /** Diagnostic schema identifier for issue-template compatibility. */
+  schemaVersion: "tidu-diagnostic/1";
+  /** Public package version that produced the report. */
+  productVersion: string;
+  /** Node.js runtime version without executable or installation paths. */
+  nodeVersion: string;
+  /** Operating-system family reported by Node.js. */
+  platform: NodeJS.Platform;
+  /** CPU architecture reported by Node.js. */
+  architecture: string;
+  /** Whether the checked endpoint is local or remote without exposing its hostname. */
+  endpointScope: "local" | "remote";
+  /** HTTP transport used by the checked endpoint. */
+  endpointProtocol: "http:" | "https:";
+  /** True only when every required component is healthy. */
+  healthy: boolean;
+  /** Sanitized component results that contain no credentials, paths, or user content. */
+  checks: readonly DiagnosticCheck[];
+}
+
 export interface ConfigurationUpdate {
   /** Isolated draft mode to update. */
   mode: ConfigurationMode;
@@ -174,6 +195,25 @@ export const diagnoseEndpoint = async (endpoint: string): Promise<DiagnosticRepo
     }),
   ]);
   return { endpoint, healthy: checks.every((item) => item.healthy), checks };
+};
+
+export const createSafeDiagnosticReport = (
+  report: DiagnosticReport,
+  productVersion: string,
+): SafeDiagnosticReport => {
+  const endpointUrl = new URL(report.endpoint);
+  const localHostnames = new Set(["127.0.0.1", "::1", "localhost"]);
+  return {
+    schemaVersion: "tidu-diagnostic/1",
+    productVersion,
+    nodeVersion: process.versions.node,
+    platform: process.platform,
+    architecture: process.arch,
+    endpointScope: localHostnames.has(endpointUrl.hostname) ? "local" : "remote",
+    endpointProtocol: endpointUrl.protocol as "http:" | "https:",
+    healthy: report.healthy,
+    checks: report.checks,
+  };
 };
 
 export const formatConfiguration = (bootstrap: ConfigCenterBootstrap): string => {

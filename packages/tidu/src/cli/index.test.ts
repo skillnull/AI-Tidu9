@@ -11,6 +11,7 @@ import { CONFIG_SCHEMA_VERSION } from "../config/index.js";
 import { startLocalRuntime } from "../runtime/index.js";
 import { runCli } from "./index.js";
 import {
+  createSafeDiagnosticReport,
   diagnoseEndpoint,
   formatConfiguration,
   loadConfiguration,
@@ -25,7 +26,7 @@ const packageVersion = (
 ).version;
 
 test("shows concise help by default", () => {
-  assert.match(runCli([]), /Usage:/);
+  assert.match(runCli([]), /Usage \/ 用法:/u);
   assert.match(runCli([]), /九门赛博提督/);
   assert.match(runCli([]), /tidu doctor/u);
   assert.match(runCli([]), /tidu clients/u);
@@ -33,6 +34,46 @@ test("shows concise help by default", () => {
   assert.match(runCli([]), /tidu config/u);
   assert.match(runCli([]), /tidu uninstall/u);
   assert.match(runCli([]), /tidu restore/u);
+});
+
+test("provides side-effect-free help for every command group", () => {
+  const helpInvocations = [
+    ["start", "--help"],
+    ["setup", "verify", "--help"],
+    ["mcp", "--help"],
+    ["doctor", "--help"],
+    ["clients", "--help"],
+    ["clients", "connect", "codex", "--help"],
+    ["clients", "rollback", "codex", "--help"],
+    ["account", "--help"],
+    ["account", "status", "--help"],
+    ["account", "relogin", "--help"],
+    ["account", "switch", "--help"],
+    ["config", "--help"],
+    ["config", "show", "--help"],
+    ["config", "set", "--help"],
+    ["uninstall", "--help"],
+    ["restore", "--help"],
+    ["enterprise", "recover-admin", "--help"],
+    ["version", "--help"],
+    ["help", "config", "set"],
+  ] as const;
+
+  for (const invocation of helpInvocations) {
+    assert.match(runCli(invocation), /Usage \/ 用法:/u, invocation.join(" "));
+  }
+});
+
+test("prints subcommand help from the executable without starting the command", () => {
+  const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
+  const result = spawnSync(process.execPath, [executablePath, "start", "--help"], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(result.stderr, "");
+  assert.match(result.stdout, /TIDU_PROVIDER/u);
+  assert.doesNotMatch(result.stdout, /Running at/u);
 });
 
 test("reports local client discovery without credential data", () => {
@@ -344,6 +385,38 @@ test("diagnoses and configures a running runtime through the public API", async 
       report.checks.map((check) => check.name),
       ["runtime", "configuration", "page"],
     );
+    const safeReport = createSafeDiagnosticReport(report, packageVersion);
+    assert.equal(safeReport.endpointScope, "local");
+    assert.equal(safeReport.productVersion, packageVersion);
+    assert.equal("endpoint" in safeReport, false);
+    assert.doesNotMatch(JSON.stringify(safeReport), /127\.0\.0\.1/u);
+
+    const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
+    const doctorProcess = spawn(
+      process.execPath,
+      [executablePath, "doctor", "--json", "--endpoint", runtime.origin],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let doctorOutput = "";
+    let doctorError = "";
+    doctorProcess.stdout.on("data", (chunk) => {
+      doctorOutput += chunk.toString();
+    });
+    doctorProcess.stderr.on("data", (chunk) => {
+      doctorError += chunk.toString();
+    });
+    const [doctorExitCode] = (await once(doctorProcess, "exit")) as [number | null];
+    assert.equal(doctorExitCode, 0);
+    assert.equal(doctorError, "");
+    const doctorReport = JSON.parse(doctorOutput) as {
+      endpointScope: string;
+      healthy: boolean;
+      schemaVersion: string;
+    };
+    assert.equal(doctorReport.endpointScope, "local");
+    assert.equal(doctorReport.healthy, true);
+    assert.equal(doctorReport.schemaVersion, "tidu-diagnostic/1");
+    assert.doesNotMatch(doctorOutput, /127\.0\.0\.1/u);
 
     const saved = await saveConfiguration(runtime.origin, {
       mode: "expert",
@@ -385,13 +458,25 @@ test("offers a simple interactive configuration fallback", async () => {
     let standardOutput = "";
     let standardError = "";
     let promptIndex = 0;
-    const promptAnswers = ["\n", "cli-personal\n", "CLI个人入口\n", "y\n"];
+    const promptMarkers = [
+      "Mode [managed/expert]",
+      "Profile ID",
+      "Virtual model name",
+      "Activate after saving?",
+      "Configure detected clients now?",
+    ];
+    const promptAnswers = ["\n", "cli-personal\n", "CLI个人入口\n", "y\n", "n\n"];
     child.stdout.on("data", (chunk) => {
       standardOutput += chunk.toString();
-      const answer = promptAnswers[promptIndex];
-      if (answer !== undefined) {
+      const promptMarker = promptMarkers[promptIndex];
+      const promptAnswer = promptAnswers[promptIndex];
+      if (
+        promptMarker !== undefined &&
+        promptAnswer !== undefined &&
+        standardOutput.includes(promptMarker)
+      ) {
         promptIndex += 1;
-        child.stdin.write(answer);
+        child.stdin.write(promptAnswer);
         if (promptIndex === promptAnswers.length) {
           child.stdin.end();
         }
@@ -401,8 +486,9 @@ test("offers a simple interactive configuration fallback", async () => {
       standardError += chunk.toString();
     });
     const [exitCode] = (await once(child, "exit")) as [number | null];
-    assert.equal(exitCode, 0);
+    assert.equal(exitCode, 0, standardError);
     assert.equal(standardError, "");
+    assert.match(standardOutput, /\[5\/5\] Clients/u);
     assert.match(standardOutput, /Configuration saved and activated/u);
     assert.match(standardOutput, /cli-personal · CLI个人入口/u);
   } finally {

@@ -1,0 +1,41 @@
+name: Product feedback / 产品反馈
+description: Share a use case, compatibility result, or improvement / 分享使用场景、兼容结果或改进建议
+title: "feedback: "
+labels:
+  - feedback
+body:
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Scenario / 场景
+      description: What were you trying to accomplish? / 你希望完成什么？
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome / 结果
+      description: What worked, what did not, and what would improve it? / 哪些有效，哪些无效，希望如何改进？
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Entry / 入口
+      options:
+        - Codex
+        - Cursor
+        - CLI
+        - Browser or OpenAI-compatible client / 浏览器或OpenAI兼容客户端
+        - Ollama
+        - Enterprise or hybrid deployment / 企业或混合部署
+        - Other / 其他
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check / 安全确认
+      options:
+        - label: This report contains no secrets, personal data, private paths, prompts, conversations, or confidential information. / 本反馈不包含秘密、个人数据、私人路径、Prompt、会话或机密信息。
+          required: true
