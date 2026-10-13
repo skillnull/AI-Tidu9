@@ -8,7 +8,7 @@ AI-Tidu9 is an intelligent collaboration hub for cross-domain scenarios. It coor
 
 ## Status
 
-The project is being rebuilt from an early AI rules package into an independent Super Agent platform. Its production-scaling candidate baseline is now implemented, but production-critical use should wait for Scheduler high availability, target-environment load testing, and real team acceptance.
+The project is now in integrated release-candidate qualification with a personal entry point, independent Agent kernel, dynamic model routing, enterprise governance, and an open capability ecosystem. Scheduler high availability, target-environment load testing, long-running local dogfooding, and real team acceptance are still pending, so production-critical use is not yet recommended.
 
 ## Direction
 
@@ -19,18 +19,9 @@ The project is being rebuilt from an early AI rules package into an independent 
 - Protect secrets and sensitive content at runtime.
 - Support individuals, teams, and enterprises without restricting continued AI exploration.
 
-## Local development
+## Install and use
 
-Node.js 22.14 or later is required. The shared Node entry supports the current environment, NVM, Homebrew, fnm, mise, asdf, and Volta. Install, build, test, publish, and Git-hook commands select a compatible runtime automatically and stop before changing dependencies when none is available.
-
-```bash
-npm run setup
-npm run check
-npm test
-node packages/tidu/dist/cli/index.js --help
-```
-
-The official npm package is `@skillnull/tidu`; its installed command remains `tidu`:
+Node.js 22.14 or later is required. The official npm package is `@skillnull/tidu`; its installed command remains `tidu`:
 
 ```bash
 npx @skillnull/tidu start
@@ -153,17 +144,26 @@ To permanently delete current data and every AI-Tidu9 uninstall snapshot, run `t
 
 An ephemeral `npx` run has no npm package to remove. After archiving data, a global installation can be removed with `npm uninstall -g @skillnull/tidu`; project dependencies should be removed through the project's existing package manager.
 
+## Documentation
+
+- [Architecture baseline](./architecture.en.md): module boundaries, data contracts, deployment modes, client compatibility, and current limitations.
+- [Core Routing and Secret Gate](./core-differentiators.md#english): dynamic model routing, capability completion, capability assembly, runtime secret protection, and the reproducible cost case.
+- [Open capability ecosystem](./ecosystem-sdk.md): Capability Provider Protocol, TypeScript and Python SDKs, permissions, signatures, isolation, and third-party Agent delegation.
+- [Integrated release candidate](./release-candidate.md): unified gates, upgrade and rollback, security and privacy checks, compatibility matrix, and known limitations.
+- [Release plan](./RELEASE_PLAN.md): current development stages and acceptance status; removed after final `v1.0.0` acceptance.
+- [Changelog](./CHANGELOG.md): permanent version history.
+
+## Contributing
+
+The shared Node entry supports the current environment, NVM, Homebrew, fnm, mise, asdf, and Volta. Install, build, test, publish, and Git-hook commands select a compatible runtime automatically and stop before changing dependencies when none is available.
+
+```bash
+npm run setup
+npm run check
+node packages/tidu/dist/cli/index.js --help
+```
+
 See the [contribution guide](./CONTRIBUTING.md) for branch, commit, pull-request, version, and release rules. Local policy scripts and GitHub Actions enforce these rules.
-
-## Release plan
-
-See the [release plan](./RELEASE_PLAN.md) for development stages and acceptance status. This temporary file will be removed after final `v1.0.0` acceptance; actual release history will remain in the [changelog](./CHANGELOG.md) and Git tags.
-
-See the [architecture baseline](./architecture.en.md) for module boundaries and current limitations.
-
-See [Core Routing and Secret Gate](./core-differentiators.md#english) for dynamic routing, capability completion, capability assembly, runtime secret protection, and the reproducible cost case.
-
-Model, Agent, client, storage, and history extensions share the Capability Provider Protocol. See [Open capability ecosystem](./ecosystem-sdk.md) for the TypeScript and Python SDKs, permission and signature verification, catalogs, untrusted-extension isolation, and bounded third-party Agent delegation.
 
 ## License
 

@@ -11,8 +11,13 @@ package-lock.json
 # Build and test output
 dist
 coverage
+.cache
+.pytest_cache
 *.tsbuildinfo
 __pycache__
 *.py[cod]
 *.egg-info
 sdk/python/build
+
+# Local logs
+*.log

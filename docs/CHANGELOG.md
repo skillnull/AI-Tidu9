@@ -6,6 +6,13 @@ All notable changes to AI-Tidu9 will be documented in this file.
 
 ## Unreleased / 未发布
 
+- Add a versioned integrated release-candidate qualification contract that separates automated evidence from reviewed dogfooding, pilot, and local-sharing evidence and fails closed on missing gates.
+- 增加版本化集成发布候选验收契约，区分自动化证据与经评审的本机试用、团队试点和本地分享证据，任一门禁缺失时默认拒绝。
+- Add one repeatable RC command for complete quality checks, npm-content validation, public-file privacy scanning, and bilingual documentation verification.
+- 增加统一可重复RC命令，覆盖完整质量检查、npm内容校验、公开文件隐私扫描和中英文文档验证。
+- Publish bilingual upgrade, rollback, security, privacy, compatibility, limitation, and feature-freeze boundaries for the integrated candidate.
+- 发布集成候选版的双语升级、回滚、安全、隐私、兼容、限制和大型功能冻结边界。
+
 ## 0.8.0-beta.1 - 2026-10-13
 
 - Add Capability Provider Protocol 1.0 with typed model, Agent, client, storage, and history adapters; explicit permission manifests; integrity, Ed25519 signature, dependency, and version verification; and enterprise, local, and official catalogs.

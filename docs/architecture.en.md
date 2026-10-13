@@ -17,6 +17,7 @@ AI-Tidu9 follows a modular-monolith-first architecture with stable adapter bound
 | `packages/tidu/src/agent` | Goal understanding, dynamic planning, bounded execution, approval, recovery, and result verification | Models understand and plan; the kernel owns validation, budgets, state, and evidence boundaries |
 | `packages/tidu/src/capabilities` | Unified registration and on-demand assembly for Agents, Skills, MCP servers, tools, and knowledge | Stores only non-sensitive metadata and selects a bounded minimal set by capability, cost, and privacy |
 | `packages/tidu/src/ecosystem` | Capability Provider protocol, SDKs, catalogs, discovery, trust, and isolation boundaries | Untrusted extensions fail closed without a compliant external sandbox; discovery never executes extensions |
+| `packages/tidu/src/qualification` | Evidence classification and gate decisions for integrated release candidates | Automated output cannot impersonate reviewed dogfooding, team-pilot, or local-material evidence |
 | `packages/tidu/src/runtime` | Lightweight local HTTP runtime, virtual-model, and configuration-center entry | Listens on loopback by default and coordinates adapters without provider implementations or business orchestration |
 | `packages/tidu/src/config-center` | Bootstrap-data contract for the local configuration center | Exposes active and isolated-draft state without direct database access |
 | `packages/tidu/src/openai` | OpenAI-compatible virtual-model, error, and request-validation contracts | Provider-neutral, does not log request content, and never fabricates inference output |
@@ -71,10 +72,10 @@ The primary runtime requires Node.js 22.14 or later. Personal mode defaults to a
 
 | Client | Current integration | Verification | Known limitation |
 | --- | --- | --- | --- |
-| Codex app, CLI, and IDE | Shared MCP registration, dedicated virtual-model profile, and app-server delegation | A real host-account turn returned `TIDU_STAGE2_OK` on 2026-10-12; automation covers protocol, configuration, rollback, and account switching | Custom virtual models use fallback model metadata and display a warning |
+| Codex app, CLI, and IDE | Shared MCP registration, dedicated virtual-model profile, and app-server delegation | A real Stage 9 host-account turn returned `TIDU_STAGE9_OK` on 2026-10-13; automation covers protocol, configuration, rollback, and account switching | Custom virtual models use fallback model metadata and display a warning |
 | Cursor Desktop and Agent CLI | Shared MCP registration; an authorized CLI can use full ACP delegation | Local MCP status is `ready`; automation covers ACP negotiation, sessions, streaming, cancellation, permissions, and account switching | The local Agent CLI is currently signed out, so a real ACP model turn was not attempted; Desktop login cannot be copied into CLI credentials |
 | OpenAI CLI | Manual `OPENAI_BASE_URL` integration design | Not installed on the current test host, so no real command regression was claimed | Shell startup files are never modified; CLI-version-specific flags require separate verification |
-| Generic OpenAI clients | `/v1/models`, Chat Completions, and Responses | Automated real HTTP, JSON, SSE, cancellation, and tool-protocol tests pass | Client-specific extensions are supported only after explicit verification |
+| Generic OpenAI clients | `/v1/models`, Chat Completions, and Responses | A real Stage 9 HTTP regression returned `TIDU_GENERIC_OK` on 2026-10-13; automation covers JSON, SSE, cancellation, and tool protocols | Client-specific extensions are supported only after explicit verification |
 | Ollama | Upstream model-provider adapter, not a host client | Automated non-streaming, streaming, and tool-protocol translation tests pass | Does not provide host accounts, IDE sessions, or client permission capabilities |
 
 ## One installation, multiple surface connectors

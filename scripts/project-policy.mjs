@@ -71,6 +71,14 @@ export const validateCommitMessage = (commitMessage) => {
     };
   }
 
+  if (PROJECT_POLICY.releaseCandidate.featureFreeze && getChangeType(header) === "feat") {
+    return {
+      valid: false,
+      reason:
+        "Large features are frozen during release-candidate qualification; use an allowed corrective change type.",
+    };
+  }
+
   const description = match[1];
   if (description !== description.trim() || /[.。]$/u.test(description)) {
     return {

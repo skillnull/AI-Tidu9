@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   AGENT_PROTOCOL_VERSION,
+  assessReleaseCandidate,
   CONFIG_SCHEMA_VERSION,
   configureCodexClient,
   createAgentEvent,
@@ -29,6 +30,7 @@ test("exposes the supported public API from one package", async () => {
   assert.equal(typeof configureCodexClient, "function");
   assert.equal(typeof createAgentKernel, "function");
   assert.equal(typeof createScalingControlPlane, "function");
+  assert.equal(typeof assessReleaseCandidate, "function");
   assert.equal(createDefaultConfiguration().schemaVersion, CONFIG_SCHEMA_VERSION);
   assert.equal(
     createAgentEvent({

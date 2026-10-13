@@ -17,6 +17,7 @@
 | `packages/tidu/src/agent` | 目标理解、动态规划、有界执行、人工确认、恢复与结果验证 | 模型负责理解与规划，内核负责校验、预算、状态和证据边界 |
 | `packages/tidu/src/capabilities` | Agent、Skill、MCP、工具和知识的统一能力注册与按需装配 | 只保存非敏感元数据，按能力、成本和隐私边界选择有界最小集合 |
 | `packages/tidu/src/ecosystem` | Capability Provider协议、SDK、能力目录、发现、信任与隔离边界 | 不可信扩展没有合规外部沙箱时失败关闭；发现阶段绝不执行扩展 |
+| `packages/tidu/src/qualification` | 集成发布候选的证据分级与门禁判定 | 自动化结果不能冒充长期试用、团队试点或本地材料人工评审 |
 | `packages/tidu/src/runtime` | 轻量本地HTTP运行时、虚拟模型与配置中心入口 | 默认仅监听回环地址，只协调适配器，不包含供应商实现或业务编排 |
 | `packages/tidu/src/config-center` | 本地配置中心引导数据契约 | 对外提供生效配置与隔离草稿的状态，不直接操作数据库 |
 | `packages/tidu/src/openai` | OpenAI兼容虚拟模型、错误与请求校验契约 | 不绑定供应商，不记录请求内容，不伪造推理结果 |
@@ -71,10 +72,10 @@ Stage 7 将任务入口拆为无状态 Gateway、单一逻辑 Scheduler 和可�
 
 | 客户端 | 当前接入 | 验证状态 | 已知限制 |
 | --- | --- | --- | --- |
-| Codex应用、CLI与IDE | 共享MCP注册、独立虚拟模型Profile与app-server委托 | 2026-10-12真实宿主账号回合返回`TIDU_STAGE2_OK`；自动化覆盖协议、配置、回滚与账号切换 | 自定义虚拟模型会使用回退模型元数据并显示警告 |
+| Codex应用、CLI与IDE | 共享MCP注册、独立虚拟模型Profile与app-server委托 | 2026-10-13 Stage 9真实宿主账号回合返回`TIDU_STAGE9_OK`；自动化覆盖协议、配置、回滚与账号切换 | 自定义虚拟模型会使用回退模型元数据并显示警告 |
 | Cursor桌面端与Agent CLI | 共享MCP注册；已授权CLI可使用完整ACP委托 | 本机MCP状态为`ready`；自动化覆盖ACP协商、会话、流式、取消、权限和账号切换 | 本机Agent CLI当前未登录，故真实ACP模型回合按安全边界未执行；桌面登录不能被复制为CLI凭据 |
 | OpenAI CLI | `OPENAI_BASE_URL` 手动接入设计 | 当前测试机未安装，因此未做真实命令回归 | 不修改Shell启动文件；不同CLI版本的命令参数需分别验证 |
-| 通用OpenAI客户端 | `/v1/models`、Chat Completions、Responses | 自动化真实HTTP、JSON、SSE、取消和工具协议测试通过 | 客户端专有扩展只有经过验证后才列为支持 |
+| 通用OpenAI客户端 | `/v1/models`、Chat Completions、Responses | 2026-10-13 Stage 9真实HTTP回归返回`TIDU_GENERIC_OK`；自动化覆盖JSON、SSE、取消和工具协议 | 客户端专有扩展只有经过验证后才列为支持 |
 | Ollama | 上游模型供应商适配器，不作为宿主客户端 | 自动化非流式、流式与工具协议转换测试通过 | 不提供宿主账户、IDE会话或客户端权限能力 |
 
 ## 一次安装，多入口连接器

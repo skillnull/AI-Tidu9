@@ -8,7 +8,7 @@
 
 ## 当前状态
 
-项目正在从早期AI规则包重构为独立的超级Agent平台，目前已完成高并发生产候选的工程基线；在Scheduler高可用、目标环境压测和真实团队验收完成前，仍不建议用于生产关键任务。
+当前版本处于集成发布候选阶段，已具备个人入口、独立Agent内核、动态模型调度、企业治理和开放能力生态。Scheduler高可用、目标环境压测、长期本机试用和真实团队验收尚未完成，因此暂不建议用于生产关键任务。
 
 ## 核心方向
 
@@ -19,18 +19,9 @@
 - 在运行时保护密钥和敏感内容。
 - 同时服务个人、团队和企业，不限制使用者继续探索AI能力。
 
-## 本地开发
+## 安装与使用
 
-需要 Node.js 22.14 或更高版本。统一Node入口支持当前环境、NVM、Homebrew、fnm、mise、asdf和Volta；安装、构建、测试、发布与Git Hook都会自动选择兼容版本，检测不到时会在修改依赖前停止。
-
-```bash
-npm run setup
-npm run check
-npm test
-node packages/tidu/dist/cli/index.js --help
-```
-
-正式npm包名为 `@skillnull/tidu`，安装后的命令保持为 `tidu`：
+需要 Node.js 22.14 或更高版本。正式npm包名为 `@skillnull/tidu`，安装后的命令保持为 `tidu`：
 
 ```bash
 npx @skillnull/tidu start
@@ -153,17 +144,26 @@ tidu restore
 
 通过 `npx` 临时运行无需移除npm包。全局安装在数据归档后执行 `npm uninstall -g @skillnull/tidu`；项目依赖使用项目原有包管理器卸载。
 
+## 文档
+
+- [架构基线](./docs/architecture.md)：模块边界、数据契约、部署方式、客户端兼容性和当前限制。
+- [核心调度与门禁](./docs/core-differentiators.md)：动态模型路由、能力补全、能力资产装配、Secret Gate及成本案例。
+- [开放能力生态](./docs/ecosystem-sdk.md)：Capability Provider Protocol、TypeScript与Python SDK、权限、签名、隔离和第三方Agent委派。
+- [集成发布候选](./docs/release-candidate.md)：统一门禁、升级与回滚、安全隐私检查、兼容矩阵和已知限制。
+- [发版计划](./docs/RELEASE_PLAN.md)：当前开发阶段和验收状态；`v1.0.0` 最终验收后删除。
+- [变更记录](./docs/CHANGELOG.md)：永久保留的版本历史。
+
+## 参与开发
+
+统一Node入口支持当前环境、NVM、Homebrew、fnm、mise、asdf和Volta；安装、构建、测试、发布与Git Hook都会自动选择兼容版本，检测不到时会在修改依赖前停止。
+
+```bash
+npm run setup
+npm run check
+node packages/tidu/dist/cli/index.js --help
+```
+
 分支、Commit、PR、版本和发布规则见 [贡献指南](./docs/CONTRIBUTING.md)。规则由本地脚本和GitHub Actions共同校验。
-
-## 发版计划
-
-开发阶段和验收状态见 [发版计划](./docs/RELEASE_PLAN.md)。该临时文件将在 `v1.0.0` 最终验收后删除，实际发布历史将保留在 [变更记录](./docs/CHANGELOG.md) 和Git Tag中。
-
-模块边界和当前限制见 [架构基线](./docs/architecture.md)。
-
-动态模型路由、能力补全、能力资产装配、Secret Gate及可复现成本案例见[核心调度与门禁](./docs/core-differentiators.md)。
-
-模型、Agent、客户端、存储和历史扩展统一使用 Capability Provider Protocol。TypeScript SDK、Python SDK、权限与签名校验、能力目录、不可信扩展隔离和第三方Agent委派边界见[开放能力生态](./docs/ecosystem-sdk.md)。
 
 ## 开源协议
 

@@ -203,22 +203,22 @@ Audience: owner and invited developers.
 - [x] Publish extension testing tools and examples / 发布扩展测试工具与示例
 - [x] Publish SDK migration policy / 发布SDK迁移策略
 - [x] Pass ecosystem quality gates / 通过生态质量门禁
-- [ ] Receive release confirmation / 获得发布确认
+- [x] Receive release confirmation / 获得发布确认
 
 ## v0.9.0-rc.N — Integrated release candidate / 完整发布候选
 
 - [ ] Complete long-term local dogfooding / 完成本机长期真实使用
-- [ ] Complete Codex, Cursor, CLI, and generic-client regression / 完成多客户端回归
+- [x] Complete Codex, Cursor, CLI, and generic-client regression / 完成多客户端回归
 - [ ] Complete team and enterprise pilot review / 完成团队与企业试点评审
-- [ ] Resolve blocker and critical defects / 收敛阻断与严重缺陷
-- [ ] Verify all supported upgrade paths / 验证全部支持的升级路径
-- [ ] Verify data and configuration rollback / 验证数据与配置回滚
-- [ ] Complete security and privacy review / 完成安全与隐私检查
-- [ ] Complete public-file privacy scan / 完成公开文件隐私扫描
-- [ ] Finish bilingual public documentation / 完成中英文公开文档
-- [ ] Finish local-only sharing materials / 完成本机分享材料
-- [ ] Publish final compatibility and limitation matrix / 发布最终兼容与限制矩阵
-- [ ] Freeze large features / 冻结大型新功能
+- [x] Resolve blocker and critical defects / 收敛阻断与严重缺陷
+- [x] Verify all supported upgrade paths / 验证全部支持的升级路径
+- [x] Verify data and configuration rollback / 验证数据与配置回滚
+- [x] Complete security and privacy review / 完成安全与隐私检查
+- [x] Complete public-file privacy scan / 完成公开文件隐私扫描
+- [x] Finish bilingual public documentation / 完成中英文公开文档
+- [x] Finish local-only sharing materials / 完成本机分享材料
+- [x] Publish final compatibility and limitation matrix / 发布最终兼容与限制矩阵
+- [x] Freeze large features / 冻结大型新功能
 - [ ] Pass final release-candidate gates / 通过最终RC门禁
 - [ ] Receive release confirmation / 获得发布确认
 
@@ -255,16 +255,16 @@ Every public release must provide the applicable artifacts below.
 - [ ] Docker images when applicable / 适用阶段的Docker镜像
 - [ ] Checksums and signatures when available / 校验和与可用签名
 - [x] Chinese and English changelog / 中英文变更记录
-- [ ] Upgrade and rollback guide / 升级与回滚说明
-- [ ] Migration notes / 迁移说明
-- [ ] Compatibility matrix / 兼容矩阵
-- [ ] Known limitations / 已知限制
-- [ ] Security notes / 安全说明
+- [x] Upgrade and rollback guide / 升级与回滚说明
+- [x] Migration notes / 迁移说明
+- [x] Compatibility matrix / 兼容矩阵
+- [x] Known limitations / 已知限制
+- [x] Security notes / 安全说明
 
 ## Current status / 当前状态
 
 - Planning / 规划：**complete / 已完成**
-- Active stage / 当前阶段：**Stage 8 — Open capability ecosystem / 阶段8：开放能力生态**
-- Latest planned release / 最近计划版本：`v0.8.0-beta.1`
-- Latest published release / 最近已发布版本：`v0.7.0-rc.1`
+- Active stage / 当前阶段：**Stage 9 — Integrated release candidate / 阶段9：完整发布候选**
+- Latest planned release / 最近计划版本：`v0.9.0-rc.N`
+- Latest published release / 最近已发布版本：`v0.8.0-beta.1`
 - Remote publishing / 远程发布：**enabled with explicit confirmation / 经明确确认后执行**

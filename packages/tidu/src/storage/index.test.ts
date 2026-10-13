@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -138,6 +138,45 @@ test("rejects a database created by a newer schema", async () => {
     database.close();
 
     await assert.rejects(openNodeSqliteStorage({ databasePath }), /not supported/u);
+  } finally {
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
+test("upgrades an earlier schema in place without losing existing metadata", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-storage-upgrade-"));
+  const databasePath = join(temporaryDirectory, "tidu.db");
+  const storageDirectory = new URL("../../storage/", import.meta.url);
+
+  try {
+    const { DatabaseSync } = await import("node:sqlite");
+    const earlierDatabase = new DatabaseSync(databasePath);
+    for (const migrationFile of [
+      "migrations/0001-initialize-metadata.sql",
+      "migrations/0002-isolate-configuration-drafts.sql",
+      "migrations/0003-add-task-capsules.sql",
+    ]) {
+      earlierDatabase.exec(readFileSync(new URL(migrationFile, storageDirectory), "utf8"));
+    }
+    earlierDatabase
+      .prepare("INSERT INTO tidu_metadata (key, value) VALUES (?, ?)")
+      .run("upgrade_marker", "preserved");
+    earlierDatabase.close();
+
+    const upgradedStorage = await openNodeSqliteStorage({ databasePath });
+    assert.equal(upgradedStorage.schemaVersion, STORAGE_SCHEMA_VERSION);
+    upgradedStorage.close();
+
+    const verifiedDatabase = new DatabaseSync(databasePath);
+    const marker = verifiedDatabase
+      .prepare("SELECT value FROM tidu_metadata WHERE key = ?")
+      .get("upgrade_marker") as { value: string };
+    const historyTable = verifiedDatabase
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get("tidu_configuration_history");
+    assert.equal(marker.value, "preserved");
+    assert.notEqual(historyTable, undefined);
+    verifiedDatabase.close();
   } finally {
     rmSync(temporaryDirectory, { force: true, recursive: true });
   }
