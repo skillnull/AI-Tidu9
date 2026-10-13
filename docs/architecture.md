@@ -16,6 +16,7 @@
 | `packages/tidu/src/protocol` | Agent任务和事件的规范化协议 | 通过显式版本演进，避免绑定具体模型 |
 | `packages/tidu/src/agent` | 目标理解、动态规划、有界执行、人工确认、恢复与结果验证 | 模型负责理解与规划，内核负责校验、预算、状态和证据边界 |
 | `packages/tidu/src/capabilities` | Agent、Skill、MCP、工具和知识的统一能力注册与按需装配 | 只保存非敏感元数据，按能力、成本和隐私边界选择有界最小集合 |
+| `packages/tidu/src/ecosystem` | Capability Provider协议、SDK、能力目录、发现、信任与隔离边界 | 不可信扩展没有合规外部沙箱时失败关闭；发现阶段绝不执行扩展 |
 | `packages/tidu/src/runtime` | 轻量本地HTTP运行时、虚拟模型与配置中心入口 | 默认仅监听回环地址，只协调适配器，不包含供应商实现或业务编排 |
 | `packages/tidu/src/config-center` | 本地配置中心引导数据契约 | 对外提供生效配置与隔离草稿的状态，不直接操作数据库 |
 | `packages/tidu/src/openai` | OpenAI兼容虚拟模型、错误与请求校验契约 | 不绑定供应商，不记录请求内容，不伪造推理结果 |
@@ -56,9 +57,15 @@ Stage 7 将任务入口拆为无状态 Gateway、单一逻辑 Scheduler 和可�
 
 自动化基线覆盖10租户、10个并行Worker和1,000个并发任务的无丢失完成，并注入租约超时、Worker消失、检查点重试、供应商失败和滚动升级回滚。该测试用于防止功能回归，不构成吞吐量SLA；正式容量结论必须在目标硬件、数据库和网络环境中重新压测。
 
+## 开放能力生态
+
+能力注册表负责按任务装配能力资产，Capability Provider Protocol 负责扩展的发现、信任、权限、调用和生命周期边界。模型、Agent、客户端、存储与历史适配器共享同一版本化Manifest；企业私有、本地和官方目录只提供元数据，启用前统一完成协议、完整性、签名、依赖与权限检查。
+
+可信Provider可在有界运行时内调用；不可信Provider必须交给返回隔离证明的外部沙箱。没有沙箱时失败关闭，控制平面不把Node `vm`或普通Worker误称为安全隔离。第三方Agent只能在明确的轮次、工具调用、时间、输出和租户边界内委派。TypeScript SDK是主npm包的稳定子路径，Python SDK仅调用平台API，两者遵守同一协议迁移策略。
+
 ## 当前限制
 
-当前主运行时需要Node.js 22.14或更高版本。个人版默认启动仅监听 `127.0.0.1` 的轻量运行时、SQLite和React + Vite配置中心。设置 `TIDU_POSTGRES_URL` 后，同一运行时会附加PostgreSQL企业控制平面和持久化生产任务队列。Docker单机配置默认仍只映射服务器回环地址；跨设备访问必须增加HTTPS反向代理与企业身份认证。当前实现支持无状态Gateway与水平Worker，但Scheduler仍是单一逻辑写入者；Scheduler高可用、领导者选举、跨主机真实容量验证和真实小团队试点仍未完成。Python SDK也计划在开放生态阶段提供。
+当前主运行时需要Node.js 22.14或更高版本。个人版默认启动仅监听 `127.0.0.1` 的轻量运行时、SQLite和React + Vite配置中心。设置 `TIDU_POSTGRES_URL` 后，同一运行时会附加PostgreSQL企业控制平面和持久化生产任务队列。Docker单机配置默认仍只映射服务器回环地址；跨设备访问必须增加HTTPS反向代理与企业身份认证。当前实现支持无状态Gateway与水平Worker，但Scheduler仍是单一逻辑写入者；Scheduler高可用、领导者选举、跨主机真实容量验证、生产沙箱适配器和真实小团队试点仍未完成。
 
 ## 客户端兼容矩阵
 

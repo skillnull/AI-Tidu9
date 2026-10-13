@@ -16,6 +16,7 @@ AI-Tidu9 follows a modular-monolith-first architecture with stable adapter bound
 | `packages/tidu/src/protocol` | Canonical Agent task and event protocol | Evolves through explicit versions without binding to one model |
 | `packages/tidu/src/agent` | Goal understanding, dynamic planning, bounded execution, approval, recovery, and result verification | Models understand and plan; the kernel owns validation, budgets, state, and evidence boundaries |
 | `packages/tidu/src/capabilities` | Unified registration and on-demand assembly for Agents, Skills, MCP servers, tools, and knowledge | Stores only non-sensitive metadata and selects a bounded minimal set by capability, cost, and privacy |
+| `packages/tidu/src/ecosystem` | Capability Provider protocol, SDKs, catalogs, discovery, trust, and isolation boundaries | Untrusted extensions fail closed without a compliant external sandbox; discovery never executes extensions |
 | `packages/tidu/src/runtime` | Lightweight local HTTP runtime, virtual-model, and configuration-center entry | Listens on loopback by default and coordinates adapters without provider implementations or business orchestration |
 | `packages/tidu/src/config-center` | Bootstrap-data contract for the local configuration center | Exposes active and isolated-draft state without direct database access |
 | `packages/tidu/src/openai` | OpenAI-compatible virtual-model, error, and request-validation contracts | Provider-neutral, does not log request content, and never fabricates inference output |
@@ -56,9 +57,15 @@ Every task has hard payload, memory, and scratch-space limits. Large files and t
 
 The automated baseline completes 1,000 concurrent tasks across 10 tenants and 10 workers without loss, and injects lease expiry, worker disappearance, checkpoint retry, provider failure, and rolling-upgrade rollback. This is a functional regression test, not a throughput SLA; production capacity claims require tests on the target hardware, database, and network.
 
+## Open capability ecosystem
+
+The capability registry assembles assets for a task, while Capability Provider Protocol owns extension discovery, trust, permissions, invocation, and lifecycle boundaries. Model, Agent, client, storage, and history adapters share one versioned manifest. Enterprise-private, local, and official catalogs expose metadata only; protocol, integrity, signature, dependency, and permission checks complete before activation.
+
+Trusted providers may run inside the bounded runtime. Untrusted providers require an external sandbox that returns isolation attestation. The control plane fails closed without one and does not misrepresent Node `vm` or an ordinary Worker as a security boundary. Third-party Agent delegation is constrained by explicit turn, tool-call, time, output, and tenant limits. The TypeScript SDK is a stable subpath of the primary npm package, while the Python SDK calls platform APIs; both follow the same protocol migration policy.
+
 ## Current limitations
 
-The primary runtime requires Node.js 22.14 or later. Personal mode defaults to a lightweight `127.0.0.1` service with SQLite and the React + Vite control center. Setting `TIDU_POSTGRES_URL` attaches the PostgreSQL enterprise control plane and durable production task queue to the same runtime. The single-host Docker profile still binds to server loopback by default; cross-device access requires an HTTPS reverse proxy and enterprise identity control. Stateless Gateways and horizontal Workers are implemented, but the Scheduler remains one logical writer. Scheduler high availability, leader election, real multi-host capacity validation, and a real small-team pilot remain incomplete. The Python SDK is planned for the open-ecosystem stage.
+The primary runtime requires Node.js 22.14 or later. Personal mode defaults to a lightweight `127.0.0.1` service with SQLite and the React + Vite control center. Setting `TIDU_POSTGRES_URL` attaches the PostgreSQL enterprise control plane and durable production task queue to the same runtime. The single-host Docker profile still binds to server loopback by default; cross-device access requires an HTTPS reverse proxy and enterprise identity control. Stateless Gateways and horizontal Workers are implemented, but the Scheduler remains one logical writer. Scheduler high availability, leader election, real multi-host capacity validation, a production sandbox adapter, and a real small-team pilot remain incomplete.
 
 ## Client compatibility matrix
 

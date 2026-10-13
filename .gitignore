@@ -12,3 +12,7 @@ package-lock.json
 dist
 coverage
 *.tsbuildinfo
+__pycache__
+*.py[cod]
+*.egg-info
+sdk/python/build

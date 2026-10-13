@@ -167,7 +167,7 @@ Audience: owner and invited developers.
 - [x] Provide Docker single-host deployment / 提供Docker单机部署
 - [ ] Complete small-team noncritical pilot / 完成小团队非关键业务试点
 - [x] Pass enterprise-pilot quality gates / 通过企业试点质量门禁
-- [ ] Receive release confirmation / 获得发布确认
+- [x] Receive release confirmation / 获得发布确认
 
 ## v0.7.0-beta.1 → v0.7.0-rc.1 — Production scaling / 高并发生产候选
 
@@ -190,19 +190,19 @@ Audience: owner and invited developers.
 
 ## v0.8.0-beta.1 — Open capability ecosystem / 开放能力生态预览版
 
-- [ ] Publish capability-provider protocol / 发布能力提供者协议
-- [ ] Publish TypeScript SDK / 发布TypeScript SDK
-- [ ] Publish Python SDK / 发布Python SDK
-- [ ] Provide model, Agent, client, storage, and history adapters / 提供多类适配器
-- [ ] Implement Skill and MCP discovery / 实现Skill与MCP发现
-- [ ] Enforce extension permission manifests / 强制扩展权限清单
-- [ ] Add signature, integrity, dependency, and version verification / 增加签名、完整性、依赖与版本校验
-- [ ] Support local, official, and enterprise-private catalogs / 支持多来源能力目录
-- [ ] Isolate untrusted extension execution / 隔离未受信扩展
-- [ ] Support bounded third-party Agent delegation / 支持受约束第三方Agent委派
-- [ ] Publish extension testing tools and examples / 发布扩展测试工具与示例
-- [ ] Publish SDK migration policy / 发布SDK迁移策略
-- [ ] Pass ecosystem quality gates / 通过生态质量门禁
+- [x] Publish capability-provider protocol / 发布能力提供者协议
+- [x] Publish TypeScript SDK / 发布TypeScript SDK
+- [x] Publish Python SDK / 发布Python SDK
+- [x] Provide model, Agent, client, storage, and history adapters / 提供多类适配器
+- [x] Implement Skill and MCP discovery / 实现Skill与MCP发现
+- [x] Enforce extension permission manifests / 强制扩展权限清单
+- [x] Add signature, integrity, dependency, and version verification / 增加签名、完整性、依赖与版本校验
+- [x] Support local, official, and enterprise-private catalogs / 支持多来源能力目录
+- [x] Isolate untrusted extension execution / 隔离未受信扩展
+- [x] Support bounded third-party Agent delegation / 支持受约束第三方Agent委派
+- [x] Publish extension testing tools and examples / 发布扩展测试工具与示例
+- [x] Publish SDK migration policy / 发布SDK迁移策略
+- [x] Pass ecosystem quality gates / 通过生态质量门禁
 - [ ] Receive release confirmation / 获得发布确认
 
 ## v0.9.0-rc.N — Integrated release candidate / 完整发布候选

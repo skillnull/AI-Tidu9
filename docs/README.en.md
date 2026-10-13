@@ -163,6 +163,8 @@ See the [architecture baseline](./architecture.en.md) for module boundaries and 
 
 See [Core Routing and Secret Gate](./core-differentiators.md#english) for dynamic routing, capability completion, capability assembly, runtime secret protection, and the reproducible cost case.
 
+Model, Agent, client, storage, and history extensions share the Capability Provider Protocol. See [Open capability ecosystem](./ecosystem-sdk.md) for the TypeScript and Python SDKs, permission and signature verification, catalogs, untrusted-extension isolation, and bounded third-party Agent delegation.
+
 ## License
 
 This project is licensed under the [GNU Affero General Public License v3.0 only](../LICENSE). See the [trademark policy](./TRADEMARKS.md) and [NOTICE](../NOTICE) for branding and attribution terms.

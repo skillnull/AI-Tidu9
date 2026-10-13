@@ -8,6 +8,11 @@ import { CONFIG_SCHEMA_VERSION } from "../config/index.js";
 import type { ConfigCenterBootstrap } from "../config-center/index.js";
 import { PRODUCT } from "../core/index.js";
 import {
+  CAPABILITY_PROVIDER_PROTOCOL_VERSION,
+  createCapabilityRuntime,
+  defineCapabilityProvider,
+} from "../ecosystem/index.js";
+import {
   createEnterpriseControlPlane,
   createInMemoryEnterpriseStateRepository,
 } from "../enterprise/index.js";
@@ -102,6 +107,51 @@ test("starts a loopback runtime with a verifiable health endpoint", async () => 
       },
       version: PRODUCT.version,
     });
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("exposes capability providers through one bounded SDK API", async () => {
+  const provider = defineCapabilityProvider({
+    manifest: {
+      id: "company.reviewer",
+      name: "Company reviewer",
+      version: "1.0.0",
+      protocolVersion: CAPABILITY_PROVIDER_PROTOCOL_VERSION,
+      kind: "agent",
+      source: "enterprise",
+      capabilities: ["code.review"],
+      permissions: ["agent.delegate"],
+      trust: "trusted",
+    },
+    invoke: async ({ input }) => ({ output: { reviewed: input } }),
+  });
+  const runtime = await startLocalRuntime({
+    capabilityProviders: [provider],
+    capabilityRuntime: createCapabilityRuntime({ grantedPermissions: ["agent.delegate"] }),
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    port: 0,
+  });
+
+  try {
+    const listResponse = await fetch(`${runtime.origin}/v1/ecosystem/providers`);
+    assert.equal(listResponse.status, 200);
+    assert.equal(
+      ((await listResponse.json()) as { providers: Array<{ id: string }> }).providers[0]?.id,
+      "company.reviewer",
+    );
+
+    const invokeResponse = await fetch(
+      `${runtime.origin}/v1/ecosystem/providers/company.reviewer/invoke`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ operation: "agent.delegate", input: "change" }),
+      },
+    );
+    assert.equal(invokeResponse.status, 200);
+    assert.deepEqual(await invokeResponse.json(), { output: { reviewed: "change" } });
   } finally {
     await runtime.close();
   }

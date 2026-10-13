@@ -39,6 +39,27 @@ export const updateJsonVersion = (content, version) => {
   );
 };
 
+export const toPythonVersion = (version) => {
+  if (!validateVersion(version)) {
+    throw new Error(`Invalid release version ${version}.`);
+  }
+  return version
+    .replace(/-alpha\.(\d+)$/u, "a$1")
+    .replace(/-beta\.(\d+)$/u, "b$1")
+    .replace(/-rc\.(\d+)$/u, "rc$1");
+};
+
+export const updatePythonVersion = (content, version) => {
+  const pythonVersion = toPythonVersion(version);
+  if (!/^(?:version\s*=|__version__\s*=)\s*["'][^"']+["']/mu.test(content)) {
+    throw new Error("Python release metadata must contain a version field.");
+  }
+  return content.replace(
+    /^((?:version|__version__)\s*=\s*["'])[^"']+(["'])/mu,
+    `$1${pythonVersion}$2`,
+  );
+};
+
 const getChangelogVersionPattern = (version) => {
   const escapedVersion = version.replaceAll(".", "\\.");
   return new RegExp(`^##\\s+(?:\\[)?${escapedVersion}(?:\\])?(?:\\s|$)`, "mu");
@@ -99,7 +120,7 @@ export const formatReleaseSummary = (
     `  ${applyTerminalColor("Version:", "blue", colorEnabled)}   ${currentVersion} → ${version}`,
     `  ${applyTerminalColor("npm tags:", "yellow", colorEnabled)}  ${getDistributionTags(version, publishedVersions).join(", ")}`,
     `  ${applyTerminalColor("CHANGELOG:", "yellow", colorEnabled)} ${version} (${releaseDate})`,
-    `  ${applyTerminalColor("Files:", "magenta", colorEnabled)}     package and connector manifests, docs/CHANGELOG.md`,
+    `  ${applyTerminalColor("Files:", "magenta", colorEnabled)}     npm, Python, connector metadata, CHANGELOG`,
     `  ${applyTerminalColor("Next:", "magenta", colorEnabled)}      local commit/tag → npm publish → push`,
     "",
   ].join("\n");
@@ -316,6 +337,8 @@ const getReleaseFiles = (repositoryRoot) => ({
     "connectors/codex/ai-tidu9/.codex-plugin/plugin.json",
   ),
   package: resolve(repositoryRoot, RELEASE.packagePath, "package.json"),
+  pythonInit: resolve(repositoryRoot, "sdk/python/src/ai_tidu9/__init__.py"),
+  pythonProject: resolve(repositoryRoot, "sdk/python/pyproject.toml"),
   pluginManifest: resolve(
     repositoryRoot,
     RELEASE.packagePath,
@@ -367,6 +390,16 @@ const synchronizeReleaseFiles = (releaseFiles, snapshots, version, releaseDate) 
     )
   ) {
     changedFiles.push(releaseFiles.package);
+  }
+  for (const pythonMetadata of [releaseFiles.pythonProject, releaseFiles.pythonInit]) {
+    if (
+      writeReleaseFileIfChanged(
+        pythonMetadata,
+        updatePythonVersion(snapshots.get(pythonMetadata), version),
+      )
+    ) {
+      changedFiles.push(pythonMetadata);
+    }
   }
   if (
     writeReleaseFileIfChanged(

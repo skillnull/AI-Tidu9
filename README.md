@@ -163,6 +163,8 @@ tidu restore
 
 动态模型路由、能力补全、能力资产装配、Secret Gate及可复现成本案例见[核心调度与门禁](./docs/core-differentiators.md)。
 
+模型、Agent、客户端、存储和历史扩展统一使用 Capability Provider Protocol。TypeScript SDK、Python SDK、权限与签名校验、能力目录、不可信扩展隔离和第三方Agent委派边界见[开放能力生态](./docs/ecosystem-sdk.md)。
+
 ## 开源协议
 
 本项目使用 [GNU Affero General Public License v3.0 only](./LICENSE)。品牌和署名规则见 [商标政策](./docs/TRADEMARKS.md) 与 [NOTICE](./NOTICE)。

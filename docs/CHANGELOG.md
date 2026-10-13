@@ -6,6 +6,15 @@ All notable changes to AI-Tidu9 will be documented in this file.
 
 ## Unreleased / 未发布
 
+- Add Capability Provider Protocol 1.0 with typed model, Agent, client, storage, and history adapters; explicit permission manifests; integrity, Ed25519 signature, dependency, and version verification; and enterprise, local, and official catalogs.
+- 增加Capability Provider Protocol 1.0，提供模型、Agent、客户端、存储与历史适配器，以及显式权限清单、完整性、Ed25519签名、依赖和版本校验，并支持企业私有、本地与官方能力目录。
+- Add bounded Skill and MCP discovery, fail-closed untrusted-extension isolation contracts, bounded third-party Agent delegation, extension test tooling, examples, and a real runtime Provider API.
+- 增加有界Skill与MCP发现、默认拒绝的不可信扩展隔离契约、有界第三方Agent委派、扩展测试工具、示例及真实运行时Provider API。
+- Publish the TypeScript ecosystem SDK through `@skillnull/tidu/ecosystem` and add a zero-runtime-dependency Python SDK with synchronized npm, connector, and Python release metadata.
+- 通过`@skillnull/tidu/ecosystem`发布TypeScript生态SDK，并增加零运行时依赖的Python SDK，同时统一同步npm、连接器与Python发布版本元数据。
+- Add bilingual ecosystem and migration guidance, including the rule that Node `vm` and ordinary Workers are not security sandboxes and that untrusted execution requires external isolation attestation.
+- 增加双语生态与迁移说明，明确Node `vm`和普通Worker不属于安全沙箱，不可信执行必须提供外部隔离证明。
+
 ## 0.7.0-rc.1 - 2026-10-13
 
 - Add the Stage 7 production-scaling core with stateless gateways, one logical scheduler, horizontally scalable workers, tenant-safe admission, backpressure, fair scheduling, leases, checkpoints, and PostgreSQL compare-and-swap task persistence.

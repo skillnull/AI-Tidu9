@@ -3,13 +3,18 @@ import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { updateJsonVersion } from "./publish-tidu.mjs";
+import { updateJsonVersion, updatePythonVersion } from "./publish-tidu.mjs";
 
 const VERSION_METADATA = Object.freeze({
   packagePath: "packages/tidu/package.json",
   manifestPaths: [
-    "packages/tidu/connectors/codex/ai-tidu9/plugin.json",
-    "packages/tidu/connectors/codex/ai-tidu9/.codex-plugin/plugin.json",
+    { path: "packages/tidu/connectors/codex/ai-tidu9/plugin.json", update: updateJsonVersion },
+    {
+      path: "packages/tidu/connectors/codex/ai-tidu9/.codex-plugin/plugin.json",
+      update: updateJsonVersion,
+    },
+    { path: "sdk/python/pyproject.toml", update: updatePythonVersion },
+    { path: "sdk/python/src/ai_tidu9/__init__.py", update: updatePythonVersion },
   ],
 });
 
@@ -41,10 +46,11 @@ export const synchronizeStagedPackageVersions = (repositoryRoot) => {
   }
 
   const synchronizedPaths = [];
-  for (const manifestPath of VERSION_METADATA.manifestPaths) {
+  for (const metadata of VERSION_METADATA.manifestPaths) {
+    const manifestPath = metadata.path;
     const absoluteManifestPath = resolve(repositoryRoot, manifestPath);
     const indexContent = readIndexFile(repositoryRoot, manifestPath);
-    const synchronizedIndexContent = updateJsonVersion(indexContent, packageVersion);
+    const synchronizedIndexContent = metadata.update(indexContent, packageVersion);
     if (synchronizedIndexContent === indexContent) {
       continue;
     }
@@ -55,7 +61,7 @@ export const synchronizeStagedPackageVersions = (repositoryRoot) => {
       absoluteManifestPath,
       worktreeContent === indexContent
         ? synchronizedIndexContent
-        : updateJsonVersion(worktreeContent, packageVersion),
+        : metadata.update(worktreeContent, packageVersion),
     );
     synchronizedPaths.push(manifestPath);
   }

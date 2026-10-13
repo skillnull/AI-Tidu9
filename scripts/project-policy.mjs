@@ -84,6 +84,12 @@ export const validateCommitMessage = (commitMessage) => {
 
 export const validateVersion = (version) => POLICY.semverPattern.test(version);
 
+const toPythonVersion = (version) =>
+  version
+    .replace(/-alpha\.(\d+)$/u, "a$1")
+    .replace(/-beta\.(\d+)$/u, "b$1")
+    .replace(/-rc\.(\d+)$/u, "rc$1");
+
 export const validateMainUpdateActor = (actor, branchName) => {
   const branchIsProtected = isProtectedBranch(branchName);
   const isOwner = actor.toLowerCase() === PROJECT_POLICY.owner.toLowerCase();
@@ -230,6 +236,27 @@ export const validateRepositoryVersions = (repositoryRoot) => {
       readJson(absoluteManifestPath).version !== tiduVersion
     ) {
       problems.push(`${manifestPath} version must match @skillnull/tidu@${tiduVersion}.`);
+    }
+  }
+
+  const pythonMetadata = [
+    {
+      path: "sdk/python/pyproject.toml",
+      pattern: /^version\s*=\s*["']([^"']+)["']/mu,
+    },
+    {
+      path: "sdk/python/src/ai_tidu9/__init__.py",
+      pattern: /^__version__\s*=\s*["']([^"']+)["']/mu,
+    },
+  ];
+  const expectedPythonVersion =
+    tiduVersion === undefined ? undefined : toPythonVersion(tiduVersion);
+  for (const metadata of pythonMetadata) {
+    const absoluteMetadataPath = join(repositoryRoot, metadata.path);
+    if (!existsSync(absoluteMetadataPath)) continue;
+    const pythonVersion = metadata.pattern.exec(readFileSync(absoluteMetadataPath, "utf8"))?.[1];
+    if (pythonVersion !== expectedPythonVersion) {
+      problems.push(`${metadata.path} version must match @skillnull/tidu@${tiduVersion}.`);
     }
   }
 

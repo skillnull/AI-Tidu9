@@ -19,6 +19,7 @@ import {
 } from "../config/index.js";
 import { createConfigCenterBootstrap } from "../config-center/index.js";
 import { PRODUCT, TiduError } from "../core/index.js";
+import type { CapabilityProviderImplementation, CapabilityRuntime } from "../ecosystem/index.js";
 import type { EnterpriseControlPlane } from "../enterprise/index.js";
 import { createEnterpriseRuntimeFromEnvironment } from "../enterprise/runtime.js";
 import { acquireRuntimeDataLock } from "../lifecycle/index.js";
@@ -71,6 +72,10 @@ export interface LocalRuntimeOptions {
   enterpriseControlPlane?: EnterpriseControlPlane;
   /** Optional production scheduler used by the stateless gateway endpoints. */
   scalingControlPlane?: ScalingControlPlane;
+  /** Capability providers exposed through the versioned ecosystem API. */
+  capabilityProviders?: readonly CapabilityProviderImplementation[];
+  /** Permission and isolation runtime required to invoke capability providers. */
+  capabilityRuntime?: CapabilityRuntime;
 }
 
 export interface LocalRuntime {
@@ -378,6 +383,8 @@ const handleRequest = async (
   agentKernel: AgentKernel | undefined,
   enterprise: EnterpriseControlPlane | undefined,
   scaling: ScalingControlPlane | undefined,
+  capabilityProviders: readonly CapabilityProviderImplementation[],
+  capabilityRuntime: CapabilityRuntime | undefined,
 ): Promise<void> => {
   const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
 
@@ -394,6 +401,55 @@ const handleRequest = async (
       },
       version: PRODUCT.version,
     });
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/v1/ecosystem/providers") {
+    sendJson(response, 200, {
+      providers: capabilityProviders.map((capabilityProvider) => capabilityProvider.manifest),
+    });
+    return;
+  }
+
+  const capabilityProviderRoute = /^\/v1\/ecosystem\/providers\/([^/]+)\/invoke$/u.exec(pathname);
+  if (request.method === "POST" && capabilityProviderRoute !== null) {
+    try {
+      validateMutationRequest(request);
+      if (capabilityRuntime === undefined) {
+        sendJson(response, 503, { error: "CAPABILITY_RUNTIME_NOT_CONFIGURED" });
+        return;
+      }
+      const providerId = decodeURIComponent(capabilityProviderRoute[1] ?? "");
+      const capabilityProvider = capabilityProviders.find(
+        (candidate) => candidate.manifest.id === providerId,
+      );
+      if (capabilityProvider === undefined) {
+        sendJson(response, 404, { error: "CAPABILITY_PROVIDER_NOT_FOUND" });
+        return;
+      }
+      const body = await readJsonBody(request);
+      if (!isRecord(body) || typeof body.operation !== "string" || !body.operation.trim()) {
+        throw new TiduError("CONFIGURATION_INVALID", "Capability operation is required.");
+      }
+      const result = await capabilityRuntime.invoke(capabilityProvider, {
+        operation: body.operation,
+        input: body.input,
+        tenantId: typeof body.tenantId === "string" ? body.tenantId : undefined,
+        timeoutMs: typeof body.timeoutMs === "number" ? body.timeoutMs : undefined,
+        maximumOutputBytes:
+          typeof body.maximumOutputBytes === "number" ? body.maximumOutputBytes : undefined,
+      });
+      sendJson(response, 200, result);
+    } catch (error) {
+      if (error instanceof TiduError) {
+        handleConfigurationMutationError(response, error);
+      } else {
+        sendJson(response, 422, {
+          error: "CAPABILITY_INVOCATION_REJECTED",
+          message: error instanceof Error ? error.message : "Capability invocation was rejected.",
+        });
+      }
+    }
     return;
   }
 
@@ -863,6 +919,8 @@ export const startLocalRuntime = async (
       agentKernel,
       enterpriseControlPlane,
       scalingControlPlane,
+      options.capabilityProviders ?? [],
+      options.capabilityRuntime,
     ).catch(() => {
       if (!response.headersSent) {
         sendJson(response, 500, { error: "INTERNAL_ERROR" });

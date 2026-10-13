@@ -16,7 +16,9 @@ import {
   getUnexpectedChangedPaths,
   parseGitStatusPaths,
   prepareChangelog,
+  toPythonVersion,
   updateJsonVersion,
+  updatePythonVersion,
   validatePublishContext,
 } from "./publish-tidu.mjs";
 import { synchronizeStagedPackageVersions } from "./sync-package-versions.mjs";
@@ -70,6 +72,21 @@ test("updates release versions without reformatting JSON metadata", () => {
   assert.throws(() => updateJsonVersion('{"name":"example"}', "1.1.0"), /version field/u);
 });
 
+test("maps SemVer prereleases to synchronized Python metadata", () => {
+  assert.equal(toPythonVersion("0.8.0-alpha.2"), "0.8.0a2");
+  assert.equal(toPythonVersion("0.8.0-beta.1"), "0.8.0b1");
+  assert.equal(toPythonVersion("1.0.0-rc.3"), "1.0.0rc3");
+  assert.equal(toPythonVersion("1.0.0"), "1.0.0");
+  assert.equal(
+    updatePythonVersion('version = "0.7.0rc1"\n', "0.8.0-beta.1"),
+    'version = "0.8.0b1"\n',
+  );
+  assert.equal(
+    updatePythonVersion('__version__ = "0.7.0rc1"\n', "0.8.0-beta.1"),
+    '__version__ = "0.8.0b1"\n',
+  );
+});
+
 test("synchronizes staged package versions into both connector manifests", () => {
   const repositoryRoot = mkdtempSync(join(tmpdir(), "tidu-version-sync-"));
   const packagePath = join(repositoryRoot, "packages/tidu/package.json");
@@ -77,11 +94,19 @@ test("synchronizes staged package versions into both connector manifests", () =>
     join(repositoryRoot, "packages/tidu/connectors/codex/ai-tidu9/plugin.json"),
     join(repositoryRoot, "packages/tidu/connectors/codex/ai-tidu9/.codex-plugin/plugin.json"),
   ];
+  const pythonMetadataPaths = [
+    join(repositoryRoot, "sdk/python/pyproject.toml"),
+    join(repositoryRoot, "sdk/python/src/ai_tidu9/__init__.py"),
+  ];
   try {
     for (const filePath of [packagePath, ...manifestPaths]) {
       mkdirSync(dirname(filePath), { recursive: true });
       writeFileSync(filePath, '{\n  "version": "0.5.0-beta.1"\n}\n');
     }
+    mkdirSync(dirname(pythonMetadataPaths[0]), { recursive: true });
+    mkdirSync(dirname(pythonMetadataPaths[1]), { recursive: true });
+    writeFileSync(pythonMetadataPaths[0], 'version = "0.5.0b1"\n');
+    writeFileSync(pythonMetadataPaths[1], '__version__ = "0.5.0b1"\n');
     execFileSync("git", ["init", "--quiet"], { cwd: repositoryRoot });
     execFileSync("git", ["add", "."], { cwd: repositoryRoot });
     writeFileSync(packagePath, '{\n  "version": "0.6.0-beta.1"\n}\n');
@@ -90,7 +115,7 @@ test("synchronizes staged package versions into both connector manifests", () =>
     const result = synchronizeStagedPackageVersions(repositoryRoot);
 
     assert.equal(result.packageVersion, "0.6.0-beta.1");
-    assert.equal(result.synchronizedPaths.length, 2);
+    assert.equal(result.synchronizedPaths.length, 4);
     for (const manifestPath of manifestPaths) {
       assert.equal(JSON.parse(readFileSync(manifestPath, "utf8")).version, "0.6.0-beta.1");
       const relativePath = manifestPath.slice(repositoryRoot.length + 1);
@@ -100,6 +125,8 @@ test("synchronizes staged package versions into both connector manifests", () =>
       });
       assert.equal(JSON.parse(stagedManifest).version, "0.6.0-beta.1");
     }
+    assert.equal(readFileSync(pythonMetadataPaths[0], "utf8"), 'version = "0.6.0b1"\n');
+    assert.equal(readFileSync(pythonMetadataPaths[1], "utf8"), '__version__ = "0.6.0b1"\n');
   } finally {
     rmSync(repositoryRoot, { recursive: true, force: true });
   }
