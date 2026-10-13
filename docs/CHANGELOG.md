@@ -6,6 +6,8 @@ All notable changes to AI-Tidu9 will be documented in this file.
 
 ## Unreleased / 未发布
 
+## 0.7.0-rc.1 - 2026-10-13
+
 - Add the Stage 7 production-scaling core with stateless gateways, one logical scheduler, horizontally scalable workers, tenant-safe admission, backpressure, fair scheduling, leases, checkpoints, and PostgreSQL compare-and-swap task persistence.
 - 增加Stage 7生产伸缩核心，支持无状态网关、单一逻辑调度器、水平扩展Worker、租户安全准入、背压、公平调度、租约、检查点及PostgreSQL比较并交换任务持久化。
 - Add bounded payload, memory, scratch, and streaming controls; provider circuit breakers and failover; metrics-first content-free diagnostics; health alerts; drain-first rolling upgrades; and rollback.
