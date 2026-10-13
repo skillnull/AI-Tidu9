@@ -186,7 +186,7 @@ Audience: owner and invited developers.
 - [x] Complete fault-injection tests / 完成故障注入测试
 - [x] Verify offline and isolated deployment / 验证离线与隔离部署
 - [x] Pass release-candidate gates / 通过RC门禁
-- [ ] Receive release confirmation / 获得发布确认
+- [x] Receive release confirmation / 获得发布确认
 
 ## v0.8.0-beta.1 — Open capability ecosystem / 开放能力生态预览版
 
@@ -249,12 +249,12 @@ Audience: owner and invited developers.
 
 Every public release must provide the applicable artifacts below.
 
-- [ ] npm package / npm安装包
-- [ ] Git tag / Git Tag
-- [ ] GitHub release notes / GitHub发布说明
+- [x] npm package / npm安装包
+- [x] Git tag / Git Tag
+- [x] GitHub release notes / GitHub发布说明
 - [ ] Docker images when applicable / 适用阶段的Docker镜像
 - [ ] Checksums and signatures when available / 校验和与可用签名
-- [ ] Chinese and English changelog / 中英文变更记录
+- [x] Chinese and English changelog / 中英文变更记录
 - [ ] Upgrade and rollback guide / 升级与回滚说明
 - [ ] Migration notes / 迁移说明
 - [ ] Compatibility matrix / 兼容矩阵
@@ -264,7 +264,7 @@ Every public release must provide the applicable artifacts below.
 ## Current status / 当前状态
 
 - Planning / 规划：**complete / 已完成**
-- Active stage / 当前阶段：**Stage 7 — Engineering complete, release confirmation pending / 阶段7：工程完成，等待发布确认**
-- Latest planned release / 最近计划版本：`v0.7.0-rc.1`
-- Latest published release / 最近已发布版本：`v0.6.0-beta.1`
+- Active stage / 当前阶段：**Stage 8 — Open capability ecosystem / 阶段8：开放能力生态**
+- Latest planned release / 最近计划版本：`v0.8.0-beta.1`
+- Latest published release / 最近已发布版本：`v0.7.0-rc.1`
 - Remote publishing / 远程发布：**enabled with explicit confirmation / 经明确确认后执行**
