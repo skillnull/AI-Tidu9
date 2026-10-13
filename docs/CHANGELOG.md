@@ -6,6 +6,8 @@ All notable changes to AI-Tidu9 will be documented in this file.
 
 ## Unreleased / 未发布
 
+## 0.8.0-beta.1 - 2026-10-13
+
 - Add Capability Provider Protocol 1.0 with typed model, Agent, client, storage, and history adapters; explicit permission manifests; integrity, Ed25519 signature, dependency, and version verification; and enterprise, local, and official catalogs.
 - 增加Capability Provider Protocol 1.0，提供模型、Agent、客户端、存储与历史适配器，以及显式权限清单、完整性、Ed25519签名、依赖和版本校验，并支持企业私有、本地与官方能力目录。
 - Add bounded Skill and MCP discovery, fail-closed untrusted-extension isolation contracts, bounded third-party Agent delegation, extension test tooling, examples, and a real runtime Provider API.
