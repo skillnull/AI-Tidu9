@@ -9,6 +9,7 @@ import {
   getDistributionTag,
   getDistributionTags,
   getNextPrereleaseVersion,
+  getUnexpectedChangedPaths,
   parseGitStatusPaths,
   prepareChangelog,
   updateJsonVersion,
@@ -70,6 +71,29 @@ test("preserves paths from git porcelain status", () => {
       " M docs/CHANGELOG.md\nM  package.json\n?? packages/tidu/generated-file.json",
     ),
     ["docs/CHANGELOG.md", "package.json", "packages/tidu/generated-file.json"],
+  );
+});
+
+test("allows partial release metadata while rejecting unrelated working changes", () => {
+  const allowedPaths = [
+    "docs/CHANGELOG.md",
+    "packages/tidu/package.json",
+    "packages/tidu/connectors/codex/ai-tidu9/plugin.json",
+  ];
+
+  assert.deepEqual(
+    getUnexpectedChangedPaths(
+      "M  packages/tidu/package.json\n M packages/tidu/connectors/codex/ai-tidu9/plugin.json",
+      allowedPaths,
+    ),
+    [],
+  );
+  assert.deepEqual(
+    getUnexpectedChangedPaths(
+      "M  packages/tidu/package.json\n M packages/tidu/src/index.ts",
+      allowedPaths,
+    ),
+    ["packages/tidu/src/index.ts"],
   );
 });
 

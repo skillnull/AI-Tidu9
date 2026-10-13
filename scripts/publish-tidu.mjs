@@ -334,24 +334,49 @@ const restoreReleaseFiles = (snapshots) => {
   }
 };
 
+const writeReleaseFileIfChanged = (filePath, content) => {
+  if (readFileSync(filePath, "utf8") === content) {
+    return false;
+  }
+  writeFileSync(filePath, content);
+  return true;
+};
+
 const synchronizeReleaseFiles = (releaseFiles, snapshots, version, releaseDate) => {
   if (!validateVersion(version)) {
     throw new Error(`Invalid release version ${version}.`);
   }
 
+  const changedFiles = [];
   const connectorManifests = [releaseFiles.codexManifest, releaseFiles.pluginManifest];
   for (const connectorManifest of connectorManifests) {
-    writeFileSync(connectorManifest, updateJsonVersion(snapshots.get(connectorManifest), version));
+    if (
+      writeReleaseFileIfChanged(
+        connectorManifest,
+        updateJsonVersion(snapshots.get(connectorManifest), version),
+      )
+    ) {
+      changedFiles.push(connectorManifest);
+    }
   }
 
-  writeFileSync(
-    releaseFiles.package,
-    updateJsonVersion(snapshots.get(releaseFiles.package), version),
-  );
-  writeFileSync(
-    releaseFiles.changelog,
-    prepareChangelog(snapshots.get(releaseFiles.changelog), version, releaseDate),
-  );
+  if (
+    writeReleaseFileIfChanged(
+      releaseFiles.package,
+      updateJsonVersion(snapshots.get(releaseFiles.package), version),
+    )
+  ) {
+    changedFiles.push(releaseFiles.package);
+  }
+  if (
+    writeReleaseFileIfChanged(
+      releaseFiles.changelog,
+      prepareChangelog(snapshots.get(releaseFiles.changelog), version, releaseDate),
+    )
+  ) {
+    changedFiles.push(releaseFiles.changelog);
+  }
+  return changedFiles;
 };
 
 const readPublishContext = (repositoryRoot) => {
@@ -391,12 +416,16 @@ const publishPreparedRelease = (repositoryRoot, argumentsList) => {
   return publishPackage(repositoryRoot, context.repositoryVersion, argumentsList);
 };
 
+export const getUnexpectedChangedPaths = (status, allowedPaths) => {
+  const allowedPathSet = new Set(allowedPaths);
+  return parseGitStatusPaths(status).filter((filePath) => !allowedPathSet.has(filePath));
+};
+
 const ensureReleaseFilesAreIsolated = (repositoryRoot, releaseFiles) => {
-  const allowedPaths = new Set(
-    Object.values(releaseFiles).map((filePath) => filePath.slice(repositoryRoot.length + 1)),
+  const allowedPaths = Object.values(releaseFiles).map((filePath) =>
+    filePath.slice(repositoryRoot.length + 1),
   );
-  const changedPaths = parseGitStatusPaths(readGitStatus(repositoryRoot));
-  const unexpectedPaths = changedPaths.filter((filePath) => !allowedPaths.has(filePath));
+  const unexpectedPaths = getUnexpectedChangedPaths(readGitStatus(repositoryRoot), allowedPaths);
   if (unexpectedPaths.length > 0) {
     throw new Error(
       `Unexpected files changed during release preparation:\n${unexpectedPaths.join("\n")}`,
@@ -409,10 +438,9 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
     throw new Error("Interactive publishing requires a terminal.");
   }
 
+  const releaseFiles = getReleaseFiles(repositoryRoot);
   const initialContext = readPublishContext(repositoryRoot);
-  if (initialContext.status !== "") {
-    throw new Error("The working tree must be clean before release preparation.");
-  }
+  ensureReleaseFilesAreIsolated(repositoryRoot, releaseFiles);
   if (
     initialContext.branchName !== "main" &&
     !/^support\/(0|[1-9]\d*)\.x$/u.test(initialContext.branchName)
@@ -450,7 +478,6 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
     throw new Error(`Local ${initialContext.branchName} must match origin before publishing.`);
   }
 
-  const releaseFiles = getReleaseFiles(repositoryRoot);
   const snapshots = captureReleaseFiles(releaseFiles);
   const releaseDate = new Date().toISOString().slice(0, 10);
   const publishedVersions = readPublishedVersions(RELEASE.packageName, repositoryRoot);
@@ -482,7 +509,20 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
   });
 
   try {
-    synchronizeReleaseFiles(releaseFiles, snapshots, candidateVersion, releaseDate);
+    const synchronizedFiles = synchronizeReleaseFiles(
+      releaseFiles,
+      snapshots,
+      candidateVersion,
+      releaseDate,
+    );
+    const synchronizedPaths = synchronizedFiles.map((filePath) =>
+      filePath.slice(repositoryRoot.length + 1),
+    );
+    process.stdout.write(
+      synchronizedPaths.length > 0
+        ? `${applyTerminalColor("✔ Release metadata synchronized:", "green", colorEnabled)}\n${synchronizedPaths.map((filePath) => `  ${filePath}`).join("\n")}\n`
+        : `${applyTerminalColor("✔ Release metadata already matches the package version.", "green", colorEnabled)}\n`,
+    );
     while (!releaseConfirmed) {
       process.stdout.write(
         formatReleaseSummary(
