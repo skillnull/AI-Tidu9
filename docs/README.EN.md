@@ -35,18 +35,25 @@ AI-Tidu9 is an intelligent collaboration hub for every domain. It coordinates in
 <a id="getting-started"></a>
 ## 🚀 Installation and first run
 
-**Node.js 22.14 or later is required.** No global installation is needed:
+**Node.js 22.14 or later is required.** Install the CLI globally, then start the configuration center:
+
+```bash
+npm install -g @skillnull/tidu
+tidu start
+```
+
+Open the configuration-center URL printed in the terminal. The guided flow detects the deployment, names the entry, connects a model, previews impact, activates the configuration, and connects supported clients.
+
+For a one-time trial without installation, use:
 
 ```bash
 npx @skillnull/tidu start
 ```
 
-Open the configuration-center URL printed in the terminal. The guided flow detects the deployment, names the entry, connects a model, previews impact, activates the configuration, and connects supported clients.
-
 When a server has no usable browser, run the same setup in the terminal:
 
 ```bash
-npx @skillnull/tidu start --cli
+tidu start --cli
 ```
 
 Verify the running system with two commands:

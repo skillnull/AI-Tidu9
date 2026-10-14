@@ -2,9 +2,11 @@
 
 [README](../README.md) · [使用实例](./EXAMPLES.md) · [English](./CLI-REFERENCE.EN.md)
 
-## ⚡ 三种调用方式
+## ⚡ 安装与调用方式
 
 ```bash
+npm install -g @skillnull/tidu  # 持久安装，提供 tidu 命令
+tidu start                      # 安装后启动
 npx @skillnull/tidu start     # 临时运行，无需全局安装
 tidu --help                   # 已安装后的总帮助
 tidu <命令> --help             # 任意命令的专属帮助

@@ -35,18 +35,25 @@
 <a id="getting-started"></a>
 ## 🚀 安装与首次启动
 
-**需要 Node.js 22.14 或更高版本。** 无需全局安装：
+**需要 Node.js 22.14 或更高版本。** 先全局安装，再启动配置中心：
+
+```bash
+npm install -g @skillnull/tidu
+tidu start
+```
+
+打开终端输出的配置中心。页面会引导完成部署识别、入口命名、模型接入、影响模拟、启用和客户端接入。
+
+如果只想免安装体验一次，可以改用：
 
 ```bash
 npx @skillnull/tidu start
 ```
 
-打开终端输出的配置中心。页面会引导完成部署识别、入口命名、模型接入、影响模拟、启用和客户端接入。
-
 服务器无法打开页面时，使用同一套终端向导：
 
 ```bash
-npx @skillnull/tidu start --cli
+tidu start --cli
 ```
 
 已启动后，用两个命令确认状态：

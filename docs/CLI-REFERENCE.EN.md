@@ -2,9 +2,11 @@
 
 [README](./README.EN.md) · [Examples](./EXAMPLES.EN.md) · [简体中文](./CLI-REFERENCE.md)
 
-## ⚡ Three command forms
+## ⚡ Installation and command forms
 
 ```bash
+npm install -g @skillnull/tidu  # Persistent install; provides the tidu command
+tidu start                      # Start after installation
 npx @skillnull/tidu start     # Ephemeral run; no global install
 tidu --help                   # Top-level help after installation
 tidu <command> --help         # Command-specific help
