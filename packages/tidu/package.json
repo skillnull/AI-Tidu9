@@ -20,7 +20,7 @@
     "./storage/migrations/*.sql": "./storage/migrations/*.sql"
   },
   "bin": {
-    "tidu": "dist/cli/index.js"
+    "tidu": "dist/cli/launcher.js"
   },
   "files": [
     "connectors",

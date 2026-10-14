@@ -364,7 +364,7 @@ const GuideCenter = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
             <article className="guide-card">
               <p className="guide-index">01 · START</p>
               <h3>Open the personal control center</h3>
-              <code>npx @skillnull/tidu start</code>
+              <code>tidu start</code>
               <ol>
                 <li>Keep the runtime terminal open.</li>
                 <li>Open the printed loopback address.</li>
@@ -442,7 +442,7 @@ const GuideCenter = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
             <article className="guide-card">
               <p className="guide-index">01 · 启动</p>
               <h3>安装并打开页面</h3>
-              <code>npx @skillnull/tidu start</code>
+              <code>tidu start</code>
               <ol>
                 <li>保持启动命令所在终端运行。</li>
                 <li>打开终端显示的配置中心地址。</li>
@@ -462,7 +462,7 @@ const GuideCenter = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
             <article className="guide-card">
               <p className="guide-index">03 · 排查</p>
               <h3>页面无法打开</h3>
-              <code>npx @skillnull/tidu doctor</code>
+              <code>tidu doctor</code>
               <ol>
                 <li>检查运行时、数据库、配置API和页面资源。</li>
                 <li>页面不可用时运行同一npm包的 config 交互向导。</li>

@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { CONFIG_SCHEMA_VERSION } from "../config/index.js";
 import { startLocalRuntime } from "../runtime/index.js";
 import { runCli } from "./index.js";
+import { supportsNodeVersion } from "./launcher.js";
 import {
   createSafeDiagnosticReport,
   diagnoseEndpoint,
@@ -24,6 +25,15 @@ const packageVersion = (
     version: string;
   }
 ).version;
+
+test("checks the minimum Node.js version before loading the CLI", () => {
+  assert.equal(supportsNodeVersion("18.20.8"), false);
+  assert.equal(supportsNodeVersion("22.13.1"), false);
+  assert.equal(supportsNodeVersion("22.14.0"), true);
+  assert.equal(supportsNodeVersion("22.22.3"), true);
+  assert.equal(supportsNodeVersion("23.0.0"), true);
+  assert.equal(supportsNodeVersion("invalid"), false);
+});
 
 test("shows concise help by default", () => {
   assert.match(runCli([]), /Usage \/ 用法:/u);

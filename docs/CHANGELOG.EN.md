@@ -9,6 +9,9 @@ This file records user-visible changes in every public AI-Tidu9 release. Compati
 
 ## Unreleased
 
+- Standardize installation guidance on switching to Node.js 22.14+ before globally installing and using the `tidu` command; no longer describe the temporary `npx` download as installation-free.
+- Check the runtime version before loading SQLite and other Node.js 22 capabilities, so older Node versions receive clear bilingual upgrade guidance instead of a missing `node:sqlite` error.
+
 ## 1.0.0 - 2026-10-13
 
 - Rebuild the public documentation system with separate language files, semantic icons and outcome-oriented primary headings, real tertiary headings for procedural steps, a clear installation and first-run path, role-based navigation, synchronized diagrams, explicit trust and failure semantics, task-oriented CLI and SDK guidance, and a reviewable contribution flow.

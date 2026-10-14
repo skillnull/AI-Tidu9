@@ -32,7 +32,7 @@ Make sure Ollama is running and the model is available, then run:
 ```bash
 TIDU_PROVIDER=ollama \
 TIDU_PROVIDER_MODEL=qwen3:8b \
-npx @skillnull/tidu start
+tidu start
 ```
 
 ### ✅ Verify
@@ -80,7 +80,7 @@ Inject `TIDU_PROVIDER_API_KEY` with a local secret manager. This guard checks on
 export TIDU_PROVIDER=openai-compatible
 export TIDU_PROVIDER_MODEL=gpt-4.1-mini
 export TIDU_PROVIDER_BASE_URL=https://api.openai.com/v1
-npx @skillnull/tidu start
+tidu start
 ```
 
 Compatible remote services must use HTTPS. HTTP is accepted only for `localhost`, `127.0.0.1`, and `::1`.

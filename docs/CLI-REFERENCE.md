@@ -7,7 +7,6 @@
 ```bash
 npm install -g @skillnull/tidu  # 持久安装，提供 tidu 命令
 tidu start                      # 安装后启动
-npx @skillnull/tidu start     # 临时运行，无需全局安装
 tidu --help                   # 已安装后的总帮助
 tidu <命令> --help             # 任意命令的专属帮助
 ```
@@ -18,7 +17,7 @@ tidu <命令> --help             # 任意命令的专属帮助
 
 | 我想要…… | 从这里开始 | 接下来 |
 | --- | --- | --- |
-| 第一次体验 | `npx @skillnull/tidu start` | 按页面向导完成配置 |
+| 第一次体验 | `tidu start` | 按页面向导完成配置 |
 | 纯终端配置 | `tidu start --cli` | 跟随五步交互向导 |
 | 接入已安装客户端 | `tidu setup install` | 使用 `tidu setup verify` 验证 |
 | 页面打不开或行为异常 | `tidu doctor` | 需要分享时改用 `tidu doctor --json` |

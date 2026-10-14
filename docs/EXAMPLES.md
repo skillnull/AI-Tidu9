@@ -32,7 +32,7 @@
 ```bash
 TIDU_PROVIDER=ollama \
 TIDU_PROVIDER_MODEL=qwen3:8b \
-npx @skillnull/tidu start
+tidu start
 ```
 
 ### ✅ 验证
@@ -81,7 +81,7 @@ curl -fsS http://127.0.0.1:9639/v1/chat/completions \
 export TIDU_PROVIDER=openai-compatible
 export TIDU_PROVIDER_MODEL=gpt-4.1-mini
 export TIDU_PROVIDER_BASE_URL=https://api.openai.com/v1
-npx @skillnull/tidu start
+tidu start
 ```
 
 兼容中转服务必须使用 HTTPS。只有 `localhost`、`127.0.0.1` 和 `::1` 可以使用 HTTP。

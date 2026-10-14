@@ -35,7 +35,20 @@
 <a id="getting-started"></a>
 ## 🚀 安装与首次启动
 
-**需要 Node.js 22.14 或更高版本。** 先全局安装，再启动配置中心：
+**需要 Node.js 22.14 或更高版本。** 安装前先确认版本：
+
+```bash
+node --version
+```
+
+如果版本低于 22.14，可使用已安装的 Node 版本管理器切换。以 NVM 为例：
+
+```bash
+nvm install 22
+nvm use 22
+```
+
+Node 版本满足要求后，安装并启动配置中心：
 
 ```bash
 npm install -g @skillnull/tidu
@@ -44,11 +57,8 @@ tidu start
 
 打开终端输出的配置中心。页面会引导完成部署识别、入口命名、模型接入、影响模拟、启用和客户端接入。
 
-如果只想免安装体验一次，可以改用：
-
-```bash
-npx @skillnull/tidu start
-```
+> [!NOTE]
+> npm 安装命令不会替用户安装或切换 Node.js。请先在当前终端切换到兼容版本，再安装 AI-Tidu9。
 
 服务器无法打开页面时，使用同一套终端向导：
 
@@ -94,7 +104,7 @@ tidu setup verify       # 验证连接器，不修改配置
 
 | 我想要…… | 从这里开始 | 数据层 |
 | --- | --- | --- |
-| 在本机统一个人模型、Skill 和 MCP | `npx @skillnull/tidu start` | SQLite，默认只监听回环地址 |
+| 在本机统一个人模型、Skill 和 MCP | `tidu start` | SQLite，默认只监听回环地址 |
 | 在服务器集中管理策略、额度和能力 | Docker 部署 + PostgreSQL | 企业控制平面 |
 | 保留 IDE 本地能力，同时经过企业出口 | 企业网关 + 员工设备连接器 | 服务端状态 + 本地私有边界 |
 | 开发模型、Agent、存储或历史 Provider | `@skillnull/tidu/ecosystem` 或 Python SDK | 通过平台 API 访问，不复制控制平面 |
@@ -119,7 +129,7 @@ OpenAI 兼容服务：
 TIDU_PROVIDER=openai-compatible \
 TIDU_PROVIDER_MODEL=gpt-4.1-mini \
 TIDU_PROVIDER_API_KEY='<runtime-key>' \
-npx @skillnull/tidu start
+tidu start
 ```
 
 本机 Ollama：
@@ -127,7 +137,7 @@ npx @skillnull/tidu start
 ```bash
 TIDU_PROVIDER=ollama \
 TIDU_PROVIDER_MODEL=qwen3:8b \
-npx @skillnull/tidu start
+tidu start
 ```
 
 > [!IMPORTANT]

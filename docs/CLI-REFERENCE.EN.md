@@ -7,7 +7,6 @@
 ```bash
 npm install -g @skillnull/tidu  # Persistent install; provides the tidu command
 tidu start                      # Start after installation
-npx @skillnull/tidu start     # Ephemeral run; no global install
 tidu --help                   # Top-level help after installation
 tidu <command> --help         # Command-specific help
 ```
@@ -18,7 +17,7 @@ tidu <command> --help         # Command-specific help
 
 | I want to… | Start here | Then |
 | --- | --- | --- |
-| Try it for the first time | `npx @skillnull/tidu start` | Complete the browser-based setup |
+| Try it for the first time | `tidu start` | Complete the browser-based setup |
 | Configure entirely in a terminal | `tidu start --cli` | Follow the five-step interactive wizard |
 | Connect installed clients | `tidu setup install` | Validate with `tidu setup verify` |
 | Diagnose an unreachable page or unexpected behavior | `tidu doctor` | Use `tidu doctor --json` for a shareable report |

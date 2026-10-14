@@ -35,7 +35,20 @@ AI-Tidu9 is an intelligent collaboration hub for every domain. It coordinates in
 <a id="getting-started"></a>
 ## 🚀 Installation and first run
 
-**Node.js 22.14 or later is required.** Install the CLI globally, then start the configuration center:
+**Node.js 22.14 or later is required.** Check the version before installation:
+
+```bash
+node --version
+```
+
+If the version is older than 22.14, switch with an installed Node version manager. For example, with NVM:
+
+```bash
+nvm install 22
+nvm use 22
+```
+
+After Node meets the requirement, install and start the configuration center:
 
 ```bash
 npm install -g @skillnull/tidu
@@ -44,11 +57,8 @@ tidu start
 
 Open the configuration-center URL printed in the terminal. The guided flow detects the deployment, names the entry, connects a model, previews impact, activates the configuration, and connects supported clients.
 
-For a one-time trial without installation, use:
-
-```bash
-npx @skillnull/tidu start
-```
+> [!NOTE]
+> The npm installation command does not install or switch Node.js. Switch the current terminal to a compatible Node version before installing AI-Tidu9.
 
 When a server has no usable browser, run the same setup in the terminal:
 
@@ -94,7 +104,7 @@ See [Core Routing and Secret Gate](./CORE-DIFFERENTIATORS.EN.md) for implementat
 
 | I want to… | Start here | State layer |
 | --- | --- | --- |
-| Unify personal models, Skills, and MCP servers locally | `npx @skillnull/tidu start` | SQLite, loopback-only by default |
+| Unify personal models, Skills, and MCP servers locally | `tidu start` | SQLite, loopback-only by default |
 | Centralize policy, quota, and capabilities on a server | Docker deployment + PostgreSQL | Enterprise control plane |
 | Preserve local IDE capabilities behind enterprise egress controls | Enterprise gateway + device connector | Server state + local private boundary |
 | Build a model, Agent, storage, or history provider | `@skillnull/tidu/ecosystem` or Python SDK | Platform APIs, without duplicating the control plane |
@@ -119,7 +129,7 @@ OpenAI-compatible service:
 TIDU_PROVIDER=openai-compatible \
 TIDU_PROVIDER_MODEL=gpt-4.1-mini \
 TIDU_PROVIDER_API_KEY='<runtime-key>' \
-npx @skillnull/tidu start
+tidu start
 ```
 
 Local Ollama:
@@ -127,7 +137,7 @@ Local Ollama:
 ```bash
 TIDU_PROVIDER=ollama \
 TIDU_PROVIDER_MODEL=qwen3:8b \
-npx @skillnull/tidu start
+tidu start
 ```
 
 > [!IMPORTANT]
