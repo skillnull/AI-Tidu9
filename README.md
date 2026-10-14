@@ -61,16 +61,21 @@ tidu setup verify       # 验证连接器，不修改配置
 
 ## 🔄 从目标到可验证结果
 
+<div align="left">
+
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 24, "rankSpacing": 24, "diagramPadding": 4}, "themeVariables": {"fontSize": "12px"}}}%%
 flowchart LR
   Goal["🎯 用户目标"] --> Entry["Codex · Cursor · CLI · 浏览器"]
-  Entry --> Gate["🛡️ 策略 · 额度 · 审批 · Secret Gate"]
-  Gate --> Kernel["AI-Tidu9 Agent 内核"]
-  Kernel --> Pool["模型 · Agent · Skill · MCP · 工具 · 知识"]
+  Entry --> Gate["🛡️ 策略 · 额度 · 审批<br/>Secret Gate"]
+  Gate --> Kernel["Agent 内核"]
+  Kernel --> Pool["模型 · Agent · Skill<br/>MCP · 工具 · 知识"]
   Pool --> Verify["✅ 独立验证"]
   Verify --> Result["📦 可验证结果"]
   Verify -. 未通过 .-> Kernel
 ```
+
+</div>
 
 这条链路有三个不可替换的责任：
 

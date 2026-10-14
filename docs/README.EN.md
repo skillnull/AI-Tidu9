@@ -61,16 +61,21 @@ tidu setup verify       # Verify connectors without changing them
 
 ## 🔄 From goal to verifiable outcome
 
+<div align="left">
+
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 24, "rankSpacing": 24, "diagramPadding": 4}, "themeVariables": {"fontSize": "12px"}}}%%
 flowchart LR
   Goal["🎯 User goal"] --> Entry["Codex · Cursor · CLI · Browser"]
-  Entry --> Gate["🛡️ Policy · Quota · Approval · Secret Gate"]
-  Gate --> Kernel["AI-Tidu9 Agent kernel"]
-  Kernel --> Pool["Model · Agent · Skill · MCP · Tool · Knowledge"]
+  Entry --> Gate["🛡️ Policy · Quota · Approval<br/>Secret Gate"]
+  Gate --> Kernel["Agent kernel"]
+  Kernel --> Pool["Model · Agent · Skill<br/>MCP · Tool · Knowledge"]
   Pool --> Verify["✅ Independent verification"]
   Verify --> Result["📦 Verifiable outcome"]
   Verify -. rejected .-> Kernel
 ```
+
+</div>
 
 This path preserves three separate responsibilities:
 
