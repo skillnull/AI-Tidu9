@@ -32,7 +32,6 @@ import {
 } from "../connectors/setup.js";
 import { PRODUCT, TiduError } from "../core/index.js";
 import {
-  archivePersonalData,
   purgePersonalData,
   resolvePersonalDataDirectory,
   restoreLatestPersonalData,
@@ -55,7 +54,8 @@ Usage / 用法:
 
 Commands / 命令:
   tidu start        Start the runtime / 启动运行时
-  tidu setup        Manage host connectors / 管理宿主连接器
+    --edition personal|enterprise  Select installation edition / 选择安装版型
+  tidu setup        Install clients and virtual model / 安装客户端与虚拟模型
   tidu mcp          Run the MCP connector / 运行MCP连接器
   tidu doctor       Diagnose the service / 诊断服务
   tidu clients      Discover or configure clients / 发现或配置客户端
@@ -194,17 +194,17 @@ Usage / 用法:
 
 Restores the latest recoverable personal-data snapshot without overwriting an existing data directory.
 恢复最近的个人数据快照，不覆盖已有数据目录。`,
-  setup: `Setup / 连接器安装
+  setup: `Setup / 客户端安装
 
 Usage / 用法:
   tidu setup [install|verify|repair|update|uninstall] [--endpoint <url>]
 
 Actions / 动作:
-  install     Install detected connectors; default / 安装已发现连接器，默认动作
+  install     Install connectors and virtual model; default / 安装连接器与虚拟模型，默认动作
   verify      Verify without changes / 只验证，不修改
   repair      Recreate owned registrations / 重建九门自有注册
   update      Refresh launch metadata / 更新启动信息
-  uninstall   Remove connectors, keep data / 移除连接器，保留数据`,
+  uninstall   Remove connectors and managed virtual model / 移除连接器与九门虚拟模型`,
   start: `Start / 启动
 
 Usage / 用法:
@@ -223,14 +223,10 @@ Starts the runtime and prints the management URL. Secrets are read from the proc
   uninstall: `Uninstall / 卸载
 
 Usage / 用法:
-  tidu uninstall [--yes]
-  tidu uninstall --purge [--confirm DELETE]
-  tidu uninstall --complete [--confirm DELETE] [--endpoint <url>]
+  tidu uninstall [--confirm DELETE] [--endpoint <url>]
 
-Modes / 模式:
-  default     Archive personal data for restore / 归档个人数据，可恢复
-  --purge     Permanently remove owned data and snapshots / 永久删除自有数据和快照
-  --complete  Also remove owned connectors, profiles, and global npm install / 同时清理自有连接器、Profile和全局npm安装`,
+Removes AI-Tidu9-owned connectors, profiles, data, snapshots, and a detected global npm install.
+移除九门自有连接器、Profile、数据、快照以及检测到的全局npm安装。`,
   version: `Version / 版本
 
 Usage / 用法:
@@ -499,8 +495,10 @@ const runClientConfiguration = async (argumentsList: readonly string[]): Promise
   throw new TiduError("UNSUPPORTED_COMMAND", `Unknown clients action: ${String(action)}`);
 };
 
-const runSetup = (argumentsList: readonly string[]): string => {
-  const requestedAction = argumentsList[1] ?? "install";
+const runSetup = async (argumentsList: readonly string[]): Promise<string> => {
+  const actionArgument = argumentsList[1];
+  const requestedAction =
+    actionArgument === undefined || actionArgument.startsWith("--") ? "install" : actionArgument;
   const supportedActions = new Set<ConnectorSetupAction>([
     "install",
     "verify",
@@ -511,12 +509,35 @@ const runSetup = (argumentsList: readonly string[]): string => {
   if (!supportedActions.has(requestedAction as ConnectorSetupAction)) {
     throw new TiduError("UNSUPPORTED_COMMAND", `Unknown setup action: ${requestedAction}`);
   }
+  const endpoint = resolveEndpoint(argumentsList);
+  if (requestedAction === "uninstall") {
+    const report = setupConnectors({ action: "uninstall", endpoint });
+    if (!report.healthy) {
+      process.exitCode = 1;
+    }
+    const removal = removeCodexClientConfiguration();
+    return [
+      formatConnectorSetupReport(report),
+      `Codex managed artifacts removed: ${removal.removedArtifactCount}`,
+    ].join("\n");
+  }
+  if (requestedAction === "verify") {
+    const report = setupConnectors({ action: "verify", endpoint });
+    if (!report.healthy) {
+      process.exitCode = 1;
+    }
+    return formatConnectorSetupReport(report);
+  }
   const report = setupConnectors({
     action: requestedAction as ConnectorSetupAction,
-    endpoint: resolveEndpoint(argumentsList),
+    endpoint,
   });
   if (!report.healthy) {
-    process.exitCode = 1;
+    setupConnectors({ action: "uninstall", endpoint });
+    throw new TiduError(
+      "CONFIGURATION_CONFLICT",
+      `Client setup failed and was rolled back.\n${formatConnectorSetupReport(report)}`,
+    );
   }
   return formatConnectorSetupReport(report);
 };
@@ -616,74 +637,35 @@ const runPersonalUninstall = async (argumentsList: readonly string[]): Promise<s
   assertDefaultLifecycleStorage();
   await assertPersonalRuntimeStopped();
   const dataDirectory = resolvePersonalDataDirectory();
-  const complete = argumentsList.includes("--complete");
-  if (complete) {
-    const confirmed =
-      readOption(argumentsList, "--confirm") === "DELETE" ||
-      (await confirmLifecycleAction(
-        `Remove all AI-Tidu9 connectors, managed client files, data, and snapshots at ${dataDirectory}? Type DELETE: `,
-        "DELETE",
-      ));
-    if (!confirmed) {
-      return `${style("Cancelled.", "yellow")} No data was changed.`;
-    }
-    const connectorReport = setupConnectors({
-      action: "uninstall",
-      endpoint: resolveEndpoint(argumentsList),
-    });
-    if (!connectorReport.healthy) {
-      throw new TiduError(
-        "CONFIGURATION_CONFLICT",
-        `Complete uninstall stopped because a connector could not be removed.\n${formatConnectorSetupReport(connectorReport)}`,
-      );
-    }
-    const codexRemoval = removeCodexClientConfiguration();
-    const dataRemoval = purgePersonalData(dataDirectory);
-    const packageRemoval = removeGlobalNpmPackage();
-    return [
-      `${style("✓", "green")} Complete AI-Tidu9 cleanup finished.`,
-      formatConnectorSetupReport(connectorReport),
-      `Codex managed artifacts removed: ${codexRemoval.removedArtifactCount}`,
-      `Data directories removed: ${dataRemoval.removedDirectoryCount}`,
-      packageRemoval,
-      "Host accounts, conversations, unrelated plugins, and custom database paths were preserved.",
-    ].join("\n");
-  }
-  const purge = argumentsList.includes("--purge");
-  if (purge) {
-    const confirmed =
-      readOption(argumentsList, "--confirm") === "DELETE" ||
-      (await confirmLifecycleAction(
-        `Permanently delete ${dataDirectory} and all AI-Tidu9 snapshots? Type DELETE: `,
-        "DELETE",
-      ));
-    if (!confirmed) {
-      return `${style("Cancelled.", "yellow")} No data was changed.`;
-    }
-    const result = purgePersonalData(dataDirectory);
-    return result.status === "missing"
-      ? `${style("✓", "green")} No personal data or snapshots were found.`
-      : `${style("✓", "green")} Permanently removed ${result.removedDirectoryCount} AI-Tidu9 data director${result.removedDirectoryCount === 1 ? "y" : "ies"}.`;
-  }
-
   const confirmed =
-    argumentsList.includes("--yes") ||
+    readOption(argumentsList, "--confirm") === "DELETE" ||
     (await confirmLifecycleAction(
-      `Archive personal data at ${dataDirectory} for a recoverable uninstall? [y/N]: `,
-      "y",
+      `Remove all AI-Tidu9 connectors, managed client files, data, snapshots, and package installation at ${dataDirectory}? Type DELETE: `,
+      "DELETE",
     ));
   if (!confirmed) {
     return `${style("Cancelled.", "yellow")} No data was changed.`;
   }
-  const result = archivePersonalData(dataDirectory);
-  if (result.status === "missing") {
-    return `${style("✓", "green")} No personal data was found. npx installations need no package removal.`;
+  const connectorReport = setupConnectors({
+    action: "uninstall",
+    endpoint: resolveEndpoint(argumentsList),
+  });
+  if (!connectorReport.healthy) {
+    throw new TiduError(
+      "CONFIGURATION_CONFLICT",
+      `Complete uninstall stopped because a connector could not be removed.\n${formatConnectorSetupReport(connectorReport)}`,
+    );
   }
+  const codexRemoval = removeCodexClientConfiguration();
+  const dataRemoval = purgePersonalData(dataDirectory);
+  const packageRemoval = removeGlobalNpmPackage();
   return [
-    `${style("✓", "green")} Personal data was archived safely.`,
-    `Snapshot: ${result.snapshotDirectory}`,
-    "Run tidu restore after reinstalling to recover it.",
-    "If installed globally, finish with: npm uninstall -g @skillnull/tidu",
+    `${style("✓", "green")} Complete AI-Tidu9 cleanup finished.`,
+    formatConnectorSetupReport(connectorReport),
+    `Codex managed artifacts removed: ${codexRemoval.removedArtifactCount}`,
+    `Data directories removed: ${dataRemoval.removedDirectoryCount}`,
+    packageRemoval,
+    "Host accounts, conversations, unrelated plugins, and custom database paths were preserved.",
   ].join("\n");
 };
 
@@ -733,6 +715,16 @@ if (isDirectExecution) {
     if (helpText !== undefined) {
       process.stdout.write(`${helpText}\n`);
     } else if (argumentsList[0] === "start") {
+      const editionIndex = argumentsList.indexOf("--edition");
+      const editionArgument = editionIndex === -1 ? undefined : argumentsList[editionIndex + 1];
+      const configuredEdition = editionArgument ?? process.env.TIDU_EDITION;
+      if (
+        configuredEdition !== undefined &&
+        configuredEdition !== "personal" &&
+        configuredEdition !== "enterprise"
+      ) {
+        throw new TiduError("CONFIGURATION_INVALID", "--edition must be personal or enterprise.");
+      }
       const { startLocalRuntime } = await import("../runtime/index.js");
       const configuredPort = process.env.TIDU_PORT;
       const port = configuredPort === undefined ? undefined : Number(configuredPort);
@@ -744,6 +736,7 @@ if (isDirectExecution) {
       }
 
       const runtime = await startLocalRuntime({
+        deployment: configuredEdition,
         databasePath: process.env.TIDU_DATABASE_PATH,
         host: process.env.TIDU_HOST,
         port,
@@ -760,7 +753,12 @@ if (isDirectExecution) {
         );
       }
 
+      let runtimeStopping = false;
       const stopRuntime = async () => {
+        if (runtimeStopping) {
+          return;
+        }
+        runtimeStopping = true;
         await runtime.close();
         process.exitCode = 0;
       };
@@ -798,7 +796,7 @@ if (isDirectExecution) {
         await enterpriseRuntime.close();
       }
     } else if (argumentsList[0] === "setup") {
-      process.stdout.write(`${runSetup(argumentsList)}\n`);
+      process.stdout.write(`${await runSetup(argumentsList)}\n`);
     } else if (argumentsList[0] === "doctor") {
       const output = await runDoctor(argumentsList);
       process.stdout.write(`${output}\n`);

@@ -31,7 +31,16 @@ test("isolates UI mode selection from the active runtime configuration", () => {
   assert.equal(preview.valid, true);
   assert.equal(preview.isolated, true);
   assert.equal(preview.risk, "medium");
-  assert.deepEqual(preview.changes, ["activeMode", "activeProfileId"]);
+  assert.deepEqual(preview.changes, [
+    "activeMode",
+    "activeProfileId",
+    "expertServices.host",
+    "expertServices.port",
+    "expertServices.responsesApiEnabled",
+    "expertServices.chatCompletionsApiEnabled",
+    "expertServices.taskApiEnabled",
+  ]);
+  assert.equal(preview.restartRequired, true);
   assert.equal(active.activeMode, "managed");
 });
 
@@ -230,7 +239,7 @@ test("round-trips an authenticated encrypted configuration export", () => {
   assert.throws(() => decryptConfigurationBundle(encrypted, "incorrect-passphrase"));
 });
 
-test("imports both isolated profiles without activating them", async () => {
+test("imports shared entry fields and expert settings without activating them", async () => {
   const storage = await openNodeSqliteStorage({ databasePath: ":memory:" });
   try {
     const workspace = await importConfigurationBundle(storage.configurationStore, {
@@ -244,7 +253,7 @@ test("imports both isolated profiles without activating them", async () => {
       extensions: [],
     });
     assert.equal(workspace.active.configuration.virtualModelName, "九门赛博提督");
-    assert.equal(workspace.drafts.managed.configuration.virtualModelName, "Managed import");
+    assert.equal(workspace.drafts.managed.configuration.virtualModelName, "Expert import");
     assert.equal(workspace.drafts.expert.configuration.virtualModelName, "Expert import");
   } finally {
     storage.close();

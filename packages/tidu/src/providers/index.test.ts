@@ -7,6 +7,7 @@ import {
   createOllamaProvider,
   createOpenAiCompatibleProvider,
   createProviderFromEnvironment,
+  discoverOllamaModels,
 } from "./index.js";
 
 interface TestServer {
@@ -395,6 +396,31 @@ test("creates providers from minimal environment configuration", () => {
     model: "gpt-test",
   });
   assert.equal(createProviderFromEnvironment({}), undefined);
+});
+
+test("discovers installed models from a running Ollama service", async () => {
+  const server = await startTestServer((request, response) => {
+    assert.equal(request.url, "/api/tags");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({
+        models: [
+          { name: "qwen3:30b", model: "qwen3:30b" },
+          { name: "qwen2.5-coder:1.5b-base" },
+          { model: "qwen3:30b" },
+        ],
+      }),
+    );
+  });
+
+  try {
+    assert.deepEqual(await discoverOllamaModels({ baseUrl: server.origin }), [
+      "qwen3:30b",
+      "qwen2.5-coder:1.5b-base",
+    ]);
+  } finally {
+    await server.close();
+  }
 });
 
 test("rejects unsafe or incomplete provider environment configuration", () => {

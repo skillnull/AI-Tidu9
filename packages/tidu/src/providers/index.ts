@@ -8,7 +8,12 @@ import {
   rewriteOpenAiSseStream,
 } from "./streaming.js";
 
-export type ProviderType = "ollama" | "openai-compatible" | "tidu-router";
+export type ProviderType =
+  | "codex-host"
+  | "cursor-host"
+  | "ollama"
+  | "openai-compatible"
+  | "tidu-router";
 export type ProviderProtocol = "chat-completions" | "responses";
 export type ProviderPrivacy = "external" | "local" | "private";
 
@@ -93,6 +98,15 @@ export interface ProviderAdapterOptions {
 export interface OpenAiCompatibleProviderOptions extends ProviderAdapterOptions {
   /** Optional bearer credential kept private by the adapter. */
   apiKey?: string;
+}
+
+export interface OllamaDiscoveryOptions {
+  /** Ollama API origin; defaults to the standard loopback endpoint. */
+  baseUrl?: string;
+  /** Optional fetch implementation for isolated tests. */
+  request?: typeof fetch;
+  /** Discovery timeout in milliseconds. */
+  timeoutMilliseconds?: number;
 }
 
 const DEFAULT_PROVIDER_TIMEOUT_MILLISECONDS = 120_000;
@@ -514,6 +528,40 @@ export const createOllamaProvider = (options: ProviderAdapterOptions): ModelProv
       };
     },
   };
+};
+
+export const discoverOllamaModels = async (
+  options: OllamaDiscoveryOptions = {},
+): Promise<readonly string[]> => {
+  const baseUrl = validateProviderBaseUrl(options.baseUrl ?? "http://127.0.0.1:11434");
+  const request = options.request ?? fetch;
+  const response = await request(createEndpoint(baseUrl, "/api/tags"), {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(options.timeoutMilliseconds ?? 3_000),
+  });
+  if (!response.ok) {
+    throw new Error(`Ollama model discovery failed with HTTP ${response.status}.`);
+  }
+  const body = await readProviderJson(response);
+  if (!isRecord(body) || !Array.isArray(body.models)) {
+    throw new Error("Ollama model discovery returned an invalid response.");
+  }
+  return [
+    ...new Set(
+      body.models.flatMap((candidate) => {
+        if (!isRecord(candidate)) {
+          return [];
+        }
+        const model =
+          typeof candidate.model === "string"
+            ? candidate.model.trim()
+            : typeof candidate.name === "string"
+              ? candidate.name.trim()
+              : "";
+        return model ? [model] : [];
+      }),
+    ),
+  ];
 };
 
 export const createProviderFromEnvironment = (

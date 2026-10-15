@@ -82,7 +82,7 @@ test("removes only AI-Tidu9-owned Codex profile artifacts", async () => {
     await configureCodexClient({ endpoint: runtime.origin, codexHomeDirectory });
     const result = removeCodexClientConfiguration({ codexHomeDirectory });
     assert.equal(result.status, "removed");
-    assert.equal(result.removedArtifactCount, 3);
+    assert.equal(result.removedArtifactCount, 4);
     assert.equal(existsSync(join(codexHomeDirectory, "ai-tidu9.config.toml")), false);
     assert.equal(existsSync(join(codexHomeDirectory, ".ai-tidu9-profile-state.json")), false);
     assert.equal(existsSync(join(codexHomeDirectory, ".ai-tidu9-backups")), false);

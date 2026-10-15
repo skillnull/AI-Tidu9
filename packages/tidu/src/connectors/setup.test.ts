@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -71,6 +79,37 @@ test("setup uses one absolute MCP launch for detected hosts", () => {
       }).healthy,
       true,
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("setup can register only the Codex connector without changing Cursor", () => {
+  const root = mkdtempSync(join(tmpdir(), "tidu-codex-only-"));
+  const binaryDirectory = join(root, "bin");
+  const codex = join(binaryDirectory, "codex");
+  try {
+    mkdirSync(binaryDirectory, { recursive: true });
+    writeFileSync(
+      codex,
+      '#!/bin/sh\nif [ "$2" = "get" ]; then exit 1; fi\nif [ "$2" = "add" ]; then exit 0; fi\nexit 1\n',
+    );
+    chmodSync(codex, 0o700);
+    const report = setupConnectors({
+      action: "install",
+      cliEntry: "/opt/tidu/dist/cli/index.js",
+      nodeExecutable: "/opt/node/bin/node",
+      homeDirectory: root,
+      executablePath: binaryDirectory,
+      targets: ["codex"],
+    });
+
+    assert.equal(report.healthy, true);
+    assert.deepEqual(
+      report.connectors.map((connector) => connector.id),
+      ["codex"],
+    );
+    assert.equal(existsSync(join(root, ".cursor/mcp.json")), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

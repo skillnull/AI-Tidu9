@@ -52,6 +52,7 @@ After Node meets the requirement, install and start the configuration center:
 
 ```bash
 npm install -g @skillnull/tidu
+tidu setup
 tidu start
 ```
 
@@ -123,10 +124,13 @@ The container binds to server loopback by default. Cross-device access requires 
 
 ### Connect a model source
 
+AI-Tidu9 automatically uses the current model from a signed-in Codex or Cursor host. You do not need to enter a model name or key. Calls go through the official host process; AI-Tidu9 never reads or copies host credentials. The commands below explicitly override that default.
+
 OpenAI-compatible service:
 
 ```bash
 TIDU_PROVIDER=openai-compatible \
+TIDU_PROVIDER_BASE_URL='https://<service>/v1' \
 TIDU_PROVIDER_MODEL=gpt-4.1-mini \
 TIDU_PROVIDER_API_KEY='<runtime-key>' \
 tidu start
@@ -141,22 +145,24 @@ tidu start
 ```
 
 > [!IMPORTANT]
-> Keys are read only from the current process environment. They never enter SQLite, page responses, or logs. Without a provider, configuration remains available and inference returns `model_provider_not_configured` explicitly.
+> Override-service keys are read only from the current process environment. They never enter SQLite, page responses, or logs. If no reusable host model or explicit provider override is available, inference returns `model_provider_not_configured` explicitly.
 
 ## 🛠️ Operate, diagnose, and remove completely
 
 ```bash
-tidu setup                 # Install detected host connectors
+tidu setup                 # Install AI-Tidu9 connectors while preserving host models
 tidu clients               # Inspect local client compatibility
 tidu account               # Inspect reusable host login state
 tidu doctor --json         # Generate a privacy-safe diagnostic summary
-tidu uninstall             # Create a recoverable archive
-tidu uninstall --complete  # Remove every AI-Tidu9-owned artifact
+tidu uninstall             # Remove every AI-Tidu9-owned artifact
 ```
 
 Complete removal preserves host accounts, conversations, unrelated plugins and configuration, and custom database paths.
 
 Generic clients use `/v1/models`, `/v1/chat/completions`, and `/v1/responses` on the same base URL. Hosts such as Codex and Cursor should prefer native Agent or MCP connectors to preserve host capability boundaries.
+Codex Desktop cannot currently add a third-party provider to its official model list. `tidu setup` therefore installs the MCP connector, preserves every official model, and lets those models call AI-Tidu9 capabilities. Use `tidu clients connect codex` to create the isolated `ai-tidu9` profile only when an explicit compatibility entry is needed; that profile does not append to the official model list.
+
+Enterprise servers deploy the runtime and PostgreSQL without running setup on employee computers or hosting a separate employee page. Employees install the personal AI-Tidu9 client, then enter the administrator-provided HTTPS company URL under Company access in their local page. The local client verifies and displays company models, policies, and capabilities as read-only data while personal configuration remains separate.
 
 ## 🛡️ Trust boundaries and security promises
 
@@ -185,9 +191,23 @@ Generic clients use `/v1/models`, `/v1/chat/completions`, and `/v1/responses` on
 ## 🤝 Development and feedback
 
 ```bash
-npm run setup
+npm run tidu:setup
+npm run tidu:dev-p
+# Develop the enterprise UI and workflows
+npm run tidu:dev-e
 npm run check
 ```
+
+`npm run tidu:setup` installs repository development dependencies only. Product initialization uses `tidu setup`; they have separate lifecycles.
+
+`tidu:dev-p` starts the complete personal runtime and development UI; `tidu:dev-e` starts the enterprise edition. Development commands run product setup before starting the service and remove the temporary client integration on exit. Open the URL printed in the terminal. UI edits hot-update; backend TypeScript edits are recompiled and restart the service. In another terminal, run CLI commands against the same development data:
+
+```bash
+npm run tidu:cli-p -- doctor
+npm run tidu:cli-p -- config show
+```
+
+Development data is isolated from the installed app by default. See [Contributing](./CONTRIBUTING.EN.md#local-development) for details.
 
 Attach a reviewed `tidu doctor --json` report when opening an issue:
 

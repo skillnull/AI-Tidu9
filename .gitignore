@@ -12,6 +12,7 @@ package-lock.json
 dist
 coverage
 .cache
+.tidu-dev
 .pytest_cache
 *.tsbuildinfo
 __pycache__

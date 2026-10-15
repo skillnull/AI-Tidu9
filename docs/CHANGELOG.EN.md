@@ -9,8 +9,10 @@ This file records user-visible changes in every public AI-Tidu9 release. Compati
 
 ## Unreleased
 
+- Correct client integration semantics: install the Codex MCP connector by default while preserving the official model list, stop presenting an isolated profile as an additive model, and actively discover the local Ollama catalog without requiring Ollama to be the active runtime first.
 - Standardize installation guidance on switching to Node.js 22.14+ before globally installing and using the `tidu` command; no longer describe the temporary `npx` download as installation-free.
 - Check the runtime version before loading SQLite and other Node.js 22 capabilities, so older Node versions receive clear bilingual upgrade guidance instead of a missing `node:sqlite` error.
+- Add `npm run tidu:dev-p`, `npm run tidu:dev-e`, and matching CLI commands for complete personal and enterprise development runtimes, UI hot updates, automatic backend rebuilds and restarts, and isolated development data.
 
 ## 1.0.0 - 2026-10-13
 
@@ -22,7 +24,8 @@ This file records user-visible changes in every public AI-Tidu9 release. Compati
 
 ## 0.9.0-rc.1 - 2026-10-13
 
-- Add a fail-closed `tidu uninstall --complete` flow that removes AI-Tidu9-owned connectors, managed client artifacts, data, snapshots, and global npm installation while preserving all unrelated host state.
+- Make `tidu uninstall` the single complete-removal flow for AI-Tidu9-owned connectors, managed client artifacts, data, snapshots, and global npm installation while preserving unrelated host state.
+- Stop enterprise servers from running setup on employee computers; employees now enter the company URL in their installed personal edition, where company configuration is stored separately and shown read-only.
 
 ## 0.8.0-beta.1 - 2026-10-13
 

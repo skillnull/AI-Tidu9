@@ -7,9 +7,13 @@
     "packages/*"
   ],
   "scripts": {
-    "setup": "sh -c '. ./scripts/use-project-node.sh && npm install --no-package-lock'",
+    "tidu:setup": "sh -c '. ./scripts/use-project-node.sh && npm install --no-package-lock'",
     "build": "sh -c '. ./scripts/use-project-node.sh && npm run build --workspaces --if-present'",
     "build:tidu": "sh -c '. ./scripts/use-project-node.sh && npm run build --workspace @skillnull/tidu'",
+    "tidu:dev-p": "sh -c '. ./scripts/use-project-node.sh && exec node scripts/dev-tidu.mjs'",
+    "tidu:dev-e": "sh -c '. ./scripts/use-project-node.sh && TIDU_DEV_EDITION=enterprise exec node scripts/dev-tidu.mjs'",
+    "tidu:cli-p": "sh -c '. ./scripts/use-project-node.sh && export TIDU_DATABASE_PATH=\"${TIDU_DATABASE_PATH:-.tidu-dev/tidu.sqlite}\" && exec node packages/tidu/dist/cli/launcher.js \"$@\"' --",
+    "tidu:cli-e": "sh -c '. ./scripts/use-project-node.sh && export TIDU_DATABASE_PATH=\"${TIDU_DATABASE_PATH:-.tidu-dev/enterprise.sqlite}\" && export TIDU_EDITION=enterprise && exec node packages/tidu/dist/cli/launcher.js \"$@\"' --",
     "check": "sh -c '. ./scripts/use-project-node.sh && npm run policy -- versions && npm run lint && npm test'",
     "lint": "sh -c '. ./scripts/use-project-node.sh && biome check --config-path=config/biome.json .'",
     "prepare": "sh -c '. ./scripts/use-project-node.sh && node scripts/install-git-hooks.mjs'",

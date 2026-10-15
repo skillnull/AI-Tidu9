@@ -9,6 +9,8 @@ export interface OpenAiModel {
   object: "model";
   /** Required AI-Tidu9 attribution retained under custom display names. */
   owned_by: "AI-Tidu9";
+  /** Human-readable virtual-model name shown by compatible client catalogs. */
+  display_name: string;
 }
 
 export interface OpenAiModelList {
@@ -57,6 +59,7 @@ export const createOpenAiModel = (
   created: Math.floor(Date.parse(activatedAt) / 1_000),
   object: "model",
   owned_by: "AI-Tidu9",
+  display_name: configuration.virtualModelName,
 });
 
 const validateModel = (

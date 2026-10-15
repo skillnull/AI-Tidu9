@@ -10,6 +10,8 @@ export type {
   ConfigurationDraft,
   ConfigurationStore,
   ConfigurationWorkspace,
+  EnterpriseConnectionSnapshot,
+  EnterpriseConnectionStore,
   NodeSqliteStorageOptions,
   SaveConfigurationDraftInput,
   StorageAdapter,

@@ -47,7 +47,7 @@ test("creates and reopens a persistent SQLite database", async () => {
   }
 });
 
-test("isolates drafts from each other and from the active configuration", async () => {
+test("shares entry fields across drafts without changing the active configuration", async () => {
   const storage = await openNodeSqliteStorage({
     databasePath: IN_MEMORY_DATABASE_PATH,
   });
@@ -68,8 +68,9 @@ test("isolates drafts from each other and from the active configuration", async 
     assert.equal(updatedWorkspace.active.configuration.activeMode, "managed");
     assert.equal(
       updatedWorkspace.drafts.managed.revision,
-      initialWorkspace.drafts.managed.revision,
+      initialWorkspace.drafts.managed.revision + 1,
     );
+    assert.equal(updatedWorkspace.drafts.managed.configuration.virtualModelName, "九门专家入口");
     assert.equal(updatedWorkspace.drafts.expert.configuration.virtualModelName, "九门专家入口");
 
     const activatedWorkspace = await storage.configurationStore.activateDraft(
@@ -134,7 +135,9 @@ test("rejects a database created by a newer schema", async () => {
 
     const { DatabaseSync } = await import("node:sqlite");
     const database = new DatabaseSync(databasePath);
-    database.prepare("UPDATE tidu_metadata SET value = ? WHERE key = ?").run("5", "schema_version");
+    database
+      .prepare("UPDATE tidu_metadata SET value = ? WHERE key = ?")
+      .run(String(Number(STORAGE_SCHEMA_VERSION) + 1), "schema_version");
     database.close();
 
     await assert.rejects(openNodeSqliteStorage({ databasePath }), /not supported/u);

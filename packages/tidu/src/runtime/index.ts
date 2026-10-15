@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
-import { extname, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
+import { inspectCodexHostLogin } from "../accounts/codex-host.js";
+import { inspectCursorHostLogin, reloginCursorHost } from "../accounts/cursor-host.js";
 import {
   type AgentKernel,
   type CreateAgentTaskInput,
@@ -18,6 +20,7 @@ import {
   type TiduConfiguration,
 } from "../config/index.js";
 import { createConfigCenterBootstrap } from "../config-center/index.js";
+import { setupConnectors } from "../connectors/setup.js";
 import { PRODUCT, TiduError } from "../core/index.js";
 import type { CapabilityProviderImplementation, CapabilityRuntime } from "../ecosystem/index.js";
 import type { EnterpriseControlPlane } from "../enterprise/index.js";
@@ -31,10 +34,25 @@ import {
   validateResponsesRequest,
 } from "../openai/index.js";
 import { activateConfigurationSafely, previewConfigurationImpact } from "../personal/index.js";
-import { createProviderFromEnvironment, type ModelProvider } from "../providers/index.js";
+import {
+  createCodexHostModelProvider,
+  createCursorHostModelProvider,
+  inspectCodexHostAccountReport,
+  inspectCodexHostConfiguration,
+} from "../providers/codex-host.js";
+import {
+  createProviderFromEnvironment,
+  discoverOllamaModels,
+  type ModelProvider,
+} from "../providers/index.js";
 import type { ScalingControlPlane, ScalingTaskRequest } from "../scaling/index.js";
 import { createSecretGate, guardModelProvider, type SecretGate } from "../security/index.js";
-import { openNodeSqliteStorage, type StorageAdapter } from "../storage/index.js";
+import {
+  type EnterpriseConnectionSnapshot,
+  openNodeSqliteStorage,
+  resolveDefaultDatabasePath,
+  type StorageAdapter,
+} from "../storage/index.js";
 
 export const DEFAULT_RUNTIME_HOST = "127.0.0.1";
 export const DEFAULT_RUNTIME_PORT = 9639;
@@ -54,8 +72,11 @@ const SECURITY_HEADERS = Object.freeze({
 });
 const MAXIMUM_JSON_BODY_BYTES = 64 * 1024;
 const MAXIMUM_INFERENCE_JSON_BODY_BYTES = 4 * 1024 * 1024;
+const ENTERPRISE_DISCOVERY_TIMEOUT_MS = 5_000;
 
 export interface LocalRuntimeOptions {
+  /** Installation edition; personal runtimes attached to enterprise state are read-only. */
+  deployment?: "personal" | "enterprise";
   /** Loopback host used by the personal runtime. */
   host?: string;
   /** TCP port used by the personal runtime; use zero to allocate a test port. */
@@ -64,6 +85,8 @@ export interface LocalRuntimeOptions {
   databasePath?: string;
   /** Explicit provider adapter; omit it to resolve runtime environment configuration. */
   provider?: ModelProvider;
+  /** Whether personal runtimes may reuse a detected host provider; defaults to true. */
+  discoverHostProvider?: boolean;
   /** Optional autonomous Agent kernel exposed through the local task-control API. */
   agentKernel?: AgentKernel;
   /** Runtime Secret Gate; defaults to automatic detection and isolated placeholder storage. */
@@ -298,6 +321,108 @@ const handleOpenAiInference = async (
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
+const normalizeEnterpriseEndpoint = (value: unknown): string => {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new TiduError("CONFIGURATION_INVALID", "Enterprise endpoint is required.");
+  }
+  let endpoint: URL;
+  try {
+    endpoint = new URL(value.trim());
+  } catch (error) {
+    throw new TiduError("CONFIGURATION_INVALID", "Enterprise endpoint is not a valid URL.", {
+      cause: error,
+    });
+  }
+  const loopback = endpoint.hostname === "127.0.0.1" || endpoint.hostname === "localhost";
+  if (endpoint.protocol !== "https:" && !(loopback && endpoint.protocol === "http:")) {
+    throw new TiduError(
+      "CONFIGURATION_INVALID",
+      "Enterprise endpoint must use HTTPS. HTTP is allowed only for local development.",
+    );
+  }
+  if (
+    endpoint.username !== "" ||
+    endpoint.password !== "" ||
+    endpoint.search !== "" ||
+    endpoint.hash !== ""
+  ) {
+    throw new TiduError(
+      "CONFIGURATION_INVALID",
+      "Enterprise endpoint must not contain credentials, query parameters, or fragments.",
+    );
+  }
+  endpoint.pathname = endpoint.pathname.replace(/\/+$/u, "") || "/";
+  return endpoint.toString().replace(/\/$/u, "");
+};
+
+const readEnterpriseConnectionSnapshot = (
+  endpoint: string,
+  payload: unknown,
+): EnterpriseConnectionSnapshot => {
+  if (!isRecord(payload) || payload.deployment !== "enterprise") {
+    throw new TiduError(
+      "CONFIGURATION_INVALID",
+      "The provided URL is not an enterprise AI-Tidu9 runtime.",
+    );
+  }
+  const product = payload.product;
+  const virtualModel = payload.virtualModel;
+  const guidance = payload.employeeGuidance;
+  if (
+    !isRecord(product) ||
+    typeof product.name !== "string" ||
+    !isRecord(virtualModel) ||
+    typeof virtualModel.id !== "string" ||
+    typeof virtualModel.name !== "string" ||
+    !Number.isInteger(payload.revision) ||
+    !Number.isInteger(payload.policyCount) ||
+    !Number.isInteger(payload.capabilityCount) ||
+    !Number.isInteger(payload.resourceCount) ||
+    !Array.isArray(guidance) ||
+    !guidance.every((step) => typeof step === "string")
+  ) {
+    throw new TiduError(
+      "CONFIGURATION_INVALID",
+      "The enterprise runtime returned an invalid public configuration.",
+    );
+  }
+  const now = new Date().toISOString();
+  return {
+    endpoint,
+    companyName: product.name,
+    revision: Number(payload.revision),
+    virtualModelId: virtualModel.id,
+    virtualModelName: virtualModel.name,
+    policyCount: Number(payload.policyCount),
+    capabilityCount: Number(payload.capabilityCount),
+    resourceCount: Number(payload.resourceCount),
+    employeeGuidance: guidance as string[],
+    connectedAt: now,
+    checkedAt: now,
+  };
+};
+
+const inspectEnterpriseEndpoint = async (
+  endpoint: string,
+): Promise<EnterpriseConnectionSnapshot> => {
+  const discoveryUrl = new URL(
+    `${new URL(endpoint).pathname.replace(/\/$/u, "")}/api/enterprise/public`,
+    endpoint,
+  );
+  const response = await fetch(discoveryUrl, {
+    headers: { accept: "application/json" },
+    redirect: "error",
+    signal: AbortSignal.timeout(ENTERPRISE_DISCOVERY_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    throw new TiduError(
+      "CONFIGURATION_INVALID",
+      `Enterprise configuration check failed with HTTP ${response.status}.`,
+    );
+  }
+  return readEnterpriseConnectionSnapshot(endpoint, await response.json());
+};
+
 const readRouteIdentifier = (match: RegExpExecArray): string => {
   const identifier = match[1];
   if (identifier === undefined) {
@@ -329,12 +454,41 @@ const readDraftConfiguration = (
     throw new TiduError("CONFIGURATION_INVALID", "Configuration payload is invalid.");
   }
 
-  return {
+  const configuration: TiduConfiguration = {
     schemaVersion: CONFIG_SCHEMA_VERSION,
     activeMode: mode,
     activeProfileId: candidate.activeProfileId,
     virtualModelName: candidate.virtualModelName,
   };
+  if (mode === "expert") {
+    const expertServices = candidate.expertServices;
+    if (
+      !isRecord(expertServices) ||
+      typeof expertServices.host !== "string" ||
+      typeof expertServices.port !== "number" ||
+      typeof expertServices.responsesApiEnabled !== "boolean" ||
+      typeof expertServices.chatCompletionsApiEnabled !== "boolean" ||
+      typeof expertServices.taskApiEnabled !== "boolean"
+    ) {
+      throw new TiduError("CONFIGURATION_INVALID", "Expert service configuration is invalid.");
+    }
+    configuration.expertServices = {
+      host: expertServices.host,
+      port: expertServices.port,
+      responsesApiEnabled: expertServices.responsesApiEnabled,
+      chatCompletionsApiEnabled: expertServices.chatCompletionsApiEnabled,
+      taskApiEnabled: expertServices.taskApiEnabled,
+    };
+  }
+  return configuration;
+};
+
+const isExpertServiceEnabled = async (
+  storage: StorageAdapter,
+  service: "chatCompletionsApiEnabled" | "responsesApiEnabled" | "taskApiEnabled",
+): Promise<boolean> => {
+  const configuration = (await storage.configurationStore.loadWorkspace()).active.configuration;
+  return configuration.activeMode !== "expert" || configuration.expertServices?.[service] !== false;
 };
 
 const validateMutationRequest = (request: import("node:http").IncomingMessage): void => {
@@ -385,6 +539,8 @@ const handleRequest = async (
   scaling: ScalingControlPlane | undefined,
   capabilityProviders: readonly CapabilityProviderImplementation[],
   capabilityRuntime: CapabilityRuntime | undefined,
+  deployment: "personal" | "enterprise",
+  runtimeNetwork: { host: string; port: number },
 ): Promise<void> => {
   const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
 
@@ -503,8 +659,294 @@ const handleRequest = async (
     sendJson(
       response,
       200,
-      await createConfigCenterBootstrap(storage, provider?.descriptor, undefined, enterprise),
+      await createConfigCenterBootstrap(
+        storage,
+        provider?.descriptor,
+        undefined,
+        enterprise,
+        deployment,
+        runtimeNetwork,
+      ),
     );
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/api/host-usage") {
+    if (deployment !== "personal") {
+      sendJson(response, 403, { error: "PERSONAL_EDITION_ONLY" });
+      return;
+    }
+    const codex = await inspectCodexHostAccountReport().catch(() => null);
+    const cursor = inspectCursorHostLogin();
+    const cursorProvider = cursor.reusable
+      ? await createCursorHostModelProvider().catch(() => undefined)
+      : undefined;
+    sendJson(response, 200, {
+      activeProvider: provider?.descriptor ?? null,
+      codex,
+      cursor: {
+        agentStatus: cursor.status,
+        agentProtocolAvailable: cursor.acpAvailable,
+        accountEmail: cursor.accountEmail ?? null,
+        accountPlan: cursor.accountPlan ?? null,
+        model: cursorProvider?.descriptor.model ?? null,
+      },
+    });
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/cursor/connect") {
+    if (deployment !== "personal") {
+      sendJson(response, 403, { error: "PERSONAL_EDITION_ONLY" });
+      return;
+    }
+    try {
+      validateMutationRequest(request);
+      await readJsonBody(request);
+      await reloginCursorHost({ stdio: "pipe" });
+      const state = inspectCursorHostLogin();
+      sendJson(response, state.reusable ? 200 : 409, {
+        connected: state.reusable,
+        status: state.status,
+      });
+    } catch (error) {
+      if (error instanceof TiduError && error.code === "CONFIGURATION_INVALID") {
+        handleConfigurationMutationError(response, error);
+      } else {
+        sendJson(response, 409, {
+          connected: false,
+          status: inspectCursorHostLogin().status,
+          reason: "cursor-sign-in-incomplete",
+        });
+      }
+    }
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/clients/codex/connect") {
+    try {
+      validateMutationRequest(request);
+      await readJsonBody(request);
+      const configuredHost = runtimeNetwork.host;
+      const clientHost =
+        configuredHost === "0.0.0.0" || configuredHost === "::"
+          ? DEFAULT_RUNTIME_HOST
+          : configuredHost;
+      const addressHost = clientHost.includes(":") ? `[${clientHost}]` : clientHost;
+      const endpoint = `http://${addressHost}:${runtimeNetwork.port}`;
+      const report = setupConnectors({ action: "install", endpoint, targets: ["codex"] });
+      const codex = report.connectors[0];
+      sendJson(response, report.healthy ? 200 : 409, {
+        connected: report.healthy,
+        message: codex?.detail ?? "Codex connector registration did not return a result.",
+      });
+    } catch (error) {
+      if (error instanceof TiduError) {
+        handleConfigurationMutationError(response, error);
+      } else {
+        sendJson(response, 500, {
+          error: "CODEX_CLIENT_CONFIGURATION_FAILED",
+          message: error instanceof Error ? error.message : "Codex client configuration failed.",
+        });
+      }
+    }
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/provider/detect") {
+    if (deployment !== "personal") {
+      sendJson(response, 403, { error: "PERSONAL_EDITION_ONLY" });
+      return;
+    }
+    try {
+      validateMutationRequest(request);
+      const body = await readJsonBody(request);
+      const selected = isRecord(body) ? body.provider : undefined;
+      if (
+        selected !== "codex-host" &&
+        selected !== "cursor-host" &&
+        selected !== "ollama" &&
+        selected !== "openai-compatible"
+      ) {
+        sendJson(response, 422, { detected: false, reason: "unknown-provider" });
+        return;
+      }
+
+      let discoveredModel: string | undefined;
+      let reason: string | undefined;
+      let account: {
+        status: string;
+        type: string | null;
+        email: string | null;
+        plan: string | null;
+      } | null = null;
+      if (selected === "codex-host") {
+        const discovered = await inspectCodexHostConfiguration(process.env.TIDU_PROVIDER_MODEL);
+        discoveredModel = discovered?.model;
+        const login = inspectCodexHostLogin();
+        account = {
+          status: login.status,
+          type: discovered?.account?.type ?? null,
+          email: discovered?.account?.email ?? null,
+          plan: discovered?.account?.plan ?? null,
+        };
+        if (discoveredModel === undefined) {
+          reason =
+            login.status === "unavailable"
+              ? "codex-cli-unavailable"
+              : login.status === "not-authenticated"
+                ? "codex-not-authenticated"
+                : "codex-model-undiscovered";
+        }
+      } else if (selected === "cursor-host") {
+        const discovered = await createCursorHostModelProvider();
+        discoveredModel = discovered?.descriptor.model;
+        const login = inspectCursorHostLogin();
+        account = {
+          status: login.status,
+          type: login.status === "authenticated" ? "cursor" : null,
+          email: login.accountEmail ?? null,
+          plan: null,
+        };
+        if (discoveredModel === undefined) {
+          reason =
+            login.status === "unavailable"
+              ? "cursor-cli-unavailable"
+              : login.status === "not-authenticated"
+                ? "cursor-not-authenticated"
+                : !login.acpAvailable
+                  ? "cursor-acp-unavailable"
+                  : "cursor-model-undiscovered";
+        }
+      } else if (selected === "ollama") {
+        try {
+          const models = await discoverOllamaModels({
+            baseUrl:
+              process.env.TIDU_PROVIDER === "ollama"
+                ? process.env.TIDU_PROVIDER_BASE_URL
+                : undefined,
+          });
+          discoveredModel =
+            provider?.descriptor.type === "ollama" && models.includes(provider.descriptor.model)
+              ? provider.descriptor.model
+              : models[0];
+          if (discoveredModel === undefined) {
+            reason = "ollama-no-models";
+          }
+        } catch {
+          reason = "ollama-unavailable";
+        }
+      } else if (provider?.descriptor.type === selected) {
+        discoveredModel = provider.descriptor.model;
+      } else {
+        reason = "compatible-provider-not-active";
+      }
+
+      const detected = discoveredModel !== undefined;
+      const matchesRuntime = detected && provider?.descriptor.type === selected;
+      sendJson(response, detected ? 200 : 409, {
+        detected,
+        matchesRuntime,
+        model: discoveredModel ?? null,
+        provider: selected,
+        account,
+        reason: reason ?? (matchesRuntime ? null : "restart-required"),
+      });
+    } catch {
+      sendJson(response, 500, { detected: false, reason: "detection-failed" });
+    }
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/api/enterprise/public") {
+    if (deployment !== "enterprise" || enterprise === undefined) {
+      sendJson(response, 404, { error: "ENTERPRISE_RUNTIME_NOT_CONFIGURED" });
+      return;
+    }
+    const [state, guidance, workspace] = await Promise.all([
+      enterprise.snapshot(),
+      enterprise.generateGuidance(),
+      storage.configurationStore.loadWorkspace(),
+    ]);
+    const activeConfiguration = workspace.active.configuration;
+    const companyName =
+      state.scopes.find((scope) => scope.type === "tenant" && scope.parentId === null)?.name ??
+      PRODUCT.name;
+    sendJson(response, 200, {
+      deployment: "enterprise",
+      product: { name: companyName, version: PRODUCT.version },
+      revision: state.revision,
+      virtualModel: {
+        id: activeConfiguration.activeProfileId,
+        name: activeConfiguration.virtualModelName,
+      },
+      policyCount: state.policies.length,
+      capabilityCount: state.capabilities.length,
+      resourceCount: state.resources.length,
+      employeeGuidance: guidance.employee,
+    });
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/enterprise/connection") {
+    if (deployment !== "personal") {
+      sendJson(response, 403, { error: "PERSONAL_EDITION_ONLY" });
+      return;
+    }
+    try {
+      validateMutationRequest(request);
+      const body = await readJsonBody(request);
+      const endpoint = normalizeEnterpriseEndpoint(isRecord(body) ? body.endpoint : undefined);
+      await storage.enterpriseConnectionStore.save(await inspectEnterpriseEndpoint(endpoint));
+      sendJson(
+        response,
+        200,
+        await createConfigCenterBootstrap(
+          storage,
+          provider?.descriptor,
+          undefined,
+          enterprise,
+          deployment,
+          runtimeNetwork,
+        ),
+      );
+    } catch (error) {
+      if (error instanceof TiduError) {
+        handleConfigurationMutationError(response, error);
+      } else {
+        sendJson(response, 502, {
+          error: "ENTERPRISE_CONNECTION_FAILED",
+          message: "The company runtime could not be reached or returned invalid data.",
+        });
+      }
+    }
+    return;
+  }
+
+  if (request.method === "DELETE" && pathname === "/api/enterprise/connection") {
+    if (deployment !== "personal") {
+      sendJson(response, 403, { error: "PERSONAL_EDITION_ONLY" });
+      return;
+    }
+    try {
+      validateMutationRequest(request);
+      await readJsonBody(request);
+      await storage.enterpriseConnectionStore.remove();
+      sendJson(
+        response,
+        200,
+        await createConfigCenterBootstrap(
+          storage,
+          provider?.descriptor,
+          undefined,
+          enterprise,
+          deployment,
+          runtimeNetwork,
+        ),
+      );
+    } catch (error) {
+      handleConfigurationMutationError(response, error);
+    }
     return;
   }
 
@@ -526,9 +968,77 @@ const handleRequest = async (
     return;
   }
 
+  if (request.method === "GET" && pathname === "/api/enterprise/members/usage") {
+    if (deployment !== "enterprise") {
+      sendJson(response, 403, { error: "ENTERPRISE_ADMIN_ONLY" });
+      return;
+    }
+    if (enterprise === undefined) {
+      sendJson(response, 404, { error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED" });
+      return;
+    }
+    const sessionId = request.headers["x-tidu-admin-session"];
+    if (typeof sessionId !== "string" || !enterprise.validateAdministratorSession(sessionId)) {
+      sendJson(response, 401, { error: "ADMINISTRATOR_SESSION_REQUIRED" });
+      return;
+    }
+    const state = await enterprise.snapshot();
+    const enterpriseResources = new Set(
+      state.resources
+        .filter((resource) => resource.ownership === "enterprise")
+        .map((resource) => resource.id),
+    );
+    const enterprisePools = state.quotaPools.filter((pool) =>
+      enterpriseResources.has(pool.resourceId),
+    );
+    const poolsById = new Map(enterprisePools.map((pool) => [pool.id, pool]));
+    const resourceNames = new Map(state.resources.map((resource) => [resource.id, resource.name]));
+    const userScopeIds = new Set(
+      state.scopes.filter((scope) => scope.type === "user").map((scope) => scope.id),
+    );
+    sendJson(response, 200, {
+      revision: state.revision,
+      totals: {
+        capacity: enterprisePools.reduce((total, pool) => total + pool.capacity, 0),
+        remaining: enterprisePools.reduce((total, pool) => total + pool.remaining, 0),
+        reserved: enterprisePools.reduce((total, pool) => total + pool.reserved, 0),
+        settled: enterprisePools.reduce((total, pool) => total + pool.settled, 0),
+      },
+      members: state.identities.map((identity) => ({
+        id: identity.id,
+        displayName: identity.displayName,
+        roles: identity.roles,
+        allocations: state.quotaAllocations
+          .filter(
+            (allocation) =>
+              userScopeIds.has(allocation.scopeId) &&
+              identity.scopeIds.includes(allocation.scopeId) &&
+              poolsById.has(allocation.poolId),
+          )
+          .map((allocation) => {
+            const pool = poolsById.get(allocation.poolId);
+            return {
+              allocationId: allocation.id,
+              resourceName:
+                pool === undefined ? "" : (resourceNames.get(pool.resourceId) ?? pool.resourceId),
+              limit: allocation.limit,
+              settled: allocation.settled,
+              reserved: allocation.reserved,
+              remaining: Math.max(0, allocation.limit - allocation.settled - allocation.reserved),
+            };
+          }),
+      })),
+    });
+    return;
+  }
+
   if (request.method === "POST" && pathname === "/api/enterprise/admin/initialize") {
     validateMutationRequest(request);
     await readJsonBody(request);
+    if (deployment !== "enterprise") {
+      sendJson(response, 403, { error: "ENTERPRISE_ADMIN_READ_ONLY" });
+      return;
+    }
     if (enterprise === undefined) {
       sendJson(response, 404, { error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED" });
       return;
@@ -553,6 +1063,10 @@ const handleRequest = async (
 
   if (request.method === "POST" && pathname === "/api/enterprise/admin/session") {
     validateMutationRequest(request);
+    if (deployment !== "enterprise") {
+      sendJson(response, 403, { error: "ENTERPRISE_ADMIN_READ_ONLY" });
+      return;
+    }
     if (enterprise === undefined) {
       sendJson(response, 404, { error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED" });
       return;
@@ -572,6 +1086,10 @@ const handleRequest = async (
   if (request.method === "POST" && pathname === "/api/enterprise/admin/rotate") {
     validateMutationRequest(request);
     await readJsonBody(request);
+    if (deployment !== "enterprise") {
+      sendJson(response, 403, { error: "ENTERPRISE_ADMIN_READ_ONLY" });
+      return;
+    }
     if (enterprise === undefined) {
       sendJson(response, 404, { error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED" });
       return;
@@ -587,6 +1105,14 @@ const handleRequest = async (
       keyId: generated.record.id,
       message: "Save this replacement administrator key now. Earlier sessions were revoked.",
     });
+    return;
+  }
+
+  if (
+    pathname.startsWith("/api/tasks") &&
+    !(await isExpertServiceEnabled(storage, "taskApiEnabled"))
+  ) {
+    sendJson(response, 404, { error: "SERVICE_DISABLED" });
     return;
   }
 
@@ -735,11 +1261,19 @@ const handleRequest = async (
   }
 
   if (request.method === "POST" && pathname === "/v1/chat/completions") {
+    if (!(await isExpertServiceEnabled(storage, "chatCompletionsApiEnabled"))) {
+      sendJson(response, 404, { error: "SERVICE_DISABLED" });
+      return;
+    }
     await handleOpenAiInference(request, response, storage, "chat-completions", provider);
     return;
   }
 
   if (request.method === "POST" && pathname === "/v1/responses") {
+    if (!(await isExpertServiceEnabled(storage, "responsesApiEnabled"))) {
+      sendJson(response, 404, { error: "SERVICE_DISABLED" });
+      return;
+    }
     await handleOpenAiInference(request, response, storage, "responses", provider);
     return;
   }
@@ -761,7 +1295,14 @@ const handleRequest = async (
       sendJson(
         response,
         200,
-        await createConfigCenterBootstrap(storage, provider?.descriptor, undefined, enterprise),
+        await createConfigCenterBootstrap(
+          storage,
+          provider?.descriptor,
+          undefined,
+          enterprise,
+          deployment,
+          runtimeNetwork,
+        ),
       );
     } catch (error) {
       handleConfigurationMutationError(response, error);
@@ -797,7 +1338,14 @@ const handleRequest = async (
       sendJson(
         response,
         200,
-        await createConfigCenterBootstrap(storage, provider?.descriptor, undefined, enterprise),
+        await createConfigCenterBootstrap(
+          storage,
+          provider?.descriptor,
+          undefined,
+          enterprise,
+          deployment,
+          runtimeNetwork,
+        ),
       );
     } catch (error) {
       handleConfigurationMutationError(response, error);
@@ -837,7 +1385,14 @@ const handleRequest = async (
       sendJson(
         response,
         200,
-        await createConfigCenterBootstrap(storage, provider?.descriptor, undefined, enterprise),
+        await createConfigCenterBootstrap(
+          storage,
+          provider?.descriptor,
+          undefined,
+          enterprise,
+          deployment,
+          runtimeNetwork,
+        ),
       );
     } catch (error) {
       handleConfigurationMutationError(response, error);
@@ -869,25 +1424,52 @@ const handleRequest = async (
 export const startLocalRuntime = async (
   options: LocalRuntimeOptions = {},
 ): Promise<LocalRuntime> => {
-  const host = options.host ?? DEFAULT_RUNTIME_HOST;
-  const port = options.port ?? DEFAULT_RUNTIME_PORT;
   const secretGate = options.secretGate ?? createSecretGate();
-  const configuredProvider = options.provider ?? createProviderFromEnvironment();
-  const provider =
-    configuredProvider === undefined
-      ? undefined
-      : guardModelProvider(configuredProvider, secretGate);
   const environmentEnterpriseRuntime =
     options.enterpriseControlPlane === undefined
       ? await createEnterpriseRuntimeFromEnvironment()
       : undefined;
   const enterpriseControlPlane =
     options.enterpriseControlPlane ?? environmentEnterpriseRuntime?.controlPlane;
+  const deployment =
+    options.deployment ??
+    (options.enterpriseControlPlane === undefined ? "personal" : "enterprise");
+  if (deployment === "enterprise" && enterpriseControlPlane === undefined) {
+    throw new TiduError("CONFIGURATION_INVALID", "Enterprise edition requires TIDU_POSTGRES_URL.");
+  }
+  const providerSetting = process.env.TIDU_PROVIDER?.trim();
+  const configuredProvider =
+    options.provider ??
+    (providerSetting === "codex-host"
+      ? await createCodexHostModelProvider(process.env.TIDU_PROVIDER_MODEL)
+      : providerSetting === "cursor-host"
+        ? await createCursorHostModelProvider()
+        : (createProviderFromEnvironment() ??
+          (deployment === "personal" && options.discoverHostProvider !== false
+            ? ((await createCodexHostModelProvider(process.env.TIDU_PROVIDER_MODEL)) ??
+              (await createCursorHostModelProvider()))
+            : undefined)));
+  const provider =
+    configuredProvider === undefined
+      ? undefined
+      : guardModelProvider(configuredProvider, secretGate);
   const scalingControlPlane =
     options.scalingControlPlane ?? environmentEnterpriseRuntime?.scalingControlPlane;
+  const defaultDatabasePath = resolveDefaultDatabasePath();
+  const enterpriseDatabasePath = join(
+    dirname(defaultDatabasePath),
+    basename(defaultDatabasePath).replace(/\.db$/u, "-enterprise.db"),
+  );
   const storage = await openNodeSqliteStorage({
-    databasePath: options.databasePath,
+    databasePath:
+      options.databasePath ?? (deployment === "enterprise" ? enterpriseDatabasePath : undefined),
   });
+  const activeConfiguration = (await storage.configurationStore.loadWorkspace()).active
+    .configuration;
+  const activeExpertServices =
+    activeConfiguration.activeMode === "expert" ? activeConfiguration.expertServices : undefined;
+  const host = options.host ?? activeExpertServices?.host ?? DEFAULT_RUNTIME_HOST;
+  const port = options.port ?? activeExpertServices?.port ?? DEFAULT_RUNTIME_PORT;
   const agentKernel =
     options.agentKernel ??
     (provider === undefined
@@ -910,6 +1492,7 @@ export const startLocalRuntime = async (
     await environmentEnterpriseRuntime?.close();
     throw error;
   }
+  const runtimeNetwork = { host, port };
   const server = createServer((request, response) => {
     void handleRequest(
       request,
@@ -921,6 +1504,8 @@ export const startLocalRuntime = async (
       scalingControlPlane,
       options.capabilityProviders ?? [],
       options.capabilityRuntime,
+      deployment,
+      runtimeNetwork,
     ).catch(() => {
       if (!response.headersSent) {
         sendJson(response, 500, { error: "INTERNAL_ERROR" });
@@ -946,6 +1531,7 @@ export const startLocalRuntime = async (
     throw new Error("Local runtime did not expose a TCP address.");
   }
 
+  runtimeNetwork.port = address.port;
   let isClosed = false;
 
   return {

@@ -90,6 +90,7 @@ test("exposes bounded Agent task creation and control through the local API", as
 test("starts a loopback runtime with a verifiable health endpoint", async () => {
   const runtime = await startLocalRuntime({
     databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
     port: 0,
   });
 
@@ -179,6 +180,7 @@ test("prevents concurrent runtimes from owning the same persistent data", async 
 test("serves the local configuration center and its bootstrap API", async () => {
   const runtime = await startLocalRuntime({
     databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
     port: 0,
   });
 
@@ -434,6 +436,7 @@ test("cancels upstream streaming work when the client disconnects", async () => 
 test("keeps mode drafts isolated until a valid draft is explicitly activated", async () => {
   const runtime = await startLocalRuntime({
     databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
     port: 0,
   });
 
@@ -467,6 +470,8 @@ test("keeps mode drafts isolated until a valid draft is explicitly activated", a
           activeMode: "expert",
           activeProfileId: "expert-local",
           virtualModelName: "本地专家入口",
+          expertServices:
+            initial.configuration.workspace.drafts.expert.configuration.expertServices,
         },
       }),
     });
@@ -534,6 +539,7 @@ test("exposes the active virtual model through OpenAI-compatible discovery", asy
 test("validates OpenAI-compatible inference requests before provider routing", async () => {
   const runtime = await startLocalRuntime({
     databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
     port: 0,
   });
 

@@ -387,7 +387,11 @@ test("normalizes safe management endpoints and rejects embedded credentials", ()
 });
 
 test("diagnoses and configures a running runtime through the public API", async () => {
-  const runtime = await startLocalRuntime({ databasePath: ":memory:", port: 0 });
+  const runtime = await startLocalRuntime({
+    databasePath: ":memory:",
+    discoverHostProvider: false,
+    port: 0,
+  });
   try {
     const report = await diagnoseEndpoint(runtime.origin);
     assert.equal(report.healthy, true);

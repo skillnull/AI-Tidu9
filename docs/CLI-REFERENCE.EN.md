@@ -6,6 +6,7 @@
 
 ```bash
 npm install -g @skillnull/tidu  # Persistent install; provides the tidu command
+tidu setup                      # Install client connectors offline
 tidu start                      # Start after installation
 tidu --help                   # Top-level help after installation
 tidu <command> --help         # Command-specific help
@@ -19,10 +20,10 @@ tidu <command> --help         # Command-specific help
 | --- | --- | --- |
 | Try it for the first time | `tidu start` | Complete the browser-based setup |
 | Configure entirely in a terminal | `tidu start --cli` | Follow the five-step interactive wizard |
-| Connect installed clients | `tidu setup install` | Validate with `tidu setup verify` |
+| Connect installed clients | `tidu setup` | Install connectors while preserving official host models |
 | Diagnose an unreachable page or unexpected behavior | `tidu doctor` | Use `tidu doctor --json` for a shareable report |
 | Edit configuration without activating it | `tidu config set ...` | Add `--activate` only after review |
-| Restore or remove everything | `tidu restore` / `tidu uninstall --complete` | Destructive deletion always requires explicit confirmation |
+| Restore or remove everything | `tidu restore` / `tidu uninstall` | Destructive deletion always requires explicit confirmation |
 
 > [!TIP]
 > You do not need to read the full reference first. Start with the command that matches the outcome; the CLI continues with guided prompts. Full flags exist for automation and expert workflows.
@@ -31,8 +32,8 @@ tidu <command> --help         # Command-specific help
 
 | Command | Purpose | State change |
 | --- | --- | --- |
-| `tidu start [--cli]` | Start the runtime; optionally enter the five-step terminal wizard | Starts a process; the wizard can save and activate configuration |
-| `tidu setup [action]` | Install, verify, repair, update, or uninstall host connectors | All actions except `verify` can change connectors |
+| `tidu start [--cli] [--edition personal|enterprise]` | Start the personal or enterprise runtime; optionally enter the five-step terminal wizard | Starts a process; enterprise control is read-only in the personal edition |
+| `tidu setup [action]` | Install, verify, repair, update, or uninstall client connectors offline | All actions except `verify` can change client configuration |
 | `tidu mcp` | Run the stdio MCP bridge for Agent hosts | No |
 | `tidu doctor` | Check runtime, configuration API, and page; optionally print a privacy-safe report | No |
 | `tidu clients` | Discover supported local clients | No |
@@ -40,7 +41,7 @@ tidu <command> --help         # Command-specific help
 | `tidu account` | Inspect reusable Codex and Cursor login state | No |
 | `tidu account relogin/switch` | Invoke the host's official login or switch flow | Yes, only when explicitly run |
 | `tidu config` | Guided configuration or isolated-draft management | `set` saves; only `--activate` changes runtime behavior |
-| `tidu uninstall` | Recoverable uninstall, data purge, or complete cleanup | Yes, with confirmation |
+| `tidu uninstall` | Remove all AI-Tidu9-owned connectors, profiles, data, and installed content | Yes, requires `DELETE` |
 | `tidu restore` | Restore the newest personal-data snapshot | Yes, with confirmation |
 | `tidu enterprise recover-admin` | Generate a new administrator key on the server | Yes, with a security audit event |
 | `tidu version` | Print the version | No |
@@ -48,12 +49,13 @@ tidu <command> --help         # Command-specific help
 ## 🩺 Start and diagnose
 
 ```bash
-tidu start [--cli]
+tidu start --edition personal [--cli]
+tidu start --edition enterprise [--cli]
 tidu doctor [--json] [--endpoint <url>]
 tidu mcp [--endpoint <url>]
 ```
 
-`start` prints the configuration-center URL. With `--cli`, it checks the runtime, selects a mode, configures the unified entry, confirms activation, and installs detected connectors step by step. `doctor` makes no changes; `--json` prints a shareable summary without hostnames, credentials, paths, or conversation content. `mcp` is normally started by a configured host connector.
+Choose the personal or enterprise edition during installation/deployment with `--edition`; the default is personal. Enterprise edition requires `TIDU_POSTGRES_URL` injected through the deployment environment and uses a separate data file. Set different `TIDU_PORT` values when both editions run at once. A personal edition connected to enterprise control can view enterprise information, while the server rejects enterprise administration requests. With `--cli`, `start` checks the runtime, selects a mode, configures the unified entry, confirms activation, and installs detected connectors step by step. `doctor` makes no changes; `--json` prints a shareable summary without hostnames, credentials, paths, or conversation content. `mcp` is normally started by a configured host connector.
 
 Common startup environment variables:
 
@@ -61,9 +63,10 @@ Common startup environment variables:
 | --- | --- |
 | `TIDU_HOST`, `TIDU_PORT` | Listen address and port; personal mode defaults to loopback |
 | `TIDU_DATABASE_PATH` | Custom SQLite path; lifecycle commands preserve it |
-| `TIDU_PROVIDER`, `TIDU_PROVIDER_MODEL` | Provider type and model |
-| `TIDU_PROVIDER_API_KEY`, `TIDU_PROVIDER_BASE_URL` | Runtime key and compatible API endpoint |
+| `TIDU_PROVIDER`, `TIDU_PROVIDER_MODEL` | Optional provider/model override; defaults to the current signed-in Codex or Cursor host model |
+| `TIDU_PROVIDER_API_KEY`, `TIDU_PROVIDER_BASE_URL` | Runtime key and endpoint for an OpenAI-compatible provider override |
 | `TIDU_POSTGRES_URL` | Enable the enterprise control plane and PostgreSQL task state |
+| `TIDU_EDITION` | Runtime edition (`personal` or `enterprise`); can also be set with `tidu start --edition` |
 | `TIDU_ENDPOINT` | Default CLI management URL, equivalent to `--endpoint` |
 
 Inject secrets through the current process environment only. Never put them in shell history, configuration files, or `--reason`.
@@ -77,7 +80,9 @@ tidu clients connect codex [--yes] [--endpoint <url>]
 tidu clients rollback codex [--yes]
 ```
 
-The default setup action is `install`. Setup manages only AI-Tidu9-owned registrations, and setup uninstall retains AI-Tidu9 data. Discovery checks presence only; it never reads account, credential, or conversation content. Dedicated Codex profile operations create a private snapshot first and roll back after failed verification.
+The default setup action is `install` and does not require a running service. It installs AI-Tidu9-owned connectors while preserving the official Codex and Cursor model lists; `setup uninstall` removes those integrations. Codex Desktop cannot currently add a third-party provider to its official model list. Run `tidu clients connect codex` explicitly only when an isolated compatibility profile is required. Discovery checks presence only and never reads account, credential, or conversation content. Profile writes create a private snapshot first and roll back after failed verification.
+
+Enterprise servers do not run setup on employee computers or host a separate employee page. After installing the personal edition, an employee enters the administrator-provided company URL under Company access in the local page. Production company URLs must use HTTPS; HTTP is accepted only for loopback development. Company configuration stays read-only and is stored separately from personal drafts and active configuration.
 
 ## 👤 Host accounts and login state
 
@@ -107,18 +112,11 @@ tidu config set --mode <managed|expert> \
 ## ♻️ Uninstall, restore, and roll back
 
 ```bash
-tidu uninstall [--yes]
-tidu uninstall --purge [--confirm DELETE]
-tidu uninstall --complete [--confirm DELETE] [--endpoint <url>]
+tidu uninstall [--confirm DELETE] [--endpoint <url>]
 tidu restore [--yes]
 ```
 
-| Mode | Result |
-| --- | --- |
-| Default uninstall | Move personal data to a recoverable snapshot; retain connectors and package |
-| `--purge` | Permanently remove the default AI-Tidu9 data directory and snapshots |
-| `--complete` | Also remove owned connectors, dedicated Codex profile and backups, default data, snapshots, and a detected global npm installation |
-| `restore` | Restore the newest snapshot only when no current data directory exists |
+`uninstall` removes AI-Tidu9 connectors, the dedicated Codex profile and backups, default data, snapshots, and a detected global npm installation. `restore` remains available only for recoverable snapshots created by older versions.
 
 Permanent operations require the full word `DELETE`; automation may pass `--confirm DELETE`. Host accounts, conversations, unrelated plugins or configuration, and custom database paths are preserved.
 

@@ -51,6 +51,8 @@ export interface ConfigurationImpactPreview {
   isolated: true;
   /** Risk classification for the proposed activation. */
   risk: "low" | "medium";
+  /** Whether activation changes the runtime listener and therefore requires a restart. */
+  restartRequired: boolean;
 }
 
 export interface SafeActivationResult {
@@ -243,17 +245,41 @@ export const previewConfigurationImpact = (
   candidate: TiduConfiguration,
 ): ConfigurationImpactPreview => {
   const validation = validateConfiguration(candidate, candidate.activeMode);
+  const activeExpertServices = active.expertServices;
+  const candidateExpertServices = candidate.expertServices;
   const changes = [
     ...(active.activeMode === candidate.activeMode ? [] : ["activeMode"]),
     ...(active.activeProfileId === candidate.activeProfileId ? [] : ["activeProfileId"]),
     ...(active.virtualModelName === candidate.virtualModelName ? [] : ["virtualModelName"]),
+    ...(activeExpertServices?.host === candidateExpertServices?.host
+      ? []
+      : ["expertServices.host"]),
+    ...(activeExpertServices?.port === candidateExpertServices?.port
+      ? []
+      : ["expertServices.port"]),
+    ...(activeExpertServices?.responsesApiEnabled === candidateExpertServices?.responsesApiEnabled
+      ? []
+      : ["expertServices.responsesApiEnabled"]),
+    ...(activeExpertServices?.chatCompletionsApiEnabled ===
+    candidateExpertServices?.chatCompletionsApiEnabled
+      ? []
+      : ["expertServices.chatCompletionsApiEnabled"]),
+    ...(activeExpertServices?.taskApiEnabled === candidateExpertServices?.taskApiEnabled
+      ? []
+      : ["expertServices.taskApiEnabled"]),
   ];
+  const restartRequired =
+    changes.includes("expertServices.host") || changes.includes("expertServices.port");
   return {
     valid: validation.valid,
     issues: validation.issues,
     changes,
     isolated: true,
-    risk: changes.includes("activeMode") || changes.includes("activeProfileId") ? "medium" : "low",
+    risk:
+      restartRequired || changes.includes("activeMode") || changes.includes("activeProfileId")
+        ? "medium"
+        : "low",
+    restartRequired,
   };
 };
 

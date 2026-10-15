@@ -7,9 +7,54 @@ Thank you for helping make AI-Tidu9 more reliable. Code, tests, documentation, c
 ## 🚀 The shortest contribution path
 
 ```bash
-npm run setup
+npm run tidu:setup
+npm run tidu:dev-p
 npm run check
 ```
+
+## ♻️ Local development
+
+`tidu:dev-p` starts the personal edition and `tidu:dev-e` starts the enterprise edition. Both install the temporary AI-Tidu9 client integration before starting the workspace UI, API, storage, and model provider, then remove it on exit. UI edits hot-update; backend TypeScript edits are recompiled and restart the service.
+
+```bash
+# Terminal 1: keep the service running
+npm run tidu:dev-p
+
+# Enterprise edition: prepare PostgreSQL below, then start the full enterprise flow
+npm run tidu:dev-e
+
+# Terminal 2: use the local CLI against the same runtime and development data
+npm run tidu:cli-p -- doctor
+npm run tidu:cli-p -- config show
+npm run tidu:cli-p -- clients
+```
+
+Open the local URL printed in the first terminal. Vite proxies `/api` to the development runtime, so configuration and task requests use the real backend. Development data defaults to `.tidu-dev/tidu.sqlite` in the repository root, isolated from the installed app's data. Set `TIDU_DATABASE_PATH` to choose another location. The runtime reuses the current signed-in Codex or Cursor host model by default. Set `TIDU_PROVIDER`, `TIDU_PROVIDER_MODEL`, and any required endpoint or key only when explicitly switching to another service.
+
+Enterprise development uses the same PostgreSQL control plane, table initialization, policy, quota, and task persistence flow as a deployed installation. There is no in-memory substitute. `tidu:dev-e` connects to PostgreSQL and runs a read-only preflight before startup. It stops and prints both setup paths when the database is missing or unreachable. Development mode adds frontend and backend hot reload only; local configuration is isolated in `.tidu-dev/enterprise.sqlite`.
+
+Use the project PostgreSQL container:
+
+```bash
+export TIDU_POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+docker compose -f config/docker/compose.yml -f config/docker/compose.dev.yml up -d postgres
+export TIDU_POSTGRES_URL="postgresql://tidu:${TIDU_POSTGRES_PASSWORD}@127.0.0.1:5432/tidu"
+npm run tidu:dev-e
+```
+
+Use a separately installed or remote PostgreSQL server:
+
+```bash
+# The account needs permission to create and update tables in the selected database.
+export TIDU_POSTGRES_URL="postgresql://<user>:<password>@<host>:<port>/<database>"
+# Set this only when the server requires verified TLS.
+export TIDU_POSTGRES_SSL=require
+npm run tidu:dev-e
+```
+
+In another terminal, run `npm run tidu:cli-e -- <command>` against the enterprise local configuration. Stopping the development server does not stop PostgreSQL. Stop the project container separately with `docker compose -f config/docker/compose.yml -f config/docker/compose.dev.yml stop postgres`.
+
+Press `Ctrl+C` to stop the development server. The runtime uses port `9639` and the development UI uses `5173` by default. Set `TIDU_PORT` to avoid a conflict with another local instance.
 
 > [!IMPORTANT]
 > `main` and `support/*` are protected release lines. Only repository owner `@skillnull` may update or merge them. Everyone else contributes through a Pull Request and cannot merge it themselves.

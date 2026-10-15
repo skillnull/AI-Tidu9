@@ -36,6 +36,8 @@ export interface CursorAcpOptions extends CursorHostInspectionOptions {
 export interface CursorAcpSession {
   /** Cursor ACP session identifier used for prompts and resume. */
   id: string;
+  /** Model ID selected for this session, when Cursor reports it. */
+  model: string | null;
 }
 
 export interface CursorAcpPromptResult {
@@ -66,9 +68,38 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const readString = (value: unknown, key: string): string | undefined =>
   isRecord(value) && typeof value[key] === "string" ? value[key] : undefined;
 
+const readCurrentModel = (value: unknown): string | undefined => {
+  if (!isRecord(value)) return undefined;
+  const directModel =
+    readString(value, "currentModelId") ??
+    readString(value, "currentModel") ??
+    readString(value, "model");
+  if (directModel !== undefined) return directModel;
+  const models = value.models;
+  if (isRecord(models)) {
+    const currentId =
+      readString(models, "currentModelId") ?? readString(models, "current_model_id");
+    if (currentId !== undefined) return currentId;
+  }
+  if (!Array.isArray(value.configOptions)) return undefined;
+  for (const option of value.configOptions) {
+    if (!isRecord(option)) continue;
+    const id = readString(option, "id") ?? readString(option, "category");
+    if (id === undefined || !/model/iu.test(id)) continue;
+    const current = option.currentValue;
+    if (typeof current === "string" && current.trim() !== "") return current;
+    if (isRecord(current)) {
+      const currentValue = readString(current, "value") ?? readString(current, "modelId");
+      if (currentValue !== undefined) return currentValue;
+    }
+  }
+  return undefined;
+};
+
 export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClient => {
   const messageChunks = new Map<string, string>();
   let initialized = false;
+  let initializedModel: string | undefined;
   const launch = createCursorAcpLaunch(options);
 
   const handleRequest = async (request: JsonRpcServerRequest): Promise<unknown> => {
@@ -127,7 +158,7 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
       if (initialized) {
         return;
       }
-      await client.request("initialize", {
+      const initializeResponse = await client.request<unknown>("initialize", {
         protocolVersion: 1,
         clientCapabilities: {
           fs: { readTextFile: false, writeTextFile: false },
@@ -135,6 +166,7 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
         },
         clientInfo: { name: "ai-tidu9", version: "0.2.0-alpha.1" },
       });
+      initializedModel = readCurrentModel(initializeResponse);
       await client.request("authenticate", { methodId: "cursor_login" });
       initialized = true;
     },
@@ -151,7 +183,7 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
       if (options.mode !== undefined && options.mode !== "agent") {
         await client.request("session/set_mode", { sessionId: id, modeId: options.mode });
       }
-      return { id };
+      return { id, model: readCurrentModel(response) ?? initializedModel ?? null };
     },
     prompt: async (
       sessionId: string,

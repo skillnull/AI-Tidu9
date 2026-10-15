@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, lstatSync } from "node:fs";
+import { accessSync, constants, existsSync, lstatSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 
 import { TiduError } from "../core/index.js";
 
@@ -57,6 +57,46 @@ export interface CodexAppServerLaunch {
 
 const DEFAULT_STATUS_TIMEOUT_MILLISECONDS = 15_000;
 
+const executableExists = (path: string): boolean => {
+  try {
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const resolveCodexCommand = (options: CodexHostInspectionOptions): string => {
+  if (options.command !== undefined) return options.command;
+  const environment = { ...process.env, ...options.environment };
+  const pathCandidates = (environment.PATH ?? "")
+    .split(delimiter)
+    .filter((directory) => directory !== "")
+    .map((directory) => join(directory, "codex"));
+  const nvmVersionsDirectory = join(
+    environment.NVM_DIR ?? join(homedir(), ".nvm"),
+    "versions",
+    "node",
+  );
+  let nvmCandidates: string[] = [];
+  try {
+    nvmCandidates = readdirSync(nvmVersionsDirectory)
+      .sort((left, right) => right.localeCompare(left, undefined, { numeric: true }))
+      .map((version) => join(nvmVersionsDirectory, version, "bin", "codex"));
+  } catch {
+    // NVM is optional.
+  }
+  return (
+    [
+      ...pathCandidates,
+      join(homedir(), ".local", "bin", "codex"),
+      ...nvmCandidates,
+      "/opt/homebrew/bin/codex",
+      "/usr/local/bin/codex",
+    ].find(executableExists) ?? "codex"
+  );
+};
+
 const resolveCodexHome = (options: CodexHostInspectionOptions): string =>
   options.codexHomeDirectory ??
   options.environment?.CODEX_HOME ??
@@ -105,7 +145,7 @@ export const inspectCodexHostLogin = (
   options: CodexHostInspectionOptions = {},
 ): CodexHostLoginState => {
   const storage = inspectAuthStorage(options);
-  const command = options.command ?? "codex";
+  const command = resolveCodexCommand(options);
   const result = spawnSync(command, ["login", "status"], {
     encoding: "utf8",
     env: resolveEnvironment(options),
@@ -132,7 +172,7 @@ const runCodexCommand = async (
   argumentsList: readonly string[],
   options: CodexHostCommandOptions,
 ): Promise<void> => {
-  const command = options.command ?? "codex";
+  const command = resolveCodexCommand(options);
   await new Promise<void>((resolve, reject) => {
     const child = spawn(command, argumentsList, {
       env: resolveEnvironment(options),
@@ -175,7 +215,7 @@ export const createCodexAppServerLaunch = (
     );
   }
   return {
-    command: options.command ?? "codex",
+    command: resolveCodexCommand(options),
     arguments: ["app-server", "--listen", "stdio://"],
     environment: resolveEnvironment(options),
   };

@@ -1,4 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
+import { accessSync, constants } from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, join } from "node:path";
 
 import { TiduError } from "../core/index.js";
 
@@ -23,6 +26,10 @@ export interface CursorHostLoginState {
   reusable: boolean;
   /** Authentication owner; AI-Tidu9 never reads or persists Cursor credentials. */
   authority: "cursor-host";
+  /** Account email only when the official status command reports it in JSON. */
+  accountEmail?: string | null;
+  /** Subscription plan only when the official status command reports it in JSON. */
+  accountPlan?: string | null;
 }
 
 export interface CursorHostInspectionOptions {
@@ -37,6 +44,8 @@ export interface CursorHostInspectionOptions {
 export interface CursorHostCommandOptions extends CursorHostInspectionOptions {
   /** Standard input/output mode used for explicit login operations. */
   stdio?: "inherit" | "pipe";
+  /** Time allowed for a user to finish the browser sign-in flow. */
+  loginTimeoutMilliseconds?: number;
 }
 
 export interface CursorAcpLaunch {
@@ -50,6 +59,28 @@ export interface CursorAcpLaunch {
 
 const DEFAULT_STATUS_TIMEOUT_MILLISECONDS = 15_000;
 const DEFAULT_COMMAND_CANDIDATES = ["agent", "cursor-agent"] as const;
+
+const resolveCursorCommands = (options: CursorHostInspectionOptions): string[] => {
+  if (options.command !== undefined) return [options.command];
+  const environment = { ...process.env, ...options.environment };
+  const directories = [
+    ...(environment.PATH ?? "").split(delimiter),
+    join(homedir(), ".local", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+  ];
+  const candidates = directories.flatMap((directory) =>
+    DEFAULT_COMMAND_CANDIDATES.map((name) => join(directory, name)),
+  );
+  return candidates.filter((candidate) => {
+    try {
+      accessSync(candidate, constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+};
 
 const resolveEnvironment = (options: CursorHostInspectionOptions): NodeJS.ProcessEnv => {
   const environment = { ...process.env, ...options.environment };
@@ -68,6 +99,32 @@ const parseLoginStatus = (statusCode: number | null, output: string): CursorHost
   return statusCode === null ? "unavailable" : "unknown";
 };
 
+const parseAccountEmail = (output: string): string | null => {
+  try {
+    const status = JSON.parse(output) as unknown;
+    if (typeof status !== "object" || status === null || Array.isArray(status)) return null;
+    const fields = status as Record<string, unknown>;
+    const candidate = fields.email ?? fields.userEmail;
+    return typeof candidate === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(candidate)
+      ? candidate
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+const parseAccountPlan = (output: string): string | null => {
+  try {
+    const status = JSON.parse(output) as unknown;
+    if (typeof status !== "object" || status === null || Array.isArray(status)) return null;
+    const fields = status as Record<string, unknown>;
+    const candidate = fields.plan ?? fields.subscription ?? fields.subscriptionType ?? fields.tier;
+    return typeof candidate === "string" && candidate.trim() !== "" ? candidate.trim() : null;
+  } catch {
+    return null;
+  }
+};
+
 const supportsCursorAcp = (command: string, options: CursorHostInspectionOptions): boolean => {
   const result = spawnSync(command, ["acp", "--help"], {
     encoding: "utf8",
@@ -81,8 +138,7 @@ const supportsCursorAcp = (command: string, options: CursorHostInspectionOptions
 export const inspectCursorHostLogin = (
   options: CursorHostInspectionOptions = {},
 ): CursorHostLoginState => {
-  const commandCandidates =
-    options.command === undefined ? DEFAULT_COMMAND_CANDIDATES : [options.command];
+  const commandCandidates = resolveCursorCommands(options);
   for (const command of commandCandidates) {
     const result = spawnSync(command, ["status"], {
       encoding: "utf8",
@@ -105,6 +161,8 @@ export const inspectCursorHostLogin = (
       acpAvailable,
       reusable: acpAvailable && status === "authenticated",
       authority: "cursor-host",
+      accountEmail: parseAccountEmail(result.stdout ?? ""),
+      accountPlan: parseAccountPlan(result.stdout ?? ""),
     };
   }
   return {
@@ -115,6 +173,8 @@ export const inspectCursorHostLogin = (
     acpAvailable: false,
     reusable: false,
     authority: "cursor-host",
+    accountEmail: null,
+    accountPlan: null,
   };
 };
 
@@ -128,6 +188,12 @@ const runCursorCommand = async (
       env: resolveEnvironment(options),
       stdio: options.stdio ?? "inherit",
     });
+    const timeout = setTimeout(() => {
+      child.kill();
+      reject(new TiduError("INTERNAL_ERROR", "Cursor browser sign-in timed out."));
+    }, options.loginTimeoutMilliseconds ?? 300_000);
+    child.once("exit", () => clearTimeout(timeout));
+    child.once("error", () => clearTimeout(timeout));
     child.once("error", reject);
     child.once("exit", (exitCode, signal) => {
       if (exitCode === 0) {

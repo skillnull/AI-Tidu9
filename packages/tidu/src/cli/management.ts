@@ -131,6 +131,9 @@ export const saveConfiguration = async (
     activeMode: update.mode,
     activeProfileId: update.activeProfileId ?? draft.configuration.activeProfileId,
     virtualModelName: update.virtualModelName ?? draft.configuration.virtualModelName,
+    ...(update.mode === "expert" && draft.configuration.expertServices !== undefined
+      ? { expertServices: draft.configuration.expertServices }
+      : {}),
   };
   const savedBootstrap = await requestBootstrap(
     endpoint,

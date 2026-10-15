@@ -17,9 +17,54 @@ flowchart LR
 ```
 
 ```bash
-npm run setup
+npm run tidu:setup
+npm run tidu:dev-p
 npm run check
 ```
+
+## ♻️ 本地开发流程
+
+`tidu:dev-p` 启动个人版，`tidu:dev-e` 启动企业版。两者会先临时安装九门客户端接入，再启动当前工作区的 UI、API、存储和模型 Provider；退出时自动移除临时接入。页面改动会热更新，后端 TypeScript 改动会自动重编译并重启服务。
+
+```bash
+# 终端一：保持服务运行
+npm run tidu:dev-p
+
+# 企业版：先完成下方 PostgreSQL 准备，再启动完整企业流程
+npm run tidu:dev-e
+
+# 终端二：通过本地 CLI 操作同一运行时和开发数据
+npm run tidu:cli-p -- doctor
+npm run tidu:cli-p -- config show
+npm run tidu:cli-p -- clients
+```
+
+浏览器打开第一个终端显示的本地地址。Vite 将 `/api` 转发给开发运行时，配置和任务请求会走实际后端。开发数据默认保存在仓库根目录 `.tidu-dev/tidu.sqlite`，与安装版数据隔离；可用 `TIDU_DATABASE_PATH` 指定位置。默认复用当前已登录的 Codex 或 Cursor 宿主模型；只有主动切换到其他服务时，才需要配置 `TIDU_PROVIDER`、`TIDU_PROVIDER_MODEL`，以及对应的服务地址和密钥。
+
+企业版开发与实际部署使用相同的 PostgreSQL 控制平面、表初始化、策略、额度和任务持久化流程，不提供内存替代实现。`tidu:dev-e` 会先连接 PostgreSQL 并执行只读检查；未配置或无法连接时停止启动，并在终端给出以下两种安装路径。开发模式只增加前后端热更新，本机配置保存在独立的 `.tidu-dev/enterprise.sqlite`。
+
+项目提供的 PostgreSQL 容器：
+
+```bash
+export TIDU_POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+docker compose -f config/docker/compose.yml -f config/docker/compose.dev.yml up -d postgres
+export TIDU_POSTGRES_URL="postgresql://tidu:${TIDU_POSTGRES_PASSWORD}@127.0.0.1:5432/tidu"
+npm run tidu:dev-e
+```
+
+使用自行安装或远程 PostgreSQL：
+
+```bash
+# 目标账号需要在指定数据库中创建和更新表的权限
+export TIDU_POSTGRES_URL="postgresql://<user>:<password>@<host>:<port>/<database>"
+# 仅在服务端要求验证 TLS 时设置
+export TIDU_POSTGRES_SSL=require
+npm run tidu:dev-e
+```
+
+另开终端可用 `npm run tidu:cli-e -- <command>` 操作企业版的本机配置。停止开发服务不会停止 PostgreSQL；项目容器可用 `docker compose -f config/docker/compose.yml -f config/docker/compose.dev.yml stop postgres` 单独停止。
+
+按 `Ctrl+C` 停止开发服务。默认运行时端口为 `9639`、开发页面端口为 `5173`；可设置 `TIDU_PORT` 更改运行时端口。
 
 > [!IMPORTANT]
 > `main` 和 `support/*` 是受保护发布线。只有仓库所有者 `@skillnull` 可以更新或合并；其他贡献者必须通过 Pull Request 参与，且不能自行合并。

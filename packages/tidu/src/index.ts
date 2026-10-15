@@ -339,6 +339,10 @@ export {
   type TaskStatus,
 } from "./protocol/index.js";
 export {
+  createCodexHostModelProvider,
+  createCursorHostModelProvider,
+} from "./providers/codex-host.js";
+export {
   createOllamaProvider,
   createOpenAiCompatibleProvider,
   createProviderFromEnvironment,
@@ -421,6 +425,8 @@ export {
   type SecretGateRule,
 } from "./security/index.js";
 export {
+  type EnterpriseConnectionSnapshot,
+  type EnterpriseConnectionStore,
   IN_MEMORY_DATABASE_PATH,
   type NodeSqliteStorageOptions,
   openNodeSqliteStorage,

@@ -10,6 +10,7 @@ AI-Tidu9 uses a modular architecture with one core, multiple entry points, and r
 | --- | --- |
 | **Separate intelligence from control** | Models handle uncertain reasoning; the kernel owns budgets, permissions, state, and acceptance |
 | **Separate entry from capability** | Hosts are entry points; models, Agents, Skills, MCP servers, and knowledge share one capability contract |
+| **Reuse the current model by default** | Delegate to the signed-in host's current model; only an explicit provider choice overrides it |
 | **Bound by default** | Every task has explicit step, time, spend, tool-call, and output-size limits |
 | **Minimize state** | Retain recovery capsules and evidence instead of copying full conversations or raw model output |
 | **Make failure explicit** | Rejection, degradation, pause, rollback, and recovery are states, not silent fallbacks disguised as success |
@@ -23,7 +24,7 @@ flowchart LR
   Entry --> Gate[Policy, quota, approval, and Secret Gate]
   Gate --> Kernel[Agent kernel<br/>Understand · Plan · Execute · Verify]
   Kernel --> Router[Dynamic routing and capability completion]
-  Router --> Models[External models / Ollama]
+  Router --> Models[Current host model / external models / Ollama]
   Router --> Assets[Agent / Skill / MCP / Tool / Knowledge]
   Models --> Kernel
   Assets --> Kernel
@@ -40,7 +41,7 @@ The core does not replace model reasoning or hard-code domain logic. It selects 
 | Entry and host | `cli`, `clients`, `accounts`, `connectors`, `openai` | CLI, client discovery, official account delegation, MCP/ACP, and OpenAI-compatible entry | Never copies host credentials or presents unverified host capabilities |
 | Configuration and control | `runtime`, `config`, `config-center` | Service startup, isolated managed/expert drafts, active publication, management API, and UI | Saving a draft never activates it; the UI is not the only control channel |
 | Agent kernel | `core`, `protocol`, `agent` | Goals, plans, budgets, approvals, recovery, evidence, and acceptance | Provider-private messages never become core state |
-| Models and capabilities | `routing`, `providers`, `capabilities`, `ecosystem`, `usage` | Model scoring, capability completion, provider protocols, extension assembly, and usage authority | Estimated cost never impersonates provider billing; discovery never executes extensions |
+| Models and capabilities | `routing`, `providers`, `capabilities`, `ecosystem`, `usage` | Use the current model through Codex app-server or Cursor ACP by default; allow Ollama and OpenAI-compatible provider overrides | Never reads or copies host credentials; estimated cost never impersonates provider billing |
 | Security and organization | `security`, `enterprise` | Runtime redaction, organization policy, roles, quota pools, and administrator access | Plugins and expert settings cannot bypass mandatory policy |
 | State and scaling | `storage`, `scaling` | SQLite/PostgreSQL adapters, task capsules, admission, leases, workers, and recovery | Never stores full conversations, raw model responses, or large tool output |
 

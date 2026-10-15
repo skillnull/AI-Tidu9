@@ -1,6 +1,6 @@
 {
   "contractVersion": "1",
-  "schemaVersion": "4",
+  "schemaVersion": "5",
   "migrations": [
     {
       "version": "1",
@@ -17,6 +17,10 @@
     {
       "version": "4",
       "file": "migrations/0004-add-configuration-history.sql"
+    },
+    {
+      "version": "5",
+      "file": "migrations/0005-add-enterprise-connection.sql"
     }
   ]
 }

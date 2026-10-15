@@ -1,9 +1,14 @@
-import { StrictMode, useCallback, useEffect, useState } from "react";
+import { StrictMode, useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { TaskControlView } from "../../src/agent/index.js";
-import type { ConfigurationMode, TiduConfiguration } from "../../src/config/index.js";
+import {
+  type ConfigurationMode,
+  type ExpertServiceConfiguration,
+  type TiduConfiguration,
+  validateConfiguration,
+} from "../../src/config/index.js";
 import type { ConfigCenterBootstrap } from "../../src/config-center/contracts.js";
-import "./styles.css";
+import "./styles.scss";
 
 type LoadingState =
   | { status: "loading" }
@@ -16,11 +21,30 @@ type OperationState =
   | { status: "success"; message: string }
   | { status: "error"; message: string };
 
+type ClientConnectionState =
+  | { status: "idle" }
+  | { status: "pending" }
+  | { status: "success"; message: string }
+  | { status: "error"; message: string };
+
 interface ConfigurationForm {
   /** Stable lowercase identifier used to select this profile. */
   activeProfileId: string;
   /** User-facing virtual-model name exposed by compatible clients. */
   virtualModelName: string;
+  /** Advanced runtime service controls available only in expert mode. */
+  expertServices?: ExpertServiceConfiguration;
+}
+
+interface EntryValidationMessages {
+  /** Validation message for the required profile ID. */
+  activeProfileId?: string;
+  /** Validation message for the required virtual-model name. */
+  virtualModelName?: string;
+  /** Validation message for the expert runtime host. */
+  expertHost?: string;
+  /** Validation message for the expert runtime port. */
+  expertPort?: string;
 }
 
 interface TaskListResponse {
@@ -30,6 +54,285 @@ interface TaskListResponse {
   tasks: readonly TaskControlView[];
 }
 
+interface HostUsageSnapshot {
+  /** Active model provider in the local runtime. */
+  activeProvider: { type: string; model: string } | null;
+  /** Codex account and official usage data, when available. */
+  codex: {
+    account: { type: string; email: string | null; plan: string | null } | null;
+    usage: {
+      limitId: string | null;
+      primary: {
+        usedPercent: number;
+        windowDurationMins: number | null;
+        resetsAt: number | null;
+      } | null;
+      secondary: {
+        usedPercent: number;
+        windowDurationMins: number | null;
+        resetsAt: number | null;
+      } | null;
+      creditBalance: string | null;
+      availableResetCredits: number | null;
+      lifetimeTokens: number | null;
+      dailyTokens: readonly { date: string; tokens: number }[];
+    } | null;
+  } | null;
+  /** Cursor account connection and selected Agent model, when reported. */
+  cursor: {
+    agentStatus: string;
+    agentProtocolAvailable: boolean;
+    accountEmail: string | null;
+    /** Subscription plan reported by the official Cursor status command. */
+    accountPlan: string | null;
+    model: string | null;
+  };
+}
+
+interface EnterpriseMemberUsageReport {
+  /** Published enterprise-state revision. */
+  revision: number;
+  /** Enterprise-funded pool totals for the current cycle. */
+  totals: {
+    /** Purchased units across enterprise pools. */
+    capacity: number;
+    /** Units still available across enterprise pools. */
+    remaining: number;
+    /** Units held by active reservations. */
+    reserved: number;
+    /** Units already settled. */
+    settled: number;
+  };
+  /** Members registered with the enterprise control plane. */
+  members: readonly {
+    /** Stable enterprise identity identifier. */
+    id: string;
+    /** Name published for administrators. */
+    displayName: string;
+    /** Enterprise roles assigned to this identity. */
+    roles: readonly string[];
+    /** Enterprise-funded allocations directly assigned to this member's user scope. */
+    allocations: readonly {
+      /** Stable allocation identifier. */
+      allocationId: string;
+      /** Name of the funded model resource. */
+      resourceName: string;
+      /** Maximum units allocated to this user scope. */
+      limit: number;
+      /** Units settled for this user scope. */
+      settled: number;
+      /** Units currently reserved for this user scope. */
+      reserved: number;
+      /** Units left within this user allocation. */
+      remaining: number;
+    }[];
+  }[];
+}
+
+const formatResetTime = (timestamp: number | null, locale: "en-US" | "zh-CN"): string =>
+  timestamp === null
+    ? locale === "zh-CN"
+      ? "未提供"
+      : "Not reported"
+    : new Date(timestamp * 1000).toLocaleString(locale);
+
+const resolveCodexPlanPricing = (
+  plan: string | null | undefined,
+): { price: string; unit: string; tierKnown: boolean } => {
+  const normalizedPlan = plan?.trim().toLowerCase();
+  if (normalizedPlan === "free") return { price: "$0", unit: "USD / month", tierKnown: true };
+  if (normalizedPlan === "plus") return { price: "$20", unit: "USD / month", tierKnown: true };
+  if (normalizedPlan === "pro") {
+    return { price: "$100 / $200 / $500", unit: "USD / month", tierKnown: false };
+  }
+  return { price: "—", unit: "—", tierKnown: false };
+};
+
+const HostUsagePanel = ({
+  snapshot,
+  locale,
+  onRefresh,
+  onConnectCursor,
+  connectingCursor,
+  cursorConnectionError,
+}: {
+  snapshot: HostUsageSnapshot | null;
+  locale: "en-US" | "zh-CN";
+  onRefresh: () => void;
+  onConnectCursor: () => void;
+  connectingCursor: boolean;
+  cursorConnectionError: string | null;
+}) => {
+  const chinese = locale === "zh-CN";
+  const usage = snapshot?.codex?.usage;
+  const codexPricing = resolveCodexPlanPricing(snapshot?.codex?.account?.plan);
+  return (
+    <section className="host-usage-panel">
+      <div className="configuration-heading">
+        <div>
+          <p className="card-label">MODEL USAGE</p>
+          <h2>{chinese ? "模型与额度统计" : "Model usage and limits"}</h2>
+          <p>
+            {chinese
+              ? "按宿主显示官方数据；没有接口的数据明确标为未提供。"
+              : "Official host data is shown per source; unavailable fields stay unreported."}
+          </p>
+        </div>
+        <button type="button" onClick={onRefresh}>
+          {chinese ? "刷新数据" : "Refresh"}
+        </button>
+      </div>
+      <div className="host-usage-grid">
+        <article className="card">
+          <p className="card-label">CODEX</p>
+          <h2>{chinese ? "Codex 账号" : "Codex account"}</h2>
+          <p>
+            {chinese ? "账号" : "Account"}：
+            {snapshot?.codex?.account?.email ??
+              snapshot?.codex?.account?.type ??
+              (chinese ? "未读取到" : "Unavailable")}
+          </p>
+          <p>
+            {chinese ? "套餐" : "Plan"}：
+            {snapshot?.codex?.account?.plan ?? (chinese ? "官方接口未提供" : "Not reported")}
+          </p>
+          <p>
+            {chinese ? "价格" : "Price"}：{codexPricing.price}
+          </p>
+          <p>
+            {chinese ? "计费单位" : "Billing unit"}：
+            {codexPricing.unit === "USD / month" && chinese ? "USD / 月" : codexPricing.unit}
+          </p>
+          {!codexPricing.tierKnown && snapshot?.codex?.account?.plan?.toLowerCase() === "pro" ? (
+            <p className="account-note">
+              {chinese
+                ? "账号接口仅返回 Pro，未返回 Pro 100、Pro 200 或 Pro 500 的具体档位。"
+                : "The account API reports Pro without identifying the Pro 100, Pro 200, or Pro 500 tier."}{" "}
+              <a
+                href="https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers"
+                target="_blank"
+                rel="noreferrer"
+              >
+                {chinese ? "查看官方定价" : "View official pricing"}
+              </a>
+            </p>
+          ) : null}
+          <p>
+            {chinese ? "当前运行模型" : "Active runtime model"}：
+            {snapshot?.activeProvider?.type === "codex-host" ? snapshot.activeProvider.model : "—"}
+          </p>
+          <p>
+            {chinese ? "剩余额度（短周期）" : "Remaining short-window quota"}：
+            {usage?.primary ? `${Math.max(0, 100 - usage.primary.usedPercent).toFixed(1)}%` : "—"}
+          </p>
+          <p>
+            {chinese ? "重置时间" : "Resets at"}：
+            {formatResetTime(usage?.primary?.resetsAt ?? null, locale)}
+          </p>
+          <p>
+            {chinese ? "剩余额度（长周期）" : "Remaining long-window quota"}：
+            {usage?.secondary
+              ? `${Math.max(0, 100 - usage.secondary.usedPercent).toFixed(1)}%`
+              : "—"}
+          </p>
+          <p>
+            {chinese ? "重置时间" : "Resets at"}：
+            {formatResetTime(usage?.secondary?.resetsAt ?? null, locale)}
+          </p>
+          <p>
+            {chinese ? "可用重置次数" : "Available resets"}：{usage?.availableResetCredits ?? "—"}
+          </p>
+          <p>
+            {chinese ? "预付余额" : "Credit balance"}：{usage?.creditBalance ?? "—"}
+          </p>
+          <p>
+            {chinese ? "账户累计 Token" : "Lifetime account tokens"}：
+            {usage?.lifetimeTokens?.toLocaleString(locale) ?? "—"}
+          </p>
+          <div className="account-history">
+            <h3>{chinese ? "每日使用量" : "Daily usage"}</h3>
+            {usage?.dailyTokens.length ? (
+              <div className="usage-history">
+                {usage.dailyTokens.map((bucket) => (
+                  <p key={bucket.date}>
+                    <span>{bucket.date}</span>
+                    <strong>{bucket.tokens.toLocaleString(locale)} tokens</strong>
+                  </p>
+                ))}
+              </div>
+            ) : (
+              <p>{chinese ? "宿主没有返回每日统计。" : "The host did not return daily usage."}</p>
+            )}
+            <p className="account-note">
+              {chinese
+                ? "官方数据为账号汇总与每日总量，未提供按模型拆分。"
+                : "Official data includes account and daily totals without a per-model breakdown."}
+            </p>
+          </div>
+        </article>
+        <article className="card">
+          <p className="card-label">CURSOR</p>
+          <h2>
+            {snapshot?.cursor.agentStatus === "authenticated"
+              ? chinese
+                ? "账号已连接"
+                : "Account connected"
+              : chinese
+                ? "连接账号后读取模型"
+                : "Connect account to read model"}
+          </h2>
+          <p>
+            {chinese ? "账号" : "Account"}：
+            {snapshot?.cursor.accountEmail ??
+              (snapshot?.cursor.agentStatus === "authenticated"
+                ? chinese
+                  ? "已连接"
+                  : "Connected"
+                : chinese
+                  ? "尚未连接"
+                  : "Not connected")}
+          </p>
+          <p>
+            {chinese ? "套餐" : "Plan"}：
+            {snapshot?.cursor.accountPlan ?? (chinese ? "官方接口未提供" : "Not reported")}
+          </p>
+          <p>
+            {chinese ? "价格" : "Price"}：{chinese ? "官方接口未提供" : "Not reported"}
+          </p>
+          <p>{chinese ? "计费单位" : "Billing unit"}：—</p>
+          <p>
+            {chinese ? "可用 Agent 模型" : "Agent model"}：{snapshot?.cursor.model ?? "—"}
+          </p>
+          <p>
+            {chinese ? "剩余额度与重置次数" : "Remaining quota and resets"}：
+            {chinese ? "请在 Cursor 设置或用量面板查看" : "See Cursor settings or usage dashboard"}
+          </p>
+          {snapshot?.cursor.agentStatus !== "authenticated" ? (
+            <button type="button" onClick={onConnectCursor} disabled={connectingCursor}>
+              {connectingCursor
+                ? chinese
+                  ? "等待浏览器授权…"
+                  : "Waiting for browser sign-in…"
+                : chinese
+                  ? "连接 Cursor 账号"
+                  : "Connect Cursor account"}
+            </button>
+          ) : null}
+          {cursorConnectionError ? <p role="alert">{cursorConnectionError}</p> : null}
+          <p>
+            {chinese
+              ? "连接会打开 Cursor 官方浏览器授权；凭据由 Cursor 管理。"
+              : "Connection opens Cursor's official browser sign-in; Cursor manages the credentials."}
+          </p>
+          <a href="https://cursor.com/dashboard" target="_blank" rel="noreferrer">
+            {chinese ? "打开 Cursor 用量面板" : "Open Cursor usage dashboard"}
+          </a>
+        </article>
+      </div>
+    </section>
+  );
+};
+
 interface ConfigurationImpactPreview {
   /** Whether the configuration passed validation. */
   valid: boolean;
@@ -37,7 +340,54 @@ interface ConfigurationImpactPreview {
   changes: readonly string[];
   /** Activation risk classification. */
   risk: "low" | "medium";
+  /** Validation issues blocking activation. */
+  issues: readonly { code: string; field: string; message: string }[];
+  /** Whether the runtime must restart to apply listener changes. */
+  restartRequired: boolean;
 }
+
+const impactChangeLabel = (
+  change: string,
+  form: ConfigurationForm,
+  mode: ConfigurationMode,
+  locale: "en-US" | "zh-CN",
+): string => {
+  const english = locale === "en-US";
+  const service = form.expertServices;
+  const labels: Record<string, string> = {
+    activeMode: english
+      ? `Runtime mode → ${modeLabel(mode, locale)}`
+      : `运行模式 → ${modeLabel(mode, locale)}`,
+    activeProfileId: english
+      ? `Profile ID → ${form.activeProfileId}`
+      : `配置标识 → ${form.activeProfileId}`,
+    virtualModelName: english
+      ? `Virtual model → ${form.virtualModelName}`
+      : `虚拟模型 → ${form.virtualModelName}`,
+    "expertServices.host": english
+      ? `Listen host → ${service?.host ?? "-"}`
+      : `监听地址 → ${service?.host ?? "-"}`,
+    "expertServices.port": english
+      ? `Listen port → ${service?.port ?? "-"}`
+      : `监听端口 → ${service?.port ?? "-"}`,
+    "expertServices.responsesApiEnabled": `Responses API → ${
+      service?.responsesApiEnabled ? (english ? "enabled" : "启用") : english ? "disabled" : "关闭"
+    }`,
+    "expertServices.chatCompletionsApiEnabled": `Chat Completions API → ${
+      service?.chatCompletionsApiEnabled
+        ? english
+          ? "enabled"
+          : "启用"
+        : english
+          ? "disabled"
+          : "关闭"
+    }`,
+    "expertServices.taskApiEnabled": `Agent Task API → ${
+      service?.taskApiEnabled ? (english ? "enabled" : "启用") : english ? "disabled" : "关闭"
+    }`,
+  };
+  return labels[change] ?? change;
+};
 
 const taskStatusLabel = (status: TaskControlView["status"], locale: "en-US" | "zh-CN"): string =>
   (locale === "zh-CN"
@@ -294,9 +644,22 @@ const requestBootstrap = async (
   return body as ConfigCenterBootstrap;
 };
 
+const DEFAULT_EXPERT_SERVICES: ExpertServiceConfiguration = {
+  host: "127.0.0.1",
+  port: 9639,
+  responsesApiEnabled: true,
+  chatCompletionsApiEnabled: true,
+  taskApiEnabled: true,
+};
+
 const toForm = (configuration: TiduConfiguration): ConfigurationForm => ({
   activeProfileId: configuration.activeProfileId,
   virtualModelName: configuration.virtualModelName,
+  ...(configuration.activeMode === "expert"
+    ? {
+        expertServices: configuration.expertServices ?? DEFAULT_EXPERT_SERVICES,
+      }
+    : {}),
 });
 
 const modeLabel = (mode: ConfigurationMode, locale: "en-US" | "zh-CN" = "zh-CN"): string =>
@@ -307,6 +670,41 @@ const modeLabel = (mode: ConfigurationMode, locale: "en-US" | "zh-CN" = "zh-CN")
     : mode === "managed"
       ? "Normal"
       : "Expert";
+
+const providerReasonLabel = (reason: string | undefined, locale: "en-US" | "zh-CN"): string => {
+  const chinese: Record<string, string> = {
+    "codex-cli-unavailable": "Codex CLI 未安装或命令不可用",
+    "codex-not-authenticated": "Codex CLI 尚未登录",
+    "codex-model-undiscovered": "Codex CLI 未返回当前模型配置",
+    "cursor-cli-unavailable": "Cursor Agent CLI 未安装或命令不可用",
+    "cursor-not-authenticated": "Cursor Agent CLI 尚未登录",
+    "cursor-acp-unavailable": "Cursor Agent CLI 未提供 ACP 模型配置",
+    "cursor-model-undiscovered": "Cursor ACP 未返回当前模型配置",
+    "ollama-unavailable": "无法连接本机 Ollama 服务",
+    "ollama-no-models": "Ollama 服务已启动，但尚未安装模型",
+    "compatible-provider-not-active": "当前运行未使用兼容服务；切换并重启后可重新检测",
+    "detection-failed": "读取配置失败，请稍后重新检测",
+  };
+  const englishLabels: Record<string, string> = {
+    "codex-cli-unavailable": "Codex CLI is unavailable",
+    "codex-not-authenticated": "Codex CLI is not signed in",
+    "codex-model-undiscovered": "Codex CLI did not report its current model configuration",
+    "cursor-cli-unavailable": "Cursor Agent CLI is unavailable",
+    "cursor-not-authenticated": "Cursor Agent CLI is not signed in",
+    "cursor-acp-unavailable": "Cursor Agent CLI does not expose model configuration over ACP",
+    "cursor-model-undiscovered": "Cursor ACP did not report its current model configuration",
+    "ollama-unavailable": "The local Ollama service is unreachable",
+    "ollama-no-models": "Ollama is running but has no installed models",
+    "compatible-provider-not-active":
+      "The compatible service is not active; switch and restart to detect it",
+    "detection-failed": "Configuration lookup failed; try again",
+  };
+  const labels = locale === "zh-CN" ? chinese : englishLabels;
+  return (
+    labels[reason ?? ""] ??
+    (locale === "zh-CN" ? "未发现该服务的模型配置" : "No model configuration found")
+  );
+};
 
 const clientReadinessLabel = (
   readiness: ConfigCenterBootstrap["clients"]["clients"][number]["readiness"],
@@ -319,18 +717,6 @@ const clientReadinessLabel = (
     return locale === "zh-CN" ? "已发现 · 能力有限" : "Detected · limited";
   }
   return locale === "zh-CN" ? "未发现" : "Not detected";
-};
-
-const clientLimitationLabel = (
-  limitation: ConfigCenterBootstrap["clients"]["clients"][number]["limitation"],
-  locale: "en-US" | "zh-CN",
-): string | null => {
-  if (limitation === "cursor-standard-chat-only") {
-    return locale === "zh-CN"
-      ? "仅发现Cursor桌面端时只能使用聊天兼容入口；这不等同于完整Agent能力。"
-      : "Cursor Desktop alone exposes only the chat-compatible entry, not the full Agent interface.";
-  }
-  return null;
 };
 
 const clientIntegrationLabel = (
@@ -515,22 +901,22 @@ const GuideCenter = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
             </article>
             <article className="guide-card">
               <p className="guide-index">03 · 发布</p>
-              <h3>生成员工接入手册</h3>
+              <h3>发布企业接入地址</h3>
               <ol>
                 <li>管理员发布模型、额度、门禁和可用客户端。</li>
-                <li>系统生成公司专属员工接入页，不展示供应商密钥。</li>
-                <li>接入页包含公司地址、登录方式、模型名称和验证步骤。</li>
-                <li>配置变更后文档自动更新并保留版本。</li>
+                <li>系统提供不含供应商密钥的企业接入地址。</li>
+                <li>管理员通过公司内部渠道把地址发给员工。</li>
+                <li>配置变更后员工本地可重新检测并读取最新修订。</li>
               </ol>
             </article>
             <article className="guide-card">
               <p className="guide-index">04 · 员工</p>
               <h3>按场景完成接入</h3>
               <ol>
-                <li>打开公司提供的员工接入页并完成身份认证。</li>
-                <li>选择Codex、Cursor、CLI、浏览器或其他客户端。</li>
-                <li>集中版直接配置虚拟模型；混合版再安装轻量连接器。</li>
-                <li>运行连通性验证，确认额度、策略和可用能力。</li>
+                <li>在员工电脑安装并启动个人版九门赛博提督。</li>
+                <li>打开本地页面的“个人”页面并找到“企业接入”。</li>
+                <li>填写管理员提供的公司链接并完成检测。</li>
+                <li>企业模型、策略和能力以只读方式显示在本地页面。</li>
               </ol>
             </article>
             <article className="guide-card">
@@ -539,7 +925,7 @@ const GuideCenter = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
               <ol>
                 <li>页面故障不停止模型网关和已启用配置。</li>
                 <li>管理员可通过等价CLI、配置文件和管理API操作。</li>
-                <li>员工接入页提供诊断、升级、回滚和支持入口。</li>
+                <li>员工通过本地页面重新检测或断开企业接入。</li>
                 <li>所有文档显示适用版本与最近发布时间。</li>
               </ol>
             </article>
@@ -564,10 +950,14 @@ const PersonalExperiencePanel = ({
   locale,
   providerConfigured,
   providerType,
+  enterprise,
+  onBootstrap,
 }: {
   locale: "en-US" | "zh-CN";
   providerConfigured: boolean;
   providerType: string | null;
+  enterprise: ConfigCenterBootstrap["enterprise"];
+  onBootstrap: (bootstrap: ConfigCenterBootstrap) => void;
 }) => {
   const english = locale === "en-US";
   return (
@@ -597,16 +987,6 @@ const PersonalExperiencePanel = ({
           </code>
         </article>
         <article className="personal-card">
-          <p className="card-label">BUDGET & ACCOUNTS</p>
-          <h3>{english ? "Snapshot attribution" : "账号快照记账"}</h3>
-          <p>
-            {english
-              ? "Running tasks keep their account snapshot after a switch."
-              : "账号切换后，运行中任务仍按原账号快照记账。"}
-          </p>
-          <code>{english ? "Provider truth first" : "供应商官方用量优先"}</code>
-        </article>
-        <article className="personal-card">
           <p className="card-label">LOCAL MODEL</p>
           <h3>
             {providerType === "ollama" ? "Ollama" : english ? "Ready to configure" : "可配置"}
@@ -633,11 +1013,164 @@ const PersonalExperiencePanel = ({
           <code>{english ? "AES-256-GCM configuration export" : "AES-256-GCM 加密配置导出"}</code>
         </article>
       </div>
+      <EnterpriseReadOnlyPanel enterprise={enterprise} locale={locale} onBootstrap={onBootstrap} />
     </section>
   );
 };
 
-const EnterprisePilotPanel = ({
+const EnterpriseReadOnlyPanel = ({
+  enterprise,
+  locale,
+  onBootstrap,
+}: {
+  enterprise: ConfigCenterBootstrap["enterprise"];
+  locale: "en-US" | "zh-CN";
+  onBootstrap: (bootstrap: ConfigCenterBootstrap) => void;
+}) => {
+  const english = locale === "en-US";
+  const [endpoint, setEndpoint] = useState(enterprise.endpoint ?? "");
+  const [pending, setPending] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+
+  useEffect(() => setEndpoint(enterprise.endpoint ?? ""), [enterprise.endpoint]);
+
+  const updateConnection = async (action: "connect" | "disconnect"): Promise<void> => {
+    setPending(true);
+    setMessage(null);
+    try {
+      const response = await fetch("/api/enterprise/connection", {
+        method: action === "connect" ? "POST" : "DELETE",
+        headers: { "content-type": "application/json" },
+        body: action === "connect" ? JSON.stringify({ endpoint: endpoint.trim() }) : "{}",
+      });
+      const result = (await response.json()) as ConfigCenterBootstrap & { message?: string };
+      if (!response.ok) {
+        throw new Error(
+          result.message ??
+            (english ? "Company connection failed." : "企业接入失败，请检查公司链接。"),
+        );
+      }
+      onBootstrap(result);
+      setMessage(
+        action === "connect"
+          ? english
+            ? "Company configuration refreshed."
+            : "企业配置已读取并更新。"
+          : english
+            ? "Company connection removed."
+            : "已断开企业接入。",
+      );
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Company connection failed.");
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <div className="enterprise-readonly">
+      <div className="configuration-heading">
+        <div>
+          <p className="card-label">ENTERPRISE CONFIGURATION</p>
+          <h2>{english ? "Company access" : "企业接入"}</h2>
+          <p>
+            {enterprise.enabled
+              ? english
+                ? `${enterprise.companyName ?? "Company"} · revision ${enterprise.revision}. Published settings are read only.`
+                : `${enterprise.companyName ?? "企业"} · 修订 ${enterprise.revision}；企业发布的配置仅可查看。`
+              : english
+                ? "Enter the company URL provided by your administrator."
+                : "填写管理员提供的公司链接即可接入，无需额外命令。"}
+          </p>
+        </div>
+        <span
+          className={`availability ${enterprise.enabled ? "availability-ready" : "availability-planned"}`}
+        >
+          {enterprise.enabled
+            ? english
+              ? "CONNECTED"
+              : "已接入"
+            : english
+              ? "NOT CONNECTED"
+              : "未接入"}
+        </span>
+      </div>
+      <form
+        className="enterprise-connection-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void updateConnection("connect");
+        }}
+      >
+        <label htmlFor="enterprise-endpoint">
+          {english ? "Company URL" : "公司链接"}
+          <input
+            id="enterprise-endpoint"
+            type="url"
+            value={endpoint}
+            placeholder="https://tidu.company.example"
+            required
+            disabled={pending}
+            onChange={(event) => setEndpoint(event.target.value)}
+          />
+        </label>
+        <button type="submit" disabled={pending || endpoint.trim() === ""}>
+          {pending
+            ? english
+              ? "Checking…"
+              : "检测中…"
+            : enterprise.enabled
+              ? english
+                ? "Check again"
+                : "重新检测"
+              : english
+                ? "Connect"
+                : "接入企业"}
+        </button>
+        {enterprise.enabled ? (
+          <button
+            type="button"
+            disabled={pending}
+            onClick={() => void updateConnection("disconnect")}
+          >
+            {english ? "Disconnect" : "断开接入"}
+          </button>
+        ) : null}
+      </form>
+      {message ? (
+        <p className="enterprise-connection-message" role="status">
+          {message}
+        </p>
+      ) : null}
+      {enterprise.enabled ? (
+        <div className="personal-grid">
+          <article className="personal-card">
+            <p className="card-label">VIRTUAL MODEL</p>
+            <h3>{enterprise.virtualModelName ?? "—"}</h3>
+            <p>{enterprise.virtualModelId ?? "—"}</p>
+          </article>
+          <article className="personal-card">
+            <p className="card-label">POLICY</p>
+            <h3>{enterprise.policyCount}</h3>
+            <p>{english ? "Mandatory and advisory policies" : "强制策略与辅助策略"}</p>
+          </article>
+          <article className="personal-card">
+            <p className="card-label">CAPABILITY CATALOG</p>
+            <h3>{enterprise.capabilityCount}</h3>
+            <p>{english ? "Published private capabilities" : "已发布内部能力"}</p>
+          </article>
+          <article className="personal-card">
+            <p className="card-label">MODEL RESOURCES</p>
+            <h3>{enterprise.resourceCount}</h3>
+            <p>{english ? "Enterprise and user-owned resources" : "企业采购与用户自带资源"}</p>
+          </article>
+        </div>
+      ) : null}
+    </div>
+  );
+};
+
+const EnterpriseEditionPanel = ({
   enterprise,
   locale,
 }: {
@@ -645,78 +1178,174 @@ const EnterprisePilotPanel = ({
   locale: "en-US" | "zh-CN";
 }) => {
   const english = locale === "en-US";
+  const administratorKeyInput = useRef<HTMLInputElement>(null);
+  const [administratorSession, setAdministratorSession] = useState<string | null>(null);
+  const [memberUsage, setMemberUsage] = useState<EnterpriseMemberUsageReport | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const loadMemberUsage = useCallback(async (sessionId: string) => {
+    const response = await fetch("/api/enterprise/members/usage", {
+      headers: { "x-tidu-admin-session": sessionId },
+      cache: "no-store",
+    });
+    if (!response.ok)
+      throw new Error(response.status === 401 ? "session-expired" : "usage-unavailable");
+    setMemberUsage((await response.json()) as EnterpriseMemberUsageReport);
+  }, []);
+
+  const signIn = async (): Promise<void> => {
+    const key = administratorKeyInput.current?.value.trim();
+    if (!key) return;
+    setLoading(true);
+    setMessage(null);
+    try {
+      const response = await fetch("/api/enterprise/admin/session", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ key }),
+      });
+      if (!response.ok) throw new Error("authentication-failed");
+      const session = (await response.json()) as { id: string };
+      setAdministratorSession(session.id);
+      await loadMemberUsage(session.id);
+    } catch {
+      setMessage(
+        english
+          ? "Administrator sign-in failed or usage is unavailable."
+          : "管理员验证失败，或用量暂不可读取。",
+      );
+    } finally {
+      if (administratorKeyInput.current) administratorKeyInput.current.value = "";
+      setLoading(false);
+    }
+  };
+
   return (
-    <section className="configuration-panel">
+    <section className="configuration-panel enterprise-edition-panel">
       <div className="configuration-heading">
         <div>
-          <p className="card-label">ENTERPRISE PILOT</p>
-          <h2>{english ? "Enterprise control plane" : "企业控制平面"}</h2>
+          <p className="card-label">ENTERPRISE EDITION</p>
+          <h2>{english ? "Enterprise configuration and usage" : "企业配置与用量"}</h2>
           <p>
-            {enterprise.enabled
-              ? english
-                ? `Published revision ${enterprise.revision}. Mandatory policy and quota controls are active.`
-                : `已发布修订 ${enterprise.revision}，强制策略与额度控制已经接入。`
-              : english
-                ? "This runtime is personal-only. Attach an enterprise control plane to enable centralized policy and quota."
-                : "当前为纯个人运行时。挂载企业控制平面后启用集中策略与额度。"}
+            {english
+              ? `Published revision ${enterprise.revision}. Member details require an administrator session.`
+              : `已发布修订 ${enterprise.revision}。成员明细仅在管理员验证后显示。`}
           </p>
         </div>
-        <span
-          className={`availability ${enterprise.enabled ? "availability-ready" : "availability-planned"}`}
-        >
-          {enterprise.enabled ? (english ? "ACTIVE" : "已启用") : english ? "PERSONAL" : "个人版"}
-        </span>
       </div>
       <div className="personal-grid">
         <article className="personal-card">
           <p className="card-label">POLICY</p>
           <h3>{enterprise.policyCount}</h3>
-          <p>{english ? "Mandatory and advisory policies" : "强制策略与辅助策略"}</p>
+          <p>{english ? "Published policies" : "已发布策略"}</p>
         </article>
         <article className="personal-card">
-          <p className="card-label">CAPABILITY CATALOG</p>
+          <p className="card-label">CAPABILITY</p>
           <h3>{enterprise.capabilityCount}</h3>
-          <p>{english ? "Published private capabilities" : "已发布内部能力"}</p>
+          <p>{english ? "Published capabilities" : "已发布能力"}</p>
         </article>
         <article className="personal-card">
           <p className="card-label">MODEL RESOURCES</p>
           <h3>{enterprise.resourceCount}</h3>
-          <p>{english ? "Enterprise and user-owned resources" : "企业采购与用户自带资源"}</p>
-        </article>
-        <article className="personal-card">
-          <p className="card-label">ADMIN ACCESS</p>
-          <h3>
-            {enterprise.administratorInitialized
-              ? english
-                ? "Initialized"
-                : "已初始化"
-              : english
-                ? "Not initialized"
-                : "未初始化"}
-          </h3>
-          <p>{english ? "One-time key with irreversible verifier" : "一次性密钥与不可逆校验值"}</p>
+          <p>{english ? "Configured model resources" : "已配置模型资源"}</p>
         </article>
       </div>
-      {enterprise.guidance ? (
-        <div className="guide-grid">
-          <article className="guide-card">
-            <p className="guide-index">ADMIN · v{enterprise.guidance.version}</p>
-            <h3>{english ? "Deployment guidance" : "管理员部署指南"}</h3>
-            <ol>
-              {enterprise.guidance.administrator.map((step) => (
-                <li key={step}>{step}</li>
+      {administratorSession === null ? (
+        <form
+          className="enterprise-admin-login"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void signIn();
+          }}
+        >
+          <label htmlFor="enterprise-admin-key">
+            {english ? "Administrator access key" : "管理员访问密钥"}
+          </label>
+          <input
+            id="enterprise-admin-key"
+            ref={administratorKeyInput}
+            type="password"
+            autoComplete="off"
+            required
+          />
+          <button type="submit" disabled={loading}>
+            {loading
+              ? english
+                ? "Verifying…"
+                : "验证中…"
+              : english
+                ? "View member usage"
+                : "查看成员用量"}
+          </button>
+        </form>
+      ) : (
+        <button
+          type="button"
+          onClick={() => {
+            setLoading(true);
+            void loadMemberUsage(administratorSession)
+              .catch(() => {
+                setAdministratorSession(null);
+                setMemberUsage(null);
+                setMessage(
+                  english ? "Session expired. Sign in again." : "会话已过期，请重新验证。",
+                );
+              })
+              .finally(() => setLoading(false));
+          }}
+          disabled={loading}
+        >
+          {english ? "Refresh member usage" : "刷新成员用量"}
+        </button>
+      )}
+      {message ? (
+        <p role="alert" className="read-only-notice">
+          {message}
+        </p>
+      ) : null}
+      {memberUsage ? (
+        <div className="enterprise-usage">
+          <h3>{english ? "Enterprise quota" : "企业额度"}</h3>
+          <p>
+            {english ? "Capacity" : "总额"} {memberUsage.totals.capacity} ·{" "}
+            {english ? "Remaining" : "剩余"} {memberUsage.totals.remaining} ·{" "}
+            {english ? "Settled" : "已结算"} {memberUsage.totals.settled} ·{" "}
+            {english ? "Reserved" : "已预留"} {memberUsage.totals.reserved}
+          </p>
+          <h3>{english ? "Connected members" : "接入成员"}</h3>
+          {memberUsage.members.length === 0 ? (
+            <p>{english ? "No members are registered yet." : "暂无已登记成员。"}</p>
+          ) : (
+            <div className="enterprise-member-grid">
+              {memberUsage.members.map((member) => (
+                <article className="personal-card" key={member.id}>
+                  <h3>{member.displayName}</h3>
+                  <p>{member.roles.join(" · ")}</p>
+                  {member.allocations.length === 0 ? (
+                    <p>
+                      {english
+                        ? "No user-scoped enterprise quota recorded."
+                        : "尚无归属该成员的企业额度记录。"}
+                    </p>
+                  ) : (
+                    member.allocations.map((allocation) => (
+                      <p key={allocation.allocationId}>
+                        {allocation.resourceName}：{english ? "used" : "已用"} {allocation.settled}{" "}
+                        / {allocation.limit} · {english ? "remaining" : "剩余"}{" "}
+                        {allocation.remaining}
+                      </p>
+                    ))
+                  )}
+                </article>
               ))}
-            </ol>
-          </article>
-          <article className="guide-card">
-            <p className="guide-index">EMPLOYEE · v{enterprise.guidance.version}</p>
-            <h3>{english ? "Employee onboarding" : "员工接入指南"}</h3>
-            <ol>
-              {enterprise.guidance.employee.map((step) => (
-                <li key={step}>{step}</li>
-              ))}
-            </ol>
-          </article>
+            </div>
+          )}
+          <p className="read-only-notice">
+            {english
+              ? "Usage reflects settled user-scoped enterprise allocations. Calls without a member identity are not attributed to a person."
+              : "这里统计已结算且绑定成员身份的企业额度；没有成员身份的调用不会归到个人。"}
+          </p>
         </div>
       ) : null}
     </section>
@@ -732,6 +1361,8 @@ interface QuickStartWizardProps {
   providerConfigured: boolean;
   /** Sanitized active provider name. */
   providerType: string | null;
+  /** Sanitized active upstream model name. */
+  providerModel: string | null;
   /** Currently selected isolated draft. */
   selectedMode: ConfigurationMode;
   /** Editable entry identity. */
@@ -740,22 +1371,28 @@ interface QuickStartWizardProps {
   isDirty: boolean;
   /** Whether an operation is running. */
   isPending: boolean;
-  /** Whether the impact preview passed. */
-  impactValid: boolean;
+  /** Latest activation impact preview. */
+  impactPreview?: ConfigurationImpactPreview;
   /** Whether this form is the active runtime configuration. */
   isActive: boolean;
-  /** Select an isolated draft. */
-  onSelectMode: (mode: ConfigurationMode) => void;
+  /** Validation messages for required entry fields. */
+  entryValidationMessages: EntryValidationMessages;
+  /** Whether this installation may modify configuration. */
+  readOnly: boolean;
   /** Update the entry identity form. */
   onFormChange: (form: ConfigurationForm) => void;
   /** Save the current draft. */
-  onSave: () => Promise<void>;
+  onSave: () => Promise<boolean>;
   /** Simulate activation impact. */
   onSimulate: () => Promise<void>;
   /** Activate the verified draft. */
   onActivate: () => Promise<void>;
+  /** Restore the previous known-good runtime configuration. */
+  onRollback: () => Promise<void>;
   /** Open client connection guidance. */
   onOpenClients: () => void;
+  /** Start the official Cursor browser sign-in flow. */
+  onConnectCursor: () => Promise<void>;
 }
 
 const QuickStartWizard = ({
@@ -763,25 +1400,149 @@ const QuickStartWizard = ({
   enterpriseEnabled,
   providerConfigured,
   providerType,
+  providerModel,
   selectedMode,
   form,
   isDirty,
   isPending,
-  impactValid,
+  impactPreview,
   isActive,
-  onSelectMode,
+  entryValidationMessages,
+  readOnly,
   onFormChange,
   onSave,
   onSimulate,
   onActivate,
+  onRollback,
   onOpenClients,
+  onConnectCursor,
 }: QuickStartWizardProps) => {
   const english = locale === "en-US";
   const [step, setStep] = useState(0);
-  const [providerChoice, setProviderChoice] = useState<"compatible" | "ollama">("ollama");
+  const [showProviderOverride, setShowProviderOverride] = useState(false);
+  const [providerChoice, setProviderChoice] = useState<
+    "codex-host" | "cursor-host" | "ollama" | "compatible"
+  >(() =>
+    providerType === "cursor-host"
+      ? "cursor-host"
+      : providerType === "ollama"
+        ? "ollama"
+        : providerType === "openai-compatible"
+          ? "compatible"
+          : "codex-host",
+  );
+  const [providerCheck, setProviderCheck] = useState<{
+    status: "idle" | "checking" | "ready" | "unavailable" | "restart-required";
+    provider?: string;
+    model?: string;
+    reason?: string;
+    account?: {
+      status: string;
+      type: string | null;
+      email: string | null;
+      plan: string | null;
+    } | null;
+  }>({ status: "idle" });
+  const [providerCheckRevision, setProviderCheckRevision] = useState(0);
+  useEffect(() => {
+    setStep(selectedMode === "expert" ? 1 : 0);
+    setProviderCheck({ status: "idle" });
+  }, [selectedMode]);
   const stepLabels = english
-    ? ["Deployment", "Entry", "Model", "Activate", "Clients"]
-    : ["部署", "入口", "模型", "启用", "客户端"];
+    ? ["Deployment", "Entry", "Model", "Activate", "Clients (optional)"]
+    : ["部署", "入口", "模型", "启用", "客户端（可选）"];
+  const entryIsValid = Object.keys(entryValidationMessages).length === 0;
+  const entryIsComplete = entryIsValid && !isDirty;
+  const clientSetupIsAvailable = isActive && !isDirty;
+  const isCurrentHostProvider = providerType === "codex-host" || providerType === "cursor-host";
+  const choiceMatchesRuntime =
+    (providerChoice === "codex-host" && providerType === "codex-host") ||
+    (providerChoice === "cursor-host" && providerType === "cursor-host") ||
+    (providerChoice === "ollama" && providerType === "ollama") ||
+    (providerChoice === "compatible" && providerType === "openai-compatible");
+  const providerLabel =
+    providerChoice === "codex-host"
+      ? "Codex"
+      : providerChoice === "cursor-host"
+        ? "Cursor"
+        : providerChoice === "ollama"
+          ? "Ollama"
+          : english
+            ? "Compatible provider"
+            : "兼容服务";
+  useEffect(() => {
+    if (step !== 2) return;
+    let current = true;
+    setProviderCheck({ status: "checking", provider: providerChoice });
+    void fetch("/api/provider/detect", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provider: providerChoice }),
+      cache: "no-store",
+      credentials: "same-origin",
+    })
+      .then(
+        async (response) =>
+          (await response.json()) as {
+            detected?: boolean;
+            matchesRuntime?: boolean;
+            model?: string | null;
+            reason?: string | null;
+            account?: {
+              status: string;
+              type: string | null;
+              email: string | null;
+              plan: string | null;
+            } | null;
+          },
+      )
+      .then((result) => {
+        if (!current) return;
+        setProviderCheck({
+          provider: providerChoice,
+          status: !result.detected
+            ? "unavailable"
+            : result.matchesRuntime
+              ? "ready"
+              : "restart-required",
+          ...(result.model ? { model: result.model } : {}),
+          ...(result.reason ? { reason: result.reason } : {}),
+          account: result.account ?? null,
+        });
+      })
+      .catch(() => {
+        if (current)
+          setProviderCheck({
+            status: "unavailable",
+            provider: providerChoice,
+            reason: "detection-failed",
+          });
+      });
+    return () => {
+      current = false;
+    };
+  }, [step, providerChoice, providerCheckRevision]);
+  const canAdvance =
+    step === 1
+      ? entryIsValid
+      : step === 2
+        ? entryIsComplete &&
+          providerConfigured &&
+          choiceMatchesRuntime &&
+          providerCheck.status === "ready" &&
+          providerCheck.provider === providerChoice
+        : step === 3
+          ? clientSetupIsAvailable
+          : true;
+  const advanceStep = async (): Promise<void> => {
+    if (!canAdvance) {
+      return;
+    }
+    if (step === 1 && isDirty && !(await onSave())) {
+      return;
+    }
+    setStep(Math.min(stepLabels.length - 1, step + 1));
+  };
 
   return (
     <section className="onboarding-panel">
@@ -791,8 +1552,8 @@ const QuickStartWizard = ({
           <h2>{english ? "Finish setup step by step" : "按步骤完成首次配置"}</h2>
           <p>
             {english
-              ? "Each step reuses the same drafts, safety preview, and activation flow as Expert mode."
-              : "向导复用正式草稿、影响模拟和启用流程，不创建第二套配置。"}
+              ? "Next saves valid entry fields automatically. Continue only when the detected model configuration matches the active runtime; activate the configuration before connecting clients."
+              : "入口必填项通过校验后，点击下一步自动保存。模型步骤只读取所选服务的配置；与当前运行配置一致后才能继续，不会调用模型。"}
           </p>
         </div>
         <span className="onboarding-counter">
@@ -802,17 +1563,20 @@ const QuickStartWizard = ({
 
       <nav className="onboarding-steps" aria-label={english ? "Setup progress" : "配置进度"}>
         {stepLabels.map((label, stepIndex) => (
-          <button
+          <span
             className={
-              stepIndex === step ? "onboarding-step onboarding-step-active" : "onboarding-step"
+              stepIndex === step
+                ? "onboarding-step onboarding-step-active"
+                : stepIndex < step
+                  ? "onboarding-step onboarding-step-complete"
+                  : "onboarding-step"
             }
-            type="button"
-            onClick={() => setStep(stepIndex)}
+            aria-current={stepIndex === step ? "step" : undefined}
             key={label}
           >
             <span>{String(stepIndex + 1).padStart(2, "0")}</span>
             {label}
-          </button>
+          </span>
         ))}
       </nav>
 
@@ -828,8 +1592,8 @@ const QuickStartWizard = ({
                   ? "Enterprise attached"
                   : "已接入企业控制平面"
                 : english
-                  ? "Personal local"
-                  : "个人本地版"}
+                  ? "Personal"
+                  : "个人版"}
             </h3>
             <p>
               {enterpriseEnabled
@@ -838,73 +1602,244 @@ const QuickStartWizard = ({
                   : "组织策略与额度已经生效；向导只编辑你被允许配置的入口。"
                 : english
                   ? "SQLite and the local control center are ready. No external database is required."
-                  : "SQLite与本地配置中心已就绪，不需要外部数据库。"}
+                  : "个人版已就绪，使用独立配置与数据存储。"}
             </p>
           </>
         ) : step === 1 ? (
           <>
-            <div className="onboarding-choice-row">
-              {(["managed", "expert"] as const).map((mode) => (
-                <button
-                  className={
-                    selectedMode === mode ? "mode-button mode-button-active" : "mode-button"
-                  }
-                  type="button"
-                  onClick={() => onSelectMode(mode)}
-                  disabled={isPending}
-                  key={mode}
-                >
-                  {modeLabel(mode, locale)}
-                </button>
-              ))}
-            </div>
+            <p className="onboarding-kicker">
+              {english ? "Global mode" : "全局配置模式"} · {modeLabel(selectedMode, locale)}
+            </p>
+            <p className="required-hint">{english ? "* Required" : "* 必填项"}</p>
             <div className="configuration-form onboarding-form">
               <label>
                 {english ? "Profile ID" : "配置标识"}
+                <span className="required-mark" aria-hidden="true">
+                  *
+                </span>
                 <input
                   value={form.activeProfileId}
+                  required
+                  aria-required="true"
+                  aria-invalid={entryValidationMessages.activeProfileId !== undefined}
                   onChange={(event) =>
                     onFormChange({ ...form, activeProfileId: event.target.value })
                   }
                   maxLength={64}
-                  disabled={isPending}
+                  disabled={isPending || readOnly}
                 />
+                {entryValidationMessages.activeProfileId ? (
+                  <small className="field-error" role="alert">
+                    {entryValidationMessages.activeProfileId}
+                  </small>
+                ) : null}
               </label>
               <label>
                 {english ? "Virtual model name" : "虚拟模型名称"}
+                <span className="required-mark" aria-hidden="true">
+                  *
+                </span>
                 <input
                   value={form.virtualModelName}
+                  required
+                  aria-required="true"
+                  aria-invalid={entryValidationMessages.virtualModelName !== undefined}
                   onChange={(event) =>
                     onFormChange({ ...form, virtualModelName: event.target.value })
                   }
                   maxLength={64}
-                  disabled={isPending}
+                  disabled={isPending || readOnly}
                 />
+                {entryValidationMessages.virtualModelName ? (
+                  <small className="field-error" role="alert">
+                    {entryValidationMessages.virtualModelName}
+                  </small>
+                ) : null}
               </label>
             </div>
+            {selectedMode === "expert" && form.expertServices ? (
+              <section className="expert-service-settings">
+                <div className="expert-service-heading">
+                  <div>
+                    <p className="card-label">ADVANCED SERVICES</p>
+                    <h3>{english ? "Runtime network and APIs" : "运行网络与服务接口"}</h3>
+                  </div>
+                  <span>
+                    {english ? "Restart required for host and port" : "地址和端口重启后生效"}
+                  </span>
+                </div>
+                <div className="configuration-form onboarding-form">
+                  <label>
+                    {english ? "Listen host" : "监听地址"}
+                    <span className="required-mark" aria-hidden="true">
+                      *
+                    </span>
+                    <input
+                      value={form.expertServices.host}
+                      required
+                      aria-invalid={entryValidationMessages.expertHost !== undefined}
+                      onChange={(event) =>
+                        onFormChange({
+                          ...form,
+                          expertServices: {
+                            ...(form.expertServices ?? DEFAULT_EXPERT_SERVICES),
+                            host: event.target.value,
+                          },
+                        })
+                      }
+                      disabled={isPending || readOnly}
+                    />
+                    {entryValidationMessages.expertHost ? (
+                      <small className="field-error" role="alert">
+                        {entryValidationMessages.expertHost}
+                      </small>
+                    ) : null}
+                  </label>
+                  <label>
+                    {english ? "Listen port" : "监听端口"}
+                    <span className="required-mark" aria-hidden="true">
+                      *
+                    </span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={form.expertServices.port}
+                      required
+                      aria-invalid={entryValidationMessages.expertPort !== undefined}
+                      onChange={(event) =>
+                        onFormChange({
+                          ...form,
+                          expertServices: {
+                            ...(form.expertServices ?? DEFAULT_EXPERT_SERVICES),
+                            port: Number(event.target.value),
+                          },
+                        })
+                      }
+                      disabled={isPending || readOnly}
+                    />
+                    {entryValidationMessages.expertPort ? (
+                      <small className="field-error" role="alert">
+                        {entryValidationMessages.expertPort}
+                      </small>
+                    ) : null}
+                  </label>
+                </div>
+                <div className="expert-service-switches">
+                  {(
+                    [
+                      ["responsesApiEnabled", "Responses API", "/v1/responses"],
+                      ["chatCompletionsApiEnabled", "Chat Completions API", "/v1/chat/completions"],
+                      ["taskApiEnabled", "Agent Task API", "/api/tasks"],
+                    ] as const
+                  ).map(([field, label, path]) => (
+                    <label key={field}>
+                      <input
+                        type="checkbox"
+                        checked={form.expertServices?.[field] ?? false}
+                        onChange={(event) =>
+                          onFormChange({
+                            ...form,
+                            expertServices: {
+                              ...(form.expertServices ?? DEFAULT_EXPERT_SERVICES),
+                              [field]: event.target.checked,
+                            },
+                          })
+                        }
+                        disabled={isPending || readOnly}
+                      />
+                      <span>
+                        <strong>{label}</strong>
+                        <code>{path}</code>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </section>
+            ) : (
+              <p className="managed-mode-note">
+                {english
+                  ? "Normal mode inherits the current network, provider, database, and service defaults automatically."
+                  : "普通模式自动继承当前运行时的网络、模型、数据库与服务默认值，无需逐项配置。"}
+              </p>
+            )}
           </>
         ) : step === 2 ? (
           <>
             <p className="onboarding-kicker">
-              {providerConfigured
-                ? english
-                  ? "Provider ready"
-                  : "模型供应商已就绪"
-                : english
-                  ? "Choose a provider path"
-                  : "选择模型接入方式"}
+              {english ? `Selected provider · ${providerLabel}` : `当前检测 · ${providerLabel}`}
             </p>
             {providerConfigured ? (
-              <h3>{providerType}</h3>
-            ) : (
+              <>
+                <h3>
+                  {isCurrentHostProvider
+                    ? english
+                      ? `Current host model · ${providerModel ?? "default"}`
+                      : `当前宿主模型 · ${providerModel ?? "默认"}`
+                    : `${providerType ?? "Provider"} · ${providerModel ?? ""}`}
+                </h3>
+                <p>
+                  {isCurrentHostProvider
+                    ? english
+                      ? "The host's current model is detected automatically. You can override it with another provider below."
+                      : "模型由宿主自动识别；如需切换，可选择其他供应商。"
+                    : english
+                      ? "A provider override is active. Select another service below to change it."
+                      : "当前使用的是手动指定的模型服务；可在下方切换。"}
+                </p>
+                <div className="onboarding-choice-row">
+                  <button
+                    type="button"
+                    onClick={() => setShowProviderOverride((current) => !current)}
+                  >
+                    {showProviderOverride
+                      ? english
+                        ? "Use current model"
+                        : "继续使用当前模型"
+                      : english
+                        ? "Change model"
+                        : "修改模型"}
+                  </button>
+                </div>
+              </>
+            ) : null}
+            {!providerConfigured || showProviderOverride ? (
               <>
                 <div className="onboarding-choice-row">
+                  <button
+                    className={
+                      providerChoice === "codex-host"
+                        ? "mode-button mode-button-active"
+                        : "mode-button"
+                    }
+                    type="button"
+                    onClick={() => {
+                      setProviderChoice("codex-host");
+                    }}
+                  >
+                    Codex
+                  </button>
+                  <button
+                    className={
+                      providerChoice === "cursor-host"
+                        ? "mode-button mode-button-active"
+                        : "mode-button"
+                    }
+                    type="button"
+                    onClick={() => {
+                      setProviderChoice("cursor-host");
+                    }}
+                  >
+                    Cursor
+                  </button>
                   <button
                     className={
                       providerChoice === "ollama" ? "mode-button mode-button-active" : "mode-button"
                     }
                     type="button"
-                    onClick={() => setProviderChoice("ollama")}
+                    onClick={() => {
+                      setProviderChoice("ollama");
+                    }}
                   >
                     Ollama
                   </button>
@@ -915,36 +1850,139 @@ const QuickStartWizard = ({
                         : "mode-button"
                     }
                     type="button"
-                    onClick={() => setProviderChoice("compatible")}
+                    onClick={() => {
+                      setProviderChoice("compatible");
+                    }}
                   >
-                    OpenAI compatible
+                    {english ? "Other compatible services" : "其他兼容服务"}
                   </button>
                 </div>
-                <code className="onboarding-command">
-                  {providerChoice === "ollama"
-                    ? "TIDU_PROVIDER=ollama TIDU_PROVIDER_MODEL=<model> tidu start"
-                    : "TIDU_PROVIDER=openai-compatible TIDU_PROVIDER_MODEL=<model> TIDU_PROVIDER_API_KEY=<runtime-key> tidu start"}
-                </code>
+                <textarea
+                  className="onboarding-command"
+                  aria-label={english ? "Provider startup command" : "模型服务启动命令"}
+                  readOnly
+                  wrap="soft"
+                  rows={providerChoice === "compatible" ? 3 : 2}
+                  value={
+                    providerChoice === "codex-host"
+                      ? "TIDU_PROVIDER=codex-host\ntidu start  # follows the current Codex model"
+                      : providerChoice === "cursor-host"
+                        ? "TIDU_PROVIDER=cursor-host\ntidu start  # follows the current Cursor model"
+                        : providerChoice === "ollama"
+                          ? "TIDU_PROVIDER=ollama\nTIDU_PROVIDER_MODEL=<installed-model> tidu start"
+                          : "TIDU_PROVIDER=openai-compatible\nTIDU_PROVIDER_BASE_URL=<service-url>\nTIDU_PROVIDER_MODEL=<model> TIDU_PROVIDER_API_KEY=<runtime-key> tidu start"
+                  }
+                />
                 <p>
                   {english
-                    ? "Restart with these process variables. Secrets are never saved by this page."
-                    : "使用上述进程变量重启；本页面不会保存密钥。"}
+                    ? "Compatible services include OpenAI and other providers offering the OpenAI API format. Set the service URL and model. Secrets stay in the process environment."
+                    : "可接入 OpenAI 及其他提供 OpenAI 兼容接口的服务；填写服务地址和模型名后重启。密钥只从进程环境读取。"}
                 </p>
               </>
-            )}
+            ) : null}
+            <div className="provider-monitor" role="status" aria-live="polite">
+              <div className="provider-monitor-heading">
+                <strong>{providerLabel}</strong>
+                <button
+                  type="button"
+                  onClick={() => setProviderCheckRevision((revision) => revision + 1)}
+                  disabled={providerCheck.status === "checking"}
+                >
+                  {providerCheck.status === "checking"
+                    ? english
+                      ? "Reading configuration…"
+                      : "正在读取配置…"
+                    : english
+                      ? "Check again"
+                      : "重新检测"}
+                </button>
+              </div>
+              <p>
+                {providerCheck.status === "checking"
+                  ? english
+                    ? `Reading ${providerLabel} model configuration…`
+                    : `正在读取 ${providerLabel} 的模型配置…`
+                  : providerCheck.status === "ready"
+                    ? english
+                      ? `Detected ${providerCheck.model}; it matches the active runtime configuration.`
+                      : `已获取模型配置：${providerCheck.model}，与当前运行配置一致。`
+                    : providerCheck.status === "restart-required"
+                      ? english
+                        ? `Detected ${providerCheck.model}, but this runtime is using another provider. Restart with ${providerLabel} to continue.`
+                        : `已获取模型配置：${providerCheck.model}，但当前运行使用其他服务；切换并重启后才能继续。`
+                      : providerCheck.status === "unavailable"
+                        ? english
+                          ? `${providerLabel} model configuration was not found: ${providerReasonLabel(providerCheck.reason, locale)}.`
+                          : `${providerLabel} 未获取到模型配置：${providerReasonLabel(providerCheck.reason, locale)}。`
+                        : english
+                          ? "Select a provider to read its current model configuration."
+                          : "选择服务后读取该服务当前模型配置。"}
+              </p>
+              <p className="provider-monitor-note">
+                {english
+                  ? "Configuration lookup only. It does not send a model request."
+                  : "仅读取配置，不会发送模型请求。"}
+              </p>
+              {providerChoice === "cursor-host" &&
+              providerCheck.reason === "cursor-not-authenticated" ? (
+                <button
+                  type="button"
+                  onClick={() =>
+                    void onConnectCursor().then(() =>
+                      setProviderCheckRevision((revision) => revision + 1),
+                    )
+                  }
+                >
+                  {english ? "Connect Cursor account" : "连接 Cursor 账号"}
+                </button>
+              ) : null}
+              {providerCheck.account ? (
+                <div className="provider-account">
+                  <p>
+                    {english ? "Account status" : "账号状态"}：
+                    {providerCheck.account.status === "authenticated"
+                      ? english
+                        ? "Signed in"
+                        : "已登录"
+                      : english
+                        ? "Not signed in"
+                        : "未登录"}
+                  </p>
+                  {providerCheck.account.type ? (
+                    <p>
+                      {english ? "Account type" : "账号类型"}：{providerCheck.account.type}
+                    </p>
+                  ) : null}
+                  {providerCheck.account.email ? (
+                    <p>
+                      {english ? "Account" : "当前账号"}：{providerCheck.account.email}
+                    </p>
+                  ) : null}
+                  {providerCheck.account.plan ? (
+                    <p>
+                      {english ? "Plan" : "账号套餐"}：{providerCheck.account.plan}
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
           </>
         ) : step === 3 ? (
           <>
             <p className="onboarding-kicker">{english ? "Safe activation" : "安全启用"}</p>
             <h3>{english ? "Save → preview → activate" : "保存 → 模拟 → 启用"}</h3>
             <div className="onboarding-choice-row">
-              <button type="button" onClick={() => void onSave()} disabled={!isDirty || isPending}>
+              <button
+                type="button"
+                onClick={() => void onSave()}
+                disabled={readOnly || !isDirty || isPending}
+              >
                 {english ? "1. Save" : "1. 保存草稿"}
               </button>
               <button
                 type="button"
                 onClick={() => void onSimulate()}
-                disabled={isDirty || isPending}
+                disabled={readOnly || isDirty || isPending}
               >
                 {english ? "2. Preview" : "2. 模拟影响"}
               </button>
@@ -952,20 +1990,60 @@ const QuickStartWizard = ({
                 className="primary-button"
                 type="button"
                 onClick={() => void onActivate()}
-                disabled={isDirty || isPending || !impactValid}
+                disabled={readOnly || isDirty || isPending || impactPreview?.valid !== true}
               >
                 {english ? "3. Activate" : "3. 启用配置"}
               </button>
+              <button type="button" onClick={() => void onRollback()} disabled={isPending}>
+                {english ? "Rollback" : "回滚"}
+              </button>
             </div>
-            <p>
-              {isActive
-                ? english
-                  ? "This entry is active."
-                  : "当前入口已经生效。"
-                : english
-                  ? "Activation remains blocked until the preview passes."
-                  : "影响模拟通过前不会允许启用。"}
-            </p>
+            {impactPreview ? (
+              <section
+                className={`impact-preview ${impactPreview.valid ? "impact-preview-valid" : "impact-preview-invalid"}`}
+                aria-live="polite"
+              >
+                <div className="impact-preview-heading">
+                  <strong>
+                    {impactPreview.valid
+                      ? english
+                        ? "Preview passed"
+                        : "模拟通过"
+                      : english
+                        ? "Activation blocked"
+                        : "无法启用"}
+                  </strong>
+                  <span>
+                    {english
+                      ? `${impactPreview.risk} risk`
+                      : `${impactPreview.risk === "low" ? "低" : "中"}风险`}
+                  </span>
+                </div>
+                {impactPreview.changes.length === 0 ? (
+                  <p>{english ? "No runtime changes." : "与当前生效配置一致，无运行影响。"}</p>
+                ) : (
+                  <ul>
+                    {impactPreview.changes.map((change) => (
+                      <li key={change}>{impactChangeLabel(change, form, selectedMode, locale)}</li>
+                    ))}
+                  </ul>
+                )}
+                {impactPreview.restartRequired ? (
+                  <p className="impact-restart">
+                    {english
+                      ? "The listener address changed. Restart the runtime after activation."
+                      : "监听地址发生变化；启用后需要重启运行时。"}
+                  </p>
+                ) : null}
+                {impactPreview.issues.length > 0 ? (
+                  <ul className="impact-issues">
+                    {impactPreview.issues.map((issue) => (
+                      <li key={`${issue.code}-${issue.field}`}>{issue.message}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </section>
+            ) : null}
           </>
         ) : (
           <>
@@ -993,8 +2071,8 @@ const QuickStartWizard = ({
         </button>
         <button
           type="button"
-          onClick={() => setStep((current) => Math.min(stepLabels.length - 1, current + 1))}
-          disabled={step === stepLabels.length - 1}
+          onClick={() => void advanceStep()}
+          disabled={step === stepLabels.length - 1 || !canAdvance || isPending}
         >
           {english ? "Next" : "下一步"}
         </button>
@@ -1008,25 +2086,116 @@ const App = () => {
     status: "loading",
   });
   const [activeSection, setActiveSection] = useState<
-    "clients" | "configuration" | "enterprise" | "guide" | "personal" | "tasks"
+    "clients" | "configuration" | "enterprise" | "guide" | "personal" | "tasks" | "usage"
   >("configuration");
   const [locale, setLocale] = useState<"en-US" | "zh-CN">("zh-CN");
   const [selectedMode, setSelectedMode] = useState<ConfigurationMode>("managed");
-  const [form, setForm] = useState<ConfigurationForm>({
+  const [configurationView, setConfigurationView] = useState<"active" | "edit">("active");
+  const selectedModeRef = useRef<ConfigurationMode>("managed");
+  const hasLoadedWorkspace = useRef(false);
+  const [configurationForm, setConfigurationForm] = useState<ConfigurationForm>({
     activeProfileId: "managed-default",
     virtualModelName: "九门赛博提督",
+    expertServices: DEFAULT_EXPERT_SERVICES,
   });
   const [operation, setOperation] = useState<OperationState>({
     status: "idle",
   });
   const [impactPreview, setImpactPreview] = useState<ConfigurationImpactPreview | undefined>();
+  const [hostUsage, setHostUsage] = useState<HostUsageSnapshot | null>(null);
+  const [connectingCursor, setConnectingCursor] = useState(false);
+  const [cursorConnectionError, setCursorConnectionError] = useState<string | null>(null);
+  const [codexConnection, setCodexConnection] = useState<ClientConnectionState>({
+    status: "idle",
+  });
+  const refreshHostUsage = useCallback(async () => {
+    try {
+      const response = await fetch("/api/host-usage", { cache: "no-store" });
+      if (!response.ok) throw new Error("Host usage unavailable");
+      setHostUsage((await response.json()) as HostUsageSnapshot);
+    } catch {
+      setHostUsage(null);
+    }
+  }, []);
+  const connectCursor = useCallback(async () => {
+    setConnectingCursor(true);
+    setCursorConnectionError(null);
+    try {
+      const response = await fetch("/api/cursor/connect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      if (!response.ok)
+        throw new Error(
+          locale === "zh-CN"
+            ? "Cursor 授权未完成，请重试。"
+            : "Cursor sign-in did not complete. Please retry.",
+        );
+      await refreshHostUsage();
+    } catch (error) {
+      setCursorConnectionError(error instanceof Error ? error.message : "Cursor connection failed");
+    } finally {
+      setConnectingCursor(false);
+    }
+  }, [locale, refreshHostUsage]);
+  const connectCodex = useCallback(async () => {
+    setCodexConnection({ status: "pending" });
+    try {
+      const response = await fetch("/api/clients/codex/connect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      const result = (await response.json()) as { message?: string };
+      if (!response.ok) {
+        throw new Error(
+          result.message ??
+            (locale === "zh-CN" ? "Codex 客户端配置失败。" : "Codex client configuration failed."),
+        );
+      }
+      setCodexConnection({
+        status: "success",
+        message:
+          locale === "zh-CN"
+            ? "九门连接器已注册。官方模型列表保持不变，重启 Codex 后可通过 MCP 使用九门能力。"
+            : "AI-Tidu9 connector registered. Official models stay unchanged; restart Codex to use AI-Tidu9 through MCP.",
+      });
+    } catch (error) {
+      setCodexConnection({
+        status: "error",
+        message:
+          error instanceof Error
+            ? error.message
+            : locale === "zh-CN"
+              ? "Codex 客户端配置失败。"
+              : "Codex client configuration failed.",
+      });
+    }
+  }, [locale]);
 
   const acceptBootstrap = useCallback(
-    (bootstrap: ConfigCenterBootstrap, mode: ConfigurationMode = selectedMode) => {
+    (bootstrap: ConfigCenterBootstrap, mode?: ConfigurationMode) => {
+      const workspace = bootstrap.configuration.workspace;
+      const nextMode =
+        mode ??
+        (hasLoadedWorkspace.current
+          ? selectedModeRef.current
+          : workspace.active.configuration.activeMode);
+
+      if (!hasLoadedWorkspace.current) {
+        hasLoadedWorkspace.current = true;
+        setActiveSection(bootstrap.deployment === "enterprise" ? "enterprise" : "personal");
+        selectedModeRef.current = nextMode;
+        setSelectedMode(nextMode);
+        setConfigurationForm(toForm(workspace.drafts.expert.configuration));
+      } else {
+        setConfigurationForm(toForm(workspace.drafts.expert.configuration));
+      }
+
       setLoadingState({ status: "ready", bootstrap });
-      setForm(toForm(bootstrap.configuration.workspace.drafts[mode].configuration));
     },
-    [selectedMode],
+    [],
   );
 
   const refresh = useCallback(async () => {
@@ -1037,7 +2206,7 @@ const App = () => {
     } catch (error) {
       setLoadingState({
         status: "error",
-        message: error instanceof Error ? error.message : "无法读取本地运行状态",
+        message: error instanceof Error ? error.message : "无法读取运行状态",
       });
     }
   }, [acceptBootstrap]);
@@ -1046,17 +2215,26 @@ const App = () => {
     void refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    if (
+      activeSection === "usage" ||
+      (activeSection === "configuration" && configurationView === "active")
+    ) {
+      void refreshHostUsage();
+    }
+  }, [activeSection, configurationView, refreshHostUsage]);
+
   if (loadingState.status !== "ready") {
     return (
       <main className="shell">
         <header className="hero">
-          <p className="eyebrow">AI-Tidu9 · LOCAL CONTROL</p>
+          <p className="eyebrow">AI-Tidu9 · CONFIGURATION CENTER</p>
           <h1>九门赛博提督</h1>
-          <p className="explanation">智能协作中枢 · 本地配置中心</p>
+          <p className="explanation">智能协作中枢 · 配置中心</p>
         </header>
         {loadingState.status === "loading" ? (
           <section className="state-panel" aria-live="polite">
-            正在连接本地运行时…
+            正在连接运行时…
           </section>
         ) : (
           <section className="state-panel state-panel-error" aria-live="assertive">
@@ -1073,25 +2251,75 @@ const App = () => {
 
   const { bootstrap } = loadingState;
   const workspace = bootstrap.configuration.workspace;
+  const form = configurationForm;
+  const setForm = (
+    nextForm: ConfigurationForm | ((current: ConfigurationForm) => ConfigurationForm),
+  ): void => {
+    setConfigurationForm(nextForm);
+  };
   const selectedDraft = workspace.drafts[selectedMode];
+  const persistedForm: ConfigurationForm =
+    selectedMode === "expert"
+      ? form
+      : {
+          activeProfileId: form.activeProfileId,
+          virtualModelName: form.virtualModelName,
+        };
+  const validation = validateConfiguration(
+    {
+      ...selectedDraft.configuration,
+      ...persistedForm,
+      activeMode: selectedMode,
+    },
+    selectedMode,
+  );
+  const entryValidationMessages: EntryValidationMessages = {};
+  for (const issue of validation.issues) {
+    if (issue.field === "activeProfileId") {
+      entryValidationMessages.activeProfileId =
+        locale === "zh-CN"
+          ? "必填；仅支持小写字母、数字和连字符，最多 64 位。"
+          : "Required; use up to 64 lowercase letters, numbers, or hyphens.";
+    } else if (issue.field === "virtualModelName") {
+      entryValidationMessages.virtualModelName =
+        locale === "zh-CN"
+          ? "必填；去除首尾空格后需为 1–64 个字符。"
+          : "Required; enter 1–64 characters after trimming spaces.";
+    } else if (issue.code === "INVALID_EXPERT_HOST") {
+      entryValidationMessages.expertHost =
+        locale === "zh-CN"
+          ? "请输入有效的主机名或 IPv4 地址。"
+          : "Enter a valid hostname or IPv4 address.";
+    } else if (issue.code === "INVALID_EXPERT_PORT") {
+      entryValidationMessages.expertPort =
+        locale === "zh-CN" ? "端口必须是 1–65535 的整数。" : "Enter an integer from 1 to 65535.";
+    }
+  }
   const savedForm = toForm(selectedDraft.configuration);
-  const isDirty =
-    form.activeProfileId !== savedForm.activeProfileId ||
-    form.virtualModelName !== savedForm.virtualModelName;
+  const savedPersistedForm: ConfigurationForm =
+    selectedMode === "expert"
+      ? savedForm
+      : {
+          activeProfileId: savedForm.activeProfileId,
+          virtualModelName: savedForm.virtualModelName,
+        };
+  const isDirty = JSON.stringify(persistedForm) !== JSON.stringify(savedPersistedForm);
   const isPending = operation.status === "pending";
   const isSelectedDraftActive =
     workspace.active.configuration.activeMode === selectedMode &&
     workspace.active.configuration.activeProfileId === form.activeProfileId &&
-    workspace.active.configuration.virtualModelName === form.virtualModelName;
-
+    workspace.active.configuration.virtualModelName === form.virtualModelName &&
+    (selectedMode === "managed" ||
+      JSON.stringify(workspace.active.configuration.expertServices) ===
+        JSON.stringify(form.expertServices));
   const selectMode = (mode: ConfigurationMode): void => {
+    selectedModeRef.current = mode;
     setSelectedMode(mode);
-    setForm(toForm(workspace.drafts[mode].configuration));
     setOperation({ status: "idle" });
     setImpactPreview(undefined);
   };
 
-  const saveDraft = async (): Promise<void> => {
+  const saveDraft = async (): Promise<boolean> => {
     setOperation({ status: "pending", action: "save" });
     try {
       const nextBootstrap = await requestBootstrap(`/api/configuration/drafts/${selectedMode}`, {
@@ -1102,7 +2330,7 @@ const App = () => {
           configuration: {
             schemaVersion: selectedDraft.configuration.schemaVersion,
             activeMode: selectedMode,
-            ...form,
+            ...persistedForm,
           },
         }),
       });
@@ -1112,11 +2340,13 @@ const App = () => {
         status: "success",
         message: `${modeLabel(selectedMode)}草稿已保存，尚未启用。`,
       });
+      return true;
     } catch (error) {
       setOperation({
         status: "error",
         message: error instanceof Error ? error.message : "保存失败",
       });
+      return false;
     }
   };
 
@@ -1130,7 +2360,7 @@ const App = () => {
           configuration: {
             schemaVersion: selectedDraft.configuration.schemaVersion,
             activeMode: selectedMode,
-            ...form,
+            ...persistedForm,
           },
         }),
       });
@@ -1209,32 +2439,31 @@ const App = () => {
   return (
     <main className="shell">
       <header className="hero">
-        <p className="eyebrow">AI-Tidu9 · LOCAL CONTROL</p>
-        <h1>九门赛博提督</h1>
-        <p className="explanation">
-          {locale === "zh-CN"
-            ? "智能协作中枢 · 本地配置中心"
-            : "Intelligent Collaboration Hub · Local Control Center"}
-        </p>
-        <button
-          className={
-            activeSection === "enterprise"
-              ? "section-button section-button-active"
-              : "section-button"
-          }
-          type="button"
-          aria-current={activeSection === "enterprise" ? "page" : undefined}
-          onClick={() => setActiveSection("enterprise")}
-        >
-          {locale === "zh-CN" ? "企业" : "Enterprise"}
-        </button>
-        <button
-          className="locale-button"
-          type="button"
-          onClick={() => setLocale((current) => (current === "zh-CN" ? "en-US" : "zh-CN"))}
-        >
-          {locale === "zh-CN" ? "EN" : "中文"}
-        </button>
+        <div className="hero-copy">
+          <p className="eyebrow">AI-Tidu9 · CONFIGURATION CENTER</p>
+          <h1>九门赛博提督</h1>
+          <p className="explanation">
+            {locale === "zh-CN"
+              ? "智能协作中枢 · 配置中心"
+              : "Intelligent Collaboration Hub · Configuration Center"}
+          </p>
+        </div>
+        <div className="hero-global-controls">
+          <div className="global-runtime-status">
+            <span className="status-dot" aria-hidden="true" />
+            <span>{locale === "zh-CN" ? "运行正常" : "Healthy"}</span>
+            <button type="button" onClick={() => void refresh()} disabled={isPending}>
+              {locale === "zh-CN" ? "刷新" : "Refresh"}
+            </button>
+          </div>
+          <button
+            className="locale-button"
+            type="button"
+            onClick={() => setLocale((current) => (current === "zh-CN" ? "en-US" : "zh-CN"))}
+          >
+            {locale === "zh-CN" ? "EN" : "中文"}
+          </button>
+        </div>
       </header>
 
       <nav
@@ -1251,18 +2480,34 @@ const App = () => {
         >
           {locale === "zh-CN" ? "任务" : "Tasks"}
         </button>
-        <button
-          className={
-            activeSection === "configuration"
-              ? "section-button section-button-active"
-              : "section-button"
-          }
-          type="button"
-          aria-current={activeSection === "configuration" ? "page" : undefined}
-          onClick={() => setActiveSection("configuration")}
-        >
-          {locale === "zh-CN" ? "配置" : "Configuration"}
-        </button>
+        {bootstrap.deployment === "personal" ? (
+          <>
+            <button
+              className={
+                activeSection === "configuration"
+                  ? "section-button section-button-active"
+                  : "section-button"
+              }
+              type="button"
+              aria-current={activeSection === "configuration" ? "page" : undefined}
+              onClick={() => setActiveSection("configuration")}
+            >
+              {locale === "zh-CN" ? "配置" : "Configuration"}
+            </button>
+            <button
+              className={
+                activeSection === "usage"
+                  ? "section-button section-button-active"
+                  : "section-button"
+              }
+              type="button"
+              aria-current={activeSection === "usage" ? "page" : undefined}
+              onClick={() => setActiveSection("usage")}
+            >
+              {locale === "zh-CN" ? "模型统计" : "Model usage"}
+            </button>
+          </>
+        ) : null}
         <button
           className={
             activeSection === "clients" ? "section-button section-button-active" : "section-button"
@@ -1273,16 +2518,34 @@ const App = () => {
         >
           {locale === "zh-CN" ? "客户端" : "Clients"}
         </button>
-        <button
-          className={
-            activeSection === "personal" ? "section-button section-button-active" : "section-button"
-          }
-          type="button"
-          aria-current={activeSection === "personal" ? "page" : undefined}
-          onClick={() => setActiveSection("personal")}
-        >
-          {locale === "zh-CN" ? "个人中心" : "Personal"}
-        </button>
+        {bootstrap.deployment === "personal" ? (
+          <button
+            className={
+              activeSection === "personal"
+                ? "section-button section-button-active"
+                : "section-button"
+            }
+            type="button"
+            aria-current={activeSection === "personal" ? "page" : undefined}
+            onClick={() => setActiveSection("personal")}
+          >
+            {locale === "zh-CN" ? "个人" : "Personal"}
+          </button>
+        ) : null}
+        {bootstrap.deployment === "enterprise" ? (
+          <button
+            className={
+              activeSection === "enterprise"
+                ? "section-button section-button-active"
+                : "section-button"
+            }
+            type="button"
+            aria-current={activeSection === "enterprise" ? "page" : undefined}
+            onClick={() => setActiveSection("enterprise")}
+          >
+            {locale === "zh-CN" ? "企业" : "Enterprise"}
+          </button>
+        ) : null}
         <button
           className={
             activeSection === "guide" ? "section-button section-button-active" : "section-button"
@@ -1295,234 +2558,231 @@ const App = () => {
         </button>
       </nav>
 
-      <section className="overview">
-        <div>
-          <span className="status-dot" aria-hidden="true" />
-          <span>{locale === "zh-CN" ? "本地运行时正常" : "Local runtime healthy"}</span>
-        </div>
-        <button type="button" onClick={() => void refresh()} disabled={isPending}>
-          {locale === "zh-CN" ? "刷新状态" : "Refresh"}
-        </button>
-      </section>
-
-      {activeSection === "configuration" ? (
+      {bootstrap.deployment === "personal" && activeSection === "configuration" ? (
         <>
-          <QuickStartWizard
-            locale={locale}
-            enterpriseEnabled={bootstrap.enterprise.enabled}
-            providerConfigured={bootstrap.runtime.provider.configured}
-            providerType={bootstrap.runtime.provider.type}
-            selectedMode={selectedMode}
-            form={form}
-            isDirty={isDirty}
-            isPending={isPending}
-            impactValid={impactPreview?.valid === true}
-            isActive={isSelectedDraftActive}
-            onSelectMode={selectMode}
-            onFormChange={setForm}
-            onSave={saveDraft}
-            onSimulate={simulateDraft}
-            onActivate={activateDraft}
-            onOpenClients={() => setActiveSection("clients")}
-          />
-          <section
-            className="cards"
-            aria-label={locale === "zh-CN" ? "运行状态" : "Runtime status"}
-          >
-            <article className="card">
-              <p className="card-label">
-                {locale === "zh-CN" ? "当前生效配置" : "ACTIVE CONFIGURATION"}
-              </p>
-              <h2>{workspace.active.configuration.virtualModelName}</h2>
-              <p>
-                {modeLabel(workspace.active.configuration.activeMode, locale)} ·{" "}
-                {workspace.active.configuration.activeProfileId}
-              </p>
-            </article>
-            <article className="card">
-              <p className="card-label">{locale === "zh-CN" ? "本地存储" : "LOCAL STORAGE"}</p>
-              <h2>{bootstrap.storage.provider.toUpperCase()}</h2>
-              <p>
-                Schema {bootstrap.storage.schemaVersion} ·{" "}
-                {locale === "zh-CN" ? "状态正常" : "healthy"}
-              </p>
-            </article>
-            <article className="card">
-              <p className="card-label">{locale === "zh-CN" ? "运行版本" : "RUNTIME VERSION"}</p>
-              <h2>v{bootstrap.product.version}</h2>
-              <p>
-                {locale === "zh-CN" ? "配置契约" : "Configuration contract"}{" "}
-                {selectedDraft.configuration.schemaVersion}
-              </p>
-            </article>
-            <article className="card">
-              <p className="card-label">
-                {locale === "zh-CN" ? "虚拟模型协议" : "VIRTUAL MODEL API"}
-              </p>
-              <h2>/v1</h2>
-              <p>
-                {bootstrap.runtime.provider.configured
-                  ? `${bootstrap.runtime.provider.type} · ${bootstrap.runtime.provider.model}`
-                  : locale === "zh-CN"
-                    ? "模型发现可用 · 供应商待配置"
-                    : "Model discovery ready · provider not configured"}
-              </p>
-              <p>JSON + SSE · Function tools</p>
-            </article>
-          </section>
-
-          <section className="configuration-panel">
-            <div className="configuration-heading">
+          <section className="configuration-view-panel">
+            <div className="configuration-view-heading">
               <div>
-                <p className="card-label">CONFIGURATION DRAFTS</p>
-                <h2>{locale === "zh-CN" ? "配置模式" : "Configuration modes"}</h2>
+                {configurationView === "edit" ? (
+                  <p className="card-label">
+                    {locale === "zh-CN" ? "正在编辑" : "EDITING"} ·{" "}
+                    {modeLabel(selectedMode, locale)} · {locale === "zh-CN" ? "草稿修订" : "draft"}{" "}
+                    {selectedDraft.revision}
+                  </p>
+                ) : null}
+                <h2>
+                  {configurationView === "active"
+                    ? locale === "zh-CN"
+                      ? "当前生效配置"
+                      : "Active configuration"
+                    : locale === "zh-CN"
+                      ? `修改${modeLabel(selectedMode, locale)}配置`
+                      : `Edit ${modeLabel(selectedMode, locale)} configuration`}
+                </h2>
                 <p>
-                  {locale === "zh-CN"
-                    ? "两个模式独立保存；切换只查看草稿，不会改变当前运行配置。"
-                    : "Normal and Expert drafts are isolated. Switching the editor never changes the active runtime profile."}
+                  {configurationView === "active"
+                    ? locale === "zh-CN"
+                      ? "这里只显示运行中的配置与环境信息。"
+                      : "This view contains only active runtime and environment details."
+                    : locale === "zh-CN"
+                      ? "这里只编辑未生效草稿；保存、模拟并启用后才会影响运行流程。"
+                      : "This view edits an inactive draft. Save, preview, and activate it to change runtime behavior."}
                 </p>
               </div>
-              <fieldset
-                className="mode-switcher"
-                aria-label={locale === "zh-CN" ? "配置模式" : "Configuration mode"}
-              >
-                {(["managed", "expert"] as const).map((mode) => (
+              <div className="configuration-view-actions">
+                {configurationView === "edit" ? (
                   <button
-                    className={
-                      selectedMode === mode ? "mode-button mode-button-active" : "mode-button"
-                    }
+                    className="locale-button"
                     type="button"
-                    aria-pressed={selectedMode === mode}
-                    onClick={() => selectMode(mode)}
+                    aria-label={locale === "zh-CN" ? "切换配置模式" : "Switch configuration mode"}
+                    onClick={() => selectMode(selectedMode === "managed" ? "expert" : "managed")}
                     disabled={isPending}
-                    key={mode}
+                    aria-pressed={selectedMode === "expert"}
                   >
-                    {modeLabel(mode, locale)}
-                  </button>
-                ))}
-              </fieldset>
-            </div>
-
-            <div className="configuration-form">
-              <label>
-                {locale === "zh-CN" ? "配置标识" : "Profile ID"}
-                <input
-                  value={form.activeProfileId}
-                  onChange={(event) =>
-                    setForm((current) => ({
-                      ...current,
-                      activeProfileId: event.target.value,
-                    }))
-                  }
-                  maxLength={64}
-                  placeholder={`${selectedMode}-default`}
-                  disabled={isPending}
-                />
-                <small>
-                  {locale === "zh-CN"
-                    ? "仅支持小写字母、数字和连字符，最长 64 位。"
-                    : "Use up to 64 lowercase letters, numbers, or hyphens."}
-                </small>
-              </label>
-              <label>
-                {locale === "zh-CN" ? "虚拟模型名称" : "Virtual model name"}
-                <input
-                  value={form.virtualModelName}
-                  onChange={(event) =>
-                    setForm((current) => ({
-                      ...current,
-                      virtualModelName: event.target.value,
-                    }))
-                  }
-                  maxLength={64}
-                  placeholder="九门赛博提督"
-                  disabled={isPending}
-                />
-                <small>
-                  {locale === "zh-CN"
-                    ? "对兼容客户端显示的名称；AI-Tidu9 标识不会因此移除。"
-                    : "Displayed by compatible clients; AI-Tidu9 attribution remains."}
-                </small>
-              </label>
-            </div>
-
-            <div className="configuration-actions">
-              <p
-                className={
-                  operation.status === "error"
-                    ? "operation-message operation-error"
-                    : "operation-message"
-                }
-                aria-live="polite"
-              >
-                {operation.status === "idle"
-                  ? isDirty
-                    ? locale === "zh-CN"
-                      ? "存在未保存修改。切换模式会放弃这些输入。"
-                      : "Unsaved changes will be discarded when switching modes."
-                    : locale === "zh-CN"
-                      ? `草稿修订 ${selectedDraft.revision}，尚未产生新的修改。`
-                      : `Draft revision ${selectedDraft.revision}; no new changes.`
-                  : operation.status === "pending"
-                    ? operation.action === "save"
+                    {selectedMode === "managed"
                       ? locale === "zh-CN"
-                        ? "正在验证并保存…"
-                        : "Validating and saving…"
-                      : operation.action === "simulate"
-                        ? locale === "zh-CN"
-                          ? "正在模拟…"
-                          : "Simulating…"
-                        : operation.action === "rollback"
-                          ? locale === "zh-CN"
-                            ? "正在回滚…"
-                            : "Rolling back…"
-                          : locale === "zh-CN"
-                            ? "正在启用…"
-                            : "Activating…"
-                    : operation.message}
-              </p>
-              <div className="action-buttons">
+                        ? "专家模式"
+                        : "Expert"
+                      : locale === "zh-CN"
+                        ? "普通模式"
+                        : "Normal"}
+                  </button>
+                ) : null}
                 <button
+                  className="configuration-view-toggle"
                   type="button"
-                  onClick={() => void saveDraft()}
-                  disabled={!isDirty || isPending}
+                  onClick={() =>
+                    setConfigurationView((view) => (view === "active" ? "edit" : "active"))
+                  }
                 >
-                  {locale === "zh-CN" ? "保存草稿" : "Save draft"}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void simulateDraft()}
-                  disabled={isDirty || isPending}
-                >
-                  {locale === "zh-CN" ? "模拟影响" : "Preview impact"}
-                </button>
-                <button
-                  className="primary-button"
-                  type="button"
-                  onClick={() => void activateDraft()}
-                  disabled={isDirty || isPending || impactPreview?.valid !== true}
-                >
-                  {locale === "zh-CN" ? "启用此配置" : "Activate"}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void rollbackConfiguration()}
-                  disabled={isPending}
-                >
-                  {locale === "zh-CN" ? "回滚" : "Rollback"}
+                  {configurationView === "active"
+                    ? locale === "zh-CN"
+                      ? "修改配置"
+                      : "Edit configuration"
+                    : locale === "zh-CN"
+                      ? "查看当前生效"
+                      : "View active configuration"}
                 </button>
               </div>
             </div>
           </section>
+
+          <div className="configuration-view-content" hidden={configurationView !== "active"}>
+            <section
+              className="cards"
+              aria-label={locale === "zh-CN" ? "运行环境" : "Runtime environment"}
+            >
+              <article className="card storage-location-card">
+                <p className="card-label">{locale === "zh-CN" ? "数据库" : "DATABASE"}</p>
+                <p className="location-value" title={bootstrap.storage.location}>
+                  {bootstrap.storage.location}
+                </p>
+                <p>
+                  {bootstrap.storage.provider.toUpperCase()} · Schema{" "}
+                  {bootstrap.storage.schemaVersion}
+                </p>
+                <dl className="configuration-facts">
+                  <div>
+                    <dt>{locale === "zh-CN" ? "连接方式" : "Connection"}</dt>
+                    <dd>{locale === "zh-CN" ? "进程内嵌入式" : "Embedded in process"}</dd>
+                  </div>
+                  <div>
+                    <dt>{locale === "zh-CN" ? "数据库服务" : "Database service"}</dt>
+                    <dd>{locale === "zh-CN" ? "无独立服务" : "No separate service"}</dd>
+                  </div>
+                  <div>
+                    <dt>{locale === "zh-CN" ? "主机 / 端口" : "Host / port"}</dt>
+                    <dd>{locale === "zh-CN" ? "不适用" : "Not applicable"}</dd>
+                  </div>
+                </dl>
+                <div className="database-tables">
+                  {bootstrap.storage.tables.map((table) => (
+                    <p key={table.name}>
+                      <code>{table.name}</code>
+                      <span>
+                        {table.rowCount} {locale === "zh-CN" ? "行" : "rows"}
+                      </span>
+                    </p>
+                  ))}
+                </div>
+              </article>
+              <article className="card active-runtime-card">
+                <p className="card-label">
+                  {locale === "zh-CN" ? "当前生效配置" : "ACTIVE CONFIGURATION"}
+                </p>
+                <h2>{modeLabel(workspace.active.configuration.activeMode, locale)}</h2>
+                <p>
+                  {locale === "zh-CN" ? "配置标识" : "Profile ID"}：
+                  {workspace.active.configuration.activeProfileId}
+                </p>
+                <p>
+                  {locale === "zh-CN" ? "虚拟模型" : "Virtual model"}：
+                  {workspace.active.configuration.virtualModelName}
+                </p>
+                <p>
+                  {locale === "zh-CN" ? "修订" : "Revision"}：{workspace.active.revision} ·{" "}
+                  {workspace.active.updatedAt}
+                </p>
+                <p>
+                  {locale === "zh-CN" ? "模型服务" : "Model provider"}：
+                  {bootstrap.runtime.provider.configured
+                    ? `${bootstrap.runtime.provider.type} · ${bootstrap.runtime.provider.model}`
+                    : locale === "zh-CN"
+                      ? "尚未配置"
+                      : "Not configured"}
+                </p>
+                <p>
+                  {locale === "zh-CN" ? "运行版本" : "Runtime version"}：v
+                  {bootstrap.product.version} · {locale === "zh-CN" ? "配置契约" : "Contract"}{" "}
+                  {workspace.active.configuration.schemaVersion}
+                </p>
+                <p className="location-value" title={bootstrap.runtime.installationLocation}>
+                  {locale === "zh-CN" ? "安装入口" : "Entry"}：
+                  {bootstrap.runtime.installationLocation}
+                </p>
+                <p>
+                  {locale === "zh-CN" ? "监听地址" : "Listen address"}：
+                  <code>{bootstrap.runtime.origin}</code>
+                </p>
+                <div className="runtime-services">
+                  {bootstrap.runtime.services.map((service) => (
+                    <p key={service.id}>
+                      <span>
+                        <strong>{service.name}</strong>
+                        <code>{service.path}</code>
+                      </span>
+                      <em className={service.enabled ? "service-enabled" : "service-disabled"}>
+                        {service.enabled
+                          ? locale === "zh-CN"
+                            ? "已启用"
+                            : "Enabled"
+                          : locale === "zh-CN"
+                            ? "已关闭"
+                            : "Disabled"}
+                      </em>
+                    </p>
+                  ))}
+                </div>
+                <p>
+                  {locale === "zh-CN" ? "草稿修订" : "Draft revisions"}：
+                  {locale === "zh-CN" ? "共享配置" : "Shared"} {workspace.drafts.managed.revision} ·{" "}
+                  {locale === "zh-CN" ? "专家扩展" : "Expert extension"}{" "}
+                  {workspace.drafts.expert.revision}
+                </p>
+              </article>
+            </section>
+          </div>
+          <div className="configuration-view-content" hidden={configurationView !== "edit"}>
+            <QuickStartWizard
+              locale={locale}
+              enterpriseEnabled={bootstrap.enterprise.enabled}
+              providerConfigured={bootstrap.runtime.provider.configured}
+              providerType={bootstrap.runtime.provider.type}
+              providerModel={bootstrap.runtime.provider.model}
+              selectedMode={selectedMode}
+              form={form}
+              isDirty={isDirty}
+              isPending={isPending}
+              impactPreview={impactPreview}
+              isActive={isSelectedDraftActive}
+              entryValidationMessages={entryValidationMessages}
+              readOnly={!bootstrap.configuration.editable}
+              onFormChange={setForm}
+              onSave={saveDraft}
+              onSimulate={simulateDraft}
+              onActivate={activateDraft}
+              onRollback={rollbackConfiguration}
+              onOpenClients={() => setActiveSection("clients")}
+              onConnectCursor={connectCursor}
+            />
+            {!bootstrap.configuration.editable ? (
+              <p className="read-only-notice">
+                {locale === "zh-CN"
+                  ? "当前配置为只读。"
+                  : "Configuration is read-only in this edition."}
+              </p>
+            ) : null}
+          </div>
         </>
-      ) : activeSection === "personal" ? (
+      ) : bootstrap.deployment === "personal" && activeSection === "usage" ? (
+        <HostUsagePanel
+          snapshot={hostUsage}
+          locale={locale}
+          onRefresh={() => void refreshHostUsage()}
+          onConnectCursor={() => void connectCursor()}
+          connectingCursor={connectingCursor}
+          cursorConnectionError={cursorConnectionError}
+        />
+      ) : bootstrap.deployment === "personal" && activeSection === "personal" ? (
         <PersonalExperiencePanel
           locale={locale}
           providerConfigured={bootstrap.runtime.provider.configured}
           providerType={bootstrap.runtime.provider.type}
+          enterprise={bootstrap.enterprise}
+          onBootstrap={acceptBootstrap}
         />
-      ) : activeSection === "enterprise" ? (
-        <EnterprisePilotPanel enterprise={bootstrap.enterprise} locale={locale} />
+      ) : bootstrap.deployment === "enterprise" && activeSection === "enterprise" ? (
+        <EnterpriseEditionPanel enterprise={bootstrap.enterprise} locale={locale} />
       ) : activeSection === "clients" ? (
         <section className="client-panel">
           <div className="configuration-heading">
@@ -1531,117 +2791,103 @@ const App = () => {
               <h2>{locale === "zh-CN" ? "本机客户端" : "Local clients"}</h2>
               <p>
                 {locale === "zh-CN"
-                  ? "只检查命令、应用和配置文件是否存在，不读取配置正文与账号数据。"
-                  : "Discovery checks metadata only and never reads configuration bodies or account data."}
+                  ? "按产品主体展示可接入入口和实际接入方式。"
+                  : "Available entry points and integration methods are grouped by provider."}
               </p>
             </div>
-            <span className="client-privacy">METADATA ONLY</span>
           </div>
           <div className="client-grid">
-            {bootstrap.clients.clients.map((client) => (
-              <article className="client-card" key={client.id}>
+            {[
+              {
+                id: "openai",
+                name: "OpenAI / Codex",
+                clients: bootstrap.clients.clients.filter(
+                  (client) => client.id === "codex" || client.id === "openai-cli",
+                ),
+              },
+              {
+                id: "cursor",
+                name: "Cursor",
+                clients: bootstrap.clients.clients.filter((client) => client.id === "cursor"),
+              },
+            ].map((group) => (
+              <article className="client-card" key={group.id}>
                 <div className="client-card-heading">
                   <div>
-                    <p className="client-protocol">
-                      {clientIntegrationLabel(client.integrationMode, locale)} · {client.protocol}
-                    </p>
-                    <h3>{client.name}</h3>
+                    <p className="client-protocol">{group.id === "openai" ? "OPENAI" : "CURSOR"}</p>
+                    <h3>{group.name}</h3>
                   </div>
-                  <span className={`client-state client-state-${client.readiness}`}>
-                    {clientReadinessLabel(client.readiness, locale)}
+                  <span
+                    className={`client-state client-state-${group.clients.some((client) => client.detected) ? "configurable" : "not-detected"}`}
+                  >
+                    {group.clients.some((client) => client.detected)
+                      ? locale === "zh-CN"
+                        ? "已接入"
+                        : "Available"
+                      : locale === "zh-CN"
+                        ? "未发现"
+                        : "Not detected"}
                   </span>
                 </div>
-                <dl className="client-signals">
-                  <div>
-                    <dt>{locale === "zh-CN" ? "命令" : "Command"}</dt>
-                    <dd>
-                      {client.signals.command
-                        ? locale === "zh-CN"
-                          ? "已发现"
-                          : "Detected"
-                        : locale === "zh-CN"
-                          ? "未发现"
-                          : "Missing"}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>{locale === "zh-CN" ? "应用" : "Application"}</dt>
-                    <dd>
-                      {client.signals.application
-                        ? locale === "zh-CN"
-                          ? "已发现"
-                          : "Detected"
-                        : locale === "zh-CN"
-                          ? "未发现"
-                          : "Missing"}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>{locale === "zh-CN" ? "配置" : "Configuration"}</dt>
-                    <dd>
-                      {client.signals.configuration
-                        ? locale === "zh-CN"
-                          ? "已存在"
-                          : "Present"
-                        : locale === "zh-CN"
-                          ? "未发现"
-                          : "Missing"}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>{locale === "zh-CN" ? "原生协议" : "Native protocol"}</dt>
-                    <dd>
-                      {client.signals.agentProtocol
-                        ? locale === "zh-CN"
-                          ? "已发现"
-                          : "Detected"
-                        : locale === "zh-CN"
-                          ? "未发现"
-                          : "Missing"}
-                    </dd>
-                  </div>
-                </dl>
+                <div className="client-products">
+                  {group.clients.map((client) => (
+                    <div className="client-product" key={client.id}>
+                      <div>
+                        <strong>{client.name}</strong>
+                        <span>
+                          {clientIntegrationLabel(client.integrationMode, locale)} ·{" "}
+                          {client.protocol}
+                        </span>
+                      </div>
+                      <span className={`client-state client-state-${client.readiness}`}>
+                        {clientReadinessLabel(client.readiness, locale)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
                 <p className="client-limitation">
-                  {clientLimitationLabel(client.limitation, locale) ??
-                    (client.detected
-                      ? client.id === "codex"
-                        ? locale === "zh-CN"
-                          ? "优先通过app-server复用当前Codex账户；虚拟模型Profile仅作兼容入口。"
-                          : "Prefer app-server delegation for the current Codex account; the virtual-model profile is a compatibility entry."
-                        : client.id === "cursor" && client.signals.agentProtocol
-                          ? locale === "zh-CN"
-                            ? "通过官方ACP复用当前Cursor账户，不读取或复制登录凭据。"
-                            : "Reuse the current Cursor account through official ACP without reading or copying credentials."
-                          : locale === "zh-CN"
-                            ? "当前不自动写入此客户端的配置。"
-                            : "This client is not modified automatically."
-                      : locale === "zh-CN"
-                        ? "安装客户端后刷新即可重新检测。"
-                        : "Install the client and refresh to detect it.")}
+                  {group.id === "openai"
+                    ? locale === "zh-CN"
+                      ? "Codex 当前不能把第三方供应商增量加入官方模型列表；九门通过 MCP 连接器接入，官方模型仍全部保留。"
+                      : "Codex cannot currently add a third-party provider to its official model list; AI-Tidu9 uses MCP so every official model remains available."
+                    : locale === "zh-CN"
+                      ? "九门作为 MCP 连接器接入 Cursor；Cursor 官方模型列表不会新增九门模型项。"
+                      : "AI-Tidu9 connects to Cursor as an MCP connector; Cursor's official model list does not gain an AI-Tidu9 model entry."}
                 </p>
-                {client.id === "codex" && client.detected ? (
-                  <code className="client-command">tidu clients connect codex</code>
+                {group.id === "openai" ? (
+                  <div className="client-connect-row">
+                    <button
+                      type="button"
+                      className="primary-button"
+                      disabled={codexConnection.status === "pending"}
+                      onClick={() => void connectCodex()}
+                    >
+                      {codexConnection.status === "pending"
+                        ? locale === "zh-CN"
+                          ? "正在安装…"
+                          : "Installing…"
+                        : locale === "zh-CN"
+                          ? "安装或更新九门连接器"
+                          : "Install or update AI-Tidu9 connector"}
+                    </button>
+                    {codexConnection.status === "success" || codexConnection.status === "error" ? (
+                      <p
+                        className={`client-connect-message client-connect-message-${codexConnection.status}`}
+                      >
+                        {codexConnection.message}
+                      </p>
+                    ) : null}
+                  </div>
                 ) : null}
               </article>
             ))}
           </div>
-          <p className="guide-note">
-            {locale === "zh-CN"
-              ? "全能力接入优先使用Codex app-server、Cursor ACP等官方原生Agent协议；OpenAI兼容虚拟模型是通用客户端的兼容入口，不能冒充宿主完整能力。Ollama属于上游模型供应商，不是客户端。"
-              : "Full-capability integration prefers official native Agent protocols such as Codex app-server and Cursor ACP. The OpenAI-compatible virtual model is a generic compatibility entry and never impersonates the host's complete capabilities. Ollama is an upstream model provider, not a client."}
-          </p>
         </section>
       ) : activeSection === "tasks" ? (
         <TaskControlPanel locale={locale} />
       ) : (
         <GuideCenter locale={locale} />
       )}
-
-      <footer>
-        {locale === "zh-CN"
-          ? "仅监听本机回环地址 · 数据默认保留在本地 · 保存不等于启用"
-          : "Loopback only · data stays local by default · saving is not activation"}
-      </footer>
     </main>
   );
 };

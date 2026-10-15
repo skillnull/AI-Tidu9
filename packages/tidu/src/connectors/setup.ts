@@ -4,8 +4,10 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -61,6 +63,8 @@ export interface ConnectorSetupOptions {
   homeDirectory?: string;
   /** PATH override used by isolated tests. */
   executablePath?: string;
+  /** Connector surfaces to mutate; defaults to every supported surface. */
+  targets?: readonly ConnectorSetupItem["id"][];
 }
 
 const CONNECTOR_NAME = "ai-tidu9";
@@ -136,6 +140,12 @@ const writeJsonAtomically = (path: string, value: unknown): void => {
   }
 };
 
+const removeDirectoryWhenEmpty = (directoryPath: string): void => {
+  if (existsSync(directoryPath) && readdirSync(directoryPath).length === 0) {
+    rmdirSync(directoryPath);
+  }
+};
+
 const updateCursorMcp = (
   path: string,
   command: string,
@@ -165,6 +175,14 @@ const updateCursorMcp = (
       return "missing";
     }
     delete servers[CONNECTOR_NAME];
+    if (
+      Object.keys(servers).length === 0 &&
+      Object.keys(root).every((key) => key === "mcpServers")
+    ) {
+      rmSync(path);
+      removeDirectoryWhenEmpty(dirname(path));
+      return "removed";
+    }
   } else {
     servers[CONNECTOR_NAME] = { type: "stdio", command, args: [...argumentsList] };
   }
@@ -241,11 +259,28 @@ export const setupConnectors = (options: ConnectorSetupOptions = {}): ConnectorS
   const codex = findCommand(["codex"], executablePath);
   const cursor = findCommand(["cursor", "agent", "cursor-agent"], executablePath);
   const cursorConfig = join(homeDirectory, ".cursor", "mcp.json");
+  const codexHome = process.env.CODEX_HOME ?? join(homeDirectory, ".codex");
+  const codexConfig = join(codexHome, "config.toml");
+  const targets = new Set(options.targets ?? (["browser", "codex", "cursor", "openai"] as const));
 
-  const codexResult = configureCodex(codex, action, nodeExecutable, mcpArguments);
-  let cursorStatus: ConnectorSetupStatus;
+  const codexResult = targets.has("codex")
+    ? configureCodex(codex, action, nodeExecutable, mcpArguments)
+    : undefined;
+  if (
+    targets.has("codex") &&
+    action === "uninstall" &&
+    existsSync(codexConfig) &&
+    lstatSync(codexConfig).isFile() &&
+    readFileSync(codexConfig, "utf8").trim() === ""
+  ) {
+    rmSync(codexConfig);
+    removeDirectoryWhenEmpty(codexHome);
+  }
+  let cursorStatus: ConnectorSetupStatus = "missing";
   const cursorAvailable = cursor !== undefined || existsSync(join("/Applications", "Cursor.app"));
-  if (!cursorAvailable) {
+  if (!targets.has("cursor")) {
+    cursorStatus = "missing";
+  } else if (!cursorAvailable) {
     cursorStatus = "unavailable";
   } else if (action === "verify") {
     const root = existsSync(cursorConfig)
@@ -278,10 +313,15 @@ export const setupConnectors = (options: ConnectorSetupOptions = {}): ConnectorS
       : "Cursor is not installed; its connector configuration was not activated.",
   };
   const universalStatus: ConnectorSetupStatus = action === "uninstall" ? "removed" : "verified";
-  const connectors: ConnectorSetupItem[] = [
-    codexResult,
-    cursorResult,
-    {
+  const connectors: ConnectorSetupItem[] = [];
+  if (codexResult !== undefined) {
+    connectors.push(codexResult);
+  }
+  if (targets.has("cursor")) {
+    connectors.push(cursorResult);
+  }
+  if (targets.has("browser")) {
+    connectors.push({
       id: "browser",
       capability: "browser-management",
       status: universalStatus,
@@ -289,8 +329,10 @@ export const setupConnectors = (options: ConnectorSetupOptions = {}): ConnectorS
         action === "uninstall"
           ? "No browser files require removal."
           : `Configuration center: ${endpoint}`,
-    },
-    {
+    });
+  }
+  if (targets.has("openai")) {
+    connectors.push({
       id: "openai",
       capability: "openai-compatible",
       status: universalStatus,
@@ -298,8 +340,8 @@ export const setupConnectors = (options: ConnectorSetupOptions = {}): ConnectorS
         action === "uninstall"
           ? "No generic-client files require removal."
           : `OpenAI-compatible base URL: ${endpoint}/v1`,
-    },
-  ];
+    });
+  }
   const healthy = connectors.every((item) =>
     action === "uninstall"
       ? item.status === "removed" || item.status === "missing" || item.status === "unavailable"

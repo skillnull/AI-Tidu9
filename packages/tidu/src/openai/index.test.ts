@@ -14,6 +14,7 @@ test("creates an attributed OpenAI-compatible virtual model", () => {
     created: 1_791_763_200,
     object: "model",
     owned_by: "AI-Tidu9",
+    display_name: "九门赛博提督",
   });
 });
 

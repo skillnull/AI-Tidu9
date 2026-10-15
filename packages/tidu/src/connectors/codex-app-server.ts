@@ -22,6 +22,10 @@ export interface CodexAgentEvent {
 export interface CodexAgentOptions extends CodexHostInspectionOptions {
   /** Working directory used for new Codex threads. */
   workingDirectory: string;
+  /** Whether new threads should remain ephemeral and out of host history. */
+  ephemeral?: boolean;
+  /** Filesystem access granted to Codex for this thread. */
+  sandbox?: "read-only" | "workspace-write";
   /** Optional model selected through Codex's authoritative model catalog. */
   model?: string;
   /** Optional notification observer for streaming UI integration. */
@@ -35,6 +39,41 @@ export interface CodexThread {
   id: string;
   /** Model selected by Codex for this thread. */
   model: string;
+}
+
+export interface CodexAccountSummary {
+  /** Host-owned account sign-in method. */
+  type: "chatgpt" | "apiKey" | "amazonBedrock" | "unknown";
+  /** Account email when the official app-server provides it. */
+  email: string | null;
+  /** Account plan when the official app-server provides it. */
+  plan: string | null;
+}
+
+export interface CodexRateLimitWindow {
+  /** Percentage of the window already consumed, as reported by Codex. */
+  usedPercent: number;
+  /** Duration of this window in minutes, when reported. */
+  windowDurationMins: number | null;
+  /** Unix timestamp for the next reset, when reported. */
+  resetsAt: number | null;
+}
+
+export interface CodexUsageSummary {
+  /** Metered Codex limit identifier, when reported. */
+  limitId: string | null;
+  /** Shorter quota window, when reported. */
+  primary: CodexRateLimitWindow | null;
+  /** Longer quota window, when reported. */
+  secondary: CodexRateLimitWindow | null;
+  /** Remaining prepaid credits, when reported. */
+  creditBalance: string | null;
+  /** Available reset credits; null means the host did not report a count. */
+  availableResetCredits: number | null;
+  /** Account lifetime token total, when reported. */
+  lifetimeTokens: number | null;
+  /** Daily account token totals, when reported. */
+  dailyTokens: readonly { date: string; tokens: number }[];
 }
 
 export interface CodexTurnResult {
@@ -53,6 +92,10 @@ export interface CodexAgentClient {
   initialize: () => Promise<void>;
   /** Starts a persistent Codex thread under the configured workspace. */
   startThread: () => Promise<CodexThread>;
+  /** Reads non-secret account metadata through the official app-server. */
+  readAccount: () => Promise<CodexAccountSummary | null>;
+  /** Reads account quota and token totals without running a model turn. */
+  readUsage: () => Promise<CodexUsageSummary>;
   /** Sends one user turn and resolves only after a terminal notification. */
   prompt: (threadId: string, text: string, signal?: AbortSignal) => Promise<CodexTurnResult>;
   /** Interrupts one active turn. */
@@ -77,6 +120,27 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const readString = (value: unknown, key: string): string | undefined =>
   isRecord(value) && typeof value[key] === "string" ? value[key] : undefined;
+
+const readNumber = (value: unknown, key: string): number | null => {
+  if (!isRecord(value)) return null;
+  const field = value[key];
+  if (typeof field === "number" && Number.isFinite(field)) return field;
+  if (typeof field === "string" && /^\d+(?:\.\d+)?$/u.test(field)) {
+    const numeric = Number(field);
+    return Number.isSafeInteger(numeric) ? numeric : null;
+  }
+  return null;
+};
+
+const readWindow = (value: unknown): CodexRateLimitWindow | null => {
+  const usedPercent = readNumber(value, "usedPercent");
+  if (usedPercent === null) return null;
+  return {
+    usedPercent,
+    windowDurationMins: readNumber(value, "windowDurationMins"),
+    resetsAt: readNumber(value, "resetsAt"),
+  };
+};
 
 const defaultServerRequest = async (
   request: JsonRpcServerRequest,
@@ -172,16 +236,74 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
         cwd: options.workingDirectory,
         model: options.model ?? null,
         approvalPolicy: "on-request",
-        sandbox: "workspace-write",
-        ephemeral: false,
+        sandbox: options.sandbox ?? "workspace-write",
+        ephemeral: options.ephemeral ?? false,
       });
       const thread = response.thread;
       const id = readString(thread, "id");
-      const model = readString(response, "model");
-      if (id === undefined || model === undefined) {
+      const model =
+        readString(response, "model") ?? readString(thread, "model") ?? options.model ?? undefined;
+      if (id === undefined) {
         throw new TiduError("INTERNAL_ERROR", "Codex returned an invalid thread response.");
       }
+      if (model === undefined || model.trim() === "") {
+        throw new TiduError(
+          "INTERNAL_ERROR",
+          "Codex did not report the active model configuration.",
+        );
+      }
       return { id, model };
+    },
+    readAccount: async (): Promise<CodexAccountSummary | null> => {
+      requireInitialized();
+      const response = await client.request<Record<string, unknown>>("account/read", {
+        refreshToken: false,
+      });
+      if (!isRecord(response.account)) return null;
+      const account = response.account;
+      const accountType = readString(account, "type");
+      const type =
+        accountType === "chatgpt" || accountType === "apiKey" || accountType === "amazonBedrock"
+          ? accountType
+          : "unknown";
+      return {
+        type,
+        email: type === "chatgpt" ? (readString(account, "email") ?? null) : null,
+        plan: type === "chatgpt" ? (readString(account, "planType") ?? null) : null,
+      };
+    },
+    readUsage: async (): Promise<CodexUsageSummary> => {
+      requireInitialized();
+      const [limits, usage] = await Promise.all([
+        client.request<Record<string, unknown>>("account/rateLimits/read", undefined),
+        client.request<Record<string, unknown>>("account/usage/read", undefined),
+      ]);
+      const byId = isRecord(limits.rateLimitsByLimitId)
+        ? limits.rateLimitsByLimitId.codex
+        : undefined;
+      const snapshot = isRecord(byId) ? byId : limits.rateLimits;
+      const resetCredits = limits.rateLimitResetCredits;
+      const buckets = Array.isArray(usage.dailyUsageBuckets)
+        ? usage.dailyUsageBuckets
+            .filter(isRecord)
+            .map((bucket) => ({
+              date: readString(bucket, "startDate") ?? "",
+              tokens: readNumber(bucket, "tokens"),
+            }))
+            .filter(
+              (bucket): bucket is { date: string; tokens: number } =>
+                bucket.date !== "" && bucket.tokens !== null,
+            )
+        : [];
+      return {
+        limitId: readString(snapshot, "limitId") ?? null,
+        primary: readWindow(isRecord(snapshot) ? snapshot.primary : null),
+        secondary: readWindow(isRecord(snapshot) ? snapshot.secondary : null),
+        creditBalance: readString(isRecord(snapshot) ? snapshot.credits : null, "balance") ?? null,
+        availableResetCredits: readNumber(resetCredits, "availableCount"),
+        lifetimeTokens: readNumber(usage.summary, "lifetimeTokens"),
+        dailyTokens: buckets,
+      };
     },
     prompt: async (
       threadId: string,

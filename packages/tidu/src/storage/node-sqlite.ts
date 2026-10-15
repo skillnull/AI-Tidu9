@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { createSqliteConfigurationStore } from "./sqlite-configuration-store.js";
+import { createSqliteEnterpriseConnectionStore } from "./sqlite-enterprise-connection-store.js";
 import { createSqliteTaskCapsuleStore } from "./sqlite-task-capsule-store.js";
 import type { NodeSqliteStorageOptions, StorageAdapter } from "./types.js";
 
@@ -135,6 +136,21 @@ const applyMigrations = (database: DatabaseSync): string => {
   return currentVersion;
 };
 
+const inspectTables = (database: DatabaseSync): readonly { name: string; rowCount: number }[] => {
+  const tables = database
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )
+    .all() as { name: string }[];
+  return tables.map((table) => {
+    const escapedName = table.name.replaceAll('"', '""');
+    const result = database.prepare(`SELECT COUNT(*) AS row_count FROM "${escapedName}"`).get() as {
+      row_count: number;
+    };
+    return { name: table.name, rowCount: result.row_count };
+  });
+};
+
 export const openNodeSqliteStorage = async (
   options: NodeSqliteStorageOptions = {},
 ): Promise<StorageAdapter> => {
@@ -157,15 +173,20 @@ export const openNodeSqliteStorage = async (
   try {
     const schemaVersion = applyMigrations(database);
     const configurationStore = createSqliteConfigurationStore(database);
+    const enterpriseConnectionStore = createSqliteEnterpriseConnectionStore(database);
     const taskCapsuleStore = createSqliteTaskCapsuleStore(database);
     let isClosed = false;
 
     return {
       configurationStore,
+      enterpriseConnectionStore,
       taskCapsuleStore,
       provider: "sqlite",
       location: databasePath,
       schemaVersion,
+      get tables() {
+        return inspectTables(database);
+      },
       close: () => {
         if (!isClosed) {
           database.close();

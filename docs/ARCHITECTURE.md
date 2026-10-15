@@ -10,6 +10,7 @@
 | --- | --- |
 | **智能与控制分离** | 模型处理不确定推理；内核处理预算、权限、状态和验收 |
 | **接入与能力分离** | 宿主只是入口；模型、Agent、Skill、MCP 和知识通过统一能力契约装配 |
+| **默认复用当前模型** | 默认委托给已登录宿主的当前模型；用户显式选择其他供应商时才覆盖 |
 | **默认有界** | 每个任务都有步数、时间、费用、工具调用和输出大小上限 |
 | **状态最小化** | 保存恢复所需的胶囊和证据，不复制完整会话或原始模型输出 |
 | **失败必须可解释** | 拒绝、降级、暂停、回滚和恢复都是显式状态，不用隐式兜底伪装成功 |
@@ -23,7 +24,7 @@ flowchart LR
   Entry --> Gate[策略、额度、审批与 Secret Gate]
   Gate --> Kernel[Agent 内核<br/>理解 · 规划 · 执行 · 验证]
   Kernel --> Router[动态路由与能力补全]
-  Router --> Models[外部模型 / Ollama]
+  Router --> Models[当前宿主模型 / 外部模型 / Ollama]
   Router --> Assets[Agent / Skill / MCP / 工具 / 知识]
   Models --> Kernel
   Assets --> Kernel
@@ -40,7 +41,7 @@ flowchart LR
 | 入口与宿主 | `cli`、`clients`、`accounts`、`connectors`、`openai` | 命令行、客户端发现、官方账号委托、MCP/ACP和OpenAI兼容入口 | 不复制宿主凭据，不伪装未验证的宿主能力 |
 | 配置与控制 | `runtime`、`config`、`config-center` | 启动服务、隔离普通/专家草稿、发布生效配置、提供管理API与页面 | 草稿保存不等于启用，页面不是唯一管理通道 |
 | Agent内核 | `core`、`protocol`、`agent` | 目标、计划、预算、审批、恢复、证据和验收 | 不把供应商私有消息当作核心状态 |
-| 模型与能力 | `routing`、`providers`、`capabilities`、`ecosystem`、`usage` | 模型评分、能力补全、供应商协议、扩展装配和用量来源分级 | 估算费用不冒充供应商账单，不在发现阶段执行扩展 |
+| 模型与能力 | `routing`、`providers`、`capabilities`、`ecosystem`、`usage` | 默认通过 Codex app-server 或 Cursor ACP 使用当前模型；支持 Ollama 与 OpenAI 兼容服务覆盖 | 不读取或复制宿主凭据；估算费用不冒充供应商账单 |
 | 安全与组织 | `security`、`enterprise` | 运行时脱敏、组织策略、角色、额度池和管理员访问边界 | 插件和专家配置不能绕过强制策略 |
 | 状态与伸缩 | `storage`、`scaling` | SQLite/PostgreSQL适配、任务胶囊、准入、租约、Worker和恢复 | 不保存完整会话、原始模型响应或大块工具输出 |
 

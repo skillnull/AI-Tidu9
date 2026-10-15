@@ -52,6 +52,7 @@ Node 版本满足要求后，安装并启动配置中心：
 
 ```bash
 npm install -g @skillnull/tidu
+tidu setup
 tidu start
 ```
 
@@ -123,10 +124,13 @@ docker compose -f config/docker/compose.yml up --build
 
 ### 配置模型来源
 
+默认自动使用已登录的 Codex 或 Cursor 宿主当前模型，不需要填写模型名或密钥。通过官方宿主进程调用，AI-Tidu9 不读取或复制宿主凭据。下面的命令用于主动覆盖默认模型。
+
 OpenAI 兼容服务：
 
 ```bash
 TIDU_PROVIDER=openai-compatible \
+TIDU_PROVIDER_BASE_URL='https://<service>/v1' \
 TIDU_PROVIDER_MODEL=gpt-4.1-mini \
 TIDU_PROVIDER_API_KEY='<runtime-key>' \
 tidu start
@@ -141,22 +145,24 @@ tidu start
 ```
 
 > [!IMPORTANT]
-> 密钥只从当前进程环境读取，不进入 SQLite、页面返回或日志。未配置供应商时，配置功能仍可使用，推理会明确返回 `model_provider_not_configured`。
+> 覆盖服务的密钥只从当前进程环境读取，不进入 SQLite、页面返回或日志。若没有可复用的宿主模型且未设置覆盖供应商，推理会明确返回 `model_provider_not_configured`。
 
 ## 🛠️ 运行、诊断与彻底移除
 
 ```bash
-tidu setup                 # 安装已发现的宿主连接器
+tidu setup                 # 安装九门连接器，保留宿主官方模型
 tidu clients               # 查看本机客户端兼容情况
 tidu account               # 查看可复用的宿主登录状态
 tidu doctor --json         # 生成不含私密数据的诊断摘要
-tidu uninstall             # 可恢复归档
-tidu uninstall --complete  # 清理全部 AI-Tidu9 自有内容
+tidu uninstall             # 清理全部 AI-Tidu9 自有内容
 ```
 
 完整卸载会保留宿主账号、会话、无关插件、无关配置和自定义数据库路径。
 
 通用客户端通过同一基址使用 `/v1/models`、`/v1/chat/completions` 和 `/v1/responses`；Codex 与 Cursor 等宿主优先使用各自的原生 Agent 或 MCP 连接器，以保留宿主能力边界。
+Codex Desktop 当前不能把第三方供应商增量加入官方模型列表。`tidu setup` 因此安装 MCP 连接器，保留全部官方模型，并让这些模型调用九门能力。仅在明确需要隔离的兼容入口时，才使用 `tidu clients connect codex` 创建 `ai-tidu9` Profile；该 Profile 不是对官方模型列表的追加。
+
+企业服务器只部署运行时与 PostgreSQL，不执行员工电脑上的 `setup`，也不提供独立员工页面。员工先安装个人版九门赛博提督，再在本地页面的“企业接入”中填写管理员提供的 HTTPS 公司链接；本地验证后以只读方式显示企业虚拟模型、策略与能力，个人配置继续独立维护。
 
 ## 🛡️ 信任边界与安全承诺
 
@@ -185,9 +191,23 @@ tidu uninstall --complete  # 清理全部 AI-Tidu9 自有内容
 ## 🤝 参与开发与反馈
 
 ```bash
-npm run setup
+npm run tidu:setup
+npm run tidu:dev-p
+# 开发企业版界面与流程
+npm run tidu:dev-e
 npm run check
 ```
+
+`npm run tidu:setup` 只安装仓库开发依赖；产品初始化使用 `tidu setup`，两者不属于同一个生命周期。
+
+`tidu:dev-p` 启动个人版完整本地运行时和开发页面，`tidu:dev-e` 启动企业版。开发命令会在启动服务前临时执行产品setup，退出时自动移除这套临时客户端接入。浏览器打开终端显示的地址。UI 改动会热更新，后端 TypeScript 改动会自动重新编译并重启服务。另开终端可像安装后一样执行 CLI 命令，共用开发数据：
+
+```bash
+npm run tidu:cli-p -- doctor
+npm run tidu:cli-p -- config show
+```
+
+开发数据默认与安装版隔离。详细说明见[贡献指南](./docs/CONTRIBUTING.md#本地开发流程)。
 
 问题反馈请附上经审查的 `tidu doctor --json` 输出：
 

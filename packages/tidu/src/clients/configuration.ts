@@ -18,15 +18,19 @@ import { PRODUCT, TiduError } from "../core/index.js";
 
 const CODEX_PROFILE_NAME = "ai-tidu9";
 const CODEX_PROFILE_FILE = `${CODEX_PROFILE_NAME}.config.toml`;
+const CODEX_MODEL_CATALOG_FILE = ".ai-tidu9-model-catalog.json";
 const STATE_FILE = ".ai-tidu9-profile-state.json";
 const BACKUP_DIRECTORY = ".ai-tidu9-backups";
 const SNAPSHOT_MANIFEST_FILE = "snapshot.json";
 const SNAPSHOT_PROFILE_FILE = "profile.config.toml";
 const SNAPSHOT_STATE_FILE = "state.json";
+const SNAPSHOT_MODEL_CATALOG_FILE = "model-catalog.json";
 
 export interface CodexClientConfigurationOptions {
   /** AI-Tidu9 management origin used by the dedicated Codex profile. */
   endpoint: string;
+  /** Whether setup must verify a running endpoint before writing; defaults to true. */
+  verifyRuntime?: boolean;
   /** Optional Codex home override; defaults to CODEX_HOME or the standard user directory. */
   codexHomeDirectory?: string;
   /** Optional fetch implementation for embedded runtimes and isolated tests. */
@@ -97,6 +101,8 @@ interface SnapshotManifest {
   profileExisted: boolean;
   /** Whether managed state existed before the transaction. */
   stateExisted: boolean;
+  /** Whether a managed model catalog existed before the transaction. */
+  modelCatalogExisted?: boolean;
 }
 
 interface VerifiedEndpoint {
@@ -104,6 +110,8 @@ interface VerifiedEndpoint {
   endpoint: string;
   /** Active virtual-model identifier returned by model discovery. */
   model: string;
+  /** Human-readable virtual-model name returned by model discovery. */
+  displayName: string;
 }
 
 interface CodexPaths {
@@ -111,6 +119,8 @@ interface CodexPaths {
   home: string;
   /** Dedicated AI-Tidu9 profile file. */
   profile: string;
+  /** Dedicated AI-Tidu9 model catalog displayed by Codex model pickers. */
+  modelCatalog: string;
   /** AI-Tidu9 ownership and connection state. */
   state: string;
   /** Root containing transaction snapshots. */
@@ -128,6 +138,7 @@ const resolveCodexPaths = (configuredDirectory?: string): CodexPaths => {
   return {
     home,
     profile: join(home, CODEX_PROFILE_FILE),
+    modelCatalog: join(home, CODEX_MODEL_CATALOG_FILE),
     state: join(home, STATE_FILE),
     backups: join(home, BACKUP_DIRECTORY),
   };
@@ -247,14 +258,22 @@ const verifyEndpoint = async (
   ) {
     throw new TiduError("INTERNAL_ERROR", "AI-Tidu9 did not expose an active virtual model.");
   }
-  return { endpoint, model: firstModel.id };
+  return {
+    endpoint,
+    model: firstModel.id,
+    displayName:
+      typeof firstModel.display_name === "string" && firstModel.display_name.trim()
+        ? firstModel.display_name.trim()
+        : firstModel.id,
+  };
 };
 
-const createCodexProfile = (endpoint: string, model: string): string =>
+const createCodexProfile = (endpoint: string, model: string, modelCatalogPath: string): string =>
   [
     "# Managed by AI-Tidu9. This file contains no provider credentials.",
     `model = ${JSON.stringify(model)}`,
     'model_provider = "ai_tidu9"',
+    `model_catalog_json = ${JSON.stringify(modelCatalogPath)}`,
     "",
     "[model_providers.ai_tidu9]",
     'name = "AI-Tidu9"',
@@ -264,6 +283,65 @@ const createCodexProfile = (endpoint: string, model: string): string =>
     "supports_websockets = false",
     "",
   ].join("\n");
+
+const createCodexModelCatalog = (model: string, displayName: string): string =>
+  `${JSON.stringify(
+    {
+      models: [
+        {
+          slug: model,
+          display_name: displayName,
+          description: "AI-Tidu9 active virtual model",
+          default_reasoning_level: "medium",
+          supported_reasoning_levels: [
+            { effort: "low", description: "Fast" },
+            { effort: "medium", description: "Balanced" },
+            { effort: "high", description: "Deep reasoning" },
+          ],
+          shell_type: "shell_command",
+          visibility: "list",
+          supported_in_api: true,
+          priority: 1,
+          additional_speed_tiers: [],
+          service_tiers: [],
+          upgrade: null,
+          base_instructions: "You are an AI coding agent routed through AI-Tidu9.",
+          model_messages: {
+            instructions_template: "You are an AI coding agent routed through AI-Tidu9.",
+            instructions_variables: {
+              personality_default: "",
+              personality_friendly: "",
+              personality_pragmatic: "",
+            },
+            approvals: null,
+            auto_review: null,
+            permissions: null,
+          },
+          include_skills_usage_instructions: true,
+          default_reasoning_summary: "none",
+          support_verbosity: true,
+          default_verbosity: "low",
+          apply_patch_tool_type: "freeform",
+          web_search_tool_type: "text_and_image",
+          truncation_policy: { mode: "tokens", limit: 10_000 },
+          input_modalities: ["text", "image"],
+          supports_parallel_tool_calls: true,
+          supports_image_detail_original: true,
+          supports_search_tool: true,
+          context_window: 128_000,
+          max_context_window: 128_000,
+          comp_hash: "ai-tidu9-1",
+          effective_context_window_percent: 95,
+          experimental_supported_tools: [],
+          use_responses_lite: false,
+          tool_mode: null,
+          multi_agent_version: null,
+        },
+      ],
+    },
+    null,
+    2,
+  )}\n`;
 
 const readManagedState = (statePath: string): CodexProfileState | undefined => {
   if (!existsSync(statePath)) {
@@ -296,10 +374,12 @@ const readManagedState = (statePath: string): CodexProfileState | undefined => {
 const createSnapshot = (paths: CodexPaths): string => {
   ensureSafeDirectory(paths.home);
   assertSafeRegularFile(paths.profile);
+  assertSafeRegularFile(paths.modelCatalog);
   assertSafeRegularFile(paths.state);
   const profileExisted = existsSync(paths.profile);
+  const modelCatalogExisted = existsSync(paths.modelCatalog);
   const stateExisted = existsSync(paths.state);
-  if (profileExisted !== stateExisted) {
+  if (profileExisted !== stateExisted || (modelCatalogExisted && !stateExisted)) {
     throw new TiduError(
       "CONFIGURATION_CONFLICT",
       "An unmanaged or incomplete ai-tidu9 Codex profile already exists; no file was changed.",
@@ -314,7 +394,12 @@ const createSnapshot = (paths: CodexPaths): string => {
   const snapshotDirectory = join(paths.backups, backupId);
   try {
     ensureSafeDirectory(snapshotDirectory);
-    const manifest: SnapshotManifest = { schemaVersion: 1, profileExisted, stateExisted };
+    const manifest: SnapshotManifest = {
+      schemaVersion: 1,
+      profileExisted,
+      stateExisted,
+      modelCatalogExisted,
+    };
     writePrivateFileAtomically(
       join(snapshotDirectory, SNAPSHOT_MANIFEST_FILE),
       `${JSON.stringify(manifest, null, 2)}\n`,
@@ -326,6 +411,10 @@ const createSnapshot = (paths: CodexPaths): string => {
     if (stateExisted) {
       copyFileSync(paths.state, join(snapshotDirectory, SNAPSHOT_STATE_FILE));
       chmodSync(join(snapshotDirectory, SNAPSHOT_STATE_FILE), 0o600);
+    }
+    if (modelCatalogExisted) {
+      copyFileSync(paths.modelCatalog, join(snapshotDirectory, SNAPSHOT_MODEL_CATALOG_FILE));
+      chmodSync(join(snapshotDirectory, SNAPSHOT_MODEL_CATALOG_FILE), 0o600);
     }
   } catch (error) {
     rmSync(snapshotDirectory, { force: true, recursive: true });
@@ -349,7 +438,9 @@ const readSnapshotManifest = (snapshotDirectory: string): SnapshotManifest => {
     !isRecord(manifest) ||
     manifest.schemaVersion !== 1 ||
     typeof manifest.profileExisted !== "boolean" ||
-    typeof manifest.stateExisted !== "boolean"
+    typeof manifest.stateExisted !== "boolean" ||
+    (manifest.modelCatalogExisted !== undefined &&
+      typeof manifest.modelCatalogExisted !== "boolean")
   ) {
     throw new TiduError("CONFIGURATION_CONFLICT", "Client backup manifest is invalid.");
   }
@@ -375,6 +466,14 @@ const restoreSnapshot = (paths: CodexPaths, backupId: string, removeSnapshot: bo
     assertSafeRegularFile(paths.state);
     rmSync(paths.state, { force: true });
   }
+  if (manifest.modelCatalogExisted) {
+    const snapshotCatalog = join(snapshotDirectory, SNAPSHOT_MODEL_CATALOG_FILE);
+    assertSafeRegularFile(snapshotCatalog);
+    writePrivateFileAtomically(paths.modelCatalog, readFileSync(snapshotCatalog, "utf8"));
+  } else {
+    assertSafeRegularFile(paths.modelCatalog);
+    rmSync(paths.modelCatalog, { force: true });
+  }
   if (removeSnapshot) {
     rmSync(snapshotDirectory, { force: true, recursive: true });
   }
@@ -396,13 +495,24 @@ export const configureCodexClient = async (
   options: CodexClientConfigurationOptions,
 ): Promise<CodexClientConfigurationResult> => {
   const request = options.request ?? fetch;
-  const verified = await verifyEndpoint(options.endpoint, request);
+  const verified =
+    options.verifyRuntime === false
+      ? {
+          endpoint: normalizeEndpoint(options.endpoint),
+          model: "managed-default",
+          displayName: PRODUCT.name,
+        }
+      : await verifyEndpoint(options.endpoint, request);
   const paths = resolveCodexPaths(options.codexHomeDirectory);
   const backupId = createSnapshot(paths);
   try {
     writePrivateFileAtomically(
+      paths.modelCatalog,
+      createCodexModelCatalog(verified.model, verified.displayName),
+    );
+    writePrivateFileAtomically(
       paths.profile,
-      createCodexProfile(verified.endpoint, verified.model),
+      createCodexProfile(verified.endpoint, verified.model, paths.modelCatalog),
     );
     const state: CodexProfileState = {
       schemaVersion: 1,
@@ -414,12 +524,14 @@ export const configureCodexClient = async (
       configuredAt: new Date().toISOString(),
     };
     writePrivateFileAtomically(paths.state, `${JSON.stringify(state, null, 2)}\n`);
-    const postWriteVerification = await verifyEndpoint(verified.endpoint, request);
-    if (postWriteVerification.model !== verified.model) {
-      throw new TiduError(
-        "CONFIGURATION_CONFLICT",
-        "The active virtual model changed during client configuration.",
-      );
+    if (options.verifyRuntime !== false) {
+      const postWriteVerification = await verifyEndpoint(verified.endpoint, request);
+      if (postWriteVerification.model !== verified.model) {
+        throw new TiduError(
+          "CONFIGURATION_CONFLICT",
+          "The active virtual model changed during client configuration.",
+        );
+      }
     }
   } catch (error) {
     restoreSnapshot(paths, backupId, true);
@@ -441,6 +553,7 @@ export const rollbackCodexClientConfiguration = (
 ): CodexClientRollbackResult => {
   const paths = resolveCodexPaths(options.codexHomeDirectory);
   assertSafeRegularFile(paths.profile);
+  assertSafeRegularFile(paths.modelCatalog);
   assertSafeRegularFile(paths.state);
   if (existsSync(paths.profile) !== existsSync(paths.state)) {
     throw new TiduError(
@@ -462,6 +575,7 @@ export const removeCodexClientConfiguration = (
 ): CodexClientRemovalResult => {
   const paths = resolveCodexPaths(options.codexHomeDirectory);
   assertSafeRegularFile(paths.profile);
+  assertSafeRegularFile(paths.modelCatalog);
   assertSafeRegularFile(paths.state);
   const profileExists = existsSync(paths.profile);
   const stateExists = existsSync(paths.state);
@@ -474,12 +588,23 @@ export const removeCodexClientConfiguration = (
   if (stateExists) {
     readManagedState(paths.state);
   }
+  const modelCatalogExists = existsSync(paths.modelCatalog);
+  if (modelCatalogExists && !stateExists) {
+    throw new TiduError(
+      "CONFIGURATION_CONFLICT",
+      "The AI-Tidu9 model catalog exists without managed ownership state.",
+    );
+  }
 
   let removedArtifactCount = 0;
   if (profileExists) {
     rmSync(paths.profile);
     rmSync(paths.state);
     removedArtifactCount += 2;
+  }
+  if (modelCatalogExists) {
+    rmSync(paths.modelCatalog);
+    removedArtifactCount += 1;
   }
   if (existsSync(paths.backups)) {
     const backupStatus = lstatSync(paths.backups);
