@@ -6,8 +6,7 @@
 
 ```bash
 npm install -g @skillnull/tidu  # Persistent install; provides the tidu command
-tidu setup                      # Install client connectors offline
-tidu start                      # Start after installation
+tidu setup                      # Configure and offer to restart hosts
 tidu --help                   # Top-level help after installation
 tidu <command> --help         # Command-specific help
 ```
@@ -18,9 +17,10 @@ tidu <command> --help         # Command-specific help
 
 | I want to… | Start here | Then |
 | --- | --- | --- |
-| Try it for the first time | `tidu start` | Complete the browser-based setup |
+| Try it for the first time | `tidu setup` | Restart when prompted, then use AI-Tidu9 directly |
 | Configure entirely in a terminal | `tidu start --cli` | Follow the five-step interactive wizard |
 | Connect installed clients | `tidu setup` | Install connectors while preserving official host models |
+| Switch between AI-Tidu9, official, or third-party channels | `tidu channel list` | Execute explicitly with `tidu channel run` |
 | Diagnose an unreachable page or unexpected behavior | `tidu doctor` | Use `tidu doctor --json` for a shareable report |
 | Edit configuration without activating it | `tidu config set ...` | Add `--activate` only after review |
 | Restore or remove everything | `tidu restore` / `tidu uninstall` | Destructive deletion always requires explicit confirmation |
@@ -37,7 +37,8 @@ tidu <command> --help         # Command-specific help
 | `tidu mcp` | Run the stdio MCP bridge for Agent hosts | No |
 | `tidu doctor` | Check runtime, configuration API, and page; optionally print a privacy-safe report | No |
 | `tidu clients` | Discover supported local clients | No |
-| `tidu clients connect/rollback codex` | Create or roll back the dedicated Codex profile | Yes, AI-Tidu9-owned files only |
+| `tidu clients connect/switch/rollback codex` | Create the unified model catalog, or restore and roll back Codex configuration | Yes; the official account is unchanged and all managed settings are recoverable |
+| `tidu channel list/run` | Inspect or invoke AI-Tidu9, official host, and provider channels | No; execution consumes the selected channel's quota |
 | `tidu account` | Inspect reusable Codex and Cursor login state | No |
 | `tidu account relogin/switch` | Invoke the host's official login or switch flow | Yes, only when explicitly run |
 | `tidu config` | Guided configuration or isolated-draft management | `set` saves; only `--activate` changes runtime behavior |
@@ -68,6 +69,14 @@ Common startup environment variables:
 | `TIDU_POSTGRES_URL` | Enable the enterprise control plane and PostgreSQL task state |
 | `TIDU_EDITION` | Runtime edition (`personal` or `enterprise`); can also be set with `tidu start --edition` |
 | `TIDU_ENDPOINT` | Default CLI management URL, equivalent to `--endpoint` |
+| `OPENAI_API_KEY`, `OPENAI_MODEL` | Direct OpenAI API channel for CI or hostless environments |
+| `DEEPSEEK_API_KEY`, `DEEPSEEK_MODEL` | DeepSeek-compatible channel |
+| `DASHSCOPE_API_KEY`, `DASHSCOPE_MODEL` | Alibaba Cloud Model Studio/Qwen channel |
+| `ZHIPU_API_KEY`, `ZHIPU_MODEL` | Zhipu GLM channel |
+| `MOONSHOT_API_KEY`, `MOONSHOT_MODEL` | Moonshot/Kimi channel |
+| `ARK_API_KEY`, `ARK_MODEL` | Volcengine Ark/Doubao channel |
+| `HUNYUAN_API_KEY`, `HUNYUAN_MODEL` | Tencent Hunyuan channel |
+| `TIDU_CHANNEL_BASE_URL`, `TIDU_CHANNEL_API_KEY`, `TIDU_CHANNEL_MODEL` | Custom OpenAI-compatible channel |
 
 Inject secrets through the current process environment only. Never put them in shell history, configuration files, or `--reason`.
 
@@ -77,10 +86,13 @@ Inject secrets through the current process environment only. Never put them in s
 tidu setup [install|verify|repair|update|uninstall] [--endpoint <url>]
 tidu clients
 tidu clients connect codex [--yes] [--endpoint <url>]
+tidu clients switch codex <official|ai-tidu9> [--yes] [--endpoint <url>]
 tidu clients rollback codex [--yes]
 ```
 
-The default setup action is `install` and does not require a running service. It installs AI-Tidu9-owned connectors while preserving the official Codex and Cursor model lists; `setup uninstall` removes those integrations. Codex Desktop cannot currently add a third-party provider to its official model list. Run `tidu clients connect codex` explicitly only when an isolated compatibility profile is required. Discovery checks presence only and never reads account, credential, or conversation content. Profile writes create a private snapshot first and roll back after failed verification.
+The default setup action is `install` and does not require a prestarted runtime. It installs the connectors and prepares the AI-Tidu9 configuration while leaving Official mode active. `clients switch codex ai-tidu9` makes the Codex list show both official and AI-Tidu9 models; `clients switch codex official` restores an official-only list. This switches configuration modes, not individual models. Official Codex remains the authority for account identity, plan, and quota data. A failed switch, normal service shutdown, manual restore, rollback, or uninstall restores the original official configuration.
+
+The installed MCP connector exposes `list_tidu_channels` and `route_tidu_channel` to both the Codex plugin and Cursor. It does not replace the host model list. The `codex` and `cursor` channels delegate to official host processes, `tidu` uses the AI-Tidu9 runtime, and provider channels read only their connector-process environment variables.
 
 Enterprise servers do not run setup on employee computers or host a separate employee page. After installing the personal edition, an employee enters the administrator-provided company URL under Company access in the local page. Production company URLs must use HTTPS; HTTP is accepted only for loopback development. Company configuration stays read-only and is stored separately from personal drafts and active configuration.
 
@@ -94,6 +106,30 @@ tidu account switch [codex|cursor] [--yes]
 ```
 
 Codex is the default host when none is specified. Status commands show only sanitized output from the official host CLI. AI-Tidu9 never reads or copies host tokens. Only `relogin` and `switch` invoke official host flows; `--yes` skips AI-Tidu9's own switch confirmation.
+
+## 🔀 Dual channels and CI
+
+```bash
+tidu channel list [--json] [--endpoint <url>]
+tidu channel run tidu --input-file prompt.txt --json
+tidu channel run codex --input-file prompt.txt [--model <id>] --json
+tidu channel run cursor --input-file prompt.txt --json
+tidu channel run qwen --input-file prompt.txt [--model <id>] --json
+```
+
+`tidu`, `codex`, and `cursor` select the virtual runtime, official Codex host, and official Cursor ACP respectively. Provider channels are `openai`, `deepseek`, `qwen`, `glm`, `kimi`, `doubao`, and `hunyuan`, plus `custom`. Selection is explicit and a failed channel never silently falls back to another provider.
+
+For CI, prefer a provider API channel and keep its credential in the CI secret store:
+
+```yaml
+- name: Run AI-Tidu9 channel
+  run: npx @skillnull/tidu channel run qwen --input-file .ci/prompt.txt --json > channel-result.json
+  env:
+    DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+    DASHSCOPE_MODEL: qwen-plus
+```
+
+Codex and Cursor host channels are intended for developer machines with an existing official login. Headless CI does not reuse desktop credentials. After `tidu setup` and a Cursor restart, its MCP tools can discover and invoke the same channel IDs.
 
 ## ⚙️ Configuration management
 

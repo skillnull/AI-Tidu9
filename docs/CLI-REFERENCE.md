@@ -6,8 +6,7 @@
 
 ```bash
 npm install -g @skillnull/tidu  # 持久安装，提供 tidu 命令
-tidu setup                      # 离线安装客户端连接器
-tidu start                      # 安装后启动
+tidu setup                      # 自动配置并按提示重启宿主
 tidu --help                   # 已安装后的总帮助
 tidu <命令> --help             # 任意命令的专属帮助
 ```
@@ -18,9 +17,10 @@ tidu <命令> --help             # 任意命令的专属帮助
 
 | 我想要…… | 从这里开始 | 接下来 |
 | --- | --- | --- |
-| 第一次体验 | `tidu start` | 按页面向导完成配置 |
+| 第一次体验 | `tidu setup` | 确认是否重启宿主；重启后直接使用九门 |
 | 纯终端配置 | `tidu start --cli` | 跟随五步交互向导 |
 | 接入已安装客户端 | `tidu setup` | 离线安装连接器并保留宿主官方模型 |
+| 切换九门、官方或第三方模型通道 | `tidu channel list` | 用 `tidu channel run` 显式执行 |
 | 页面打不开或行为异常 | `tidu doctor` | 需要分享时改用 `tidu doctor --json` |
 | 修改配置但暂不生效 | `tidu config set ...` | 确认后增加 `--activate` |
 | 回滚或彻底移除 | `tidu restore` / `tidu uninstall` | 永久删除前必须明确确认 |
@@ -37,7 +37,8 @@ tidu <命令> --help             # 任意命令的专属帮助
 | `tidu mcp` | 运行供Agent宿主调用的stdio MCP桥 | 否 |
 | `tidu doctor` | 检查运行时、配置API和页面；可输出隐私安全报告 | 否 |
 | `tidu clients` | 发现本机支持的客户端 | 否 |
-| `tidu clients connect/rollback codex` | 创建或回滚 AI-Tidu9 专属Codex Profile | 是，且只修改 AI-Tidu9 自有文件 |
+| `tidu clients connect/switch/rollback codex` | 创建统一模型目录，或恢复、回滚 Codex 配置 | 是；官方账号不变，所有托管项均可恢复 |
+| `tidu channel list/run` | 查看或显式调用九门、官方宿主与厂商通道 | 否；调用会消耗所选通道额度 |
 | `tidu account` | 查看Codex和Cursor的可复用登录状态 | 否 |
 | `tidu account relogin/switch` | 调用宿主官方登录或切换流程 | 是，需要主动执行 |
 | `tidu config` | 引导式配置，或查看、修改隔离草稿 | `set`会保存草稿，`--activate`才启用 |
@@ -68,6 +69,14 @@ tidu mcp [--endpoint <url>]
 | `TIDU_POSTGRES_URL` | 启用企业控制平面和PostgreSQL任务状态 |
 | `TIDU_EDITION` | 运行版型；可用 `personal` 或 `enterprise`，也可通过 `tidu start --edition` 指定 |
 | `TIDU_ENDPOINT` | CLI默认管理地址，等价于 `--endpoint` |
+| `OPENAI_API_KEY`、`OPENAI_MODEL` | CI或无宿主环境中的OpenAI官方API通道 |
+| `DEEPSEEK_API_KEY`、`DEEPSEEK_MODEL` | DeepSeek兼容通道 |
+| `DASHSCOPE_API_KEY`、`DASHSCOPE_MODEL` | 阿里云百炼/千问兼容通道 |
+| `ZHIPU_API_KEY`、`ZHIPU_MODEL` | 智谱GLM兼容通道 |
+| `MOONSHOT_API_KEY`、`MOONSHOT_MODEL` | Moonshot/Kimi兼容通道 |
+| `ARK_API_KEY`、`ARK_MODEL` | 火山方舟/豆包兼容通道 |
+| `HUNYUAN_API_KEY`、`HUNYUAN_MODEL` | 腾讯混元兼容通道 |
+| `TIDU_CHANNEL_BASE_URL`、`TIDU_CHANNEL_API_KEY`、`TIDU_CHANNEL_MODEL` | 自定义OpenAI兼容通道 |
 
 密钥只应通过当前进程环境注入，不要写入命令历史、配置文件或 `--reason`。
 
@@ -77,10 +86,13 @@ tidu mcp [--endpoint <url>]
 tidu setup [install|verify|repair|update|uninstall] [--endpoint <url>]
 tidu clients
 tidu clients connect codex [--yes] [--endpoint <url>]
+tidu clients switch codex <official|ai-tidu9> [--yes] [--endpoint <url>]
 tidu clients rollback codex [--yes]
 ```
 
-`setup` 默认动作是 `install`，不依赖运行时已启动。它会安装 AI-Tidu9 自有连接器，并保留 Codex 与 Cursor 的官方模型列表；`setup uninstall` 会移除这些客户端接入。Codex Desktop 当前不支持把第三方供应商增量加入官方模型列表。需要隔离兼容入口时，可显式执行 `tidu clients connect codex` 创建专属 Profile。`clients` 只检查命令、应用和配置文件是否存在，不读取账号、密钥或会话正文。Profile 写入前会创建私有快照，失败时自动回滚。
+`setup` 默认动作是 `install`，不要求预先启动运行时。它会安装连接器并准备九门配置，但保持官方配置生效。`clients switch codex ai-tidu9` 切到九门配置后，Codex 列表同时显示官方模型与九门模型；`clients switch codex official` 恢复仅显示官方模型。这里切换的是配置模式，不是具体模型。官方账号、套餐和额度仍由官方 Codex 管理。切换失败、服务正常退出、手动恢复、回滚或卸载时恢复原始官方配置。
+
+安装后的同一个 MCP 连接器会向 Codex 插件和 Cursor 提供 `list_tidu_channels` 与 `route_tidu_channel`。宿主自己的模型列表不被覆盖；选择 `codex` 或 `cursor` 时由官方宿主进程执行，选择 `tidu` 时走九门运行时，选择厂商ID时读取当前连接器进程的环境变量。
 
 企业服务器不执行员工电脑上的 `setup`，也不提供独立员工页面。员工安装个人版后，在本地页面的“企业接入”中填写管理员提供的公司链接。正式企业入口必须使用 HTTPS；本地开发仅允许回环地址使用 HTTP。企业配置在个人版中只读，并与个人草稿和生效配置分开保存。
 
@@ -94,6 +106,30 @@ tidu account switch [codex|cursor] [--yes]
 ```
 
 不指定宿主时默认操作Codex；`account` 和 `account status` 只显示官方CLI提供的脱敏状态。AI-Tidu9 不读取或复制宿主Token。`relogin`、`switch` 才会调用宿主官方流程，`switch --yes` 仅跳过 AI-Tidu9 自己的确认提示。
+
+## 🔀 双通道与CI
+
+```bash
+tidu channel list [--json] [--endpoint <url>]
+tidu channel run tidu --input-file prompt.txt --json
+tidu channel run codex --input-file prompt.txt [--model <id>] --json
+tidu channel run cursor --input-file prompt.txt --json
+tidu channel run qwen --input-file prompt.txt [--model <id>] --json
+```
+
+`tidu`、`codex`、`cursor` 分别代表九门虚拟通道、Codex官方宿主和Cursor官方ACP。厂商通道包括 `openai`、`deepseek`、`qwen`、`glm`、`kimi`、`doubao`、`hunyuan`，另有 `custom`。通道必须显式选择，失败时不会静默切换供应商。
+
+CI建议使用厂商API通道，并把密钥保存在CI Secret中。以下示例不把密钥写入参数或仓库：
+
+```yaml
+- name: Run AI-Tidu9 channel
+  run: npx @skillnull/tidu channel run qwen --input-file .ci/prompt.txt --json > channel-result.json
+  env:
+    DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+    DASHSCOPE_MODEL: qwen-plus
+```
+
+Codex和Cursor宿主通道适合已有官方登录的开发机。无交互CI不复用桌面端凭据，应使用独立API通道。Cursor执行 `tidu setup` 并重启后，可直接通过MCP工具发现和调用这些通道。
 
 ## ⚙️ 配置管理
 

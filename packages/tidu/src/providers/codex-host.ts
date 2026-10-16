@@ -31,6 +31,9 @@ const requestPrompt = (request: ProviderExecutionRequest): string => {
   return `${instructions.join(" ")}\n\nConversation:\n${JSON.stringify(conversation)}`;
 };
 
+const responseModel = (request: ProviderExecutionRequest): string =>
+  typeof request.body.model === "string" ? request.body.model : request.virtualModelId;
+
 const createResponse = (request: ProviderExecutionRequest, text: string): unknown => {
   const responseId = `tidu_${randomUUID()}`;
   if (request.protocol === "chat-completions") {
@@ -38,7 +41,7 @@ const createResponse = (request: ProviderExecutionRequest, text: string): unknow
       id: responseId,
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
-      model: request.virtualModelId,
+      model: responseModel(request),
       choices: [
         {
           index: 0,
@@ -52,7 +55,7 @@ const createResponse = (request: ProviderExecutionRequest, text: string): unknow
     id: responseId,
     object: "response",
     status: "completed",
-    model: request.virtualModelId,
+    model: responseModel(request),
     output: [
       {
         id: `${responseId}_message`,
@@ -78,16 +81,20 @@ const createJsonStream = (
             id: responseId,
             object: "chat.completion.chunk",
             created: Math.floor(Date.now() / 1000),
-            model: request.virtualModelId,
+            model: responseModel(request),
             choices: [
-              { index: 0, delta: { role: "assistant", content: text }, finish_reason: null },
+              {
+                index: 0,
+                delta: { role: "assistant", content: text },
+                finish_reason: null,
+              },
             ],
           },
           {
             id: responseId,
             object: "chat.completion.chunk",
             created: Math.floor(Date.now() / 1000),
-            model: request.virtualModelId,
+            model: responseModel(request),
             choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
           },
         ].map((event) => `data: ${JSON.stringify(event)}\n\n`)
@@ -107,10 +114,15 @@ const createJsonStream = (
 };
 
 const runCodexTurn = async (request: ProviderExecutionRequest, model?: string): Promise<string> => {
+  const requestedModel =
+    typeof request.body.model === "string" && request.body.model !== request.virtualModelId
+      ? request.body.model
+      : model;
   const workingDirectory = await mkdtemp(join(tmpdir(), "tidu-model-"));
   const client = createCodexAgentClient({
     workingDirectory,
-    ...(model === undefined ? {} : { model }),
+    ...(requestedModel === undefined ? {} : { model: requestedModel }),
+    modelProvider: "openai",
     ephemeral: true,
     sandbox: "read-only",
   });
@@ -150,6 +162,7 @@ export const inspectCodexHostAccountReport = async (): Promise<CodexHostAccountR
   const workingDirectory = await mkdtemp(join(tmpdir(), "tidu-account-report-"));
   const client = createCodexAgentClient({
     workingDirectory,
+    modelProvider: "openai",
     ephemeral: true,
     sandbox: "read-only",
   });
@@ -174,6 +187,7 @@ export const inspectCodexHostConfiguration = async (
   const client = createCodexAgentClient({
     workingDirectory,
     model: modelOverride,
+    modelProvider: "openai",
     ephemeral: true,
     sandbox: "read-only",
   });
@@ -207,9 +221,17 @@ export const createCodexHostModelProvider = async (
     execute: async (request): Promise<ProviderExecutionResult> => {
       const text = await runCodexTurn(request, modelOverride);
       if (request.body.stream === true) {
-        return { kind: "stream", statusCode: 200, stream: createJsonStream(request, text) };
+        return {
+          kind: "stream",
+          statusCode: 200,
+          stream: createJsonStream(request, text),
+        };
       }
-      return { kind: "json", statusCode: 200, body: createResponse(request, text) };
+      return {
+        kind: "json",
+        statusCode: 200,
+        body: createResponse(request, text),
+      };
     },
   };
 };
@@ -253,7 +275,11 @@ export const createCursorHostModelProvider = async (): Promise<ModelProvider | u
             stream: createJsonStream(request, result.text),
           };
         }
-        return { kind: "json", statusCode: 200, body: createResponse(request, result.text) };
+        return {
+          kind: "json",
+          statusCode: 200,
+          body: createResponse(request, result.text),
+        };
       } finally {
         try {
           await client.close();

@@ -106,21 +106,9 @@ See [Core Routing and Secret Gate](./CORE-DIFFERENTIATORS.EN.md) for implementat
 | I want to… | Start here | State layer |
 | --- | --- | --- |
 | Unify personal models, Skills, and MCP servers locally | `tidu start` | SQLite, loopback-only by default |
-| Centralize policy, quota, and capabilities on a server | Docker deployment + PostgreSQL | Enterprise control plane |
-| Preserve local IDE capabilities behind enterprise egress controls | Enterprise gateway + device connector | Server state + local private boundary |
+| Centralize policy, quota, and capabilities on a server | [Remote deployment](./REMOTE-DEPLOYMENT.EN.md) | Enterprise control plane |
+| Preserve local IDE capabilities behind enterprise egress controls | [Remote deployment](./REMOTE-DEPLOYMENT.EN.md) | Server state + local private boundary |
 | Build a model, Agent, storage, or history provider | `@skillnull/tidu/ecosystem` or Python SDK | Platform APIs, without duplicating the control plane |
-
-<details>
-<summary><strong>Enterprise single-host pilot: minimal Docker command</strong></summary>
-
-```bash
-TIDU_POSTGRES_PASSWORD='<private-password>' \
-docker compose -f config/docker/compose.yml up --build
-```
-
-The container binds to server loopback by default. Cross-device access requires an HTTPS reverse proxy and enterprise identity controls; never expose the management port directly.
-
-</details>
 
 ### Connect a model source
 
@@ -150,9 +138,10 @@ tidu start
 ## 🛠️ Operate, diagnose, and remove completely
 
 ```bash
-tidu setup                 # Install AI-Tidu9 connectors while preserving host models
+tidu setup                 # Configure AI-Tidu9 and offer to restart hosts
 tidu clients               # Inspect local client compatibility
 tidu account               # Inspect reusable host login state
+tidu channel list          # Inspect AI-Tidu9, official host, and provider channels
 tidu doctor --json         # Generate a privacy-safe diagnostic summary
 tidu uninstall             # Remove every AI-Tidu9-owned artifact
 ```
@@ -160,9 +149,9 @@ tidu uninstall             # Remove every AI-Tidu9-owned artifact
 Complete removal preserves host accounts, conversations, unrelated plugins and configuration, and custom database paths.
 
 Generic clients use `/v1/models`, `/v1/chat/completions`, and `/v1/responses` on the same base URL. Hosts such as Codex and Cursor should prefer native Agent or MCP connectors to preserve host capability boundaries.
-Codex Desktop cannot currently add a third-party provider to its official model list. `tidu setup` therefore installs the MCP connector, preserves every official model, and lets those models call AI-Tidu9 capabilities. Use `tidu clients connect codex` to create the isolated `ai-tidu9` profile only when an explicit compatibility entry is needed; that profile does not append to the official model list.
+`tidu setup` installs the MCP connector and prepares a rollback-safe AI-Tidu9 Codex configuration without leaving Official mode. The management page switches configuration modes, not individual models: AI-Tidu9 mode shows current official models plus the AI-Tidu9 virtual model, while Official mode shows official models only. The official Codex process remains the authority for account identity, plan, and quota data. Official selections execute through official Codex; only the AI-Tidu9 model uses the local router. Restore, rollback, and uninstall remove managed blocks and recover the original official configuration.
 
-Enterprise servers deploy the runtime and PostgreSQL without running setup on employee computers or hosting a separate employee page. Employees install the personal AI-Tidu9 client, then enter the administrator-provided HTTPS company URL under Company access in their local page. The local client verifies and displays company models, policies, and capabilities as read-only data while personal configuration remains separate.
+Use `tidu channel run <channel>` for explicit dual-channel execution. `tidu` uses the virtual runtime, while `codex` and `cursor` delegate to official host processes. CI can select `openai`, `deepseek`, `qwen`, `glm`, `kimi`, `doubao`, `hunyuan`, or `custom`. The Codex plugin and Cursor receive `list_tidu_channels` and `route_tidu_channel` through the same MCP connector without replacing the host's official model list.
 
 ## 🛡️ Trust boundaries and security promises
 
@@ -185,29 +174,16 @@ Enterprise servers deploy the runtime and PostgreSQL without running setup on em
 | [Open capability ecosystem](./ECOSYSTEM-SDK.EN.md) | How do I connect providers and third-party Agents safely? |
 | [Python SDK](../sdk/python/README.EN.md) | How do I invoke the AI-Tidu9 Provider API from Python? |
 | [Contributing](./CONTRIBUTING.EN.md) | What are the branch, commit, version, maintenance-line, and release rules? |
+| [Remote deployment](./REMOTE-DEPLOYMENT.EN.md) | How do I deploy the server runtime while isolating cross-device access? |
+| [Local development](./LOCAL-DEVELOPMENT.EN.md) | How do I start, verify, and stop the repository development environment? |
 | [Trademark and attribution](./TRADEMARKS.EN.md) | How do renamed or commercial deployments describe their origin correctly? |
 | [Changelog](./CHANGELOG.EN.md) | What changed in each published version? |
 
-## 🤝 Development and feedback
+## 🛠️ Local development
 
-```bash
-npm run tidu:setup
-npm run tidu:dev-p
-# Develop the enterprise UI and workflows
-npm run tidu:dev-e
-npm run check
-```
+Repository startup, Codex configuration acceptance, checks, and shutdown are maintained in the [Local development guide](./LOCAL-DEVELOPMENT.EN.md). The main user document does not duplicate development-environment operations.
 
-`npm run tidu:setup` installs repository development dependencies only. Product initialization uses `tidu setup`; they have separate lifecycles.
-
-`tidu:dev-p` starts the complete personal runtime and development UI; `tidu:dev-e` starts the enterprise edition. Development commands run product setup before starting the service and remove the temporary client integration on exit. Open the URL printed in the terminal. UI edits hot-update; backend TypeScript edits are recompiled and restart the service. In another terminal, run CLI commands against the same development data:
-
-```bash
-npm run tidu:cli-p -- doctor
-npm run tidu:cli-p -- config show
-```
-
-Development data is isolated from the installed app by default. See [Contributing](./CONTRIBUTING.EN.md#local-development) for details.
+## 🤝 Feedback
 
 Attach a reviewed `tidu doctor --json` report when opening an issue:
 

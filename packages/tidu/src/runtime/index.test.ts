@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -113,6 +113,189 @@ test("starts a loopback runtime with a verifiable health endpoint", async () => 
   }
 });
 
+test("configures the complete Codex dual-channel entry from the local API", async () => {
+  const temporaryRoot = mkdtempSync(join(tmpdir(), "tidu-runtime-codex-"));
+  const executableDirectory = join(temporaryRoot, "bin");
+  const codexHomeDirectory = join(temporaryRoot, "codex-home");
+  const codexExecutable = join(executableDirectory, "codex");
+  const originalEnvironment = {
+    codexHome: process.env.CODEX_HOME,
+    executablePath: process.env.PATH,
+  };
+  mkdirSync(executableDirectory, { recursive: true });
+  mkdirSync(codexHomeDirectory, { recursive: true });
+  writeFileSync(join(codexHomeDirectory, "config.toml"), 'model = "official-test"\n', {
+    mode: 0o600,
+  });
+  writeFileSync(
+    join(codexHomeDirectory, "models_cache.json"),
+    JSON.stringify({
+      models: [
+        {
+          slug: "official-test",
+          display_name: "Official Test",
+          visibility: "list",
+          supported_in_api: true,
+        },
+      ],
+    }),
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    codexExecutable,
+    '#!/bin/sh\nif [ "$2" = "get" ]; then exit 1; fi\nif [ "$2" = "add" ]; then exit 0; fi\nexit 1\n',
+  );
+  chmodSync(codexExecutable, 0o700);
+  process.env.CODEX_HOME = codexHomeDirectory;
+  process.env.PATH = `${executableDirectory}:${originalEnvironment.executablePath ?? ""}`;
+  let providerFailure: Error | undefined;
+  const provider: ModelProvider = {
+    descriptor: { type: "codex-host", model: "official-test" },
+    execute: async (request) => {
+      if (providerFailure !== undefined) throw providerFailure;
+      return {
+        kind: "json",
+        statusCode: 200,
+        body: {
+          id: "verified",
+          object: "response",
+          model: request.virtualModelId,
+          output: [],
+        },
+      };
+    },
+  };
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
+    port: 0,
+    provider,
+  });
+
+  try {
+    const response = await fetch(`${runtime.origin}/api/clients/codex/connect`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      activeMode: "official",
+      connected: true,
+      model: "managed-default",
+      profile: "ai-tidu9",
+    });
+    const statusResponse = await fetch(`${runtime.origin}/api/clients/codex/configuration`);
+    assert.equal(statusResponse.status, 200);
+    assert.deepEqual(await statusResponse.json(), {
+      activeMode: "official",
+      endpoint: runtime.origin,
+      installed: true,
+      model: "managed-default",
+    });
+    const modelSelectionResponse = await fetch(
+      `${runtime.origin}/api/clients/codex/configuration`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "managed-default" }),
+      },
+    );
+    assert.equal(modelSelectionResponse.status, 422);
+    assert.match(
+      JSON.stringify(await modelSelectionResponse.json()),
+      /configuration mode must be official or ai-tidu9/iu,
+    );
+    const tiduModeResponse = await fetch(`${runtime.origin}/api/clients/codex/configuration`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "ai-tidu9" }),
+    });
+    assert.equal(tiduModeResponse.status, 200);
+    assert.equal(
+      ((await tiduModeResponse.json()) as { activeMode: string }).activeMode,
+      "ai-tidu9",
+    );
+    const tiduConfiguration = readFileSync(join(codexHomeDirectory, "config.toml"), "utf8");
+    assert.match(tiduConfiguration, /model = "official-test"/u);
+    assert.match(tiduConfiguration, /model_provider = "ai_tidu9"/u);
+    const catalog = JSON.parse(
+      readFileSync(join(codexHomeDirectory, ".ai-tidu9-model-catalog.json"), "utf8"),
+    ) as { models: { slug: string }[] };
+    assert.deepEqual(
+      catalog.models.map(({ slug }) => slug),
+      ["official-test", "managed-default"],
+    );
+    const officialModeResponse = await fetch(`${runtime.origin}/api/clients/codex/configuration`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "official" }),
+    });
+    assert.equal(officialModeResponse.status, 200);
+    assert.equal(
+      readFileSync(join(codexHomeDirectory, "config.toml"), "utf8"),
+      'model = "official-test"\n',
+    );
+    providerFailure = new Error("official session expired");
+    const failedSwitchResponse = await fetch(`${runtime.origin}/api/clients/codex/configuration`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "ai-tidu9" }),
+    });
+    assert.equal(failedSwitchResponse.status, 503);
+    const failedSwitch = (await failedSwitchResponse.json()) as {
+      failureSource: string;
+      nextSteps: string[];
+      reason: string;
+      reasonCode: string;
+    };
+    assert.equal(failedSwitch.failureSource, "official-codex");
+    assert.equal(failedSwitch.reasonCode, "provider_request_failed");
+    assert.match(failedSwitch.reason, /official session expired/u);
+    assert.equal(
+      failedSwitch.nextSteps.some((step) => step.includes("codex login status")),
+      true,
+    );
+    assert.equal(
+      readFileSync(join(codexHomeDirectory, "config.toml"), "utf8"),
+      'model = "official-test"\n',
+    );
+  } finally {
+    await runtime.close();
+    if (originalEnvironment.codexHome === undefined) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = originalEnvironment.codexHome;
+    }
+    process.env.PATH = originalEnvironment.executablePath;
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("rejects local Codex client configuration in enterprise deployments", async () => {
+  const enterpriseControlPlane = createEnterpriseControlPlane(
+    createInMemoryEnterpriseStateRepository(),
+  );
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
+    enterpriseControlPlane,
+    port: 0,
+  });
+
+  try {
+    const response = await fetch(`${runtime.origin}/api/clients/codex/connect`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(response.status, 403);
+    assert.deepEqual(await response.json(), { error: "PERSONAL_EDITION_ONLY" });
+  } finally {
+    await runtime.close();
+  }
+});
+
 test("exposes capability providers through one bounded SDK API", async () => {
   const provider = defineCapabilityProvider({
     manifest: {
@@ -130,7 +313,9 @@ test("exposes capability providers through one bounded SDK API", async () => {
   });
   const runtime = await startLocalRuntime({
     capabilityProviders: [provider],
-    capabilityRuntime: createCapabilityRuntime({ grantedPermissions: ["agent.delegate"] }),
+    capabilityRuntime: createCapabilityRuntime({
+      grantedPermissions: ["agent.delegate"],
+    }),
     databasePath: IN_MEMORY_DATABASE_PATH,
     port: 0,
   });
@@ -152,7 +337,9 @@ test("exposes capability providers through one bounded SDK API", async () => {
       },
     );
     assert.equal(invokeResponse.status, 200);
-    assert.deepEqual(await invokeResponse.json(), { output: { reviewed: "change" } });
+    assert.deepEqual(await invokeResponse.json(), {
+      output: { reviewed: "change" },
+    });
   } finally {
     await runtime.close();
   }
@@ -572,10 +759,12 @@ test("validates OpenAI-compatible inference requests before provider routing", a
     });
     assert.equal(chatResponse.status, 503);
     assert.equal(chatResponse.headers.get("x-ai-tidu9"), "true");
-    assert.equal(
-      ((await chatResponse.json()) as { error: { code: string } }).error.code,
-      "model_provider_not_configured",
-    );
+    const chatFailure = (await chatResponse.json()) as {
+      error: { code: string; failure_source: string; next_steps: string[] };
+    };
+    assert.equal(chatFailure.error.code, "model_provider_not_configured");
+    assert.equal(chatFailure.error.failure_source, "ai-tidu9");
+    assert.equal(chatFailure.error.next_steps.length, 3);
 
     const responsesResponse = await fetch(`${runtime.origin}/v1/responses`, {
       method: "POST",
@@ -583,10 +772,12 @@ test("validates OpenAI-compatible inference requests before provider routing", a
       body: JSON.stringify({ model: "managed-default", input: "hello" }),
     });
     assert.equal(responsesResponse.status, 503);
-    assert.equal(
-      ((await responsesResponse.json()) as { error: { code: string } }).error.code,
-      "model_provider_not_configured",
-    );
+    const responseFailure = (await responsesResponse.json()) as {
+      error: { code: string; failure_source: string; next_steps: string[] };
+    };
+    assert.equal(responseFailure.error.code, "model_provider_not_configured");
+    assert.equal(responseFailure.error.failure_source, "ai-tidu9");
+    assert.equal(responseFailure.error.next_steps.length, 3);
   } finally {
     await runtime.close();
   }
@@ -689,7 +880,9 @@ test("exposes stateless scaling admission and production health summaries", asyn
 
     const healthResponse = await fetch(`${runtime.origin}/health`);
     assert.equal(healthResponse.status, 503);
-    const health = (await healthResponse.json()) as { scaling: { status: string } };
+    const health = (await healthResponse.json()) as {
+      scaling: { status: string };
+    };
     assert.equal(health.scaling.status, "unavailable");
   } finally {
     await runtime.close();

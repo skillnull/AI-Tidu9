@@ -133,7 +133,7 @@ AI-Tidu9 只保存自身运行必需的数据。完整会话可留在宿主，�
 
 | 客户端 | 首选入口 | 能力归属 | 当前边界 |
 | --- | --- | --- | --- |
-| Codex应用、CLI、IDE | MCP + app-server / 专属Profile | Codex官方会话与权限 | 自定义虚拟模型可能显示回退模型元数据提示 |
+| Codex应用、CLI、IDE | MCP + app-server / 统一模型目录 | Codex官方账号、会话与权限 | 官方模型直连官方进程；九门模型经过本地路由 |
 | Cursor桌面端、Agent CLI | 用户级MCP；已授权CLI使用ACP | Cursor宿主与CLI账号 | 桌面登录不能复制为CLI凭据 |
 | 通用OpenAI客户端 | `/v1/models`、Chat Completions、Responses | AI-Tidu9 模型池与Agent内核 | 客户端专有能力需单独验证 |
 | 浏览器 | 配置中心或企业网关 | AI-Tidu9 运行时 | 跨设备必须使用HTTPS与身份控制 |

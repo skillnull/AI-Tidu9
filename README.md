@@ -106,21 +106,9 @@ tidu setup verify       # 验证连接器，不修改配置
 | 我想要…… | 从这里开始 | 数据层 |
 | --- | --- | --- |
 | 在本机统一个人模型、Skill 和 MCP | `tidu start` | SQLite，默认只监听回环地址 |
-| 在服务器集中管理策略、额度和能力 | Docker 部署 + PostgreSQL | 企业控制平面 |
-| 保留 IDE 本地能力，同时经过企业出口 | 企业网关 + 员工设备连接器 | 服务端状态 + 本地私有边界 |
+| 在服务器集中管理策略、额度和能力 | [远程部署文档](./docs/REMOTE-DEPLOYMENT.md) | 企业控制平面 |
+| 保留 IDE 本地能力，同时经过企业出口 | [远程部署文档](./docs/REMOTE-DEPLOYMENT.md) | 服务端状态 + 本地私有边界 |
 | 开发模型、Agent、存储或历史 Provider | `@skillnull/tidu/ecosystem` 或 Python SDK | 通过平台 API 访问，不复制控制平面 |
-
-<details>
-<summary><strong>企业单机试点：最小 Docker 启动命令</strong></summary>
-
-```bash
-TIDU_POSTGRES_PASSWORD='<private-password>' \
-docker compose -f config/docker/compose.yml up --build
-```
-
-容器默认只映射到服务器回环地址。跨设备访问必须在前方配置 HTTPS 反向代理与企业身份认证，不得直接暴露管理端口。
-
-</details>
 
 ### 配置模型来源
 
@@ -150,9 +138,10 @@ tidu start
 ## 🛠️ 运行、诊断与彻底移除
 
 ```bash
-tidu setup                 # 安装九门连接器，保留宿主官方模型
+tidu setup                 # 自动配置九门并按提示重启宿主
 tidu clients               # 查看本机客户端兼容情况
 tidu account               # 查看可复用的宿主登录状态
+tidu channel list          # 查看九门、官方宿主与厂商通道
 tidu doctor --json         # 生成不含私密数据的诊断摘要
 tidu uninstall             # 清理全部 AI-Tidu9 自有内容
 ```
@@ -160,9 +149,9 @@ tidu uninstall             # 清理全部 AI-Tidu9 自有内容
 完整卸载会保留宿主账号、会话、无关插件、无关配置和自定义数据库路径。
 
 通用客户端通过同一基址使用 `/v1/models`、`/v1/chat/completions` 和 `/v1/responses`；Codex 与 Cursor 等宿主优先使用各自的原生 Agent 或 MCP 连接器，以保留宿主能力边界。
-Codex Desktop 当前不能把第三方供应商增量加入官方模型列表。`tidu setup` 因此安装 MCP 连接器，保留全部官方模型，并让这些模型调用九门能力。仅在明确需要隔离的兼容入口时，才使用 `tidu clients connect codex` 创建 `ai-tidu9` Profile；该 Profile 不是对官方模型列表的追加。
+`tidu setup` 会安装 MCP 连接器，并生成一个可回滚的 Codex 九门配置，但不会自动切走官方配置。管理页只切换“九门”和“官方”两种配置，不选择具体模型：九门配置让 Codex 模型列表同时显示当前官方模型和九门虚拟模型；官方配置只显示官方模型。官方账号、套餐和额度信息始终由官方 Codex 管理。官方模型仍交给官方 Codex 进程执行，九门模型才经过本地九门路由。手动恢复、回滚或卸载会删除九门托管块并恢复原始官方配置。
 
-企业服务器只部署运行时与 PostgreSQL，不执行员工电脑上的 `setup`，也不提供独立员工页面。员工先安装个人版九门赛博提督，再在本地页面的“企业接入”中填写管理员提供的 HTTPS 公司链接；本地验证后以只读方式显示企业虚拟模型、策略与能力，个人配置继续独立维护。
+双通道入口使用 `tidu channel run <channel>`。`tidu` 走九门虚拟模型，`codex` 与 `cursor` 由官方宿主进程执行；CI可使用 `openai`、`deepseek`、`qwen`、`glm`、`kimi`、`doubao`、`hunyuan` 或 `custom` 厂商通道。Codex插件与Cursor通过同一MCP连接器获得 `list_tidu_channels` 和 `route_tidu_channel`，无需替换宿主官方模型列表。
 
 ## 🛡️ 信任边界与安全承诺
 
@@ -185,29 +174,16 @@ Codex Desktop 当前不能把第三方供应商增量加入官方模型列表。
 | [开放能力生态](./docs/ECOSYSTEM-SDK.md) | 如何安全地接入 Provider 和第三方 Agent？ |
 | [Python SDK](./sdk/python/README.md) | 如何从 Python 调用 AI-Tidu9 Provider API？ |
 | [贡献指南](./docs/CONTRIBUTING.md) | 分支、提交、版本、维护线和发布规则是什么？ |
+| [远程部署](./docs/REMOTE-DEPLOYMENT.md) | 如何部署服务器运行时并隔离跨设备访问？ |
+| [本地开发](./docs/LOCAL-DEVELOPMENT.md) | 如何启动、验证并停止仓库开发环境？ |
 | [商标与署名](./docs/TRADEMARKS.md) | 修改名称或商业部署时，如何正确说明来源？ |
 | [变更记录](./docs/CHANGELOG.md) | 每个已发布版本实际改变了什么？ |
 
-## 🤝 参与开发与反馈
+## 🛠️ 本地开发
 
-```bash
-npm run tidu:setup
-npm run tidu:dev-p
-# 开发企业版界面与流程
-npm run tidu:dev-e
-npm run check
-```
+仓库开发的启动、Codex 配置验收、检查和停止流程统一放在[本地开发文档](./docs/LOCAL-DEVELOPMENT.md)。主文档不混入开发环境操作细节。
 
-`npm run tidu:setup` 只安装仓库开发依赖；产品初始化使用 `tidu setup`，两者不属于同一个生命周期。
-
-`tidu:dev-p` 启动个人版完整本地运行时和开发页面，`tidu:dev-e` 启动企业版。开发命令会在启动服务前临时执行产品setup，退出时自动移除这套临时客户端接入。浏览器打开终端显示的地址。UI 改动会热更新，后端 TypeScript 改动会自动重新编译并重启服务。另开终端可像安装后一样执行 CLI 命令，共用开发数据：
-
-```bash
-npm run tidu:cli-p -- doctor
-npm run tidu:cli-p -- config show
-```
-
-开发数据默认与安装版隔离。详细说明见[贡献指南](./docs/CONTRIBUTING.md#本地开发流程)。
+## 🤝 问题反馈
 
 问题反馈请附上经审查的 `tidu doctor --json` 输出：
 

@@ -3,6 +3,8 @@ import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
+const runtimeTarget = `http://${process.env.TIDU_HOST ?? "127.0.0.1"}:${process.env.TIDU_RUNTIME_PORT ?? process.env.TIDU_PORT ?? "9639"}`;
+
 export default defineConfig({
   root: fileURLToPath(new URL("./ui", import.meta.url)),
   plugins: [react()],
@@ -10,7 +12,13 @@ export default defineConfig({
     host: "127.0.0.1",
     proxy: {
       "/api": {
-        target: `http://${process.env.TIDU_HOST ?? "127.0.0.1"}:${process.env.TIDU_PORT ?? "9639"}`,
+        target: runtimeTarget,
+      },
+      "/health": {
+        target: runtimeTarget,
+      },
+      "/v1": {
+        target: runtimeTarget,
       },
     },
   },

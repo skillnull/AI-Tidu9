@@ -1,6 +1,12 @@
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 
+import {
+  createTiduChannelGateway,
+  TIDU_CHANNEL_IDS,
+  type TiduChannelGateway,
+  type TiduChannelId,
+} from "../channels/index.js";
 import { PRODUCT } from "../core/index.js";
 
 export interface TiduMcpServerOptions {
@@ -14,6 +20,8 @@ export interface TiduMcpServerOptions {
   request?: typeof fetch;
   /** Maximum accepted bytes for one newline-framed request. */
   maximumMessageBytes?: number;
+  /** Explicit channel gateway override used by embedded hosts and isolated tests. */
+  channelGateway?: TiduChannelGateway;
 }
 
 export interface TiduMcpServer {
@@ -86,7 +94,7 @@ const toolDefinitions = Object.freeze([
   {
     name: "route_tidu_task",
     description:
-      "Route one text task through the active AI-Tidu9 policy and model configuration. The configured runtime must have a real provider.",
+      "Default AI-Tidu9 entry: route one text task through the active 九门 policy and virtual model. Use this unless the user explicitly selects another channel.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -94,6 +102,27 @@ const toolDefinitions = Object.freeze([
         input: { type: "string", minLength: 1, maxLength: 100_000 },
       },
       required: ["input"],
+    },
+  },
+  {
+    name: "list_tidu_channels",
+    description:
+      "List the AI-Tidu9 virtual channel, official host channels, and configured provider channels without returning credentials.",
+    inputSchema: { type: "object", additionalProperties: false, properties: {} },
+  },
+  {
+    name: "route_tidu_channel",
+    description:
+      "Run one text request through an explicit AI-Tidu9, official host, or configured provider channel.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        channel: { type: "string", enum: TIDU_CHANNEL_IDS },
+        input: { type: "string", minLength: 1, maxLength: 100_000 },
+        model: { type: "string", minLength: 1, maxLength: 128 },
+      },
+      required: ["channel", "input"],
     },
   },
 ]);
@@ -121,6 +150,7 @@ const handleToolCall = async (
   params: unknown,
   endpoint: string,
   request: typeof fetch,
+  channelGateway: TiduChannelGateway,
 ): Promise<Record<string, unknown>> => {
   if (!isRecord(params) || typeof params.name !== "string") {
     throw new Error("MCP tool call is invalid.");
@@ -159,6 +189,38 @@ const handleToolCall = async (
     });
     return { content: [{ type: "text", text: extractResponseText(response) }] };
   }
+  if (params.name === "list_tidu_channels") {
+    const channels = await channelGateway.list();
+    return {
+      content: [{ type: "text", text: JSON.stringify(channels) }],
+      structuredContent: { channels },
+    };
+  }
+  if (params.name === "route_tidu_channel") {
+    const argumentsValue = params.arguments;
+    const channel = isRecord(argumentsValue) ? argumentsValue.channel : undefined;
+    const input = isRecord(argumentsValue) ? argumentsValue.input : undefined;
+    const model = isRecord(argumentsValue) ? argumentsValue.model : undefined;
+    if (
+      typeof channel !== "string" ||
+      !TIDU_CHANNEL_IDS.includes(channel as TiduChannelId) ||
+      typeof input !== "string" ||
+      input.trim() === "" ||
+      input.length > 100_000 ||
+      (model !== undefined && (typeof model !== "string" || model.trim() === ""))
+    ) {
+      throw new Error("route_tidu_channel requires a valid channel, input, and optional model.");
+    }
+    const result = await channelGateway.run({
+      channel: channel as TiduChannelId,
+      input,
+      ...(typeof model === "string" ? { model } : {}),
+    });
+    return {
+      content: [{ type: "text", text: result.text }],
+      structuredContent: result,
+    };
+  }
   throw new Error(`Unknown AI-Tidu9 MCP tool: ${params.name}`);
 };
 
@@ -169,6 +231,7 @@ export const startTiduMcpServer = (options: TiduMcpServerOptions = {}): TiduMcpS
   const endpoint = normalizeEndpoint(
     options.endpoint ?? process.env.TIDU_ENDPOINT ?? "http://127.0.0.1:9639",
   );
+  const channelGateway = options.channelGateway ?? createTiduChannelGateway({ endpoint, request });
   const maximumMessageBytes = options.maximumMessageBytes ?? DEFAULT_MAXIMUM_MESSAGE_BYTES;
   const lines = createInterface({ input, crlfDelay: Number.POSITIVE_INFINITY });
 
@@ -184,13 +247,15 @@ export const startTiduMcpServer = (options: TiduMcpServerOptions = {}): TiduMcpS
           protocolVersion: MCP_PROTOCOL_VERSION,
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: "ai-tidu9", title: PRODUCT.explanation, version: PRODUCT.version },
+          instructions:
+            "AI-Tidu9 is the default collaboration gateway. Route tasks through route_tidu_task unless the user explicitly requests an official or provider channel; use route_tidu_channel for that explicit switch.",
         };
       } else if (requestMessage.method === "ping") {
         result = {};
       } else if (requestMessage.method === "tools/list") {
         result = { tools: toolDefinitions };
       } else if (requestMessage.method === "tools/call") {
-        result = await handleToolCall(requestMessage.params, endpoint, request);
+        result = await handleToolCall(requestMessage.params, endpoint, request, channelGateway);
       } else {
         throw new Error(`Unsupported MCP method: ${requestMessage.method}`);
       }

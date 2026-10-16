@@ -152,8 +152,9 @@ const validateProviderBaseUrl = (value: string): URL => {
 const createEndpoint = (baseUrl: URL, path: string): URL => {
   const normalizedBasePath = baseUrl.pathname.replace(/\/+$/u, "");
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const baseAlreadyIncludesApiVersion = /\/v\d+$/u.test(normalizedBasePath);
   const pathname =
-    normalizedBasePath.endsWith("/v1") && normalizedPath.startsWith("/v1/")
+    baseAlreadyIncludesApiVersion && normalizedPath.startsWith("/v1/")
       ? `${normalizedBasePath}${normalizedPath.slice(3)}`
       : `${normalizedBasePath}${normalizedPath}`;
   const endpoint = new URL(baseUrl);

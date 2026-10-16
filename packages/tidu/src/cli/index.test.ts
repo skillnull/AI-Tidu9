@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -41,6 +42,7 @@ test("shows concise help by default", () => {
   assert.match(runCli([]), /tidu doctor/u);
   assert.match(runCli([]), /tidu clients/u);
   assert.match(runCli([]), /tidu account/u);
+  assert.match(runCli([]), /tidu channel/u);
   assert.match(runCli([]), /tidu config/u);
   assert.match(runCli([]), /tidu uninstall/u);
   assert.match(runCli([]), /tidu restore/u);
@@ -59,6 +61,9 @@ test("provides side-effect-free help for every command group", () => {
     ["account", "status", "--help"],
     ["account", "relogin", "--help"],
     ["account", "switch", "--help"],
+    ["channel", "--help"],
+    ["channel", "list", "--help"],
+    ["channel", "run", "--help"],
     ["config", "--help"],
     ["config", "show", "--help"],
     ["config", "set", "--help"],
@@ -117,7 +122,10 @@ test("configures and rolls back a dedicated Codex profile through the CLI", asyn
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-cli-codex-"));
   const codexHomeDirectory = join(temporaryDirectory, ".codex");
   const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
-  const runtime = await startLocalRuntime({ databasePath: ":memory:", port: 0 });
+  const runtime = await startLocalRuntime({
+    databasePath: ":memory:",
+    port: 0,
+  });
   const runCommand = async (commandArguments: readonly string[]) => {
     const child = spawn(process.execPath, [executablePath, ...commandArguments], {
       env: { ...process.env, CODEX_HOME: codexHomeDirectory },
@@ -160,6 +168,38 @@ test("configures and rolls back a dedicated Codex profile through the CLI", asyn
   }
 });
 
+test("setup preserves official Codex defaults without requiring a running runtime", () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-cli-setup-"));
+  const codexHomeDirectory = join(temporaryDirectory, ".codex");
+  const binaryDirectory = join(temporaryDirectory, "bin");
+  const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
+  try {
+    mkdirSync(binaryDirectory, { recursive: true });
+    const fakeCodex = join(binaryDirectory, "codex");
+    writeFileSync(fakeCodex, '#!/bin/sh\nif [ "$2" = "get" ]; then exit 1; fi\nexit 0\n', {
+      mode: 0o700,
+    });
+    const environment = {
+      ...process.env,
+      CODEX_HOME: codexHomeDirectory,
+      HOME: temporaryDirectory,
+      PATH: binaryDirectory,
+    };
+    const configured = spawnSync(
+      process.execPath,
+      [executablePath, "setup", "--endpoint", "http://127.0.0.1:9639", "--no-restart"],
+      { encoding: "utf8", env: environment },
+    );
+
+    assert.equal(configured.status, 0, configured.stderr);
+    assert.match(configured.stdout, /Codex AI-Tidu9 configuration prepared: ai-tidu9/u);
+    assert.equal(existsSync(join(codexHomeDirectory, "config.toml")), false);
+    assert.equal(existsSync(join(codexHomeDirectory, "ai-tidu9.config.toml")), true);
+  } finally {
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
 test("reuses, refreshes, and switches host-owned Codex and Cursor logins through the CLI", () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-cli-account-"));
   const codexHomeDirectory = join(temporaryDirectory, ".codex");
@@ -170,7 +210,9 @@ test("reuses, refreshes, and switches host-owned Codex and Cursor logins through
   try {
     mkdirSync(codexHomeDirectory, { mode: 0o700 });
     mkdirSync(fakeBinDirectory, { mode: 0o700 });
-    writeFileSync(join(codexHomeDirectory, "auth.json"), "test-only", { mode: 0o600 });
+    writeFileSync(join(codexHomeDirectory, "auth.json"), "test-only", {
+      mode: 0o600,
+    });
     const fakeCodexPath = join(fakeBinDirectory, "codex");
     writeFileSync(
       fakeCodexPath,
@@ -270,7 +312,11 @@ test("refuses to remove a custom database path", () => {
   try {
     const result = spawnSync(process.execPath, [executablePath, "uninstall", "--yes"], {
       encoding: "utf8",
-      env: { ...process.env, TIDU_DATABASE_PATH: databasePath, TIDU_PORT: "0" },
+      env: {
+        ...process.env,
+        TIDU_DATABASE_PATH: databasePath,
+        TIDU_PORT: "0",
+      },
     });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /Custom database paths are preserved/u);
@@ -374,6 +420,44 @@ test("starts the local runtime from the executable entry point", async () => {
   }
 });
 
+test("starts and stops the local runtime automatically with the MCP host session", async () => {
+  const reservation = createServer();
+  reservation.listen(0, "127.0.0.1");
+  await once(reservation, "listening");
+  const address = reservation.address();
+  if (address === null || typeof address === "string") {
+    assert.fail("Expected a TCP listener address.");
+  }
+  const port = address.port;
+  reservation.close();
+  await once(reservation, "close");
+
+  const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
+  const child = spawn(
+    process.execPath,
+    [executablePath, "mcp", "--endpoint", `http://127.0.0.1:${port}`],
+    {
+      env: { ...process.env, TIDU_DATABASE_PATH: ":memory:" },
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+  let standardOutput = "";
+  let standardError = "";
+  child.stdout.on("data", (chunk) => {
+    standardOutput += chunk.toString();
+  });
+  child.stderr.on("data", (chunk) => {
+    standardError += chunk.toString();
+  });
+  child.stdin.end(
+    `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} })}\n`,
+  );
+  const [exitCode] = (await once(child, "exit")) as [number | null];
+
+  assert.equal(exitCode, 0, standardError);
+  assert.match(standardOutput, /AI-Tidu9 is the default collaboration gateway/u);
+});
+
 test("normalizes safe management endpoints and rejects embedded credentials", () => {
   assert.equal(normalizeManagementEndpoint(), "http://127.0.0.1:9639");
   assert.equal(
@@ -462,7 +546,10 @@ test("diagnoses and configures a running runtime through the public API", async 
 });
 
 test("offers a simple interactive configuration fallback", async () => {
-  const runtime = await startLocalRuntime({ databasePath: ":memory:", port: 0 });
+  const runtime = await startLocalRuntime({
+    databasePath: ":memory:",
+    port: 0,
+  });
   const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
   const child = spawn(process.execPath, [executablePath, "config", "--endpoint", runtime.origin], {
     stdio: ["pipe", "pipe", "pipe"],

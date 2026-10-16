@@ -108,6 +108,32 @@ test("forwards OpenAI-compatible requests without exposing provider identity", a
   }
 });
 
+test("preserves provider-specific API versions in compatible base URLs", async () => {
+  let receivedPath = "";
+  const server = await startTestServer((request, response) => {
+    void readBody(request).then(() => {
+      receivedPath = request.url ?? "";
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ choices: [] }));
+    });
+  });
+
+  try {
+    const provider = createOpenAiCompatibleProvider({
+      baseUrl: `${server.origin}/api/v4`,
+      model: "provider-model",
+    });
+    await provider.execute({
+      protocol: "chat-completions",
+      body: { messages: [{ role: "user", content: "hello" }] },
+      virtualModelId: "virtual-model",
+    });
+    assert.equal(receivedPath, "/api/v4/chat/completions");
+  } finally {
+    await server.close();
+  }
+});
+
 test("translates Ollama chat and Responses payloads into the virtual model contract", async () => {
   const receivedBodies: Record<string, unknown>[] = [];
   const server = await startTestServer((request, response) => {

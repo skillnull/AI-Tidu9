@@ -14,7 +14,7 @@ Except for Python-specific snippets, the commands and TypeScript examples requir
 | Put an existing model service behind one entry | [OpenAI-compatible service](#example-openai-compatible) | Individuals, teams |
 | Use AI-Tidu9 like a model from an existing client | [Generic client](#example-generic-client) | Client users |
 | Connect Codex, Cursor, and CLI hosts | [Host connectors](#example-host-connectors) | Agent users |
-| Start a single-host enterprise pilot | [Docker + PostgreSQL](#example-enterprise-pilot) | Administrators, platform teams |
+| Start a single-host enterprise pilot | [Remote deployment](./REMOTE-DEPLOYMENT.EN.md) | Administrators, platform teams |
 | Build a governed capability | [Provider SDK](#example-provider-sdk) | Agent engineers |
 | Protect sensitive values before model egress | [Secret Gate](#example-secret-gate) | Security and platform engineers |
 
@@ -156,39 +156,6 @@ tidu setup verify
 tidu setup repair
 tidu clients rollback codex
 ```
-
-<a id="example-enterprise-pilot"></a>
-## 🏢 Enterprise pilot: start with one server
-
-### 🎯 Goal
-
-Run AI-Tidu9 and PostgreSQL on one server, bound to loopback, then expose controlled cross-device access through an existing HTTPS gateway.
-
-### ▶️ Start
-
-Inject `TIDU_POSTGRES_PASSWORD` through the deployment system, then run:
-
-```bash
-: "${TIDU_POSTGRES_PASSWORD:?inject with your deployment secret system}"
-docker compose -f config/docker/compose.yml up --build
-```
-
-### ✅ Verify
-
-Verify on the server:
-
-```bash
-curl -fsS http://127.0.0.1:9639/health
-docker compose -f config/docker/compose.yml ps
-```
-
-### 📌 Expected result
-
-The runtime and PostgreSQL should be healthy, the management port should bind only to `127.0.0.1`, and enterprise state should use PostgreSQL while personal mode can continue using SQLite.
-
-### 🚦 Before production
-
-Before expanding the pilot, configure HTTPS, identity authentication, organization scope, and access logs at the gateway. Test capacity, backup recovery, administrator-key rotation, upgrades, and rollback.
 
 <a id="example-provider-sdk"></a>
 ## 🛠️ Provider SDK: build a governed capability

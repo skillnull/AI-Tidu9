@@ -133,7 +133,7 @@ AI-Tidu9 retains only the data required for its own operation. Full conversation
 
 | Client | Preferred entry | Capability owner | Current boundary |
 | --- | --- | --- | --- |
-| Codex app, CLI, and IDE | MCP + app-server / dedicated profile | Official Codex session and permissions | A custom virtual model may show fallback model-metadata warnings |
+| Codex app, CLI, and IDE | MCP + app-server / unified model catalog | Official Codex account, session, and permissions | Official models use the official process; the AI-Tidu9 model uses the local router |
 | Cursor Desktop and Agent CLI | User-level MCP; authorized CLI through ACP | Cursor host and CLI account | Desktop login cannot be copied into CLI credentials |
 | Generic OpenAI client | `/v1/models`, Chat Completions, Responses | AI-Tidu9 model pool and Agent kernel | Client-specific extensions require separate verification |
 | Browser | Configuration center or enterprise gateway | AI-Tidu9 runtime | Cross-device access requires HTTPS and identity control |

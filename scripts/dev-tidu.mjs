@@ -1,11 +1,16 @@
 import { spawn, spawnSync } from "node:child_process";
+import { createServer } from "node:net";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
 const workspaceRoot = fileURLToPath(new URL("../packages/tidu/", import.meta.url));
+const defaultPublicPort = 9639;
 const edition = process.env.TIDU_DEV_EDITION ?? "personal";
-const runtimePort = Number(process.env.TIDU_PORT ?? 9639);
+const publicPortSetting = process.env.TIDU_PORT?.trim();
+const configuredPublicPort =
+  publicPortSetting === undefined ? undefined : Number(publicPortSetting);
 const databasePath =
   process.env.TIDU_DATABASE_PATH ??
   join(repositoryRoot, ".tidu-dev", edition === "enterprise" ? "enterprise.sqlite" : "tidu.sqlite");
@@ -15,28 +20,48 @@ if (edition !== "personal" && edition !== "enterprise") {
   process.exit(1);
 }
 
-if (!Number.isInteger(runtimePort) || runtimePort < 1 || runtimePort > 65_535) {
+if (
+  configuredPublicPort !== undefined &&
+  (!Number.isInteger(configuredPublicPort) ||
+    configuredPublicPort < 1 ||
+    configuredPublicPort > 65_535)
+) {
   process.stderr.write("TIDU_PORT must be an integer from 1 to 65535 for local development.\n");
   process.exit(1);
 }
 
-const enterprisePostgresqlGuide = (postgresDetected) => `
-企业版开发需要可连接的 PostgreSQL 数据库。
-Enterprise development requires a reachable PostgreSQL database.
+const publicPort = configuredPublicPort ?? defaultPublicPort;
+const internalRuntimePort = await new Promise((resolve, reject) => {
+  const server = createServer();
+  server.once("error", reject);
+  server.listen(0, "127.0.0.1", () => {
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      server.close();
+      reject(new Error("Unable to allocate the internal development runtime port."));
+      return;
+    }
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(address.port);
+    });
+  });
+});
 
-方案一 / Option 1 · 启动项目提供的 PostgreSQL 容器
+const enterprisePostgresqlGuide = (postgresDetected) => `
+企业版本地开发需要 PostgreSQL。
+Local enterprise development requires PostgreSQL.
+
+启动项目提供的 PostgreSQL 容器 / Start the project PostgreSQL container
   1. export TIDU_POSTGRES_PASSWORD="$(openssl rand -hex 24)"
   2. docker compose -f config/docker/compose.yml -f config/docker/compose.dev.yml up -d postgres
   3. export TIDU_POSTGRES_URL="postgresql://tidu:\${TIDU_POSTGRES_PASSWORD}@127.0.0.1:5432/tidu"
   4. npm run tidu:dev-e
 
-方案二 / Option 2 · 使用自行安装的 PostgreSQL
-  1. 创建数据库和具有建表权限的用户。
-  2. export TIDU_POSTGRES_URL="postgresql://<user>:<password>@<host>:<port>/<database>"
-  3. 服务端要求验证 TLS 时设置 TIDU_POSTGRES_SSL=require。
-  4. npm run tidu:dev-e
-
-${postgresDetected ? "已发现本机 PostgreSQL 服务，但仍需通过 TIDU_POSTGRES_URL 指定数据库与账号。" : "未发现已就绪的本机 PostgreSQL 服务。"}
+${postgresDetected ? "已发现本机 PostgreSQL 服务，但仍需设置 TIDU_POSTGRES_URL。" : "未发现已就绪的本机 PostgreSQL 服务。"}
 `;
 
 const verifyEnterprisePostgresql = async () => {
@@ -89,48 +114,97 @@ if (edition === "enterprise") {
   await verifyEnterprisePostgresql();
 }
 
-const build = spawnSync("npm", ["run", "build:tidu"], {
-  cwd: repositoryRoot,
-  stdio: "inherit",
-});
+const backendBuild = spawnSync(
+  process.execPath,
+  ["node_modules/typescript/bin/tsc", "-p", "packages/tidu/tsconfig.build.json"],
+  {
+    cwd: repositoryRoot,
+    stdio: "inherit",
+  },
+);
 
-if (build.status !== 0) {
-  process.exit(build.status ?? 1);
+if (backendBuild.status !== 0) {
+  process.exit(backendBuild.status ?? 1);
 }
 
-const runtimeEndpoint = `http://${process.env.TIDU_HOST ?? "127.0.0.1"}:${runtimePort}`;
-const managesLocalClients = edition === "personal";
-if (managesLocalClients) {
-  const setup = spawnSync(
-    process.execPath,
-    ["packages/tidu/dist/cli/launcher.js", "setup", "install", "--endpoint", runtimeEndpoint],
-    {
-      cwd: repositoryRoot,
-      env: process.env,
-      stdio: "inherit",
+const runtimeProcess = spawn(
+  join(repositoryRoot, "node_modules/.bin/tsx"),
+  ["watch", "packages/tidu/src/cli/index.ts", "start", "--edition", edition],
+  {
+    cwd: repositoryRoot,
+    env: {
+      ...process.env,
+      NODE_ENV: "development",
+      TIDU_CONNECTOR_CLI_ENTRY: join(repositoryRoot, "packages/tidu/dist/cli/launcher.js"),
+      TIDU_DATABASE_PATH: databasePath,
+      TIDU_DEV_SILENT: "1",
+      TIDU_HOST: process.env.TIDU_HOST ?? "127.0.0.1",
+      TIDU_PORT: String(internalRuntimePort),
     },
-  );
+    stdio: "inherit",
+  },
+);
 
-  if (setup.status !== 0) {
-    process.exit(setup.status ?? 1);
+let runtimeReady = false;
+for (let attempt = 0; attempt < 100; attempt += 1) {
+  try {
+    const response = await fetch(`http://127.0.0.1:${internalRuntimePort}/health`, {
+      signal: AbortSignal.timeout(500),
+    });
+    if (response.ok) {
+      runtimeReady = true;
+      break;
+    }
+  } catch {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
   }
 }
 
+if (!runtimeReady) {
+  runtimeProcess.kill("SIGTERM");
+  process.stderr.write("Development runtime did not become ready within 10 seconds.\n");
+  process.exit(1);
+}
+
+const typeCheckerProcess = spawn(
+  process.execPath,
+  [
+    "node_modules/typescript/bin/tsc",
+    "-p",
+    "packages/tidu/tsconfig.json",
+    "--watch",
+    "--preserveWatchOutput",
+    "--pretty",
+    "false",
+  ],
+  { cwd: repositoryRoot, stdio: ["ignore", "pipe", "inherit"] },
+);
+
+if (typeCheckerProcess.stdout !== null) {
+  const typeCheckerOutput = createInterface({ input: typeCheckerProcess.stdout });
+  typeCheckerOutput.on("line", (line) => {
+    const message = line.replace(/^\d{1,2}:\d{2}:\d{2}\s*(?:AM|PM)?\s*-\s*/u, "").trim();
+    if (
+      message === "" ||
+      message === "Starting compilation in watch mode..." ||
+      message === "File change detected. Starting incremental compilation..."
+    ) {
+      return;
+    }
+    const summary = message.match(/^Found (\d+) errors?\. Watching for file changes\.$/u);
+    if (summary !== null) {
+      const errorCount = Number(summary[1]);
+      process.stdout.write(
+        errorCount === 0 ? "✓ TS 通过 · 监听中\n" : `✗ TS ${errorCount} 个错误 · 监听中\n`,
+      );
+      return;
+    }
+    process.stdout.write(`${message}\n`);
+  });
+}
+
 const processes = [
-  spawn(
-    process.execPath,
-    ["--watch", "packages/tidu/dist/cli/launcher.js", "start", "--edition", edition],
-    {
-      cwd: repositoryRoot,
-      env: {
-        ...process.env,
-        NODE_ENV: "development",
-        TIDU_DATABASE_PATH: databasePath,
-        TIDU_HOST: process.env.TIDU_HOST ?? "127.0.0.1",
-      },
-      stdio: "inherit",
-    },
-  ),
+  runtimeProcess,
   spawn(
     process.execPath,
     [
@@ -140,38 +214,22 @@ const processes = [
       "--watch",
       "--preserveWatchOutput",
     ],
-    { cwd: repositoryRoot, stdio: "inherit" },
+    { cwd: repositoryRoot, stdio: "ignore" },
   ),
-  spawn("../../node_modules/.bin/vite", ["--host", "127.0.0.1"], {
+  typeCheckerProcess,
+  spawn("../../node_modules/.bin/vite", ["--host", "127.0.0.1", "--port", String(publicPort)], {
     cwd: workspaceRoot,
-    env: { ...process.env, TIDU_PORT: String(runtimePort) },
+    env: { ...process.env, TIDU_RUNTIME_PORT: String(internalRuntimePort) },
     stdio: "inherit",
   }),
 ];
 
 let stopping = false;
-let clientSetupInstalled = managesLocalClients;
 const stop = (signal = "SIGTERM") => {
   if (stopping) {
     return;
   }
   stopping = true;
-  if (clientSetupInstalled) {
-    clientSetupInstalled = false;
-    const cleanup = spawnSync(
-      process.execPath,
-      ["packages/tidu/dist/cli/launcher.js", "setup", "uninstall", "--endpoint", runtimeEndpoint],
-      {
-        cwd: repositoryRoot,
-        env: process.env,
-        stdio: "inherit",
-      },
-    );
-    if (cleanup.status !== 0) {
-      process.stderr.write("Local client cleanup did not complete. Run: tidu setup uninstall\n");
-      process.exitCode = 1;
-    }
-  }
   for (const childProcess of processes) {
     if (childProcess.exitCode === null) {
       childProcess.kill(signal);

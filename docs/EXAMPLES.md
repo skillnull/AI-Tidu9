@@ -14,7 +14,7 @@
 | 把现有模型服务变成 AI-Tidu9 统一入口 | [OpenAI 兼容服务](#example-openai-compatible) | 个人、团队 |
 | 让现有客户端像选模型一样调用 AI-Tidu9 | [通用客户端](#example-generic-client) | 客户端使用者 |
 | 接入 Codex、Cursor 和 CLI | [宿主连接器](#example-host-connectors) | Agent 用户 |
-| 启动企业单机试点 | [Docker + PostgreSQL](#example-enterprise-pilot) | 管理员、平台团队 |
+| 启动企业单机试点 | [远程部署文档](./REMOTE-DEPLOYMENT.md) | 管理员、平台团队 |
 | 开发自己的能力并受 AI-Tidu9 治理 | [Provider SDK](#example-provider-sdk) | Agent 工程师 |
 | 在模型出站前保护敏感值 | [Secret Gate](#example-secret-gate) | 安全与平台工程师 |
 
@@ -157,41 +157,6 @@ tidu setup verify
 tidu setup repair
 tidu clients rollback codex
 ```
-
-<a id="example-enterprise-pilot"></a>
-## 🏢 企业单机试点：从一台服务器开始
-
-### 🎯 目标
-
-用一个只监听服务器回环地址的 AI-Tidu9 实例和 PostgreSQL 启动企业试点，再由现有 HTTPS 网关提供跨设备访问。
-
-### ▶️ 启动
-
-通过部署系统注入 `TIDU_POSTGRES_PASSWORD` 后执行：
-
-```bash
-: "${TIDU_POSTGRES_PASSWORD:?inject with your deployment secret system}"
-docker compose -f config/docker/compose.yml up --build
-```
-
-### ✅ 验证
-
-在服务器本机执行：
-
-```bash
-curl -fsS http://127.0.0.1:9639/health
-docker compose -f config/docker/compose.yml ps
-```
-
-### 📌 预期结果
-
-- AI-Tidu9 与 PostgreSQL 健康检查通过；
-- 管理端口只映射到 `127.0.0.1`；
-- 企业状态进入 PostgreSQL，个人轻量模式仍可以独立使用 SQLite。
-
-### 🚦 上线前检查
-
-在网关配置 HTTPS、身份认证、组织范围和访问日志。完成容量、备份恢复、管理员密钥轮换、升级与回滚验证后，再扩大使用范围。
 
 <a id="example-provider-sdk"></a>
 ## 🛠️ Provider SDK：开发受治理的能力

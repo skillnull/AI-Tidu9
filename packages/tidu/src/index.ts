@@ -116,14 +116,30 @@ export {
   createCapabilityRegistry,
 } from "./capabilities/index.js";
 export {
+  createTiduChannelGateway,
+  TIDU_CHANNEL_IDS,
+  type TiduChannelDescriptor,
+  type TiduChannelGateway,
+  type TiduChannelGatewayOptions,
+  type TiduChannelId,
+  type TiduChannelKind,
+  type TiduChannelRunRequest,
+  type TiduChannelRunResult,
+} from "./channels/index.js";
+export {
   type CodexClientConfigurationOptions,
   type CodexClientConfigurationResult,
+  type CodexClientMode,
+  type CodexClientModeOptions,
   type CodexClientRemovalResult,
   type CodexClientRollbackOptions,
   type CodexClientRollbackResult,
+  type CodexClientStatus,
   configureCodexClient,
+  inspectCodexClientConfiguration,
   removeCodexClientConfiguration,
   rollbackCodexClientConfiguration,
+  switchCodexClientConfiguration,
 } from "./clients/configuration.js";
 export {
   discoverLocalClients,

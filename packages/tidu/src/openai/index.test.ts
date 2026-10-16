@@ -132,6 +132,7 @@ test("accepts Responses custom tools used by coding-agent clients", () => {
             tools: [{ type: "function", name: "read_file", parameters: {} }],
           },
           { type: "web_search", search_context_size: "medium" },
+          { type: "tool_search" },
         ],
         tool_choice: "auto",
       },

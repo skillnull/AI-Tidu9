@@ -39,6 +39,8 @@ export interface CodexHostInspectionOptions {
   environment?: NodeJS.ProcessEnv;
   /** Maximum duration for the status probe. */
   timeoutMilliseconds?: number;
+  /** Provider forced for delegated app-server requests, without changing the user's configuration. */
+  modelProvider?: string;
 }
 
 export interface CodexHostCommandOptions extends CodexHostInspectionOptions {
@@ -216,7 +218,14 @@ export const createCodexAppServerLaunch = (
   }
   return {
     command: resolveCodexCommand(options),
-    arguments: ["app-server", "--listen", "stdio://"],
+    arguments: [
+      ...(options.modelProvider === undefined
+        ? []
+        : ["-c", `model_provider=${JSON.stringify(options.modelProvider)}`]),
+      "app-server",
+      "--listen",
+      "stdio://",
+    ],
     environment: resolveEnvironment(options),
   };
 };

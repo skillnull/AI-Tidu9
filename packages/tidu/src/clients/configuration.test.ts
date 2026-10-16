@@ -4,18 +4,42 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { TiduError } from "../core/index.js";
 import { startLocalRuntime } from "../runtime/index.js";
 import {
   configureCodexClient,
+  inspectCodexClientConfiguration,
   removeCodexClientConfiguration,
   rollbackCodexClientConfiguration,
+  switchCodexClientConfiguration,
 } from "./configuration.js";
 
-test("writes a dedicated Codex profile and rolls it back without touching default configuration", async () => {
+const writeOfficialModelCache = (codexHomeDirectory: string): void => {
+  writeFileSync(
+    join(codexHomeDirectory, "models_cache.json"),
+    JSON.stringify({
+      models: [
+        {
+          slug: "user-default",
+          display_name: "Official Default",
+          description: "Official Codex model",
+          visibility: "list",
+          supported_in_api: true,
+        },
+      ],
+    }),
+    { mode: 0o600 },
+  );
+};
+
+test("writes an isolated Codex profile and switches back to the official configuration", async () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-config-"));
   const codexHomeDirectory = join(temporaryDirectory, ".codex");
   const defaultConfiguration = join(codexHomeDirectory, "config.toml");
-  const runtime = await startLocalRuntime({ databasePath: ":memory:", port: 0 });
+  const runtime = await startLocalRuntime({
+    databasePath: ":memory:",
+    port: 0,
+  });
 
   try {
     mkdirSync(codexHomeDirectory, { mode: 0o700, recursive: true });
@@ -24,6 +48,7 @@ test("writes a dedicated Codex profile and rolls it back without touching defaul
       flag: "wx",
       mode: 0o600,
     });
+    writeOfficialModelCache(codexHomeDirectory);
     const result = await configureCodexClient({
       endpoint: runtime.origin,
       codexHomeDirectory,
@@ -36,6 +61,45 @@ test("writes a dedicated Codex profile and rolls it back without touching defaul
     assert.match(profile, /model_provider = "ai_tidu9"/u);
     assert.match(profile, new RegExp(`base_url = "${runtime.origin}/v1"`, "u"));
     assert.doesNotMatch(profile, /api[_-]?key|token|secret/iu);
+    const activeDefaultConfiguration = readFileSync(defaultConfiguration, "utf8");
+    assert.equal(activeDefaultConfiguration, 'model = "user-default"\n');
+    const configuredStatus = inspectCodexClientConfiguration({
+      codexHomeDirectory,
+    });
+    assert.equal(configuredStatus.activeMode, "official");
+    const catalog = JSON.parse(
+      readFileSync(join(codexHomeDirectory, ".ai-tidu9-model-catalog.json"), "utf8"),
+    ) as { models: { slug: string }[] };
+    assert.deepEqual(
+      catalog.models.map(({ slug }) => slug),
+      ["user-default", "managed-default"],
+    );
+
+    await switchCodexClientConfiguration({
+      mode: "ai-tidu9",
+      codexHomeDirectory,
+      request: async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/v1/responses") && init?.method === "POST") {
+          return Response.json({
+            id: "verified",
+            object: "response",
+            output: [],
+          });
+        }
+        return fetch(input, init);
+      },
+    });
+    const tiduDefaultConfiguration = readFileSync(defaultConfiguration, "utf8");
+    assert.match(tiduDefaultConfiguration, /model = "user-default"/u);
+    assert.match(tiduDefaultConfiguration, /model_provider = "ai_tidu9"/u);
+    assert.match(tiduDefaultConfiguration, /\[model_providers\.ai_tidu9\]/u);
+
+    await switchCodexClientConfiguration({
+      mode: "official",
+      codexHomeDirectory,
+    });
+    assert.equal(inspectCodexClientConfiguration({ codexHomeDirectory }).activeMode, "official");
     assert.equal(readFileSync(defaultConfiguration, "utf8"), 'model = "user-default"\n');
 
     const rollback = rollbackCodexClientConfiguration({ codexHomeDirectory });
@@ -48,22 +112,73 @@ test("writes a dedicated Codex profile and rolls it back without touching defaul
   }
 });
 
-test("backs up and restores an earlier managed Codex profile", async () => {
+test("does not duplicate an unchanged managed Codex profile", async () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-update-"));
   const codexHomeDirectory = join(temporaryDirectory, ".codex");
-  const runtime = await startLocalRuntime({ databasePath: ":memory:", port: 0 });
+  const runtime = await startLocalRuntime({
+    databasePath: ":memory:",
+    port: 0,
+  });
 
   try {
-    await configureCodexClient({ endpoint: runtime.origin, codexHomeDirectory });
+    const first = await configureCodexClient({
+      endpoint: runtime.origin,
+      codexHomeDirectory,
+    });
     const profilePath = join(codexHomeDirectory, "ai-tidu9.config.toml");
-    const originalProfile = readFileSync(profilePath, "utf8");
-    await configureCodexClient({ endpoint: runtime.origin, codexHomeDirectory });
+    const second = await configureCodexClient({
+      endpoint: runtime.origin,
+      codexHomeDirectory,
+    });
+    assert.equal(second.backupId, first.backupId);
     const rollback = rollbackCodexClientConfiguration({ codexHomeDirectory });
 
     assert.equal(rollback.status, "restored");
-    assert.equal(readFileSync(profilePath, "utf8"), originalProfile);
-    assert.equal(rollbackCodexClientConfiguration({ codexHomeDirectory }).status, "restored");
     assert.equal(existsSync(profilePath), false);
+    assert.equal(existsSync(join(codexHomeDirectory, "config.toml")), false);
+  } finally {
+    await runtime.close();
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
+test("does not shrink the unified catalog when an older Codex cache omits official models", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-catalog-"));
+  const codexHomeDirectory = join(temporaryDirectory, ".codex");
+  const runtime = await startLocalRuntime({ databasePath: ":memory:", port: 0 });
+  try {
+    mkdirSync(codexHomeDirectory, { mode: 0o700, recursive: true });
+    writeFileSync(
+      join(codexHomeDirectory, "models_cache.json"),
+      JSON.stringify({
+        models: [
+          {
+            slug: "official-current",
+            display_name: "Official Current",
+            visibility: "list",
+            supported_in_api: true,
+          },
+          {
+            slug: "official-newer",
+            display_name: "Official Newer",
+            visibility: "list",
+            supported_in_api: true,
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+    await configureCodexClient({ endpoint: runtime.origin, codexHomeDirectory });
+    writeOfficialModelCache(codexHomeDirectory);
+    await configureCodexClient({ endpoint: runtime.origin, codexHomeDirectory });
+
+    const catalog = JSON.parse(
+      readFileSync(join(codexHomeDirectory, ".ai-tidu9-model-catalog.json"), "utf8"),
+    ) as { models: { slug: string }[] };
+    assert.deepEqual(
+      catalog.models.map(({ slug }) => slug),
+      ["official-current", "official-newer", "user-default", "managed-default"],
+    );
   } finally {
     await runtime.close();
     rmSync(temporaryDirectory, { force: true, recursive: true });
@@ -74,19 +189,34 @@ test("removes only AI-Tidu9-owned Codex profile artifacts", async () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-remove-"));
   const codexHomeDirectory = join(temporaryDirectory, ".codex");
   const unrelatedFile = join(codexHomeDirectory, "config.toml");
-  const runtime = await startLocalRuntime({ databasePath: ":memory:", port: 0 });
+  const runtime = await startLocalRuntime({
+    databasePath: ":memory:",
+    port: 0,
+  });
 
   try {
     mkdirSync(codexHomeDirectory, { mode: 0o700, recursive: true });
     writeFileSync(unrelatedFile, "preserve = true\n", { mode: 0o600 });
-    await configureCodexClient({ endpoint: runtime.origin, codexHomeDirectory });
+    await configureCodexClient({
+      endpoint: runtime.origin,
+      codexHomeDirectory,
+    });
+    assert.match(readFileSync(unrelatedFile, "utf8"), /preserve = true/u);
+    writeFileSync(
+      unrelatedFile,
+      `${readFileSync(unrelatedFile, "utf8")}\n[notice]\nkeep = true\n`,
+      { mode: 0o600 },
+    );
     const result = removeCodexClientConfiguration({ codexHomeDirectory });
     assert.equal(result.status, "removed");
     assert.equal(result.removedArtifactCount, 4);
     assert.equal(existsSync(join(codexHomeDirectory, "ai-tidu9.config.toml")), false);
     assert.equal(existsSync(join(codexHomeDirectory, ".ai-tidu9-profile-state.json")), false);
     assert.equal(existsSync(join(codexHomeDirectory, ".ai-tidu9-backups")), false);
-    assert.equal(readFileSync(unrelatedFile, "utf8"), "preserve = true\n");
+    const restoredConfiguration = readFileSync(unrelatedFile, "utf8");
+    assert.match(restoredConfiguration, /preserve = true/u);
+    assert.match(restoredConfiguration, /\[notice\]\nkeep = true/u);
+    assert.doesNotMatch(restoredConfiguration, /ai_tidu9/u);
     assert.equal(removeCodexClientConfiguration({ codexHomeDirectory }).status, "missing");
   } finally {
     await runtime.close();
@@ -119,7 +249,7 @@ test("automatically rolls back when post-write connectivity verification fails",
         codexHomeDirectory,
         request,
       }),
-      /Cannot reach the AI-Tidu9 runtime/u,
+      /configured AI-Tidu9 service cannot be reached/u,
     );
     assert.equal(existsSync(join(codexHomeDirectory, "ai-tidu9.config.toml")), false);
     assert.equal(existsSync(join(codexHomeDirectory, ".ai-tidu9-profile-state.json")), false);
@@ -129,10 +259,129 @@ test("automatically rolls back when post-write connectivity verification fails",
   }
 });
 
+test("keeps the official configuration active when inference verification fails", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-probe-failure-"));
+  const codexHomeDirectory = join(temporaryDirectory, ".codex");
+  const defaultConfiguration = join(codexHomeDirectory, "config.toml");
+  try {
+    mkdirSync(codexHomeDirectory, { mode: 0o700, recursive: true });
+    writeFileSync(defaultConfiguration, 'model = "official-model"\n', {
+      mode: 0o600,
+    });
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory,
+      verifyRuntime: false,
+    });
+    const request: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.endsWith("/health")) {
+        return Response.json({ product: "九门赛博提督", status: "ok" });
+      }
+      if (url.endsWith("/v1/models")) {
+        return Response.json({
+          object: "list",
+          data: [{ id: "managed-default", owned_by: "AI-Tidu9" }],
+        });
+      }
+      return Response.json(
+        {
+          error: {
+            message: "tools contains unsupported definitions: tool_search.",
+          },
+        },
+        { status: 400 },
+      );
+    };
+
+    await assert.rejects(
+      switchCodexClientConfiguration({
+        mode: "ai-tidu9",
+        codexHomeDirectory,
+        request,
+      }),
+      (error: unknown) => {
+        assert.equal(error instanceof TiduError, true);
+        if (!(error instanceof TiduError)) return false;
+        assert.equal(error.details.failureSource, "ai-tidu9");
+        assert.equal(error.details.reasonCode, "tidu_inference_failed");
+        assert.match(String(error.details.reason), /tool_search/u);
+        assert.equal(Array.isArray(error.details.nextSteps), true);
+        return true;
+      },
+    );
+    assert.equal(readFileSync(defaultConfiguration, "utf8"), 'model = "official-model"\n');
+    assert.equal(inspectCodexClientConfiguration({ codexHomeDirectory }).activeMode, "official");
+  } finally {
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
+test("attributes an official Codex inference failure and keeps official mode active", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-official-failure-"));
+  const codexHomeDirectory = join(temporaryDirectory, ".codex");
+  const defaultConfiguration = join(codexHomeDirectory, "config.toml");
+  try {
+    mkdirSync(codexHomeDirectory, { mode: 0o700, recursive: true });
+    writeFileSync(defaultConfiguration, 'model = "official-model"\n', { mode: 0o600 });
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory,
+      verifyRuntime: false,
+    });
+    const request: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.endsWith("/health")) {
+        return Response.json({ product: "九门赛博提督", status: "ok" });
+      }
+      if (url.endsWith("/v1/models")) {
+        return Response.json({
+          object: "list",
+          data: [{ id: "managed-default", owned_by: "AI-Tidu9" }],
+        });
+      }
+      return Response.json(
+        {
+          error: {
+            code: "provider_request_failed",
+            failure_source: "official-codex",
+            message: "Failure source: Official Codex. Reason: official session expired.",
+            next_steps: ["Run 'codex login status'."],
+          },
+        },
+        { status: 502 },
+      );
+    };
+
+    await assert.rejects(
+      switchCodexClientConfiguration({
+        mode: "ai-tidu9",
+        codexHomeDirectory,
+        request,
+      }),
+      (error: unknown) => {
+        assert.equal(error instanceof TiduError, true);
+        if (!(error instanceof TiduError)) return false;
+        assert.equal(error.details.failureSource, "official-codex");
+        assert.equal(error.details.reasonCode, "provider_request_failed");
+        assert.deepEqual(error.details.nextSteps, ["Run 'codex login status'."]);
+        return true;
+      },
+    );
+    assert.equal(readFileSync(defaultConfiguration, "utf8"), 'model = "official-model"\n');
+    assert.equal(inspectCodexClientConfiguration({ codexHomeDirectory }).activeMode, "official");
+  } finally {
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
 test("refuses to overwrite an unmanaged dedicated profile", async () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-conflict-"));
   const codexHomeDirectory = join(temporaryDirectory, ".codex");
-  const runtime = await startLocalRuntime({ databasePath: ":memory:", port: 0 });
+  const runtime = await startLocalRuntime({
+    databasePath: ":memory:",
+    port: 0,
+  });
 
   try {
     mkdirSync(codexHomeDirectory, { mode: 0o700, recursive: true });

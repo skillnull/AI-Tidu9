@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { realpathSync } from "node:fs";
-import { isAbsolute, join, relative } from "node:path";
+import { readFileSync, realpathSync } from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 import {
@@ -18,12 +18,19 @@ import {
   switchCursorHostAccount,
 } from "../accounts/cursor-host.js";
 import {
+  createTiduChannelGateway,
+  TIDU_CHANNEL_IDS,
+  type TiduChannelId,
+} from "../channels/index.js";
+import {
   configureCodexClient,
   removeCodexClientConfiguration,
   rollbackCodexClientConfiguration,
+  switchCodexClientConfiguration,
 } from "../clients/configuration.js";
 import { discoverLocalClients, formatLocalClientDiscovery } from "../clients/index.js";
 import type { ConfigurationMode } from "../config/index.js";
+import { detectRunningHosts, restartDetectedHosts } from "../connectors/host-restart.js";
 import { startTiduMcpServer } from "../connectors/mcp-server.js";
 import {
   type ConnectorSetupAction,
@@ -59,6 +66,7 @@ Commands / 命令:
   tidu mcp          Run the MCP connector / 运行MCP连接器
   tidu doctor       Diagnose the service / 诊断服务
   tidu clients      Discover or configure clients / 发现或配置客户端
+  tidu channel      List or run model channels / 查看或调用模型通道
   tidu account      Inspect or change host login / 检查或切换宿主账号
   tidu config       View or edit configuration / 查看或编辑配置
   tidu uninstall    Archive or remove AI-Tidu9 / 归档或卸载九门赛博提督
@@ -111,6 +119,7 @@ Options / 选项:
 Usage / 用法:
   tidu clients
   tidu clients connect codex [--yes] [--endpoint <url>]
+  tidu clients switch codex <official|ai-tidu9> [--yes] [--endpoint <url>]
   tidu clients rollback codex [--yes]
 
 Discovery checks presence only and never reads credential contents.
@@ -121,7 +130,7 @@ Usage / 用法:
   tidu clients connect codex [--yes] [--endpoint <url>]
 
 Creates and verifies only the dedicated ai-tidu9 Codex profile, with a private rollback snapshot.
-仅创建并验证九门专属Codex Profile，同时保留私有回滚快照。`,
+创建并验证包含官方模型与九门模型的统一 Codex 模型目录，同时保留私有回滚快照。`,
   "clients rollback": `Clients rollback / 回滚客户端配置
 
 Usage / 用法:
@@ -129,6 +138,31 @@ Usage / 用法:
 
 Restores the latest AI-Tidu9-owned Codex profile snapshot.
 恢复最近一次由九门管理的Codex Profile快照。`,
+  channel: `Channel / 模型通道
+
+Usage / 用法:
+  tidu channel list [--json] [--endpoint <url>]
+  tidu channel run <channel> (--input <text> | --input-file <path>) [--model <id>] [--json] [--endpoint <url>]
+
+Channels / 通道:
+  tidu, codex, cursor, openai, deepseek, qwen, glm, kimi, doubao, hunyuan, custom
+
+CI should inject provider credentials through environment variables and use --json.
+CI应通过环境变量注入厂商凭据，并使用--json输出。`,
+  "channel list": `Channel list / 通道列表
+
+Usage / 用法:
+  tidu channel list [--json] [--endpoint <url>]
+
+Lists readiness without printing credentials, private endpoints, or account content.
+列出通道就绪状态，不输出凭据、私有端点或账号正文。`,
+  "channel run": `Channel run / 调用通道
+
+Usage / 用法:
+  tidu channel run <channel> (--input <text> | --input-file <path>) [--model <id>] [--json] [--endpoint <url>]
+
+Use tidu for the virtual channel, codex/cursor for official host delegation, or a provider ID for direct API access.
+tidu走九门虚拟通道；codex/cursor委托官方宿主；厂商ID走对应API直连。`,
   config: `Config / 配置
 
 Usage / 用法:
@@ -197,14 +231,17 @@ Restores the latest recoverable personal-data snapshot without overwriting an ex
   setup: `Setup / 客户端安装
 
 Usage / 用法:
-  tidu setup [install|verify|repair|update|uninstall] [--endpoint <url>]
+  tidu setup [install|verify|repair|update|uninstall] [--endpoint <url>] [--restart|--no-restart]
 
 Actions / 动作:
   install     Install connectors and virtual model; default / 安装连接器与虚拟模型，默认动作
   verify      Verify without changes / 只验证，不修改
   repair      Recreate owned registrations / 重建九门自有注册
   update      Refresh launch metadata / 更新启动信息
-  uninstall   Remove connectors and managed virtual model / 移除连接器与九门虚拟模型`,
+  uninstall   Remove connectors and managed virtual model / 移除连接器与九门虚拟模型
+
+The default setup preserves official Codex defaults, installs an isolated ai-tidu9 profile, then offers to restart running hosts for MCP discovery.
+默认setup会保留官方Codex配置，安装隔离的九门Profile，并询问是否重启宿主以加载MCP。`,
   start: `Start / 启动
 
 Usage / 用法:
@@ -315,6 +352,55 @@ const runDoctor = async (argumentsList: readonly string[]): Promise<string> => {
     ? style("All management checks passed.", "green")
     : style("Some checks failed. The active runtime configuration was not changed.", "yellow");
   return [`Endpoint: ${report.endpoint}`, ...lines, summary].join("\n");
+};
+
+const readChannelInput = (argumentsList: readonly string[]): string => {
+  const inlineInput = readOption(argumentsList, "--input");
+  const inputFile = readOption(argumentsList, "--input-file");
+  if (inlineInput !== undefined && inputFile !== undefined) {
+    throw new TiduError("CONFIGURATION_INVALID", "Use exactly one of --input or --input-file.");
+  }
+  const input =
+    inlineInput ?? (inputFile === undefined ? undefined : readFileSync(resolve(inputFile), "utf8"));
+  if (input === undefined || input.trim() === "" || input.length > 100_000) {
+    throw new TiduError("CONFIGURATION_INVALID", "Channel input must contain 1-100000 characters.");
+  }
+  return input;
+};
+
+const runChannel = async (argumentsList: readonly string[]): Promise<string> => {
+  const action = argumentsList[1] ?? "list";
+  const gateway = createTiduChannelGateway({ endpoint: resolveEndpoint(argumentsList) });
+  if (action === "list") {
+    const channels = await gateway.list();
+    if (argumentsList.includes("--json")) {
+      return JSON.stringify({ channels }, null, 2);
+    }
+    return channels
+      .map(
+        (channel) =>
+          `${channel.available ? style("✓", "green") : style("○", "yellow")} ${channel.id} [${channel.kind}]${channel.model === null ? "" : ` · ${channel.model}`}: ${channel.detail}`,
+      )
+      .join("\n");
+  }
+  if (action !== "run") {
+    throw new TiduError("UNSUPPORTED_COMMAND", `Unknown channel action: ${action}`);
+  }
+  const channel = argumentsList[2];
+  if (channel === undefined || !TIDU_CHANNEL_IDS.includes(channel as TiduChannelId)) {
+    throw new TiduError(
+      "CONFIGURATION_INVALID",
+      `Channel must be one of: ${TIDU_CHANNEL_IDS.join(", ")}.`,
+    );
+  }
+  const result = await gateway.run({
+    channel: channel as TiduChannelId,
+    input: readChannelInput(argumentsList),
+    ...(readOption(argumentsList, "--model") === undefined
+      ? {}
+      : { model: readOption(argumentsList, "--model") }),
+  });
+  return argumentsList.includes("--json") ? JSON.stringify(result, null, 2) : result.text;
 };
 
 const runInteractiveConfiguration = async (endpoint: string): Promise<string> => {
@@ -449,6 +535,16 @@ const confirmLifecycleAction = async (
   }
 };
 
+const confirmDefaultAction = async (question: string): Promise<boolean> => {
+  const readline = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await readline.question(question)).trim().toLowerCase();
+    return answer === "" || answer === "y" || answer === "yes";
+  } finally {
+    readline.close();
+  }
+};
+
 const runClientConfiguration = async (argumentsList: readonly string[]): Promise<string> => {
   const action = argumentsList[1];
   const client = argumentsList[2];
@@ -491,6 +587,25 @@ const runClientConfiguration = async (argumentsList: readonly string[]): Promise
     return result.status === "missing"
       ? `${style("✓", "green")} No Codex profile snapshot was found.`
       : `${style("✓", "green")} Codex profile '${result.profile}' restored from ${result.backupId}.`;
+  }
+  if (action === "switch") {
+    const mode = argumentsList[3];
+    if (mode !== "official" && mode !== "ai-tidu9") {
+      throw new TiduError(
+        "CONFIGURATION_INVALID",
+        "clients switch codex requires official or ai-tidu9.",
+      );
+    }
+    const confirmed =
+      argumentsList.includes("--yes") ||
+      (await confirmLifecycleAction(`Switch Codex configuration to '${mode}'? [y/N]: `, "y"));
+    if (!confirmed) {
+      return `${style("Cancelled.", "yellow")} No client configuration was changed.`;
+    }
+    const result = await switchCodexClientConfiguration({ mode });
+    return result.activeMode === "official"
+      ? `${style("✓", "green")} Official Codex configuration restored.`
+      : `${style("✓", "green")} AI-Tidu9 inference verified and Codex configuration switched.`;
   }
   throw new TiduError("UNSUPPORTED_COMMAND", `Unknown clients action: ${String(action)}`);
 };
@@ -539,7 +654,81 @@ const runSetup = async (argumentsList: readonly string[]): Promise<string> => {
       `Client setup failed and was rolled back.\n${formatConnectorSetupReport(report)}`,
     );
   }
-  return formatConnectorSetupReport(report);
+  const codexReady = report.connectors.some(
+    (connector) => connector.id === "codex" && connector.status !== "unavailable",
+  );
+  let profileSummary = "Codex AI-Tidu9 configuration: skipped because Codex is not installed.";
+  if (codexReady) {
+    try {
+      const configured = await configureCodexClient({ endpoint, verifyRuntime: false });
+      profileSummary = `Codex AI-Tidu9 configuration prepared: ${configured.profile}; Official mode remains active.`;
+    } catch (error) {
+      setupConnectors({ action: "uninstall", endpoint });
+      throw error;
+    }
+  }
+
+  const runningHosts = detectRunningHosts();
+  let restartRequested = argumentsList.includes("--restart") || argumentsList.includes("--yes");
+  if (
+    runningHosts.length > 0 &&
+    !restartRequested &&
+    !argumentsList.includes("--no-restart") &&
+    process.stdin.isTTY &&
+    process.stdout.isTTY
+  ) {
+    restartRequested = await confirmDefaultAction(
+      `Restart ${runningHosts.join(" and ")} now to activate AI-Tidu9? [Y/n]: `,
+    );
+  }
+  const restartResults = restartRequested ? restartDetectedHosts(runningHosts) : [];
+  const restartSummary =
+    runningHosts.length === 0
+      ? "Host restart: no running desktop host detected."
+      : restartRequested
+        ? restartResults.map((result) => result.detail).join("\n")
+        : "Host restart: pending; restart the detected host to activate AI-Tidu9.";
+  return [formatConnectorSetupReport(report), profileSummary, restartSummary].join("\n");
+};
+
+const endpointIsHealthy = async (endpoint: string): Promise<boolean> => {
+  try {
+    const response = await fetch(`${endpoint}/health`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(750),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+};
+
+const ensureMcpRuntime = async (
+  endpoint: string,
+): Promise<{ close: () => Promise<void> } | undefined> => {
+  const endpointUrl = new URL(endpoint);
+  if (!["127.0.0.1", "::1", "localhost"].includes(endpointUrl.hostname)) {
+    return undefined;
+  }
+  if (await endpointIsHealthy(endpoint)) {
+    return undefined;
+  }
+  const { startLocalRuntime } = await import("../runtime/index.js");
+  try {
+    return await startLocalRuntime({
+      host: endpointUrl.hostname,
+      port: Number(endpointUrl.port || 9639),
+      databasePath: process.env.TIDU_DATABASE_PATH,
+    });
+  } catch (error) {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+      if (await endpointIsHealthy(endpoint)) {
+        return undefined;
+      }
+    }
+    throw error;
+  }
 };
 
 const runAccount = async (argumentsList: readonly string[]): Promise<string> => {
@@ -741,13 +930,16 @@ if (isDirectExecution) {
         host: process.env.TIDU_HOST,
         port,
       });
-      process.stdout.write(
-        `${PRODUCT.explanation}\nRunning at ${runtime.origin}\nConfiguration center: ${runtime.origin}\n`,
-      );
+      const silentDevelopmentRuntime = process.env.TIDU_DEV_SILENT === "1";
+      if (!silentDevelopmentRuntime) {
+        process.stdout.write(
+          `${PRODUCT.explanation}\nRunning at ${runtime.origin}\nConfiguration center: ${runtime.origin}\n`,
+        );
+      }
 
       if (argumentsList.includes("--cli")) {
         process.stdout.write(`${await runInteractiveConfiguration(runtime.origin)}\n`);
-      } else {
+      } else if (!silentDevelopmentRuntime) {
         process.stdout.write(
           "Guided setup: open the configuration center. Terminal setup: tidu start --cli\n",
         );
@@ -765,8 +957,14 @@ if (isDirectExecution) {
       process.once("SIGINT", stopRuntime);
       process.once("SIGTERM", stopRuntime);
     } else if (argumentsList[0] === "mcp") {
-      const server = startTiduMcpServer({ endpoint: resolveEndpoint(argumentsList) });
-      await server.completed;
+      const endpoint = resolveEndpoint(argumentsList);
+      const ownedRuntime = await ensureMcpRuntime(endpoint);
+      const server = startTiduMcpServer({ endpoint });
+      try {
+        await server.completed;
+      } finally {
+        await ownedRuntime?.close();
+      }
     } else if (argumentsList[0] === "enterprise" && argumentsList[1] === "recover-admin") {
       const reasonIndex = argumentsList.indexOf("--reason");
       const reason = reasonIndex === -1 ? undefined : argumentsList[reasonIndex + 1];
@@ -803,6 +1001,8 @@ if (isDirectExecution) {
       if (output.includes("Some checks failed.")) {
         process.exitCode = 1;
       }
+    } else if (argumentsList[0] === "channel") {
+      process.stdout.write(`${await runChannel(argumentsList)}\n`);
     } else if (argumentsList[0] === "clients" && argumentsList[1] !== undefined) {
       process.stdout.write(`${await runClientConfiguration(argumentsList)}\n`);
     } else if (argumentsList[0] === "account") {

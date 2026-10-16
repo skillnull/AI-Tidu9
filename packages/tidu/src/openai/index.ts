@@ -27,6 +27,12 @@ export interface OpenAiErrorBody {
     code: string;
     /** Human-readable error without request content or secrets. */
     message: string;
+    /** Component responsible for a routed inference failure. */
+    failure_source?: "ai-tidu9" | "official-codex";
+    /** Concise underlying failure reason without recovery instructions. */
+    reason?: string;
+    /** Ordered recovery actions safe to show to the user. */
+    next_steps?: readonly string[];
     /** Request field responsible for the failure when applicable. */
     param: string | null;
     /** Broad OpenAI-compatible error category. */
@@ -49,7 +55,8 @@ export const createOpenAiError = (
   message: string,
   type: OpenAiErrorBody["error"]["type"],
   param: string | null = null,
-): OpenAiErrorBody => ({ error: { code, message, param, type } });
+  diagnostic?: Pick<OpenAiErrorBody["error"], "failure_source" | "next_steps" | "reason">,
+): OpenAiErrorBody => ({ error: { code, message, param, type, ...diagnostic } });
 
 export const createOpenAiModel = (
   configuration: TiduConfiguration,
@@ -113,6 +120,9 @@ const isResponsesTool = (value: unknown, depth = 0): boolean => {
         value.search_context_size === "high") &&
       (value.user_location === undefined || isRecord(value.user_location))
     );
+  }
+  if (value.type === "tool_search") {
+    return true;
   }
   if (!isFunctionName(value.name)) {
     return false;

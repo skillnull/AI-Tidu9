@@ -15,6 +15,12 @@ import {
 } from "../agent/index.js";
 import { createModelProviderAgentAdapters } from "../agent/model-provider.js";
 import {
+  configureCodexClient,
+  inspectCodexClientConfiguration,
+  removeCodexClientConfiguration,
+  switchCodexClientConfiguration,
+} from "../clients/configuration.js";
+import {
   CONFIG_SCHEMA_VERSION,
   type ConfigurationMode,
   type TiduConfiguration,
@@ -29,6 +35,7 @@ import { acquireRuntimeDataLock } from "../lifecycle/index.js";
 import {
   createOpenAiError,
   createOpenAiModel,
+  type OpenAiErrorBody,
   type OpenAiRequestValidation,
   validateChatCompletionRequest,
   validateResponsesRequest,
@@ -238,6 +245,46 @@ const sendOpenAiValidation = (
   return true;
 };
 
+const providerFailureSource = (provider: ModelProvider): "ai-tidu9" | "official-codex" =>
+  provider.descriptor.type === "codex-host" ? "official-codex" : "ai-tidu9";
+
+const providerRecoverySteps = (failureSource: "ai-tidu9" | "official-codex"): readonly string[] =>
+  failureSource === "official-codex"
+    ? [
+        "Run 'codex login status' and sign in again if the official session is unavailable.",
+        "Switch to an official model and verify that official Codex inference succeeds.",
+        "Retry AI-Tidu9 after official Codex access is restored.",
+      ]
+    : [
+        "Check the AI-Tidu9 /health endpoint and confirm the configured local or remote service is reachable.",
+        "Check the AI-Tidu9 provider configuration and upstream model compatibility.",
+        "Update the AI-Tidu9 Codex configuration, retry, or switch to Official mode.",
+      ];
+
+const createProviderFailure = (
+  provider: ModelProvider,
+  reason: string,
+  code = "provider_request_failed",
+): OpenAiErrorBody => {
+  const failureSource = providerFailureSource(provider);
+  const sourceLabel = failureSource === "official-codex" ? "Official Codex" : "AI-Tidu9";
+  const nextSteps = providerRecoverySteps(failureSource);
+  return createOpenAiError(
+    code,
+    `Failure source: ${sourceLabel}. Reason: ${reason} Next steps: ${nextSteps.join(" ")}`,
+    "server_error",
+    null,
+    { failure_source: failureSource, next_steps: nextSteps, reason },
+  );
+};
+
+const providerResponseFailureReason = (body: unknown, statusCode: number): string => {
+  if (isRecord(body) && isRecord(body.error) && typeof body.error.message === "string") {
+    return body.error.message.slice(0, 240);
+  }
+  return `The configured upstream returned HTTP ${statusCode}.`;
+};
+
 const handleOpenAiInference = async (
   request: import("node:http").IncomingMessage,
   response: import("node:http").ServerResponse,
@@ -261,10 +308,12 @@ const handleOpenAiInference = async (
   }
   const workspace = await storage.configurationStore.loadWorkspace();
   const activeModelId = workspace.active.configuration.activeProfileId;
+  const requestedModelId =
+    isRecord(body) && typeof body.model === "string" ? body.model : activeModelId;
   const validation =
     protocol === "chat-completions"
-      ? validateChatCompletionRequest(body, activeModelId)
-      : validateResponsesRequest(body, activeModelId);
+      ? validateChatCompletionRequest(body, requestedModelId)
+      : validateResponsesRequest(body, requestedModelId);
   if (sendOpenAiValidation(response, validation, requestId)) {
     return;
   }
@@ -282,21 +331,29 @@ const handleOpenAiInference = async (
       });
       if (result.kind === "stream") {
         await sendOpenAiStream(response, result.statusCode, result.stream, requestId);
-      } else {
-        sendOpenAiJson(response, result.statusCode, result.body, requestId);
-      }
-    } catch {
-      if (!response.headersSent) {
+      } else if (result.statusCode >= 400) {
         sendOpenAiJson(
           response,
-          502,
-          createOpenAiError(
-            "provider_request_failed",
-            "The configured provider could not complete the request.",
-            "server_error",
+          result.statusCode,
+          createProviderFailure(
+            provider,
+            providerResponseFailureReason(result.body, result.statusCode),
+            "upstream_request_failed",
           ),
           requestId,
         );
+      } else {
+        sendOpenAiJson(response, result.statusCode, result.body, requestId);
+      }
+    } catch (error) {
+      if (!response.headersSent) {
+        const providerMessage = error instanceof Error ? error.message.trim() : "";
+        const reason = providerMessage.includes("tool_search")
+          ? "The active upstream model does not support Codex tool_search definitions. Switch back to the official Codex configuration or select a compatible upstream model."
+          : providerMessage === ""
+            ? "The configured provider could not complete the request."
+            : `The configured provider could not complete the request: ${providerMessage.slice(0, 240)}`;
+        sendOpenAiJson(response, 502, createProviderFailure(provider, reason), requestId);
       } else if (!response.writableEnded) {
         response.end();
       }
@@ -311,8 +368,18 @@ const handleOpenAiInference = async (
     503,
     createOpenAiError(
       "model_provider_not_configured",
-      "The virtual model is available, but no model provider is configured yet.",
+      "Failure source: AI-Tidu9. Reason: no upstream model provider is configured. Next steps: Configure an AI-Tidu9 provider or restore an available host provider. Update the AI-Tidu9 Codex configuration and retry. Switch to Official mode if AI-Tidu9 is not required.",
       "server_error",
+      null,
+      {
+        failure_source: "ai-tidu9",
+        reason: "No upstream model provider is configured.",
+        next_steps: [
+          "Configure an AI-Tidu9 provider or restore an available host provider.",
+          "Update the AI-Tidu9 Codex configuration and retry.",
+          "Switch to Official mode if AI-Tidu9 is not required.",
+        ],
+      },
     ),
     requestId,
   );
@@ -526,6 +593,26 @@ const handleConfigurationMutationError = (
     });
     return;
   }
+  if (
+    error instanceof TiduError &&
+    error.code === "INTERNAL_ERROR" &&
+    (error.details.failureSource === "official-codex" || error.details.failureSource === "ai-tidu9")
+  ) {
+    const failureSource = error.details.failureSource;
+    const nextSteps = Array.isArray(error.details.nextSteps)
+      ? error.details.nextSteps.filter((step): step is string => typeof step === "string")
+      : [];
+    sendJson(response, 503, {
+      error: error.code,
+      failureSource,
+      message: error.message,
+      nextSteps,
+      reason: typeof error.details.reason === "string" ? error.details.reason : error.message,
+      reasonCode:
+        typeof error.details.reasonCode === "string" ? error.details.reasonCode : "unknown_failure",
+    });
+    return;
+  }
   throw error;
 };
 
@@ -611,7 +698,9 @@ const handleRequest = async (
 
   if (request.method === "GET" && pathname === "/api/scaling") {
     if (scaling === undefined) {
-      sendJson(response, 404, { error: "SCALING_CONTROL_PLANE_NOT_CONFIGURED" });
+      sendJson(response, 404, {
+        error: "SCALING_CONTROL_PLANE_NOT_CONFIGURED",
+      });
       return;
     }
     const metrics = scaling.metrics();
@@ -625,7 +714,9 @@ const handleRequest = async (
   if (request.method === "POST" && pathname === "/api/scaling/tasks") {
     validateMutationRequest(request);
     if (scaling === undefined) {
-      sendJson(response, 404, { error: "SCALING_CONTROL_PLANE_NOT_CONFIGURED" });
+      sendJson(response, 404, {
+        error: "SCALING_CONTROL_PLANE_NOT_CONFIGURED",
+      });
       return;
     }
     try {
@@ -676,11 +767,13 @@ const handleRequest = async (
       sendJson(response, 403, { error: "PERSONAL_EDITION_ONLY" });
       return;
     }
-    const codex = await inspectCodexHostAccountReport().catch(() => null);
     const cursor = inspectCursorHostLogin();
-    const cursorProvider = cursor.reusable
-      ? await createCursorHostModelProvider().catch(() => undefined)
-      : undefined;
+    const [codex, cursorProvider] = await Promise.all([
+      inspectCodexHostAccountReport().catch(() => null),
+      cursor.reusable
+        ? createCursorHostModelProvider().catch(() => undefined)
+        : Promise.resolve(undefined),
+    ]);
     sendJson(response, 200, {
       activeProvider: provider?.descriptor ?? null,
       codex,
@@ -724,6 +817,10 @@ const handleRequest = async (
   }
 
   if (request.method === "POST" && pathname === "/api/clients/codex/connect") {
+    if (deployment !== "personal") {
+      sendJson(response, 403, { error: "PERSONAL_EDITION_ONLY" });
+      return;
+    }
     try {
       validateMutationRequest(request);
       await readJsonBody(request);
@@ -734,11 +831,29 @@ const handleRequest = async (
           : configuredHost;
       const addressHost = clientHost.includes(":") ? `[${clientHost}]` : clientHost;
       const endpoint = `http://${addressHost}:${runtimeNetwork.port}`;
-      const report = setupConnectors({ action: "install", endpoint, targets: ["codex"] });
+      const report = setupConnectors({
+        action: "install",
+        endpoint,
+        targets: ["codex"],
+        cliEntry: process.env.TIDU_CONNECTOR_CLI_ENTRY,
+      });
       const codex = report.connectors[0];
+      if (!report.healthy) {
+        sendJson(response, 409, {
+          connected: false,
+          message: codex?.detail ?? "Codex connector registration failed.",
+        });
+        return;
+      }
+      const configured = await configureCodexClient({
+        endpoint,
+        verifyRuntime: false,
+      });
       sendJson(response, report.healthy ? 200 : 409, {
-        connected: report.healthy,
-        message: codex?.detail ?? "Codex connector registration did not return a result.",
+        connected: true,
+        profile: configured.profile,
+        model: configured.model,
+        activeMode: configured.activeMode,
       });
     } catch (error) {
       if (error instanceof TiduError) {
@@ -749,6 +864,74 @@ const handleRequest = async (
           message: error instanceof Error ? error.message : "Codex client configuration failed.",
         });
       }
+    }
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/api/clients/codex/configuration") {
+    sendJson(response, 200, inspectCodexClientConfiguration());
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/clients/codex/configuration") {
+    if (deployment !== "personal") {
+      sendJson(response, 403, { error: "PERSONAL_EDITION_ONLY" });
+      return;
+    }
+    try {
+      validateMutationRequest(request);
+      const body = await readJsonBody(request);
+      const mode = isRecord(body) ? body.mode : undefined;
+      if (mode !== "official" && mode !== "ai-tidu9") {
+        throw new TiduError(
+          "CONFIGURATION_INVALID",
+          "Codex configuration mode must be official or ai-tidu9.",
+        );
+      }
+      if (mode === "ai-tidu9") {
+        const configuredHost = runtimeNetwork.host;
+        const clientHost =
+          configuredHost === "0.0.0.0" || configuredHost === "::"
+            ? DEFAULT_RUNTIME_HOST
+            : configuredHost;
+        const addressHost = clientHost.includes(":") ? `[${clientHost}]` : clientHost;
+        await configureCodexClient({
+          endpoint: `http://${addressHost}:${runtimeNetwork.port}`,
+        });
+      }
+      sendJson(response, 200, await switchCodexClientConfiguration({ mode }));
+    } catch (error) {
+      handleConfigurationMutationError(response, error);
+    }
+    return;
+  }
+
+  if (request.method === "DELETE" && pathname === "/api/clients/codex/configuration") {
+    if (deployment !== "personal") {
+      sendJson(response, 403, { error: "PERSONAL_EDITION_ONLY" });
+      return;
+    }
+    try {
+      validateMutationRequest(request);
+      await readJsonBody(request);
+      const configuredHost = runtimeNetwork.host;
+      const clientHost =
+        configuredHost === "0.0.0.0" || configuredHost === "::"
+          ? DEFAULT_RUNTIME_HOST
+          : configuredHost;
+      const addressHost = clientHost.includes(":") ? `[${clientHost}]` : clientHost;
+      setupConnectors({
+        action: "uninstall",
+        endpoint: `http://${addressHost}:${runtimeNetwork.port}`,
+        targets: ["codex"],
+        cliEntry: process.env.TIDU_CONNECTOR_CLI_ENTRY,
+      });
+      sendJson(response, 200, {
+        ...removeCodexClientConfiguration(),
+        configuration: inspectCodexClientConfiguration(),
+      });
+    } catch (error) {
+      handleConfigurationMutationError(response, error);
     }
     return;
   }
@@ -768,7 +951,10 @@ const handleRequest = async (
         selected !== "ollama" &&
         selected !== "openai-compatible"
       ) {
-        sendJson(response, 422, { detected: false, reason: "unknown-provider" });
+        sendJson(response, 422, {
+          detected: false,
+          reason: "unknown-provider",
+        });
         return;
       }
 
@@ -952,7 +1138,9 @@ const handleRequest = async (
 
   if (request.method === "GET" && pathname === "/api/enterprise") {
     if (enterprise === undefined) {
-      sendJson(response, 404, { error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED" });
+      sendJson(response, 404, {
+        error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED",
+      });
       return;
     }
     const state = await enterprise.snapshot();
@@ -974,7 +1162,9 @@ const handleRequest = async (
       return;
     }
     if (enterprise === undefined) {
-      sendJson(response, 404, { error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED" });
+      sendJson(response, 404, {
+        error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED",
+      });
       return;
     }
     const sessionId = request.headers["x-tidu-admin-session"];
@@ -1040,7 +1230,9 @@ const handleRequest = async (
       return;
     }
     if (enterprise === undefined) {
-      sendJson(response, 404, { error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED" });
+      sendJson(response, 404, {
+        error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED",
+      });
       return;
     }
     let generated: Awaited<ReturnType<EnterpriseControlPlane["initializeAdministratorKey"]>>;
@@ -1048,7 +1240,9 @@ const handleRequest = async (
       generated = await enterprise.initializeAdministratorKey();
     } catch (error) {
       if (error instanceof Error && error.message.includes("already initialized")) {
-        sendJson(response, 409, { error: "ADMINISTRATOR_KEY_ALREADY_INITIALIZED" });
+        sendJson(response, 409, {
+          error: "ADMINISTRATOR_KEY_ALREADY_INITIALIZED",
+        });
         return;
       }
       throw error;
@@ -1068,7 +1262,9 @@ const handleRequest = async (
       return;
     }
     if (enterprise === undefined) {
-      sendJson(response, 404, { error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED" });
+      sendJson(response, 404, {
+        error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED",
+      });
       return;
     }
     const body = await readJsonBody(request);
@@ -1091,7 +1287,9 @@ const handleRequest = async (
       return;
     }
     if (enterprise === undefined) {
-      sendJson(response, 404, { error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED" });
+      sendJson(response, 404, {
+        error: "ENTERPRISE_CONTROL_PLANE_NOT_CONFIGURED",
+      });
       return;
     }
     const sessionId = request.headers["x-tidu-admin-session"];
@@ -1544,6 +1742,9 @@ export const startLocalRuntime = async (
 
       isClosed = true;
       try {
+        if (deployment === "personal" && port !== 0) {
+          await switchCodexClientConfiguration({ mode: "official" }).catch(() => undefined);
+        }
         await close(server);
       } finally {
         storage.close();

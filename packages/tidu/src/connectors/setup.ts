@@ -309,7 +309,7 @@ export const setupConnectors = (options: ConnectorSetupOptions = {}): ConnectorS
     capability: "mcp-tools",
     status: cursorStatus,
     detail: cursorAvailable
-      ? `Cursor desktop and CLI connector is ${cursorStatus}. Restart Cursor to reload it.`
+      ? `Cursor desktop and CLI connector is ${cursorStatus}; dual-channel tools are available after restart.`
       : "Cursor is not installed; its connector configuration was not activated.",
   };
   const universalStatus: ConnectorSetupStatus = action === "uninstall" ? "removed" : "verified";

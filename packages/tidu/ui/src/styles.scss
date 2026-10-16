@@ -1348,19 +1348,81 @@ h2 {
 
     button {
       min-height: 34px;
+      margin-right: 8px;
+      margin-bottom: 14px;
+
+      &.danger-button {
+        border-color: rgb(255 92 111 / 45%);
+        color: #ff9da9;
+      }
+    }
+
+    .client-configuration-status {
+      display: flex;
+      align-items: center;
+      margin-bottom: 12px;
+      color: #98a5b3;
+      font-size: 10px;
+
+      strong,
+      span,
+      code {
+        margin-right: 8px;
+      }
+
+      code {
+        color: #69c8ba;
+      }
+    }
+
+    .codex-configuration-modes {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin: 0 0 12px;
+
+      .codex-configuration-mode {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        margin: 0 8px 8px 0;
+        padding: 10px 12px;
+        text-align: left;
+
+        span {
+          margin-top: 4px;
+          color: #748191;
+          font-size: 9px;
+        }
+
+        &.selected {
+          border-color: #58b8aa;
+          background: rgb(88 184 170 / 10%);
+
+          strong {
+            color: #69c8ba;
+          }
+        }
+      }
     }
 
     .client-connect-message {
-      margin: 10px 0 0;
+      margin: 0;
+      padding: 10px 12px;
+      border: 1px solid #26313d;
+      border-radius: 6px;
+      background: #0a1016;
       color: #748191;
       font-size: 10px;
       line-height: 1.6;
+      white-space: pre-line;
 
       &.client-connect-message-success {
+        border-color: rgb(83 185 139 / 35%);
         color: #8fe0b8;
       }
 
       &.client-connect-message-error {
+        border-color: rgb(255 92 111 / 35%);
         color: #ff9da9;
       }
     }
