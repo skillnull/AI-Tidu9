@@ -90,7 +90,7 @@ tidu clients switch codex <official|ai-tidu9> [--yes] [--endpoint <url>]
 tidu clients rollback codex [--yes]
 ```
 
-The default setup action is `install` and does not require a prestarted runtime. It installs the connectors and prepares the AI-Tidu9 configuration while leaving Official mode active. `clients switch codex ai-tidu9` makes the Codex list show both official and AI-Tidu9 models; `clients switch codex official` restores an official-only list. This switches configuration modes, not individual models. Official Codex remains the authority for account identity, plan, and quota data. A failed switch, normal service shutdown, manual restore, rollback, or uninstall restores the original official configuration.
+The default setup action is `install` and does not require a prestarted runtime. It installs the connectors and prepares the AI-Tidu9 configuration while leaving direct Official mode active. `clients switch codex ai-tidu9` adds one AI-Tidu9 virtual-model entry to Codex. Its official or company upstream is selected on the AI-Tidu9 configuration page; company models are never separate Codex entries. `clients switch codex official` restores an official-only list. Official Codex remains the authority for account identity, plan, and quota data. AI-Tidu9 keeps only its original installation baseline and latest rollback point.
 
 The installed MCP connector exposes `list_tidu_channels` and `route_tidu_channel` to both the Codex plugin and Cursor. It does not replace the host model list. The `codex` and `cursor` channels delegate to official host processes, `tidu` uses the AI-Tidu9 runtime, and provider channels read only their connector-process environment variables.
 

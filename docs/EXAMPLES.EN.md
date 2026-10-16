@@ -42,13 +42,13 @@ curl -fsS http://127.0.0.1:9639/health
 curl -fsS http://127.0.0.1:9639/v1/models
 ```
 
-The default virtual model ID is `managed-default`. If `/v1/models` returns another ID, use that value:
+The default virtual model ID is `ai-tidu9-config`. If `/v1/models` returns another ID, use that value:
 
 ```bash
 curl -fsS http://127.0.0.1:9639/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "managed-default",
+    "model": "ai-tidu9-config",
     "messages": [{"role": "user", "content": "Explain capability completion in three points"}]
   }'
 ```
@@ -91,7 +91,7 @@ Compatible remote services must use HTTPS. HTTP is accepted only for `localhost`
 curl -fsS http://127.0.0.1:9639/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "managed-default",
+    "model": "ai-tidu9-config",
     "input": "Return one short runtime status sentence"
   }'
 ```
@@ -112,7 +112,7 @@ Connect any client that supports a custom OpenAI Base URL.
 | Field | Local personal mode |
 | --- | --- |
 | Base URL | `http://127.0.0.1:9639/v1` |
-| Model | Read from `GET /v1/models`; default: `managed-default` |
+| Model | Read from `GET /v1/models`; default: `ai-tidu9-config` |
 | API Key | Use a non-sensitive placeholder only if the client requires a value |
 
 Fetch the model list before sending a minimal conversation. Use `/v1/chat/completions` for Chat Completions-only clients or `/v1/responses` when supported.

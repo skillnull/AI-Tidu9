@@ -50,13 +50,15 @@ test("Codex app-server adapter negotiates, streams, and completes a turn", async
     const client = createCodexAgentClient({ command, workingDirectory: root });
     await client.initialize();
     const thread = await client.startThread();
-    const result = await client.prompt(thread.id, "test");
+    const deltas: string[] = [];
+    const result = await client.prompt(thread.id, "test", undefined, (delta) => deltas.push(delta));
     assert.deepEqual(result, {
       threadId: "thread-1",
       turnId: "turn-1",
       status: "completed",
       text: "codex-result",
     });
+    assert.deepEqual(deltas, ["codex-result"]);
     await client.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

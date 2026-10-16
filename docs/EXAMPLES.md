@@ -42,13 +42,13 @@ curl -fsS http://127.0.0.1:9639/health
 curl -fsS http://127.0.0.1:9639/v1/models
 ```
 
-默认配置返回的模型 ID 是 `managed-default`。如果 `/v1/models` 返回其他 ID，请在请求中使用实际值：
+默认配置返回的模型 ID 是 `ai-tidu9-config`。如果 `/v1/models` 返回其他 ID，请在请求中使用实际值：
 
 ```bash
 curl -fsS http://127.0.0.1:9639/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "managed-default",
+    "model": "ai-tidu9-config",
     "messages": [{"role": "user", "content": "用三点说明能力补全的价值"}]
   }'
 ```
@@ -92,7 +92,7 @@ tidu start
 curl -fsS http://127.0.0.1:9639/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "managed-default",
+    "model": "ai-tidu9-config",
     "input": "返回一句简短的运行状态说明"
   }'
 ```
@@ -113,7 +113,7 @@ AI-Tidu9 验证请求、把虚拟模型 ID 替换为真实上游模型、转发�
 | 字段 | 本机个人版 |
 | --- | --- |
 | Base URL | `http://127.0.0.1:9639/v1` |
-| Model | 从 `GET /v1/models` 读取，默认 `managed-default` |
+| Model | 从 `GET /v1/models` 读取，默认 `ai-tidu9-config` |
 | API Key | 客户端强制要求时填写非敏感占位值；本机 AI-Tidu9 不依赖它 |
 
 配置后先执行模型列表请求，再发送一条最小对话。如果客户端只支持 Chat Completions，使用 `/v1/chat/completions`；支持 Responses 时也可以使用 `/v1/responses`。

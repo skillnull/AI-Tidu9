@@ -19,7 +19,7 @@
     "prepare": "sh -c '. ./scripts/use-project-node.sh && node scripts/install-git-hooks.mjs'",
     "policy": "sh -c '. ./scripts/use-project-node.sh && node scripts/project-policy.mjs \"$@\"' --",
     "publish:tidu": "sh -c '. ./scripts/use-project-node.sh && node scripts/publish-tidu.mjs'",
-    "test": "sh -c '. ./scripts/use-project-node.sh && node --test scripts/*.test.mjs && npm run test --workspaces --if-present && python3 -m unittest discover -s sdk/python/tests'"
+    "test": "sh -c '. ./scripts/use-project-node.sh && node --test --test-reporter=dot scripts/*.test.mjs && npm run test --workspaces --if-present && python3 -m unittest discover -s sdk/python/tests'"
   },
   "engines": {
     "node": ">=22.14.0"

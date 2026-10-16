@@ -4,10 +4,12 @@ import test from "node:test";
 
 import { TiduError } from "../core/index.js";
 import {
+  createCatalogModelRouter,
   createOllamaProvider,
   createOpenAiCompatibleProvider,
   createProviderFromEnvironment,
   discoverOllamaModels,
+  type ModelProvider,
 } from "./index.js";
 
 interface TestServer {
@@ -52,6 +54,40 @@ const startTestServer = async (
   };
 };
 
+test("routes official catalog models separately from company and virtual models", async () => {
+  const calls: string[] = [];
+  const createProvider = (label: string): ModelProvider => ({
+    descriptor: { type: "openai-compatible", model: `${label}-upstream` },
+    execute: async (request) => {
+      calls.push(`${label}:${String(request.body.model)}`);
+      return { kind: "json", statusCode: 200, body: { label } };
+    },
+  });
+  const router = createCatalogModelRouter({
+    defaultProvider: createProvider("company"),
+    officialProvider: createProvider("official"),
+  });
+
+  for (const [model, modelSource] of [
+    ["ai-tidu9-config", "company"],
+    ["company-service-model", "company"],
+    ["gpt-official", "official"],
+  ] as const) {
+    await router.execute({
+      protocol: "responses",
+      body: { model, input: "hello" },
+      virtualModelId: "ai-tidu9-config",
+      routing: { modelSource },
+    });
+  }
+
+  assert.deepEqual(calls, [
+    "company:ai-tidu9-config",
+    "company:company-service-model",
+    "official:gpt-official",
+  ]);
+});
+
 test("forwards OpenAI-compatible requests without exposing provider identity", async () => {
   let receivedPath = "";
   let receivedAuthorization = "";
@@ -82,10 +118,10 @@ test("forwards OpenAI-compatible requests without exposing provider identity", a
     const result = await provider.execute({
       protocol: "chat-completions",
       body: {
-        model: "managed-default",
+        model: "ai-tidu9-config",
         messages: [{ role: "user", content: "hello" }],
       },
-      virtualModelId: "managed-default",
+      virtualModelId: "ai-tidu9-config",
     });
 
     assert.equal(result.statusCode, 200);
@@ -96,7 +132,7 @@ test("forwards OpenAI-compatible requests without exposing provider identity", a
     assert.equal(receivedPath, "/v1/chat/completions");
     assert.equal(receivedAuthorization, "Bearer test-only-secret");
     assert.equal(receivedBody.model, "upstream-model");
-    assert.equal((result.body as { model: string }).model, "managed-default");
+    assert.equal((result.body as { model: string }).model, "ai-tidu9-config");
     assert.deepEqual(provider.descriptor, {
       type: "openai-compatible",
       model: "upstream-model",
@@ -157,15 +193,15 @@ test("translates Ollama chat and Responses payloads into the virtual model contr
     const chat = await provider.execute({
       protocol: "chat-completions",
       body: {
-        model: "managed-default",
+        model: "ai-tidu9-config",
         messages: [{ role: "user", content: "hello" }],
       },
-      virtualModelId: "managed-default",
+      virtualModelId: "ai-tidu9-config",
     });
     const responses = await provider.execute({
       protocol: "responses",
-      body: { model: "managed-default", input: "hello again" },
-      virtualModelId: "managed-default",
+      body: { model: "ai-tidu9-config", input: "hello again" },
+      virtualModelId: "ai-tidu9-config",
     });
 
     assert.equal(chat.kind, "json");
@@ -174,14 +210,14 @@ test("translates Ollama chat and Responses payloads into the virtual model contr
       throw new Error("Expected JSON provider results.");
     }
     assert.equal(chat.statusCode, 200);
-    assert.equal((chat.body as { model: string }).model, "managed-default");
+    assert.equal((chat.body as { model: string }).model, "ai-tidu9-config");
     assert.deepEqual((chat.body as { usage: unknown }).usage, {
       prompt_tokens: 7,
       completion_tokens: 3,
       total_tokens: 10,
     });
     assert.equal(responses.statusCode, 200);
-    assert.equal((responses.body as { model: string }).model, "managed-default");
+    assert.equal((responses.body as { model: string }).model, "ai-tidu9-config");
     assert.equal((responses.body as { output_text: string }).output_text, "local result");
     assert.equal(receivedBodies.length, 2);
     assert.equal(receivedBodies[0]?.model, "qwen-test");
@@ -218,7 +254,7 @@ test("normalizes Ollama function calls and tool-result continuation messages", a
     const result = await provider.execute({
       protocol: "chat-completions",
       body: {
-        model: "managed-default",
+        model: "ai-tidu9-config",
         messages: [
           {
             role: "assistant",
@@ -240,7 +276,7 @@ test("normalizes Ollama function calls and tool-result continuation messages", a
           },
         ],
       },
-      virtualModelId: "managed-default",
+      virtualModelId: "ai-tidu9-config",
     });
 
     assert.equal(result.kind, "json");
@@ -287,11 +323,11 @@ test("streams OpenAI-compatible SSE while preserving the virtual model identity"
     const result = await provider.execute({
       protocol: "chat-completions",
       body: {
-        model: "managed-default",
+        model: "ai-tidu9-config",
         messages: [{ role: "user", content: "hello" }],
         stream: true,
       },
-      virtualModelId: "managed-default",
+      virtualModelId: "ai-tidu9-config",
     });
 
     assert.equal(result.kind, "stream");
@@ -299,7 +335,7 @@ test("streams OpenAI-compatible SSE while preserving the virtual model identity"
       throw new Error("Expected a streaming provider result.");
     }
     const events = await new Response(result.stream).text();
-    assert.match(events, /"model":"managed-default"/u);
+    assert.match(events, /"model":"ai-tidu9-config"/u);
     assert.doesNotMatch(events, /upstream-model/u);
     assert.match(events, /data: \[DONE\]/u);
   } finally {
@@ -336,7 +372,7 @@ test("streams Ollama text and function calls as Chat Completions SSE", async () 
     const result = await provider.execute({
       protocol: "chat-completions",
       body: {
-        model: "managed-default",
+        model: "ai-tidu9-config",
         messages: [{ role: "user", content: "weather" }],
         stream: true,
         tools: [
@@ -349,7 +385,7 @@ test("streams Ollama text and function calls as Chat Completions SSE", async () 
           },
         ],
       },
-      virtualModelId: "managed-default",
+      virtualModelId: "ai-tidu9-config",
     });
 
     assert.equal(result.kind, "stream");
@@ -360,7 +396,7 @@ test("streams Ollama text and function calls as Chat Completions SSE", async () 
     assert.equal(receivedBody.stream, true);
     assert.equal(Array.isArray(receivedBody.tools), true);
     assert.match(events, /chat\.completion\.chunk/u);
-    assert.match(events, /"model":"managed-default"/u);
+    assert.match(events, /"model":"ai-tidu9-config"/u);
     assert.match(events, /"name":"lookup"/u);
     assert.match(events, /"finish_reason":"tool_calls"/u);
     assert.match(events, /data: \[DONE\]/u);
@@ -388,8 +424,8 @@ test("streams Ollama text as Responses events", async () => {
     const provider = createOllamaProvider({ baseUrl: server.origin, model: "qwen-test" });
     const result = await provider.execute({
       protocol: "responses",
-      body: { model: "managed-default", input: "hello", stream: true },
-      virtualModelId: "managed-default",
+      body: { model: "ai-tidu9-config", input: "hello", stream: true },
+      virtualModelId: "ai-tidu9-config",
     });
     assert.equal(result.kind, "stream");
     if (result.kind !== "stream") {
@@ -399,7 +435,7 @@ test("streams Ollama text as Responses events", async () => {
     assert.match(events, /event: response\.created/u);
     assert.match(events, /event: response\.output_text\.delta/u);
     assert.match(events, /event: response\.completed/u);
-    assert.match(events, /"model":"managed-default"/u);
+    assert.match(events, /"model":"ai-tidu9-config"/u);
   } finally {
     await server.close();
   }

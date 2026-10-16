@@ -96,8 +96,13 @@ export interface CodexAgentClient {
   readAccount: () => Promise<CodexAccountSummary | null>;
   /** Reads account quota and token totals without running a model turn. */
   readUsage: () => Promise<CodexUsageSummary>;
-  /** Sends one user turn and resolves only after a terminal notification. */
-  prompt: (threadId: string, text: string, signal?: AbortSignal) => Promise<CodexTurnResult>;
+  /** Sends one user turn, streams text deltas, and resolves after a terminal notification. */
+  prompt: (
+    threadId: string,
+    text: string,
+    signal?: AbortSignal,
+    onTextDelta?: (delta: string) => void,
+  ) => Promise<CodexTurnResult>;
   /** Interrupts one active turn. */
   cancel: (threadId: string, turnId: string) => Promise<void>;
   /** Terminates the delegated app-server process. */
@@ -113,6 +118,8 @@ interface TurnState {
   reject: (error: Error) => void;
   /** Removes cancellation listeners. */
   cleanup: () => void;
+  /** Receives text as soon as the official app-server emits it. */
+  onTextDelta?: (delta: string) => void;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -171,6 +178,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       const delta = readString(notification.params, "delta");
       if (state !== undefined && delta !== undefined) {
         state.text += delta;
+        state.onTextDelta?.(delta);
       }
       return;
     }
@@ -309,6 +317,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       threadId: string,
       text: string,
       signal?: AbortSignal,
+      onTextDelta?: (delta: string) => void,
     ): Promise<CodexTurnResult> => {
       requireInitialized();
       if (text.trim() === "") {
@@ -340,6 +349,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           resolve,
           reject,
           cleanup: () => signal?.removeEventListener("abort", abort),
+          onTextDelta,
         });
       });
     },

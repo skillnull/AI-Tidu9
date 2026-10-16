@@ -7,15 +7,16 @@ test("creates a safe managed configuration", () => {
   const configuration = createDefaultConfiguration();
 
   assert.equal(configuration.activeMode, "managed");
-  assert.equal(configuration.activeProfileId, "managed-default");
+  assert.equal(configuration.activeProfileId, "ai-tidu9-config");
   assert.equal(configuration.virtualModelName, "九门赛博提督");
+  assert.deepEqual(configuration.modelSelection, { source: "official", model: "current" });
 });
 
 test("keeps managed and expert defaults isolated", () => {
   const managedConfiguration = createDefaultConfiguration("managed");
   const expertConfiguration = createDefaultConfiguration("expert");
 
-  assert.equal(managedConfiguration.activeProfileId, "managed-default");
+  assert.equal(managedConfiguration.activeProfileId, "ai-tidu9-config");
   assert.equal(expertConfiguration.activeProfileId, "expert-default");
   assert.equal(expertConfiguration.activeMode, "expert");
 });

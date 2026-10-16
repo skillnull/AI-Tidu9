@@ -19,10 +19,14 @@ Development data is stored in `.tidu-dev/tidu.sqlite`, isolated from globally in
 
 ## Local Codex configuration acceptance
 
-The management page switches configuration modes, not individual models:
+The configuration page is the single upstream selector for the AI-Tidu9 virtual model. It lists official and company-provider models and accepts a custom model ID:
 
-- **AI-Tidu9**: the Codex model list shows AI-Tidu9 and official models while the official Codex account, plan, and quota information remain unchanged.
-- **Official**: active AI-Tidu9-managed blocks are removed and the Codex model list shows official models only.
+- **AI-Tidu9**: Codex gains one AI-Tidu9 virtual-model entry; its official or company upstream is selected on the configuration page.
+- **Direct Official**: active AI-Tidu9-managed blocks are removed and Codex shows official models only.
+
+AI-Tidu9 keeps only its original installation baseline and latest rollback point in its own backup directory; unrelated Codex configuration backups are never removed.
+
+In development mode, the Services page shows only `tidu:dev-p` and `tidu:cli-p`, never the locally installed service rows. Before starting, `tidu:dev-p` checks the installed-runtime lock and default port. On conflict it stops and asks for `tidu service stop && tidu uninstall --confirm DELETE`; it never removes data automatically.
 
 Before switching to AI-Tidu9, the local runtime must be reachable and pass a minimal inference check. A failed check leaves or restores Official mode and reports the concrete error. A normal local development shutdown also restores Official mode when AI-Tidu9 mode is active.
 

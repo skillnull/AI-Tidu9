@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   type ConfigurationMode,
   createDefaultConfiguration,
+  DEFAULT_VIRTUAL_MODEL_ID,
   type ExpertServiceConfiguration,
   type TiduConfiguration,
   validateConfiguration,
@@ -34,8 +35,15 @@ interface ExpertDraftPayload {
 
 const normalizeConfiguration = (configuration: TiduConfiguration): TiduConfiguration => ({
   ...configuration,
-  activeProfileId: configuration.activeProfileId.trim(),
+  activeProfileId:
+    configuration.activeProfileId.trim() === "managed-default"
+      ? DEFAULT_VIRTUAL_MODEL_ID
+      : configuration.activeProfileId.trim(),
   virtualModelName: configuration.virtualModelName.trim(),
+  modelSelection: {
+    source: configuration.modelSelection?.source ?? "official",
+    model: configuration.modelSelection?.model.trim() || "current",
+  },
   ...(configuration.expertServices
     ? {
         expertServices: {
@@ -73,8 +81,9 @@ const readSharedConfiguration = (row: ConfigurationRow): TiduConfiguration => {
   const sharedConfiguration: TiduConfiguration = {
     schemaVersion: "1",
     activeMode: "managed",
-    activeProfileId: storedConfiguration.activeProfileId ?? "managed-default",
+    activeProfileId: storedConfiguration.activeProfileId ?? DEFAULT_VIRTUAL_MODEL_ID,
     virtualModelName: storedConfiguration.virtualModelName ?? "九门赛博提督",
+    modelSelection: storedConfiguration.modelSelection ?? { source: "official", model: "current" },
   };
   return assertValidConfiguration(sharedConfiguration, "managed");
 };
@@ -207,6 +216,7 @@ export const createSqliteConfigurationStore = (database: DatabaseSync): Configur
       activeMode: "managed",
       activeProfileId: configuration.activeProfileId,
       virtualModelName: configuration.virtualModelName,
+      modelSelection: configuration.modelSelection,
     };
     const expertPayload: ExpertDraftPayload = {
       expertServices: configuration.expertServices ?? readExpertServices(draftRows.expert),

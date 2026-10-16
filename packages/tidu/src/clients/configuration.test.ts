@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +17,7 @@ import { startLocalRuntime } from "../runtime/index.js";
 import {
   configureCodexClient,
   inspectCodexClientConfiguration,
+  listCodexOfficialModels,
   removeCodexClientConfiguration,
   rollbackCodexClientConfiguration,
   switchCodexClientConfiguration,
@@ -31,6 +40,56 @@ const writeOfficialModelCache = (codexHomeDirectory: string): void => {
     { mode: 0o600 },
   );
 };
+
+test("lists current and retained official Codex models without managed entries", () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-model-list-"));
+  const codexHomeDirectory = join(temporaryDirectory, ".codex");
+
+  try {
+    mkdirSync(codexHomeDirectory, { mode: 0o700, recursive: true });
+    writeOfficialModelCache(codexHomeDirectory);
+    writeFileSync(
+      join(codexHomeDirectory, ".ai-tidu9-model-catalog.json"),
+      JSON.stringify({
+        models: [
+          {
+            slug: "user-default",
+            display_name: "Stale duplicate",
+            visibility: "list",
+            supported_in_api: true,
+          },
+          {
+            slug: "gpt-retained",
+            display_name: "Retained official model",
+            visibility: "list",
+            supported_in_api: true,
+          },
+          {
+            slug: "ai-tidu9-config",
+            display_name: "AI-Tidu9",
+            visibility: "list",
+            supported_in_api: true,
+          },
+          {
+            slug: "company-model",
+            display_name: "Company model",
+            description: "Company service model: example",
+            visibility: "list",
+            supported_in_api: true,
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+
+    assert.deepEqual(listCodexOfficialModels(codexHomeDirectory), [
+      { id: "user-default", name: "Official Default" },
+      { id: "gpt-retained", name: "Retained official model" },
+    ]);
+  } finally {
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
 
 test("writes an isolated Codex profile and switches back to the official configuration", async () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-config-"));
@@ -57,8 +116,9 @@ test("writes an isolated Codex profile and switches back to the official configu
     const profile = readFileSync(profilePath, "utf8");
 
     assert.equal(result.status, "configured");
-    assert.equal(result.model, "managed-default");
+    assert.equal(result.model, "ai-tidu9-config");
     assert.match(profile, /model_provider = "ai_tidu9"/u);
+    assert.match(profile, /requires_openai_auth = false/u);
     assert.match(profile, new RegExp(`base_url = "${runtime.origin}/v1"`, "u"));
     assert.doesNotMatch(profile, /api[_-]?key|token|secret/iu);
     const activeDefaultConfiguration = readFileSync(defaultConfiguration, "utf8");
@@ -72,7 +132,7 @@ test("writes an isolated Codex profile and switches back to the official configu
     ) as { models: { slug: string }[] };
     assert.deepEqual(
       catalog.models.map(({ slug }) => slug),
-      ["user-default", "managed-default"],
+      ["ai-tidu9-config", "user-default"],
     );
 
     await switchCodexClientConfiguration({
@@ -112,6 +172,33 @@ test("writes an isolated Codex profile and switches back to the official configu
   }
 });
 
+test("keeps company service models behind the single virtual-model catalog entry", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-company-catalog-"));
+  const codexHomeDirectory = join(temporaryDirectory, ".codex");
+  const runtime = await startLocalRuntime({
+    databasePath: ":memory:",
+    port: 0,
+    provider: {
+      descriptor: { type: "openai-compatible", model: "corp-model-v2" },
+      execute: async () => ({ kind: "json", statusCode: 200, body: { output: [] } }),
+    },
+  });
+  try {
+    await configureCodexClient({ endpoint: runtime.origin, codexHomeDirectory });
+    const catalog = JSON.parse(
+      readFileSync(join(codexHomeDirectory, ".ai-tidu9-model-catalog.json"), "utf8"),
+    ) as { models: { slug: string; display_name: string }[] };
+    assert.deepEqual(
+      catalog.models.map(({ slug }) => slug),
+      ["ai-tidu9-config"],
+    );
+    assert.equal(catalog.models[0]?.display_name, "九门赛博提督");
+  } finally {
+    await runtime.close();
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
 test("does not duplicate an unchanged managed Codex profile", async () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-update-"));
   const codexHomeDirectory = join(temporaryDirectory, ".codex");
@@ -138,6 +225,39 @@ test("does not duplicate an unchanged managed Codex profile", async () => {
     assert.equal(existsSync(join(codexHomeDirectory, "config.toml")), false);
   } finally {
     await runtime.close();
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
+test("retains only the original baseline and latest managed Codex snapshot", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-retention-"));
+  const codexHomeDirectory = join(temporaryDirectory, ".codex");
+
+  try {
+    const first = await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory,
+      verifyRuntime: false,
+    });
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9640",
+      codexHomeDirectory,
+      verifyRuntime: false,
+    });
+    const latest = await configureCodexClient({
+      endpoint: "http://127.0.0.1:9641",
+      codexHomeDirectory,
+      verifyRuntime: false,
+    });
+    const snapshotIds = readdirSync(join(codexHomeDirectory, ".ai-tidu9-backups")).sort();
+
+    assert.deepEqual(snapshotIds.sort(), [first.backupId, latest.backupId].sort());
+    const state = JSON.parse(
+      readFileSync(join(codexHomeDirectory, ".ai-tidu9-profile-state.json"), "utf8"),
+    ) as { backupId: string; originalBackupId: string };
+    assert.equal(state.originalBackupId, first.backupId);
+    assert.equal(state.backupId, latest.backupId);
+  } finally {
     rmSync(temporaryDirectory, { force: true, recursive: true });
   }
 });
@@ -177,7 +297,7 @@ test("does not shrink the unified catalog when an older Codex cache omits offici
     ) as { models: { slug: string }[] };
     assert.deepEqual(
       catalog.models.map(({ slug }) => slug),
-      ["official-current", "official-newer", "user-default", "managed-default"],
+      ["ai-tidu9-config", "official-current", "official-newer", "user-default"],
     );
   } finally {
     await runtime.close();
@@ -236,7 +356,7 @@ test("automatically rolls back when post-write connectivity verification fails",
     if (requestCount === 2) {
       return Response.json({
         object: "list",
-        data: [{ id: "managed-default", owned_by: "AI-Tidu9" }],
+        data: [{ id: "ai-tidu9-config", owned_by: "AI-Tidu9" }],
       });
     }
     throw new Error("simulated disconnect");
@@ -281,7 +401,7 @@ test("keeps the official configuration active when inference verification fails"
       if (url.endsWith("/v1/models")) {
         return Response.json({
           object: "list",
-          data: [{ id: "managed-default", owned_by: "AI-Tidu9" }],
+          data: [{ id: "ai-tidu9-config", owned_by: "AI-Tidu9" }],
         });
       }
       return Response.json(
@@ -337,7 +457,7 @@ test("attributes an official Codex inference failure and keeps official mode act
       if (url.endsWith("/v1/models")) {
         return Response.json({
           object: "list",
-          data: [{ id: "managed-default", owned_by: "AI-Tidu9" }],
+          data: [{ id: "ai-tidu9-config", owned_by: "AI-Tidu9" }],
         });
       }
       return Response.json(

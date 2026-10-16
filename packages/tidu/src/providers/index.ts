@@ -26,6 +26,10 @@ export interface ProviderRoutingContext {
   role?: "main" | "planning" | "specialist" | "verification" | "worker";
   /** Secret Gate scope shared across one durable Agent task. */
   securityScopeId?: string;
+  /** Upstream provider group selected behind the virtual-model entry. */
+  modelSource?: "company" | "official";
+  /** Upstream model selected without changing the public virtual-model identity. */
+  targetModel?: string;
 }
 
 export interface ProviderDescriptor {
@@ -73,7 +77,51 @@ export interface ModelProvider {
   descriptor: ProviderDescriptor;
   /** Executes one validated inference request as JSON or Server-Sent Events. */
   execute: (request: ProviderExecutionRequest) => Promise<ProviderExecutionResult>;
+  /** Lists safe upstream model identifiers when the provider supports discovery. */
+  listModels?: () => Promise<readonly { id: string; name: string }[]>;
+  /** Releases persistent provider processes and connections owned by this adapter. */
+  close?: () => Promise<void>;
 }
+
+export interface CatalogModelRouterOptions {
+  /** Default provider used by the AI-Tidu9 virtual model and company service entry. */
+  defaultProvider: ModelProvider;
+  /** Official Codex provider used only for account-owned model identifiers. */
+  officialProvider?: ModelProvider;
+}
+
+export const createCatalogModelRouter = (options: CatalogModelRouterOptions): ModelProvider => ({
+  descriptor: { type: "tidu-router", model: options.defaultProvider.descriptor.model },
+  execute: async (request) => {
+    if (request.routing?.modelSource === "official" && options.officialProvider === undefined) {
+      return {
+        kind: "json",
+        statusCode: 503,
+        body: createOpenAiError(
+          "official_provider_not_configured",
+          "The selected official model source is unavailable.",
+          "server_error",
+        ),
+      };
+    }
+    const useOfficialProvider =
+      options.officialProvider !== undefined && request.routing?.modelSource === "official";
+    const selectedProvider =
+      useOfficialProvider && options.officialProvider !== undefined
+        ? options.officialProvider
+        : options.defaultProvider;
+    return selectedProvider.execute(request);
+  },
+  listModels: () => options.defaultProvider.listModels?.() ?? Promise.resolve([]),
+  close: async () => {
+    const providers = new Set(
+      [options.defaultProvider, options.officialProvider].filter(
+        (provider): provider is ModelProvider => provider !== undefined,
+      ),
+    );
+    await Promise.all([...providers].map((provider) => provider.close?.()));
+  },
+});
 
 export interface ProviderEnvironment {
   /** Provider adapter name. */
@@ -192,6 +240,23 @@ export const createOpenAiCompatibleProvider = (
 
   return {
     descriptor: { type: "openai-compatible", model },
+    listModels: async () => {
+      const headers: Record<string, string> = { accept: "application/json" };
+      if (apiKey) headers.authorization = `Bearer ${apiKey}`;
+      const response = await fetch(createEndpoint(baseUrl, "/v1/models"), {
+        headers,
+        signal: AbortSignal.timeout(Math.min(timeoutMilliseconds, 10_000)),
+      });
+      if (!response.ok) return [{ id: model, name: model }];
+      const body = await readProviderJson(response);
+      if (!isRecord(body) || !Array.isArray(body.data)) return [{ id: model, name: model }];
+      const models = body.data.flatMap((candidate) =>
+        isRecord(candidate) && typeof candidate.id === "string"
+          ? [{ id: candidate.id, name: candidate.id }]
+          : [],
+      );
+      return models.length > 0 ? models : [{ id: model, name: model }];
+    },
     execute: async (request) => {
       const streaming = request.body.stream === true;
       const endpoint = createEndpoint(
@@ -208,7 +273,7 @@ export const createOpenAiCompatibleProvider = (
       const response = await fetch(endpoint, {
         method: "POST",
         headers,
-        body: JSON.stringify({ ...request.body, model }),
+        body: JSON.stringify({ ...request.body, model: request.routing?.targetModel ?? model }),
         signal: combineSignals(request.signal, timeoutMilliseconds),
       });
       if (streaming && response.ok) {
@@ -425,6 +490,11 @@ export const createOllamaProvider = (options: ProviderAdapterOptions): ModelProv
 
   return {
     descriptor: { type: "ollama", model },
+    listModels: async () =>
+      (await discoverOllamaModels({ baseUrl: baseUrl.origin })).map((modelId) => ({
+        id: modelId,
+        name: modelId,
+      })),
     execute: async (request) => {
       const streaming = request.body.stream === true;
       const tools = toOllamaTools(request);
@@ -432,7 +502,7 @@ export const createOllamaProvider = (options: ProviderAdapterOptions): ModelProv
         method: "POST",
         headers: { accept: "application/json", "content-type": "application/json" },
         body: JSON.stringify({
-          model,
+          model: request.routing?.targetModel ?? model,
           messages: toOllamaMessages(request),
           stream: streaming,
           ...(tools === undefined ? {} : { tools }),

@@ -334,25 +334,32 @@ export const createSecretGate = (options: SecretGateOptions = {}): SecretGate =>
 export const guardModelProvider = (
   provider: ModelProvider,
   secretGate: SecretGate,
-): ModelProvider => ({
-  descriptor: provider.descriptor,
-  execute: async (request: ProviderExecutionRequest) => {
-    const persistentScopeId = request.routing?.securityScopeId;
-    const scopeId = persistentScopeId ?? `request-${randomUUID()}`;
-    const protectedRequest = secretGate.protect(request.body, {
-      scopeId,
-      destination: "model",
-    });
-    try {
-      return await provider.execute({
-        ...request,
-        body: protectedRequest.value,
-        routing: { ...request.routing, securityScopeId: scopeId },
+): ModelProvider => {
+  const guarded: ModelProvider = {
+    descriptor: provider.descriptor,
+    execute: async (request: ProviderExecutionRequest) => {
+      const persistentScopeId = request.routing?.securityScopeId;
+      const scopeId = persistentScopeId ?? `request-${randomUUID()}`;
+      const protectedRequest = secretGate.protect(request.body, {
+        scopeId,
+        destination: "model",
       });
-    } finally {
-      if (persistentScopeId === undefined) {
-        secretGate.closeScope(scopeId);
+      try {
+        return await provider.execute({
+          ...request,
+          body: protectedRequest.value,
+          routing: { ...request.routing, securityScopeId: scopeId },
+        });
+      } finally {
+        if (persistentScopeId === undefined) {
+          secretGate.closeScope(scopeId);
+        }
       }
-    }
-  },
-});
+    },
+  };
+  if (provider.listModels !== undefined) {
+    guarded.listModels = () => provider.listModels?.() ?? Promise.resolve([]);
+  }
+  if (provider.close !== undefined) guarded.close = () => provider.close?.() ?? Promise.resolve();
+  return guarded;
+};

@@ -103,7 +103,7 @@ test("uses a configured model provider for understanding, planning, execution, a
       };
     },
   };
-  const adapters = createModelProviderAgentAdapters(provider, "managed-default");
+  const adapters = createModelProviderAgentAdapters(provider, "ai-tidu9-config");
   const kernel = createAgentKernel({
     store: createInMemoryTaskCapsuleStore(),
     ...adapters,

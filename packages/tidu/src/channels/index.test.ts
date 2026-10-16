@@ -21,7 +21,7 @@ test("lists virtual, host, and provider channels without exposing credentials", 
       DASHSCOPE_API_KEY: "private-value",
       DASHSCOPE_MODEL: "qwen-model",
     },
-    request: async () => Response.json({ data: [{ id: "managed-default" }] }),
+    request: async () => Response.json({ data: [{ id: "ai-tidu9-config" }] }),
     codexAvailable: () => true,
     cursorAvailable: () => false,
   });
@@ -40,7 +40,7 @@ test("routes virtual and official host channels through separate adapters", asyn
     environment: {},
     request: async (input) =>
       String(input).endsWith("/v1/models")
-        ? Response.json({ data: [{ id: "managed-default" }] })
+        ? Response.json({ data: [{ id: "ai-tidu9-config" }] })
         : Response.json({ output_text: "tidu-result" }),
     createCodexProvider: async () => createProvider("official-model", "official-result"),
     createCursorProvider: async () => undefined,
@@ -50,7 +50,7 @@ test("routes virtual and official host channels through separate adapters", asyn
 
   assert.deepEqual(await gateway.run({ channel: "tidu", input: "work" }), {
     channel: "tidu",
-    model: "managed-default",
+    model: "ai-tidu9-config",
     text: "tidu-result",
   });
   assert.deepEqual(await gateway.run({ channel: "codex", input: "work" }), {

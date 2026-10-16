@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
@@ -17,6 +18,7 @@ import { createModelProviderAgentAdapters } from "../agent/model-provider.js";
 import {
   configureCodexClient,
   inspectCodexClientConfiguration,
+  listCodexOfficialModels,
   removeCodexClientConfiguration,
   switchCodexClientConfiguration,
 } from "../clients/configuration.js";
@@ -48,6 +50,7 @@ import {
   inspectCodexHostConfiguration,
 } from "../providers/codex-host.js";
 import {
+  createCatalogModelRouter,
   createProviderFromEnvironment,
   discoverOllamaModels,
   type ModelProvider,
@@ -80,6 +83,146 @@ const SECURITY_HEADERS = Object.freeze({
 const MAXIMUM_JSON_BODY_BYTES = 64 * 1024;
 const MAXIMUM_INFERENCE_JSON_BODY_BYTES = 4 * 1024 * 1024;
 const ENTERPRISE_DISCOVERY_TIMEOUT_MS = 5_000;
+
+const runtimeProcessKind = (): "development" | "installed" =>
+  process.env.NODE_ENV === "development" ? "development" : "installed";
+
+interface ServiceDiagnostic {
+  /** Stable diagnostic identifier. */
+  id: "network" | "process" | "provider" | "storage";
+  /** Human-readable diagnostic detail. */
+  message: string;
+  /** Latest diagnostic outcome. */
+  status: "passed" | "warning";
+}
+
+interface ServiceInventory {
+  /** Time at which this service snapshot was generated. */
+  checkedAt: string;
+  /** Core non-secret runtime environment information. */
+  environment: {
+    /** Active virtual-model upstream identifier. */
+    activeModel: string;
+    /** HTTP endpoint currently serving this runtime. */
+    endpoint: string;
+    /** Node.js runtime version. */
+    nodeVersion: string;
+    /** Operating-system platform identifier. */
+    platform: NodeJS.Platform;
+    /** Active model-provider adapter. */
+    providerType: string;
+    /** Storage adapter and schema version. */
+    storage: string;
+    /** Runtime uptime measured in whole seconds. */
+    uptimeSeconds: number;
+    /** AI-Tidu9 product version. */
+    version: string;
+  };
+  /** Mutually exclusive runtime shape active on this page. */
+  mode: "development" | "installed";
+  /** Latest checks used to determine overall service health. */
+  diagnostics: readonly ServiceDiagnostic[];
+  /** Runtime and CLI entries belonging to the active mode. */
+  services: readonly {
+    /** Actions currently accepted for this service. */
+    actions: readonly ("check" | "refresh" | "restart" | "start" | "stop")[];
+    /** Stable service identifier. */
+    id: string;
+    /** Service role. */
+    kind: "cli" | "runtime";
+    /** User-facing service name. */
+    name: string;
+    /** Active process identifier, or null for command entries. */
+    processId: number | null;
+    /** Current service state. */
+    status: "ready" | "running" | "stopped";
+  }[];
+}
+
+const createServiceInventory = async (
+  storage: StorageAdapter,
+  provider: ModelProvider | undefined,
+  runtimeNetwork: { host: string; port: number },
+): Promise<ServiceInventory> => {
+  const development = runtimeProcessKind() === "development";
+  const workspace = await storage.configurationStore.loadWorkspace();
+  const modelSelection = workspace.active.configuration.modelSelection;
+  const endpointHost = runtimeNetwork.host.includes(":")
+    ? `[${runtimeNetwork.host}]`
+    : runtimeNetwork.host;
+  const endpoint = `http://${endpointHost}:${runtimeNetwork.port}`;
+  return {
+    checkedAt: new Date().toISOString(),
+    environment: {
+      activeModel: `${modelSelection.source}:${modelSelection.model}`,
+      endpoint,
+      nodeVersion: process.version,
+      platform: process.platform,
+      providerType: provider?.descriptor.type ?? "not-configured",
+      storage: `${storage.provider} · schema ${storage.schemaVersion}`,
+      uptimeSeconds: Math.floor(process.uptime()),
+      version: PRODUCT.version,
+    },
+    mode: development ? ("development" as const) : ("installed" as const),
+    diagnostics: [
+      {
+        id: "process",
+        status: "passed",
+        message: `PID ${process.pid} · uptime ${Math.floor(process.uptime())}s`,
+      },
+      { id: "network", status: "passed", message: endpoint },
+      {
+        id: "storage",
+        status: "passed",
+        message: `${storage.provider} · schema ${storage.schemaVersion}`,
+      },
+      {
+        id: "provider",
+        status: provider === undefined ? "warning" : "passed",
+        message:
+          provider === undefined
+            ? "Model provider is not configured"
+            : `${provider.descriptor.type} · ${provider.descriptor.model}`,
+      },
+    ],
+    services: [
+      {
+        id: development ? "tidu:dev-p" : "tidu-service",
+        name: development ? "tidu:dev-p" : "tidu 服务",
+        kind: "runtime" as const,
+        status: "running" as const,
+        processId: process.pid,
+        actions: ["refresh", "restart", "stop"] as const,
+      },
+      {
+        id: development ? "tidu:cli-p" : "tidu-cli",
+        name: development ? "tidu:cli-p" : "tidu CLI",
+        kind: "cli" as const,
+        status: "ready" as const,
+        processId: null,
+        actions: ["refresh", "check"] as const,
+      },
+    ],
+  };
+};
+
+const scheduleInstalledRuntimeRestart = (): void => {
+  const runtimeArguments = process.argv.slice(1);
+  const helperSource = [
+    'const { spawn } = require("node:child_process");',
+    "const args = JSON.parse(process.argv[1]);",
+    "setTimeout(() => {",
+    "  const child = spawn(process.execPath, args, { detached: true, env: process.env, stdio: 'ignore' });",
+    "  child.unref();",
+    "}, 500);",
+  ].join("\n");
+  const helper = spawn(process.execPath, ["-e", helperSource, JSON.stringify(runtimeArguments)], {
+    detached: true,
+    env: process.env,
+    stdio: "ignore",
+  });
+  helper.unref();
+};
 
 export interface LocalRuntimeOptions {
   /** Installation edition; personal runtimes attached to enterprise state are read-only. */
@@ -308,16 +451,36 @@ const handleOpenAiInference = async (
   }
   const workspace = await storage.configurationStore.loadWorkspace();
   const activeModelId = workspace.active.configuration.activeProfileId;
-  const requestedModelId =
-    isRecord(body) && typeof body.model === "string" ? body.model : activeModelId;
   const validation =
     protocol === "chat-completions"
-      ? validateChatCompletionRequest(body, requestedModelId)
-      : validateResponsesRequest(body, requestedModelId);
+      ? validateChatCompletionRequest(body, activeModelId)
+      : validateResponsesRequest(body, activeModelId);
   if (sendOpenAiValidation(response, validation, requestId)) {
     return;
   }
   if (provider !== undefined) {
+    const modelSelection = workspace.active.configuration.modelSelection ?? {
+      source: "official" as const,
+      model: "current",
+    };
+    if (
+      modelSelection.source === "company" &&
+      provider.descriptor.type !== "tidu-router" &&
+      provider.descriptor.type !== "openai-compatible" &&
+      provider.descriptor.type !== "ollama"
+    ) {
+      sendOpenAiJson(
+        response,
+        503,
+        createOpenAiError(
+          "company_provider_not_configured",
+          "The selected company model source is not configured.",
+          "server_error",
+        ),
+        requestId,
+      );
+      return;
+    }
     const controller = new AbortController();
     const abortProvider = () => controller.abort();
     request.once("aborted", abortProvider);
@@ -328,6 +491,10 @@ const handleOpenAiInference = async (
         body: body as Record<string, unknown>,
         virtualModelId: activeModelId,
         signal: controller.signal,
+        routing: {
+          modelSource: modelSelection.source,
+          ...(modelSelection.model === "current" ? {} : { targetModel: modelSelection.model }),
+        },
       });
       if (result.kind === "stream") {
         await sendOpenAiStream(response, result.statusCode, result.stream, requestId);
@@ -526,6 +693,16 @@ const readDraftConfiguration = (
     activeMode: mode,
     activeProfileId: candidate.activeProfileId,
     virtualModelName: candidate.virtualModelName,
+    modelSelection:
+      isRecord(candidate.modelSelection) &&
+      (candidate.modelSelection.source === "official" ||
+        candidate.modelSelection.source === "company") &&
+      typeof candidate.modelSelection.model === "string"
+        ? {
+            source: candidate.modelSelection.source,
+            model: candidate.modelSelection.model,
+          }
+        : { source: "official", model: "current" },
   };
   if (mode === "expert") {
     const expertServices = candidate.expertServices;
@@ -635,6 +812,7 @@ const handleRequest = async (
     const scalingHealth = await scaling?.health();
     sendJson(response, scalingHealth?.status === "unavailable" ? 503 : 200, {
       product: PRODUCT.name,
+      runtimeMode: process.env.NODE_ENV === "development" ? "development" : "installed",
       status: scalingHealth?.status === "unavailable" ? "unavailable" : "ok",
       scaling: scalingHealth ?? { status: "disabled" },
       storage: {
@@ -644,6 +822,56 @@ const handleRequest = async (
       },
       version: PRODUCT.version,
     });
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/api/services") {
+    sendJson(response, 200, await createServiceInventory(storage, provider, runtimeNetwork));
+    return;
+  }
+
+  const serviceActionRoute = /^\/api\/services\/([^/]+)\/(refresh|check|start|stop|restart)$/u.exec(
+    pathname,
+  );
+  if (request.method === "POST" && serviceActionRoute !== null) {
+    validateMutationRequest(request);
+    const serviceId = decodeURIComponent(serviceActionRoute[1] ?? "");
+    const action = serviceActionRoute[2];
+    const inventory = await createServiceInventory(storage, provider, runtimeNetwork);
+    const service = inventory.services.find((candidate) => candidate.id === serviceId);
+    if (service === undefined) {
+      sendJson(response, 404, { error: "SERVICE_NOT_FOUND" });
+      return;
+    }
+    if (action === "refresh" || (service.kind === "cli" && action === "check")) {
+      sendJson(response, 200, {
+        ...inventory,
+        result: {
+          checkedAt: new Date().toISOString(),
+          message: service.kind === "cli" ? "CLI entry check passed" : "Service status refreshed",
+          status: "passed",
+        },
+      });
+      return;
+    }
+    if (service.kind !== "runtime") {
+      sendJson(response, 409, { error: "ACTION_NOT_SUPPORTED" });
+      return;
+    }
+    if (action === "start") {
+      sendJson(response, 409, { error: "SERVICE_ALREADY_RUNNING" });
+      return;
+    }
+    if (runtimeProcessKind() === "development" && action === "restart") {
+      sendJson(response, 409, {
+        error: "DEVELOPMENT_SUPERVISOR_REQUIRED",
+        command: "npm run tidu:dev-p",
+      });
+      return;
+    }
+    if (action === "restart") scheduleInstalledRuntimeRestart();
+    sendJson(response, 202, { accepted: true, action, serviceId });
+    setTimeout(() => process.kill(process.pid, "SIGTERM"), 100);
     return;
   }
 
@@ -831,25 +1059,17 @@ const handleRequest = async (
           : configuredHost;
       const addressHost = clientHost.includes(":") ? `[${clientHost}]` : clientHost;
       const endpoint = `http://${addressHost}:${runtimeNetwork.port}`;
-      const report = setupConnectors({
-        action: "install",
-        endpoint,
-        targets: ["codex"],
-        cliEntry: process.env.TIDU_CONNECTOR_CLI_ENTRY,
-      });
-      const codex = report.connectors[0];
-      if (!report.healthy) {
-        sendJson(response, 409, {
-          connected: false,
-          message: codex?.detail ?? "Codex connector registration failed.",
-        });
-        return;
-      }
       const configured = await configureCodexClient({
         endpoint,
         verifyRuntime: false,
       });
-      sendJson(response, report.healthy ? 200 : 409, {
+      setupConnectors({
+        action: "uninstall",
+        endpoint,
+        targets: ["codex"],
+        cliEntry: process.env.TIDU_CONNECTOR_CLI_ENTRY,
+      });
+      sendJson(response, 200, {
         connected: true,
         profile: configured.profile,
         model: configured.model,
@@ -888,15 +1108,35 @@ const handleRequest = async (
           "Codex configuration mode must be official or ai-tidu9.",
         );
       }
+      const configuredHost = runtimeNetwork.host;
+      const clientHost =
+        configuredHost === "0.0.0.0" || configuredHost === "::"
+          ? DEFAULT_RUNTIME_HOST
+          : configuredHost;
+      const addressHost = clientHost.includes(":") ? `[${clientHost}]` : clientHost;
+      const endpoint = `http://${addressHost}:${runtimeNetwork.port}`;
       if (mode === "ai-tidu9") {
-        const configuredHost = runtimeNetwork.host;
-        const clientHost =
-          configuredHost === "0.0.0.0" || configuredHost === "::"
-            ? DEFAULT_RUNTIME_HOST
-            : configuredHost;
-        const addressHost = clientHost.includes(":") ? `[${clientHost}]` : clientHost;
         await configureCodexClient({
-          endpoint: `http://${addressHost}:${runtimeNetwork.port}`,
+          endpoint,
+        });
+        const report = setupConnectors({
+          action: "install",
+          endpoint,
+          targets: ["codex"],
+          cliEntry: process.env.TIDU_CONNECTOR_CLI_ENTRY,
+        });
+        if (!report.healthy) {
+          throw new TiduError(
+            "CONFIGURATION_INVALID",
+            report.connectors[0]?.detail ?? "Codex connector registration failed.",
+          );
+        }
+      } else {
+        setupConnectors({
+          action: "uninstall",
+          endpoint,
+          targets: ["codex"],
+          cliEntry: process.env.TIDU_CONNECTOR_CLI_ENTRY,
         });
       }
       sendJson(response, 200, await switchCodexClientConfiguration({ mode }));
@@ -1430,8 +1670,29 @@ const handleRequest = async (
 
   if (request.method === "GET" && pathname === "/v1/models") {
     const workspace = await storage.configurationStore.loadWorkspace();
-    const model = createOpenAiModel(workspace.active.configuration, workspace.active.updatedAt);
-    sendOpenAiJson(response, 200, { object: "list", data: [model] }, randomUUID());
+    const virtualModel = createOpenAiModel(
+      workspace.active.configuration,
+      workspace.active.updatedAt,
+    );
+    sendOpenAiJson(response, 200, { object: "list", data: [virtualModel] }, randomUUID());
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/api/models/upstreams") {
+    const workspace = await storage.configurationStore.loadWorkspace();
+    const companyModels = await provider?.listModels?.().catch(() => []);
+    sendJson(response, 200, {
+      selection: workspace.active.configuration.modelSelection ?? {
+        source: "official",
+        model: "current",
+      },
+      official: listCodexOfficialModels(),
+      company: companyModels ?? [],
+      companyConfigured:
+        provider?.descriptor.type === "tidu-router" ||
+        provider?.descriptor.type === "openai-compatible" ||
+        provider?.descriptor.type === "ollama",
+    });
     return;
   }
 
@@ -1439,8 +1700,12 @@ const handleRequest = async (
   if (request.method === "GET" && modelRoute !== null) {
     const requestId = randomUUID();
     const workspace = await storage.configurationStore.loadWorkspace();
-    const model = createOpenAiModel(workspace.active.configuration, workspace.active.updatedAt);
-    if (modelRoute[1] !== model.id) {
+    const virtualModel = createOpenAiModel(
+      workspace.active.configuration,
+      workspace.active.updatedAt,
+    );
+    const model = virtualModel.id === modelRoute[1] ? virtualModel : undefined;
+    if (model === undefined) {
       sendOpenAiJson(
         response,
         404,
@@ -1636,7 +1901,7 @@ export const startLocalRuntime = async (
     throw new TiduError("CONFIGURATION_INVALID", "Enterprise edition requires TIDU_POSTGRES_URL.");
   }
   const providerSetting = process.env.TIDU_PROVIDER?.trim();
-  const configuredProvider =
+  const selectedProvider =
     options.provider ??
     (providerSetting === "codex-host"
       ? await createCodexHostModelProvider(process.env.TIDU_PROVIDER_MODEL)
@@ -1647,6 +1912,25 @@ export const startLocalRuntime = async (
             ? ((await createCodexHostModelProvider(process.env.TIDU_PROVIDER_MODEL)) ??
               (await createCursorHostModelProvider()))
             : undefined)));
+  const officialProvider =
+    options.provider === undefined &&
+    selectedProvider !== undefined &&
+    selectedProvider.descriptor.type !== "codex-host" &&
+    selectedProvider.descriptor.type !== "cursor-host" &&
+    deployment === "personal" &&
+    options.discoverHostProvider !== false
+      ? await createCodexHostModelProvider()
+      : undefined;
+  const configuredProvider =
+    options.provider === undefined &&
+    selectedProvider !== undefined &&
+    selectedProvider.descriptor.type !== "codex-host" &&
+    selectedProvider.descriptor.type !== "cursor-host"
+      ? createCatalogModelRouter({
+          defaultProvider: selectedProvider,
+          officialProvider,
+        })
+      : selectedProvider;
   const provider =
     configuredProvider === undefined
       ? undefined
@@ -1658,10 +1942,17 @@ export const startLocalRuntime = async (
     dirname(defaultDatabasePath),
     basename(defaultDatabasePath).replace(/\.db$/u, "-enterprise.db"),
   );
-  const storage = await openNodeSqliteStorage({
-    databasePath:
-      options.databasePath ?? (deployment === "enterprise" ? enterpriseDatabasePath : undefined),
-  });
+  let storage: Awaited<ReturnType<typeof openNodeSqliteStorage>>;
+  try {
+    storage = await openNodeSqliteStorage({
+      databasePath:
+        options.databasePath ?? (deployment === "enterprise" ? enterpriseDatabasePath : undefined),
+    });
+  } catch (error) {
+    await provider?.close?.();
+    await environmentEnterpriseRuntime?.close();
+    throw error;
+  }
   const activeConfiguration = (await storage.configurationStore.loadWorkspace()).active
     .configuration;
   const activeExpertServices =
@@ -1687,6 +1978,7 @@ export const startLocalRuntime = async (
     runtimeDataLock = acquireRuntimeDataLock(storage.location);
   } catch (error) {
     storage.close();
+    await provider?.close?.();
     await environmentEnterpriseRuntime?.close();
     throw error;
   }
@@ -1718,6 +2010,7 @@ export const startLocalRuntime = async (
   } catch (error) {
     storage.close();
     runtimeDataLock?.release();
+    await provider?.close?.();
     await environmentEnterpriseRuntime?.close();
     throw error;
   }
@@ -1725,6 +2018,7 @@ export const startLocalRuntime = async (
   if (address === null || typeof address === "string") {
     await close(server);
     storage.close();
+    await provider?.close?.();
     await environmentEnterpriseRuntime?.close();
     throw new Error("Local runtime did not expose a TCP address.");
   }
@@ -1749,6 +2043,7 @@ export const startLocalRuntime = async (
       } finally {
         storage.close();
         runtimeDataLock?.release();
+        await provider?.close?.();
         await environmentEnterpriseRuntime?.close();
       }
     },

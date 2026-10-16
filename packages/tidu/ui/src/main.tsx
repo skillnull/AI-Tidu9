@@ -8,6 +8,7 @@ import {
   HostUsagePanel,
   type HostUsageSnapshot,
 } from "./components/host-usage-panel.js";
+import { ServiceControlPanel } from "./components/service-control-panel.js";
 import {
   type ClientConnectionState,
   type ConfigurationForm,
@@ -76,7 +77,7 @@ const formatCodexFailure = (failure: CodexFailureResponse, locale: "en-US" | "zh
     : [
         "本地：确认开发服务正在运行；远程：确认 HTTPS 地址及 /health 可以访问。",
         "检查九门的模型供应商配置和上游模型兼容性。",
-        "点击“更新九门配置”后重试；仍不可用时先切回“官方”。",
+        "点击“修复 / 安装 Codex 连接”后重试；仍不可用时先切回“官方直连”。",
       ];
   return `故障归属：${officialFailure ? "官方 Codex" : "九门服务"}\n具体原因：${reason}\n处理流程：\n${steps.map((step, index) => `${index + 1}. ${step}`).join("\n")}`;
 };
@@ -86,7 +87,14 @@ const App = () => {
     status: "loading",
   });
   const [activeSection, setActiveSection] = useState<
-    "clients" | "configuration" | "enterprise" | "guide" | "personal" | "tasks" | "usage"
+    | "clients"
+    | "configuration"
+    | "enterprise"
+    | "guide"
+    | "personal"
+    | "services"
+    | "tasks"
+    | "usage"
   >("configuration");
   const [locale, setLocale] = useState<"en-US" | "zh-CN">("zh-CN");
   const [selectedMode, setSelectedMode] = useState<ConfigurationMode>("managed");
@@ -94,8 +102,9 @@ const App = () => {
   const selectedModeRef = useRef<ConfigurationMode>("managed");
   const hasLoadedWorkspace = useRef(false);
   const [configurationForm, setConfigurationForm] = useState<ConfigurationForm>({
-    activeProfileId: "managed-default",
+    activeProfileId: "ai-tidu9-config",
     virtualModelName: "九门赛博提督",
+    modelSelection: { source: "official", model: "current" },
     expertServices: DEFAULT_EXPERT_SERVICES,
   });
   const [operation, setOperation] = useState<OperationState>({
@@ -116,6 +125,7 @@ const App = () => {
     endpoint: null,
     model: null,
   });
+  const [codexSelectedMode, setCodexSelectedMode] = useState<"official" | "ai-tidu9">("official");
   const [codexConfigurationPending, setCodexConfigurationPending] = useState(false);
   const refreshCodexConfiguration = useCallback(async () => {
     const response = await fetch("/api/clients/codex/configuration", {
@@ -128,7 +138,9 @@ const App = () => {
           : "Codex 配置状态读取失败。",
       );
     }
-    setCodexConfiguration((await response.json()) as CodexConfigurationStatus);
+    const configuration = (await response.json()) as CodexConfigurationStatus;
+    setCodexConfiguration(configuration);
+    setCodexSelectedMode(configuration.activeMode);
   }, []);
   const refreshHostUsage = useCallback(async () => {
     setHostUsageState({ status: "loading" });
@@ -190,8 +202,8 @@ const App = () => {
         status: "success",
         message:
           locale === "zh-CN"
-            ? "九门配置已安装，当前仍保持官方模式。选择“九门”后，Codex 模型列表会同时显示九门与官方模型。"
-            : "AI-Tidu9 configuration is installed while Official mode remains active. Select AI-Tidu9 to show both AI-Tidu9 and official models in Codex.",
+            ? "九门配置已准备，当前保持纯官方直连；九门模型与 MCP 不会在确认切换前启用。"
+            : "AI-Tidu9 is prepared while pure Official direct mode remains active. Its model and MCP stay disabled until you confirm the switch.",
       });
       await refreshCodexConfiguration();
     } catch (error) {
@@ -222,15 +234,16 @@ const App = () => {
           throw new Error(formatCodexFailure(result, locale));
         }
         setCodexConfiguration(result);
+        setCodexSelectedMode(result.activeMode);
         setCodexConnection({
           status: "success",
           message:
             mode === "official"
               ? locale === "zh-CN"
-                ? "已恢复官方 Codex 配置。官方账号和模型目录将在重启 Codex 后显示。"
-                : "Official Codex configuration restored. Restart Codex to reload the account and model catalog."
+                ? "已恢复纯官方 Codex 直连，并注销九门 MCP。重启 Codex 后现有会话也会完全卸载九门进程。"
+                : "Pure Official Codex direct mode is restored and the AI-Tidu9 MCP is unregistered. Restart Codex to unload it from existing sessions."
               : locale === "zh-CN"
-                ? "九门本地服务与推理验证通过。重启 Codex 后，模型列表会同时显示九门与官方模型；官方账号身份保持不变。"
+                ? "九门本地服务与推理验证通过。重启 Codex 后会显示一个九门虚拟模型；其上游模型由配置页决定，官方账号身份保持不变。"
                 : "The local AI-Tidu9 service and inference were verified. Restart Codex to show both AI-Tidu9 and official models while retaining the official account identity.",
         });
       } catch (error) {
@@ -245,49 +258,6 @@ const App = () => {
     },
     [locale, refreshCodexConfiguration],
   );
-
-  const uninstallCodexConfiguration = useCallback(async () => {
-    setCodexConfigurationPending(true);
-    setCodexConnection({ status: "pending" });
-    try {
-      const response = await fetch("/api/clients/codex/configuration", {
-        method: "DELETE",
-        headers: { "content-type": "application/json" },
-        body: "{}",
-      });
-      const result = (await response.json()) as {
-        configuration?: CodexConfigurationStatus;
-        message?: string;
-      };
-      if (!response.ok) {
-        throw new Error(
-          result.message ?? `Codex configuration removal failed (${response.status})`,
-        );
-      }
-      setCodexConfiguration(
-        result.configuration ?? {
-          installed: false,
-          activeMode: "official",
-          endpoint: null,
-          model: null,
-        },
-      );
-      setCodexConnection({
-        status: "success",
-        message:
-          locale === "zh-CN"
-            ? "九门 Codex Profile、模型目录、MCP 注册和托管配置已卸载，官方配置已恢复。"
-            : "AI-Tidu9 Codex profile, model catalog, MCP registration, and managed settings were removed; official configuration was restored.",
-      });
-    } catch (error) {
-      setCodexConnection({
-        status: "error",
-        message: error instanceof Error ? error.message : "Codex configuration removal failed.",
-      });
-    } finally {
-      setCodexConfigurationPending(false);
-    }
-  }, [locale]);
 
   const acceptBootstrap = useCallback(
     (bootstrap: ConfigCenterBootstrap, mode?: ConfigurationMode) => {
@@ -385,6 +355,7 @@ const App = () => {
       : {
           activeProfileId: form.activeProfileId,
           virtualModelName: form.virtualModelName,
+          modelSelection: form.modelSelection,
         };
   const validation = validateConfiguration(
     {
@@ -423,6 +394,7 @@ const App = () => {
       : {
           activeProfileId: savedForm.activeProfileId,
           virtualModelName: savedForm.virtualModelName,
+          modelSelection: savedForm.modelSelection,
         };
   const isDirty = JSON.stringify(persistedForm) !== JSON.stringify(savedPersistedForm);
   const isPending = operation.status === "pending";
@@ -430,6 +402,8 @@ const App = () => {
     workspace.active.configuration.activeMode === selectedMode &&
     workspace.active.configuration.activeProfileId === form.activeProfileId &&
     workspace.active.configuration.virtualModelName === form.virtualModelName &&
+    workspace.active.configuration.modelSelection.source === form.modelSelection.source &&
+    workspace.active.configuration.modelSelection.model === form.modelSelection.model &&
     (selectedMode === "managed" ||
       JSON.stringify(workspace.active.configuration.expertServices) ===
         JSON.stringify(form.expertServices));
@@ -607,6 +581,20 @@ const App = () => {
           {locale === "zh-CN" ? "任务" : "Tasks"}
         </button>
         {bootstrap.deployment === "personal" ? (
+          <button
+            className={
+              activeSection === "services"
+                ? "section-button section-button-active"
+                : "section-button"
+            }
+            type="button"
+            aria-current={activeSection === "services" ? "page" : undefined}
+            onClick={() => setActiveSection("services")}
+          >
+            {locale === "zh-CN" ? "服务" : "Services"}
+          </button>
+        ) : null}
+        {bootstrap.deployment === "personal" ? (
           <>
             <button
               className={
@@ -712,8 +700,8 @@ const App = () => {
                 <p>
                   {configurationView === "active"
                     ? locale === "zh-CN"
-                      ? "这里只显示运行中的配置与环境信息。"
-                      : "This view contains only active runtime and environment details."
+                      ? "这里只显示当前生效的配置；运行状态统一在服务页查看。"
+                      : "This view shows active configuration only; runtime status is available under Services."
                     : locale === "zh-CN"
                       ? "这里只编辑未生效草稿；保存、模拟并启用后才会影响运行流程。"
                       : "This view edits an inactive draft. Save, preview, and activate it to change runtime behavior."}
@@ -760,42 +748,8 @@ const App = () => {
           <div className="configuration-view-content" hidden={configurationView !== "active"}>
             <section
               className="cards"
-              aria-label={locale === "zh-CN" ? "运行环境" : "Runtime environment"}
+              aria-label={locale === "zh-CN" ? "生效配置" : "Active configuration"}
             >
-              <article className="card storage-location-card">
-                <p className="card-label">{locale === "zh-CN" ? "数据库" : "DATABASE"}</p>
-                <p className="location-value" title={bootstrap.storage.location}>
-                  {bootstrap.storage.location}
-                </p>
-                <p>
-                  {bootstrap.storage.provider.toUpperCase()} · Schema{" "}
-                  {bootstrap.storage.schemaVersion}
-                </p>
-                <dl className="configuration-facts">
-                  <div>
-                    <dt>{locale === "zh-CN" ? "连接方式" : "Connection"}</dt>
-                    <dd>{locale === "zh-CN" ? "进程内嵌入式" : "Embedded in process"}</dd>
-                  </div>
-                  <div>
-                    <dt>{locale === "zh-CN" ? "数据库服务" : "Database service"}</dt>
-                    <dd>{locale === "zh-CN" ? "无独立服务" : "No separate service"}</dd>
-                  </div>
-                  <div>
-                    <dt>{locale === "zh-CN" ? "主机 / 端口" : "Host / port"}</dt>
-                    <dd>{locale === "zh-CN" ? "不适用" : "Not applicable"}</dd>
-                  </div>
-                </dl>
-                <div className="database-tables">
-                  {bootstrap.storage.tables.map((table) => (
-                    <p key={table.name}>
-                      <code>{table.name}</code>
-                      <span>
-                        {table.rowCount} {locale === "zh-CN" ? "行" : "rows"}
-                      </span>
-                    </p>
-                  ))}
-                </div>
-              </article>
               <article className="card active-runtime-card">
                 <p className="card-label">
                   {locale === "zh-CN" ? "当前生效配置" : "ACTIVE CONFIGURATION"}
@@ -810,49 +764,29 @@ const App = () => {
                   {workspace.active.configuration.virtualModelName}
                 </p>
                 <p>
+                  {locale === "zh-CN" ? "当前上游" : "Selected upstream"}：
+                  {workspace.active.configuration.modelSelection.source === "official"
+                    ? locale === "zh-CN"
+                      ? "官方模型"
+                      : "Official"
+                    : locale === "zh-CN"
+                      ? "公司模型"
+                      : "Company"}
+                  {" · "}
+                  {workspace.active.configuration.modelSelection.model === "current"
+                    ? locale === "zh-CN"
+                      ? "跟随当前官方模型"
+                      : "Follow current official model"
+                    : workspace.active.configuration.modelSelection.model}
+                </p>
+                <p>
                   {locale === "zh-CN" ? "修订" : "Revision"}：{workspace.active.revision} ·{" "}
                   {workspace.active.updatedAt}
                 </p>
                 <p>
-                  {locale === "zh-CN" ? "模型服务" : "Model provider"}：
-                  {bootstrap.runtime.provider.configured
-                    ? `${bootstrap.runtime.provider.type} · ${bootstrap.runtime.provider.model}`
-                    : locale === "zh-CN"
-                      ? "尚未配置"
-                      : "Not configured"}
-                </p>
-                <p>
-                  {locale === "zh-CN" ? "运行版本" : "Runtime version"}：v
-                  {bootstrap.product.version} · {locale === "zh-CN" ? "配置契约" : "Contract"}{" "}
+                  {locale === "zh-CN" ? "配置契约" : "Configuration contract"}：
                   {workspace.active.configuration.schemaVersion}
                 </p>
-                <p className="location-value" title={bootstrap.runtime.installationLocation}>
-                  {locale === "zh-CN" ? "安装入口" : "Entry"}：
-                  {bootstrap.runtime.installationLocation}
-                </p>
-                <p>
-                  {locale === "zh-CN" ? "监听地址" : "Listen address"}：
-                  <code>{bootstrap.runtime.origin}</code>
-                </p>
-                <div className="runtime-services">
-                  {bootstrap.runtime.services.map((service) => (
-                    <p key={service.id}>
-                      <span>
-                        <strong>{service.name}</strong>
-                        <code>{service.path}</code>
-                      </span>
-                      <em className={service.enabled ? "service-enabled" : "service-disabled"}>
-                        {service.enabled
-                          ? locale === "zh-CN"
-                            ? "已启用"
-                            : "Enabled"
-                          : locale === "zh-CN"
-                            ? "已关闭"
-                            : "Disabled"}
-                      </em>
-                    </p>
-                  ))}
-                </div>
                 <p>
                   {locale === "zh-CN" ? "草稿修订" : "Draft revisions"}：
                   {locale === "zh-CN" ? "共享配置" : "Shared"} {workspace.drafts.managed.revision} ·{" "}
@@ -903,6 +837,8 @@ const App = () => {
           connectingCursor={connectingCursor}
           cursorConnectionError={cursorConnectionError}
         />
+      ) : bootstrap.deployment === "personal" && activeSection === "services" ? (
+        <ServiceControlPanel locale={locale} />
       ) : bootstrap.deployment === "personal" && activeSection === "personal" ? (
         <PersonalExperiencePanel
           locale={locale}
@@ -978,8 +914,8 @@ const App = () => {
                 <p className="client-limitation">
                   {group.id === "openai"
                     ? locale === "zh-CN"
-                      ? "这里切换的是配置模式，不是具体模型。九门模式显示九门与官方模型；官方模式只显示官方模型。两种模式都保留 Codex 官方登录账号、套餐与额度信息。"
-                      : "This switches configuration modes, not individual models. AI-Tidu9 mode shows AI-Tidu9 and official models; Official mode shows only official models. Both retain the official Codex account, plan, and quota information."
+                      ? "这里只管理 Codex 接入，不配置上游模型。九门模式在 Codex 中只增加一个九门虚拟模型；其官方或公司上游在配置页选择。"
+                      : "This area manages Codex connectivity, not upstream selection. AI-Tidu9 mode adds one virtual model to Codex; select its official or company upstream on the configuration page."
                     : locale === "zh-CN"
                       ? "九门作为 MCP 连接器接入 Cursor；Cursor 官方模型列表不会新增九门模型项。"
                       : "AI-Tidu9 connects to Cursor as an MCP connector; Cursor's official model list does not gain an AI-Tidu9 model entry."}
@@ -987,79 +923,115 @@ const App = () => {
                 {group.id === "openai" ? (
                   <div className="client-connect-row">
                     <div className="client-configuration-status">
-                      <strong>{locale === "zh-CN" ? "当前配置" : "Active configuration"}</strong>
+                      <strong>
+                        {locale === "zh-CN" ? "Codex 接入模式" : "Codex connection mode"}
+                      </strong>
                       <span>
                         {codexConfiguration.activeMode === "official"
                           ? locale === "zh-CN"
-                            ? "官方 Codex"
-                            : "Official Codex"
+                            ? "官方直连"
+                            : "Official direct"
                           : locale === "zh-CN"
-                            ? "九门"
-                            : "AI-Tidu9"}
+                            ? "九门模式"
+                            : "AI-Tidu9 mode"}
                       </span>
                     </div>
                     <div className="codex-configuration-modes">
                       <button
                         type="button"
                         className={
-                          codexConfiguration.activeMode === "ai-tidu9"
+                          codexSelectedMode === "ai-tidu9"
                             ? "codex-configuration-mode selected"
                             : "codex-configuration-mode"
                         }
                         disabled={codexConfigurationPending || !codexConfiguration.installed}
-                        onClick={() => void updateCodexConfiguration("ai-tidu9")}
+                        onClick={() => setCodexSelectedMode("ai-tidu9")}
                       >
-                        <strong>{locale === "zh-CN" ? "九门" : "AI-Tidu9"}</strong>
+                        <strong>{locale === "zh-CN" ? "九门模式" : "AI-Tidu9 mode"}</strong>
                         <span>
                           {locale === "zh-CN"
-                            ? "Codex 列表显示九门 + 官方模型"
-                            : "Codex shows AI-Tidu9 + official models"}
+                            ? "一个九门虚拟模型，上游在配置页选择"
+                            : "One virtual model; choose its upstream in Configuration"}
                         </span>
                       </button>
                       <button
                         type="button"
                         className={
-                          codexConfiguration.activeMode === "official"
+                          codexSelectedMode === "official"
                             ? "codex-configuration-mode selected"
                             : "codex-configuration-mode"
                         }
                         disabled={codexConfigurationPending}
-                        onClick={() => void updateCodexConfiguration("official")}
+                        onClick={() => setCodexSelectedMode("official")}
                       >
-                        <strong>{locale === "zh-CN" ? "官方" : "Official"}</strong>
+                        <strong>{locale === "zh-CN" ? "官方直连" : "Official direct"}</strong>
                         <span>
                           {locale === "zh-CN"
-                            ? "Codex 列表只显示官方模型"
-                            : "Codex shows official models only"}
+                            ? "仅使用账号可用的官方模型"
+                            : "Only account-available official models"}
                         </span>
                       </button>
                     </div>
-                    <button
-                      type="button"
-                      className="primary-button"
-                      disabled={codexConnection.status === "pending"}
-                      onClick={() => void connectCodex()}
-                    >
-                      {codexConnection.status === "pending"
-                        ? locale === "zh-CN"
-                          ? "正在更新…"
-                          : "Updating…"
-                        : locale === "zh-CN"
-                          ? codexConfiguration.installed
-                            ? "更新九门配置"
-                            : "安装九门配置"
-                          : codexConfiguration.installed
-                            ? "Update AI-Tidu9 configuration"
-                            : "Install AI-Tidu9 configuration"}
-                    </button>
-                    <button
-                      type="button"
-                      className="danger-button"
-                      disabled={codexConfigurationPending || !codexConfiguration.installed}
-                      onClick={() => void uninstallCodexConfiguration()}
-                    >
-                      {locale === "zh-CN" ? "卸载九门配置" : "Remove AI-Tidu9 configuration"}
-                    </button>
+                    {codexSelectedMode !== codexConfiguration.activeMode ? (
+                      <div className="codex-mode-confirmation">
+                        <p>
+                          {locale === "zh-CN"
+                            ? `待切换：${codexConfiguration.activeMode === "official" ? "官方直连" : "九门模式"} → ${codexSelectedMode === "official" ? "官方直连" : "九门模式"}`
+                            : `Pending: ${codexConfiguration.activeMode === "official" ? "Official direct" : "AI-Tidu9 mode"} → ${codexSelectedMode === "official" ? "Official direct" : "AI-Tidu9 mode"}`}
+                        </p>
+                        <button
+                          type="button"
+                          className="primary-button"
+                          disabled={codexConfigurationPending}
+                          onClick={() => void updateCodexConfiguration(codexSelectedMode)}
+                        >
+                          {codexConfigurationPending
+                            ? locale === "zh-CN"
+                              ? "切换中…"
+                              : "Switching…"
+                            : locale === "zh-CN"
+                              ? "确认切换"
+                              : "Confirm switch"}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={codexConfigurationPending}
+                          onClick={() => setCodexSelectedMode(codexConfiguration.activeMode)}
+                        >
+                          {locale === "zh-CN" ? "取消" : "Cancel"}
+                        </button>
+                      </div>
+                    ) : null}
+                    <div className="codex-global-setup">
+                      <div>
+                        <strong>
+                          {locale === "zh-CN" ? "全局 Codex 配置" : "Global Codex setup"}
+                        </strong>
+                        <span>
+                          {locale === "zh-CN"
+                            ? "准备九门配置档和完整模型目录，供本机新启动的 Codex 会话使用；不会切换当前接入模式。"
+                            : "Prepare the AI-Tidu9 profile and complete model catalog for newly started Codex sessions on this device. This does not switch the active mode."}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        className="primary-button"
+                        disabled={codexConnection.status === "pending"}
+                        onClick={() => void connectCodex()}
+                      >
+                        {codexConnection.status === "pending"
+                          ? locale === "zh-CN"
+                            ? "正在更新…"
+                            : "Updating…"
+                          : locale === "zh-CN"
+                            ? codexConfiguration.installed
+                              ? "更新全局配置"
+                              : "准备全局配置"
+                            : codexConfiguration.installed
+                              ? "Update global setup"
+                              : "Prepare global setup"}
+                      </button>
+                    </div>
                     {codexConnection.status === "success" || codexConnection.status === "error" ? (
                       <p
                         className={`client-connect-message client-connect-message-${codexConnection.status}`}

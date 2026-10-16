@@ -7,8 +7,8 @@ export interface OpenAiModel {
   created: number;
   /** OpenAI-compatible object discriminator. */
   object: "model";
-  /** Required AI-Tidu9 attribution retained under custom display names. */
-  owned_by: "AI-Tidu9";
+  /** Provider attribution retained under custom display names. */
+  owned_by: string;
   /** Human-readable virtual-model name shown by compatible client catalogs. */
   display_name: string;
 }
@@ -68,6 +68,31 @@ export const createOpenAiModel = (
   owned_by: "AI-Tidu9",
   display_name: configuration.virtualModelName,
 });
+
+export const createCompanyModelId = (model: string): string | undefined => {
+  const normalizedModel = model
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .slice(0, 48);
+  return normalizedModel === "" ? undefined : `company-${normalizedModel}`;
+};
+
+export const createProviderOpenAiModel = (
+  provider: { model: string; type: string },
+  activatedAt: string,
+): OpenAiModel | undefined => {
+  if (provider.type === "codex-host" || provider.type === "cursor-host") return undefined;
+  const modelId = createCompanyModelId(provider.model);
+  if (modelId === undefined) return undefined;
+  return {
+    id: modelId,
+    created: Math.floor(Date.parse(activatedAt) / 1_000),
+    object: "model",
+    owned_by: "AI-Tidu9 company service",
+    display_name: provider.model,
+  };
+};
 
 const validateModel = (
   body: Record<string, unknown>,

@@ -1,6 +1,15 @@
 export const CONFIG_SCHEMA_VERSION = "1" as const;
+export const DEFAULT_VIRTUAL_MODEL_ID = "ai-tidu9-config";
 
 export type ConfigurationMode = "managed" | "expert";
+export type ModelSource = "company" | "official";
+
+export interface ModelSelection {
+  /** Provider group used behind the single AI-Tidu9 virtual-model entry. */
+  source: ModelSource;
+  /** Upstream model ID, or `current` to follow the active official Codex model. */
+  model: string;
+}
 
 export interface ExpertServiceConfiguration {
   /** Network interface used by the local runtime after the next restart. */
@@ -24,6 +33,8 @@ export interface TiduConfiguration {
   activeMode: ConfigurationMode;
   /** Virtual-model display name exposed to compatible clients. */
   virtualModelName: string;
+  /** Upstream selected behind the virtual model. */
+  modelSelection: ModelSelection;
   /** Advanced service settings, present only for expert-mode configurations. */
   expertServices?: ExpertServiceConfiguration;
 }
@@ -36,6 +47,7 @@ export interface ConfigurationValidationIssue {
     | "INVALID_MODE"
     | "INVALID_PROFILE_ID"
     | "INVALID_SCHEMA"
+    | "INVALID_MODEL_SELECTION"
     | "INVALID_VIRTUAL_MODEL_NAME";
   /** Configuration field that failed validation. */
   field: keyof TiduConfiguration;
@@ -55,9 +67,10 @@ export const createDefaultConfiguration = (
 ): TiduConfiguration => {
   const configuration: TiduConfiguration = {
     schemaVersion: CONFIG_SCHEMA_VERSION,
-    activeProfileId: `${mode}-default`,
+    activeProfileId: mode === "managed" ? DEFAULT_VIRTUAL_MODEL_ID : "expert-default",
     activeMode: mode,
     virtualModelName: "九门赛博提督",
+    modelSelection: { source: "official", model: "current" },
   };
   if (mode === "expert") {
     configuration.expertServices = {
@@ -104,6 +117,17 @@ export const validateConfiguration = (
       code: "INVALID_VIRTUAL_MODEL_NAME",
       field: "virtualModelName",
       message: "Virtual-model name must contain 1-64 characters.",
+    });
+  }
+  if (
+    (configuration.modelSelection.source !== "official" &&
+      configuration.modelSelection.source !== "company") ||
+    !/^[a-z0-9][a-z0-9._:-]{0,127}$/iu.test(configuration.modelSelection.model.trim())
+  ) {
+    issues.push({
+      code: "INVALID_MODEL_SELECTION",
+      field: "modelSelection",
+      message: "Model selection must contain a supported source and non-empty model ID.",
     });
   }
   if (expectedMode === "expert" && configuration.expertServices !== undefined) {

@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-
+import { DEFAULT_VIRTUAL_MODEL_ID } from "../config/index.js";
 import { PRODUCT, TiduError } from "../core/index.js";
 
 const CODEX_PROFILE_NAME = "ai-tidu9";
@@ -26,6 +26,8 @@ const SNAPSHOT_PROFILE_FILE = "profile.config.toml";
 const SNAPSHOT_STATE_FILE = "state.json";
 const SNAPSHOT_MODEL_CATALOG_FILE = "model-catalog.json";
 const SNAPSHOT_DEFAULT_CONFIGURATION_FILE = "config.toml";
+const MANAGED_SNAPSHOT_ID_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u;
 
 export interface CodexClientConfigurationOptions {
   /** AI-Tidu9 management origin used by the dedicated Codex profile. */
@@ -36,6 +38,13 @@ export interface CodexClientConfigurationOptions {
   codexHomeDirectory?: string;
   /** Optional fetch implementation for embedded runtimes and isolated tests. */
   request?: typeof fetch;
+}
+
+export interface CodexOfficialModel {
+  /** Account-visible official model identifier. */
+  id: string;
+  /** Human-readable official model name. */
+  name: string;
 }
 
 export interface CodexClientRollbackOptions {
@@ -274,7 +283,7 @@ const activateDefaultCodexConfiguration = (
     'name = "AI-Tidu9"',
     `base_url = ${JSON.stringify(`${endpoint}/v1`)}`,
     'wire_api = "responses"',
-    "requires_openai_auth = true",
+    "requires_openai_auth = false",
     "supports_websockets = false",
     MANAGED_PROVIDER_END,
   );
@@ -439,8 +448,10 @@ const verifyEndpoint = async (
     });
   }
   const modelList = await requestJson(request, endpoint, "/v1/models");
-  const models = modelList.data;
-  const firstModel = Array.isArray(models) ? models[0] : undefined;
+  const models = Array.isArray(modelList.data) ? modelList.data : [];
+  const firstModel = models.find(
+    (candidate) => isRecord(candidate) && candidate.owned_by === "AI-Tidu9",
+  );
   if (
     !isRecord(firstModel) ||
     typeof firstModel.id !== "string" ||
@@ -549,7 +560,7 @@ const createCodexProfile = (endpoint: string, model: string, modelCatalogPath: s
     'name = "AI-Tidu9"',
     `base_url = ${JSON.stringify(`${endpoint}/v1`)}`,
     'wire_api = "responses"',
-    "requires_openai_auth = true",
+    "requires_openai_auth = false",
     "supports_websockets = false",
     "",
   ].join("\n");
@@ -662,6 +673,11 @@ const readManagedCatalogHistory = (
           isRecord(candidate) &&
           typeof candidate.slug === "string" &&
           candidate.slug !== tiduModel &&
+          candidate.slug !== "managed-default" &&
+          !(
+            typeof candidate.description === "string" &&
+            candidate.description.startsWith("Company service model")
+          ) &&
           candidate.visibility === "list" &&
           candidate.supported_in_api === true,
       );
@@ -669,6 +685,24 @@ const readManagedCatalogHistory = (
       return [];
     }
   });
+};
+
+export const listCodexOfficialModels = (
+  codexHomeDirectory?: string,
+): readonly CodexOfficialModel[] => {
+  const paths = resolveCodexPaths(codexHomeDirectory);
+  const currentModels = readOfficialCatalogModels(paths);
+  const historicalModels = readManagedCatalogHistory(paths, DEFAULT_VIRTUAL_MODEL_ID).sort(
+    (left, right) => String(left.slug).localeCompare(String(right.slug), "en"),
+  );
+  const modelsById = new Map<string, CodexOfficialModel>();
+  for (const model of [...currentModels, ...historicalModels]) {
+    const id = String(model.slug);
+    if (!modelsById.has(id)) {
+      modelsById.set(id, { id, name: String(model.display_name) });
+    }
+  }
+  return [...modelsById.values()];
 };
 
 const createUnifiedCodexModelCatalog = (
@@ -679,12 +713,17 @@ const createUnifiedCodexModelCatalog = (
   const tiduCatalog = JSON.parse(createCodexModelCatalog(model, displayName)) as {
     models: Record<string, unknown>[];
   };
-  const modelsBySlug = new Map<string, Record<string, unknown>>();
+  const modelsBySlug = new Map<string, Record<string, unknown>>([
+    [model, tiduCatalog.models[0] as Record<string, unknown>],
+  ]);
   const officialModels = [
     ...readManagedCatalogHistory(paths, model),
     ...readOfficialCatalogModels(paths),
   ];
   for (const officialModel of officialModels) {
+    if (officialModel.slug === model || officialModel.slug === "managed-default") {
+      continue;
+    }
     const modelMessages = isRecord(officialModel.model_messages)
       ? officialModel.model_messages
       : undefined;
@@ -700,7 +739,6 @@ const createUnifiedCodexModelCatalog = (
       base_instructions: baseInstructions,
     });
   }
-  modelsBySlug.set(model, tiduCatalog.models[0] as Record<string, unknown>);
   return `${JSON.stringify({ models: [...modelsBySlug.values()] }, null, 2)}\n`;
 };
 
@@ -929,10 +967,31 @@ const listSnapshotIds = (paths: CodexPaths): readonly string[] => {
   }
   ensureSafeDirectory(paths.backups);
   return readdirSync(paths.backups, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+    .filter(
+      (entry) =>
+        entry.isDirectory() &&
+        !entry.isSymbolicLink() &&
+        MANAGED_SNAPSHOT_ID_PATTERN.test(entry.name),
+    )
     .map((entry) => entry.name)
     .sort()
     .reverse();
+};
+
+const pruneManagedSnapshots = (paths: CodexPaths, retainedIds: readonly string[]): void => {
+  const retained = new Set(retainedIds);
+  for (const backupId of listSnapshotIds(paths)) {
+    if (retained.has(backupId)) {
+      continue;
+    }
+    const snapshotDirectory = join(paths.backups, backupId);
+    try {
+      readSnapshotManifest(snapshotDirectory);
+    } catch {
+      continue;
+    }
+    rmSync(snapshotDirectory, { force: true, recursive: true });
+  }
 };
 
 export const configureCodexClient = async (
@@ -943,7 +1002,7 @@ export const configureCodexClient = async (
     options.verifyRuntime === false
       ? {
           endpoint: normalizeEndpoint(options.endpoint),
-          model: "managed-default",
+          model: DEFAULT_VIRTUAL_MODEL_ID,
           displayName: PRODUCT.name,
         }
       : await verifyEndpoint(options.endpoint, request);
@@ -977,6 +1036,7 @@ export const configureCodexClient = async (
       activeMode: "official",
       configuredAt: new Date().toISOString(),
     });
+    pruneManagedSnapshots(paths, [existingState.originalBackupId, existingState.backupId]);
     return {
       status: "configured",
       client: "codex",
@@ -1015,6 +1075,7 @@ export const configureCodexClient = async (
         );
       }
     }
+    pruneManagedSnapshots(paths, [state.originalBackupId, state.backupId]);
   } catch (error) {
     restoreSnapshot(paths, backupId, true);
     throw error;

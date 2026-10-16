@@ -90,7 +90,7 @@ tidu clients switch codex <official|ai-tidu9> [--yes] [--endpoint <url>]
 tidu clients rollback codex [--yes]
 ```
 
-`setup` 默认动作是 `install`，不要求预先启动运行时。它会安装连接器并准备九门配置，但保持官方配置生效。`clients switch codex ai-tidu9` 切到九门配置后，Codex 列表同时显示官方模型与九门模型；`clients switch codex official` 恢复仅显示官方模型。这里切换的是配置模式，不是具体模型。官方账号、套餐和额度仍由官方 Codex 管理。切换失败、服务正常退出、手动恢复、回滚或卸载时恢复原始官方配置。
+`setup` 默认动作是 `install`，不要求预先启动运行时。它会安装连接器并准备九门配置，但保持官方直连生效。`clients switch codex ai-tidu9` 只在 Codex 中增加一个九门虚拟模型；官方或公司上游模型在九门配置页选择，公司模型不会成为独立 Codex 模型项。`clients switch codex official` 恢复仅显示官方模型。官方账号、套餐和额度仍由官方 Codex 管理。九门自有备份只保留首次安装基线与最新回滚点。
 
 安装后的同一个 MCP 连接器会向 Codex 插件和 Cursor 提供 `list_tidu_channels` 与 `route_tidu_channel`。宿主自己的模型列表不被覆盖；选择 `codex` 或 `cursor` 时由官方宿主进程执行，选择 `tidu` 时走九门运行时，选择厂商ID时读取当前连接器进程的环境变量。
 

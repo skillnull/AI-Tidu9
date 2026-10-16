@@ -251,6 +251,10 @@ export const previewConfigurationImpact = (
     ...(active.activeMode === candidate.activeMode ? [] : ["activeMode"]),
     ...(active.activeProfileId === candidate.activeProfileId ? [] : ["activeProfileId"]),
     ...(active.virtualModelName === candidate.virtualModelName ? [] : ["virtualModelName"]),
+    ...(active.modelSelection.source === candidate.modelSelection.source &&
+    active.modelSelection.model === candidate.modelSelection.model
+      ? []
+      : ["modelSelection"]),
     ...(activeExpertServices?.host === candidateExpertServices?.host
       ? []
       : ["expertServices.host"]),

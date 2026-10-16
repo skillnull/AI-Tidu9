@@ -3,6 +3,7 @@ import type { TaskControlView } from "../../src/agent/index.js";
 import type {
   ConfigurationMode,
   ExpertServiceConfiguration,
+  ModelSelection,
   TiduConfiguration,
 } from "../../src/config/index.js";
 import type { ConfigCenterBootstrap } from "../../src/config-center/contracts.js";
@@ -69,6 +70,8 @@ export interface ConfigurationForm {
   activeProfileId: string;
   /** User-facing virtual-model name exposed by compatible clients. */
   virtualModelName: string;
+  /** Upstream selected behind the single virtual-model entry. */
+  modelSelection: ModelSelection;
   /** Advanced runtime service controls available only in expert mode. */
   expertServices?: ExpertServiceConfiguration;
 }
@@ -122,6 +125,9 @@ const impactChangeLabel = (
     virtualModelName: english
       ? `Virtual model → ${form.virtualModelName}`
       : `虚拟模型 → ${form.virtualModelName}`,
+    modelSelection: english
+      ? `Upstream model → ${form.modelSelection.source} · ${form.modelSelection.model}`
+      : `上游模型 → ${form.modelSelection.source === "official" ? "官方" : "公司"} · ${form.modelSelection.model}`,
     "expertServices.host": english
       ? `Listen host → ${service?.host ?? "-"}`
       : `监听地址 → ${service?.host ?? "-"}`,
@@ -413,6 +419,7 @@ export const DEFAULT_EXPERT_SERVICES: ExpertServiceConfiguration = {
 export const toForm = (configuration: TiduConfiguration): ConfigurationForm => ({
   activeProfileId: configuration.activeProfileId,
   virtualModelName: configuration.virtualModelName,
+  modelSelection: configuration.modelSelection ?? { source: "official", model: "current" },
   ...(configuration.activeMode === "expert"
     ? {
         expertServices: configuration.expertServices ?? DEFAULT_EXPERT_SERVICES,
@@ -1153,6 +1160,15 @@ interface QuickStartWizardProps {
   onConnectCursor: () => Promise<void>;
 }
 
+interface UpstreamModelCatalog {
+  /** Whether a company provider is active in this runtime. */
+  companyConfigured: boolean;
+  /** Company-provider models available behind the virtual model. */
+  company: readonly { id: string; name: string }[];
+  /** Official Codex models available to the signed-in account. */
+  official: readonly { id: string; name: string }[];
+}
+
 export const QuickStartWizard = ({
   locale,
   enterpriseEnabled,
@@ -1202,6 +1218,14 @@ export const QuickStartWizard = ({
     } | null;
   }>({ status: "idle" });
   const [providerCheckRevision, setProviderCheckRevision] = useState(0);
+  const [upstreamCatalog, setUpstreamCatalog] = useState<UpstreamModelCatalog>({
+    companyConfigured: false,
+    company: [],
+    official: [],
+  });
+  const [upstreamCatalogStatus, setUpstreamCatalogStatus] = useState<"error" | "loading" | "ready">(
+    "loading",
+  );
   useEffect(() => {
     setStep(selectedMode === "expert" ? 1 : 0);
     setProviderCheck({ status: "idle" });
@@ -1230,6 +1254,17 @@ export const QuickStartWizard = ({
             : "兼容服务";
   useEffect(() => {
     if (step !== 2) return;
+    setUpstreamCatalogStatus("loading");
+    void fetch("/api/models/upstreams", { cache: "no-store" })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Model catalog unavailable");
+        setUpstreamCatalog((await response.json()) as UpstreamModelCatalog);
+        setUpstreamCatalogStatus("ready");
+      })
+      .catch(() => {
+        setUpstreamCatalog({ companyConfigured: false, company: [], official: [] });
+        setUpstreamCatalogStatus("error");
+      });
     let current = true;
     setProviderCheck({ status: "checking", provider: providerChoice });
     void fetch("/api/provider/detect", {
@@ -1524,6 +1559,140 @@ export const QuickStartWizard = ({
           </>
         ) : step === 2 ? (
           <>
+            <section className="provider-monitor">
+              <div className="provider-monitor-heading">
+                <strong>{english ? "Virtual-model upstream" : "九门虚拟模型上游"}</strong>
+              </div>
+              <p>
+                {english
+                  ? "Codex shows one AI-Tidu9 model entry. Choose the official or company model used behind it."
+                  : "Codex 只显示一个九门虚拟模型；在这里选择它实际调用的官方模型或公司模型。"}
+              </p>
+              <div className="onboarding-choice-row">
+                <button
+                  className={
+                    form.modelSelection.source === "official"
+                      ? "mode-button mode-button-active"
+                      : "mode-button"
+                  }
+                  type="button"
+                  onClick={() =>
+                    onFormChange({
+                      ...form,
+                      modelSelection: { source: "official", model: "current" },
+                    })
+                  }
+                  disabled={isPending || readOnly}
+                >
+                  {english ? "Official models" : "官方模型"}
+                </button>
+                <button
+                  className={
+                    form.modelSelection.source === "company"
+                      ? "mode-button mode-button-active"
+                      : "mode-button"
+                  }
+                  type="button"
+                  onClick={() =>
+                    onFormChange({
+                      ...form,
+                      modelSelection: {
+                        source: "company",
+                        model: upstreamCatalog.company[0]?.id ?? providerModel ?? "",
+                      },
+                    })
+                  }
+                  disabled={isPending || readOnly}
+                >
+                  {english ? "Company models" : "公司模型"}
+                </button>
+              </div>
+              <div className="upstream-model-list" aria-live="polite">
+                {upstreamCatalogStatus === "loading" ? (
+                  <p>{english ? "Loading available models…" : "正在读取可用模型…"}</p>
+                ) : upstreamCatalogStatus === "error" ? (
+                  <p className="upstream-model-empty">
+                    {english
+                      ? "The model catalog could not be loaded. You can still enter a custom model ID below."
+                      : "模型列表读取失败，仍可在下方填写自定义模型 ID。"}
+                  </p>
+                ) : null}
+                {form.modelSelection.source === "official" ? (
+                  <button
+                    type="button"
+                    className={
+                      form.modelSelection.model === "current"
+                        ? "upstream-model-option selected"
+                        : "upstream-model-option"
+                    }
+                    onClick={() =>
+                      onFormChange({
+                        ...form,
+                        modelSelection: { source: "official", model: "current" },
+                      })
+                    }
+                    disabled={isPending || readOnly}
+                  >
+                    <strong>
+                      {english ? "Follow current official model" : "跟随当前官方模型"}
+                    </strong>
+                    <span>
+                      {providerModel ?? (english ? "Automatically detected" : "自动识别")}
+                    </span>
+                  </button>
+                ) : null}
+                {(form.modelSelection.source === "official"
+                  ? upstreamCatalog.official
+                  : upstreamCatalog.company
+                ).map((model) => (
+                  <button
+                    type="button"
+                    className={
+                      form.modelSelection.model === model.id
+                        ? "upstream-model-option selected"
+                        : "upstream-model-option"
+                    }
+                    key={model.id}
+                    onClick={() =>
+                      onFormChange({
+                        ...form,
+                        modelSelection: { source: form.modelSelection.source, model: model.id },
+                      })
+                    }
+                    disabled={isPending || readOnly}
+                  >
+                    <strong>{model.name}</strong>
+                    <code>{model.id}</code>
+                  </button>
+                ))}
+                {upstreamCatalogStatus === "ready" &&
+                form.modelSelection.source === "company" &&
+                upstreamCatalog.company.length === 0 ? (
+                  <p className="upstream-model-empty">
+                    {english
+                      ? "No company models were returned. Configure a company provider or enter a custom model ID."
+                      : "公司服务尚未返回模型，请先配置公司服务，或填写自定义模型 ID。"}
+                  </p>
+                ) : null}
+              </div>
+              <label className="upstream-custom-model">
+                {english ? "Custom model ID" : "自定义模型 ID"}
+                <input
+                  value={form.modelSelection.model}
+                  onChange={(event) =>
+                    onFormChange({
+                      ...form,
+                      modelSelection: {
+                        ...form.modelSelection,
+                        model: event.target.value,
+                      },
+                    })
+                  }
+                  placeholder={english ? "Enter a model ID" : "输入模型 ID"}
+                  disabled={isPending || readOnly}
+                />
+              </label>
+            </section>
             <p className="onboarding-kicker">
               {english ? `Selected provider · ${providerLabel}` : `当前检测 · ${providerLabel}`}
             </p>
@@ -1555,8 +1724,8 @@ export const QuickStartWizard = ({
                         ? "Use current model"
                         : "继续使用当前模型"
                       : english
-                        ? "Change model"
-                        : "修改模型"}
+                        ? "Change model source"
+                        : "切换模型来源"}
                   </button>
                 </div>
               </>

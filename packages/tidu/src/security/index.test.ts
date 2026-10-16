@@ -40,18 +40,24 @@ test("supports explicit blocking rules and isolated concurrent scopes", () => {
 
 test("guards every model request without exposing retained secret values", async () => {
   let upstreamBody: unknown;
+  let closed = false;
   const provider: ModelProvider = {
     descriptor: { type: "openai-compatible", model: "guard-test" },
     execute: async (request) => {
       upstreamBody = request.body;
       return { kind: "json", statusCode: 200, body: { ok: true } };
     },
+    close: async () => {
+      closed = true;
+    },
   };
   const guarded = guardModelProvider(provider, createSecretGate());
   await guarded.execute({
     protocol: "chat-completions",
-    virtualModelId: "managed-default",
+    virtualModelId: "ai-tidu9-config",
     body: { apiKey: "non-production-secret-value" },
   });
   assert.doesNotMatch(JSON.stringify(upstreamBody), /non-production-secret-value/u);
+  await guarded.close?.();
+  assert.equal(closed, true);
 });

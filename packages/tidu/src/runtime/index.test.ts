@@ -99,6 +99,7 @@ test("starts a loopback runtime with a verifiable health endpoint", async () => 
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), {
       product: PRODUCT.name,
+      runtimeMode: "installed",
       scaling: { status: "disabled" },
       status: "ok",
       storage: {
@@ -108,6 +109,28 @@ test("starts a loopback runtime with a verifiable health endpoint", async () => 
       },
       version: PRODUCT.version,
     });
+    const services = (await (await fetch(`${runtime.origin}/api/services`)).json()) as {
+      mode: string;
+      services: Array<{ id: string; status: string }>;
+    };
+    assert.equal(services.mode, "installed");
+    assert.deepEqual(
+      services.services.map(({ id, status }) => [id, status]),
+      [
+        ["tidu-service", "running"],
+        ["tidu-cli", "ready"],
+      ],
+    );
+    assert.equal(
+      (
+        await fetch(`${runtime.origin}/api/services/tidu-cli/check`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        })
+      ).status,
+      200,
+    );
   } finally {
     await runtime.close();
   }
@@ -182,7 +205,7 @@ test("configures the complete Codex dual-channel entry from the local API", asyn
     assert.deepEqual(await response.json(), {
       activeMode: "official",
       connected: true,
-      model: "managed-default",
+      model: "ai-tidu9-config",
       profile: "ai-tidu9",
     });
     const statusResponse = await fetch(`${runtime.origin}/api/clients/codex/configuration`);
@@ -191,14 +214,14 @@ test("configures the complete Codex dual-channel entry from the local API", asyn
       activeMode: "official",
       endpoint: runtime.origin,
       installed: true,
-      model: "managed-default",
+      model: "ai-tidu9-config",
     });
     const modelSelectionResponse = await fetch(
       `${runtime.origin}/api/clients/codex/configuration`,
       {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "managed-default" }),
+        body: JSON.stringify({ model: "ai-tidu9-config" }),
       },
     );
     assert.equal(modelSelectionResponse.status, 422);
@@ -224,7 +247,7 @@ test("configures the complete Codex dual-channel entry from the local API", asyn
     ) as { models: { slug: string }[] };
     assert.deepEqual(
       catalog.models.map(({ slug }) => slug),
-      ["official-test", "managed-default"],
+      ["ai-tidu9-config", "official-test"],
     );
     const officialModeResponse = await fetch(`${runtime.origin}/api/clients/codex/configuration`, {
       method: "POST",
@@ -463,31 +486,31 @@ test("routes validated inference through an injected real provider adapter", asy
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "managed-default",
+        model: "ai-tidu9-config",
         messages: [{ role: "user", content: "hello" }],
       }),
     });
     assert.equal(chatResponse.status, 200);
     assert.equal(chatResponse.headers.get("x-ai-tidu9"), "true");
-    assert.equal(((await chatResponse.json()) as { model: string }).model, "managed-default");
+    assert.equal(((await chatResponse.json()) as { model: string }).model, "ai-tidu9-config");
 
     const responsesResponse = await fetch(`${runtime.origin}/v1/responses`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "managed-default", input: "hello" }),
+      body: JSON.stringify({ model: "ai-tidu9-config", input: "hello" }),
     });
     assert.equal(responsesResponse.status, 200);
-    assert.equal(((await responsesResponse.json()) as { model: string }).model, "managed-default");
+    assert.equal(((await responsesResponse.json()) as { model: string }).model, "ai-tidu9-config");
     assert.deepEqual(requests, [
       {
         protocol: "chat-completions",
-        model: "managed-default",
-        virtualModelId: "managed-default",
+        model: "ai-tidu9-config",
+        virtualModelId: "ai-tidu9-config",
       },
       {
         protocol: "responses",
-        model: "managed-default",
-        virtualModelId: "managed-default",
+        model: "ai-tidu9-config",
+        virtualModelId: "ai-tidu9-config",
       },
     ]);
   } finally {
@@ -509,7 +532,7 @@ test("streams provider events through the virtual-model endpoint without bufferi
           start: (controller) => {
             controller.enqueue(
               encoder.encode(
-                'data: {"id":"chatcmpl-test","model":"managed-default","choices":[{"delta":{"content":"hello"}}]}\n\n',
+                'data: {"id":"chatcmpl-test","model":"ai-tidu9-config","choices":[{"delta":{"content":"hello"}}]}\n\n',
               ),
             );
             controller.enqueue(encoder.encode("data: [DONE]\n\n"));
@@ -530,7 +553,7 @@ test("streams provider events through the virtual-model endpoint without bufferi
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "managed-default",
+        model: "ai-tidu9-config",
         messages: [{ role: "user", content: "hello" }],
         stream: true,
         tools: [
@@ -571,7 +594,7 @@ test("cancels upstream streaming work when the client disconnects", async () => 
           start: (controller) => {
             controller.enqueue(
               encoder.encode(
-                'data: {"id":"chatcmpl-test","model":"managed-default","choices":[{"delta":{"content":"hello"}}]}\n\n',
+                'data: {"id":"chatcmpl-test","model":"ai-tidu9-config","choices":[{"delta":{"content":"hello"}}]}\n\n',
               ),
             );
           },
@@ -591,7 +614,7 @@ test("cancels upstream streaming work when the client disconnects", async () => 
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "managed-default",
+        model: "ai-tidu9-config",
         messages: [{ role: "user", content: "hello" }],
         stream: true,
       }),
@@ -714,10 +737,48 @@ test("exposes the active virtual model through OpenAI-compatible discovery", asy
     };
     assert.equal(models.object, "list");
     assert.equal(models.data.length, 1);
-    assert.equal(models.data[0]?.id, "managed-default");
+    assert.equal(models.data[0]?.id, "ai-tidu9-config");
     assert.equal(models.data[0]?.object, "model");
     assert.equal(models.data[0]?.owned_by, "AI-Tidu9");
     assert.equal(Number.isInteger(models.data[0]?.created), true);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("publishes company models only through the upstream-selection API", async () => {
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    port: 0,
+    provider: {
+      descriptor: { type: "openai-compatible", model: "company-model/v2" },
+      listModels: async () => [
+        { id: "company-model/v2", name: "Company Model V2" },
+        { id: "company-model/v3", name: "Company Model V3" },
+      ],
+      execute: async () => ({ kind: "json", statusCode: 200, body: { output: [] } }),
+    },
+  });
+
+  try {
+    const response = await fetch(`${runtime.origin}/v1/models`);
+    const models = (await response.json()) as {
+      data: Array<{ id: string; display_name: string; owned_by: string }>;
+    };
+    assert.deepEqual(
+      models.data.map(({ id }) => id),
+      ["ai-tidu9-config"],
+    );
+    assert.equal((await fetch(`${runtime.origin}/v1/models/company-company-model-v2`)).status, 404);
+    const upstreams = (await (await fetch(`${runtime.origin}/api/models/upstreams`)).json()) as {
+      companyConfigured: boolean;
+      company: Array<{ id: string; name: string }>;
+    };
+    assert.equal(upstreams.companyConfigured, true);
+    assert.deepEqual(upstreams.company, [
+      { id: "company-model/v2", name: "Company Model V2" },
+      { id: "company-model/v3", name: "Company Model V3" },
+    ]);
   } finally {
     await runtime.close();
   }
@@ -741,7 +802,7 @@ test("validates OpenAI-compatible inference requests before provider routing", a
     const invalidResponse = await fetch(`${runtime.origin}/v1/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "managed-default", messages: [] }),
+      body: JSON.stringify({ model: "ai-tidu9-config", messages: [] }),
     });
     assert.equal(invalidResponse.status, 400);
     assert.equal(
@@ -753,7 +814,7 @@ test("validates OpenAI-compatible inference requests before provider routing", a
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "managed-default",
+        model: "ai-tidu9-config",
         messages: [{ role: "user", content: "hello" }],
       }),
     });
@@ -769,7 +830,7 @@ test("validates OpenAI-compatible inference requests before provider routing", a
     const responsesResponse = await fetch(`${runtime.origin}/v1/responses`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "managed-default", input: "hello" }),
+      body: JSON.stringify({ model: "ai-tidu9-config", input: "hello" }),
     });
     assert.equal(responsesResponse.status, 503);
     const responseFailure = (await responsesResponse.json()) as {

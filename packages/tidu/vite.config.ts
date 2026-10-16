@@ -4,6 +4,7 @@ import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
 const runtimeTarget = `http://${process.env.TIDU_HOST ?? "127.0.0.1"}:${process.env.TIDU_RUNTIME_PORT ?? process.env.TIDU_PORT ?? "9639"}`;
+const managerTarget = `http://127.0.0.1:${process.env.TIDU_MANAGER_PORT ?? process.env.TIDU_RUNTIME_PORT ?? process.env.TIDU_PORT ?? "9639"}`;
 
 export default defineConfig({
   root: fileURLToPath(new URL("./ui", import.meta.url)),
@@ -11,6 +12,9 @@ export default defineConfig({
   server: {
     host: "127.0.0.1",
     proxy: {
+      "/api/services": {
+        target: managerTarget,
+      },
       "/api": {
         target: runtimeTarget,
       },

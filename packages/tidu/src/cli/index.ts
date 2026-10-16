@@ -63,6 +63,7 @@ Commands / 命令:
   tidu start        Start the runtime / 启动运行时
     --edition personal|enterprise  Select installation edition / 选择安装版型
   tidu setup        Install clients and virtual model / 安装客户端与虚拟模型
+  tidu service      Inspect or control the runtime / 查看或控制运行服务
   tidu mcp          Run the MCP connector / 运行MCP连接器
   tidu doctor       Diagnose the service / 诊断服务
   tidu clients      Discover or configure clients / 发现或配置客户端
@@ -257,6 +258,13 @@ Environment / 环境变量:
 
 Starts the runtime and prints the management URL. Secrets are read from the process environment only.
 启动运行时并输出管理地址；密钥只从当前进程环境读取。`,
+  service: `Service / 服务
+
+Usage / 用法:
+  tidu service [status|stop|restart] [--endpoint <url>]
+
+Reads the active runtime shape and controls only its runtime service. Use tidu start when stopped.
+读取当前运行形态并只控制对应运行时服务；停止后使用 tidu start 启动。`,
   uninstall: `Uninstall / 卸载
 
 Usage / 用法:
@@ -608,6 +616,51 @@ const runClientConfiguration = async (argumentsList: readonly string[]): Promise
       : `${style("✓", "green")} AI-Tidu9 inference verified and Codex configuration switched.`;
   }
   throw new TiduError("UNSUPPORTED_COMMAND", `Unknown clients action: ${String(action)}`);
+};
+
+const runServiceControl = async (argumentsList: readonly string[]): Promise<string> => {
+  const action = argumentsList[1] ?? "status";
+  if (action !== "status" && action !== "stop" && action !== "restart") {
+    throw new TiduError(
+      "CONFIGURATION_INVALID",
+      "service requires status, stop, or restart; use tidu start when stopped.",
+    );
+  }
+  const endpoint = resolveEndpoint(argumentsList);
+  const inventoryResponse = await fetch(`${endpoint}/api/services`, {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!inventoryResponse.ok) {
+    throw new TiduError("INTERNAL_ERROR", "AI-Tidu9 service inventory is unavailable.");
+  }
+  const inventory = (await inventoryResponse.json()) as {
+    mode: "development" | "installed";
+    services: Array<{ id: string; kind: "cli" | "runtime"; name: string; status: string }>;
+  };
+  if (action === "status") {
+    return inventory.services.map((service) => `${service.name}: ${service.status}`).join("\n");
+  }
+  const runtimeService = inventory.services.find((service) => service.kind === "runtime");
+  if (runtimeService === undefined) {
+    throw new TiduError("INTERNAL_ERROR", "AI-Tidu9 runtime service was not found.");
+  }
+  const response = await fetch(
+    `${endpoint}/api/services/${encodeURIComponent(runtimeService.id)}/${action}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (!response.ok) {
+    throw new TiduError("INTERNAL_ERROR", `AI-Tidu9 service ${action} was rejected.`);
+  }
+  if (action === "stop") {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 300));
+  }
+  return `${runtimeService.name}: ${action} accepted.`;
 };
 
 const runSetup = async (argumentsList: readonly string[]): Promise<string> => {
@@ -995,6 +1048,8 @@ if (isDirectExecution) {
       }
     } else if (argumentsList[0] === "setup") {
       process.stdout.write(`${await runSetup(argumentsList)}\n`);
+    } else if (argumentsList[0] === "service") {
+      process.stdout.write(`${await runServiceControl(argumentsList)}\n`);
     } else if (argumentsList[0] === "doctor") {
       const output = await runDoctor(argumentsList);
       process.stdout.write(`${output}\n`);

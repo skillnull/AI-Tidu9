@@ -29,6 +29,7 @@ These rules apply to the entire repository.
 
 ## Response protocol
 
-- First line: `[AI-TIDU9] Loaded`
+- When the active request is routed through AI-Tidu9, first line: `[AI-TIDU9] Loaded`.
+- Official direct mode must not inject an AI-Tidu9 loading marker.
 - Use Simplified Chinese for user-facing communication unless requested otherwise.
-- Last line after completed checks: `[AI-TIDU9] Done · All checks passed`
+- When the active request is routed through AI-Tidu9, use `[AI-TIDU9] Done · All checks passed` after completed checks.
