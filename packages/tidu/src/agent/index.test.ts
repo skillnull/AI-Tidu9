@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { createCapabilityRegistry } from "../capabilities/index.js";
 import type { ModelProvider } from "../providers/index.js";
+import { createDynamicModelRouter, type RoutableModel } from "../routing/index.js";
 import { createSecretGate } from "../security/index.js";
 import { openNodeSqliteStorage } from "../storage/index.js";
 import {
@@ -119,6 +120,134 @@ test("uses a configured model provider for understanding, planning, execution, a
   assert.equal(result.task.status, "completed");
   assert.equal(result.result?.trustLevel, "low");
   assert.equal(responseIndex, 4);
+});
+
+test("completes an Agent task only after a specialist fills the main model capability gap", async () => {
+  const calls = { main: 0, specialist: 0, specialistEvidenceSeen: false };
+  const mainProvider: ModelProvider = {
+    descriptor: { type: "openai-compatible", model: "main-text" },
+    execute: async (request) => {
+      calls.main += 1;
+      const serializedRequest = JSON.stringify(request.body);
+      if (serializedRequest.includes("vision specialist observed the chart")) {
+        calls.specialistEvidenceSeen = true;
+      }
+      let response: unknown;
+      if (serializedRequest.includes("Normalize the goal")) {
+        response = {
+          objective: "Explain the chart",
+          acceptanceCriteria: ["The chart is explained with visual evidence"],
+          constraints: [],
+          assumptions: [],
+          requiredCapabilities: ["vision"],
+        };
+      } else if (serializedRequest.includes("dependency-ordered steps")) {
+        response = {
+          revision: 1,
+          steps: [{ id: "explain", title: "Explain the observed chart", kind: "reason" }],
+        };
+      } else if (serializedRequest.includes("Execute only this non-tool step")) {
+        response = {
+          summary: "The chart rises after the specialist-observed turning point.",
+          evidence: [
+            {
+              kind: "model",
+              integrity: "reported",
+              summary: "Vision specialist observed the chart turning point.",
+              supportsCriteria: [0],
+            },
+          ],
+        };
+      } else {
+        const evidenceId = /evidence-[a-f0-9-]+/iu.exec(serializedRequest)?.[0];
+        response = {
+          summary: "The chart rises after the observed turning point.",
+          criteria: [
+            {
+              criterionIndex: 0,
+              accepted: evidenceId !== undefined,
+              reason: "Specialist evidence supports the visual conclusion.",
+              evidenceIds: evidenceId === undefined ? [] : [evidenceId],
+            },
+          ],
+        };
+      }
+      return {
+        kind: "json",
+        statusCode: 200,
+        body: { choices: [{ message: { content: JSON.stringify(response) } }] },
+      };
+    },
+  };
+  const specialistProvider: ModelProvider = {
+    descriptor: { type: "openai-compatible", model: "vision-specialist" },
+    execute: async () => {
+      calls.specialist += 1;
+      return {
+        kind: "json",
+        statusCode: 200,
+        body: { choices: [{ message: { content: "vision specialist observed the chart" } }] },
+      };
+    },
+  };
+  const models: RoutableModel[] = [
+    {
+      profile: {
+        id: "main-text",
+        capabilities: ["text", "structured-output"],
+        inputCostPerMillionTokens: 0.1,
+        outputCostPerMillionTokens: 0.1,
+        averageLatencyMilliseconds: 10,
+        availability: 1,
+        privacy: "external",
+        remainingRequests: null,
+        enabled: true,
+      },
+      provider: mainProvider,
+    },
+    {
+      profile: {
+        id: "vision-specialist",
+        capabilities: ["text", "structured-output", "vision"],
+        inputCostPerMillionTokens: 0.2,
+        outputCostPerMillionTokens: 0.2,
+        averageLatencyMilliseconds: 20,
+        availability: 1,
+        privacy: "external",
+        remainingRequests: null,
+        enabled: true,
+      },
+      provider: specialistProvider,
+    },
+  ];
+  const router = createDynamicModelRouter(models, {
+    enabled: true,
+    mainModelId: "main-text",
+    weights: { capability: 5, cost: 2, privacy: 2, latency: 1, availability: 2 },
+    capabilityCompletion: {
+      enabled: true,
+      poolModelIds: ["vision-specialist"],
+      maximumSpecialists: 1,
+    },
+  });
+  const kernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    ...createModelProviderAgentAdapters(router, "ai-tidu9-config"),
+  });
+
+  const created = await kernel.createTask({
+    goal: {
+      objective: "Explain the chart",
+      acceptanceCriteria: ["The chart is explained with visual evidence"],
+    },
+  });
+  const completed = await kernel.runTask(created.task.taskId);
+
+  assert.equal(completed.task.status, "completed");
+  assert.equal(completed.result?.accepted, true);
+  assert.equal(completed.result?.summary, "The chart rises after the observed turning point.");
+  assert.equal(calls.specialist, 2);
+  assert.equal(calls.specialistEvidenceSeen, true);
 });
 
 test("completes a bounded task only after independent acceptance verification", async () => {

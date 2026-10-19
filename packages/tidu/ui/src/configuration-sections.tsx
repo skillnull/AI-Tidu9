@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { TaskControlView } from "../../src/agent/index.js";
 import type {
+  AgentHostId,
+  CapabilityCompletionConfiguration,
+  CapabilitySpecialistConfiguration,
   ConfigurationMode,
   ExpertServiceConfiguration,
   ModelSelection,
@@ -72,6 +75,8 @@ export interface ConfigurationForm {
   virtualModelName: string;
   /** Upstream selected behind the single virtual-model entry. */
   modelSelection: ModelSelection;
+  /** Agent-level capability completion shared by every host. */
+  capabilityCompletion: CapabilityCompletionConfiguration;
   /** Advanced runtime service controls available only in expert mode. */
   expertServices?: ExpertServiceConfiguration;
 }
@@ -93,6 +98,321 @@ interface TaskListResponse {
   /** Bounded task summaries ordered by latest update. */
   tasks: readonly TaskControlView[];
 }
+
+interface CapabilityCompletionStatusResponse {
+  /** Host currently backing the active primary model, when identifiable. */
+  activeHost: AgentHostId | null;
+  /** Whether capability completion can be executed by this runtime. */
+  available: boolean;
+  /** Whether the active policy has at least one usable specialist. */
+  operational: boolean;
+  /** Active capability-completion configuration. */
+  configuration: CapabilityCompletionConfiguration;
+  /** Active primary-model selection. */
+  mainModel: ModelSelection;
+  /** Recent bounded routing records. */
+  records: readonly {
+    /** Host that originated the request. */
+    host: AgentHostId;
+    /** ISO timestamp for this routing decision. */
+    occurredAt: string;
+    /** Agent role handled by the request. */
+    role: string;
+    /** Whether a specialist was invoked. */
+    complemented: boolean;
+    /** Final routing outcome. */
+    outcome: "failed" | "succeeded";
+    /** Primary model used for the request. */
+    mainModelId: string;
+    /** Specialist models used for the request. */
+    specialistModelIds: readonly string[];
+    /** Capabilities required by the request. */
+    requiredCapabilities: readonly string[];
+    /** Capabilities the primary model did not provide. */
+    missingCapabilities: readonly string[];
+  }[];
+  /** Connected company capability summary. */
+  company: { connected: boolean; publishedCapabilityCount: number };
+  /** Host entry points exposed by the runtime. */
+  hosts: readonly string[];
+}
+
+const MODEL_CAPABILITIES = [
+  {
+    id: "text",
+    zh: "文本理解与生成",
+    en: "Text",
+    detail: "阅读、归纳与生成文本",
+  },
+  {
+    id: "structured-output",
+    zh: "结构化输出",
+    en: "Structured output",
+    detail: "稳定返回 JSON 等结构",
+  },
+  {
+    id: "reasoning",
+    zh: "复杂推理",
+    en: "Reasoning",
+    detail: "多步骤分析与决策",
+  },
+  { id: "code", zh: "代码工程", en: "Code", detail: "代码理解、修改与调试" },
+  {
+    id: "vision",
+    zh: "视觉理解",
+    en: "Vision",
+    detail: "读取图片、截图与图表",
+  },
+  {
+    id: "web-research",
+    zh: "联网研究",
+    en: "Web research",
+    detail: "检索并整合外部资料",
+  },
+  {
+    id: "tool-use",
+    zh: "工具调用",
+    en: "Tool use",
+    detail: "调用工具并处理结果",
+  },
+  {
+    id: "long-context",
+    zh: "长上下文",
+    en: "Long context",
+    detail: "处理大型代码库或长文档",
+  },
+  {
+    id: "document-analysis",
+    zh: "文档分析",
+    en: "Document analysis",
+    detail: "解析复杂文档和表格",
+  },
+  {
+    id: "domain-context",
+    zh: "领域知识",
+    en: "Domain context",
+    detail: "使用公司或行业专有知识",
+  },
+  {
+    id: "local-private",
+    zh: "本地隐私",
+    en: "Local private",
+    detail: "数据不离开本地边界",
+  },
+] as const;
+
+type CatalogModel = {
+  id: string;
+  name: string;
+  capabilities?: readonly string[];
+  capabilitySource?: "company-published" | "host-catalog" | "provider-catalog";
+  inputCostPerMillionTokens?: number | null;
+  outputCostPerMillionTokens?: number | null;
+};
+
+const capabilityLabel = (capability: string, english: boolean): string => {
+  const item = MODEL_CAPABILITIES.find((candidate) => candidate.id === capability);
+  return item ? (english ? item.en : item.zh) : capability;
+};
+
+const CapabilityPicker = ({
+  selected,
+  available,
+  english,
+  disabled,
+  onChange,
+}: {
+  selected: readonly string[];
+  available?: readonly string[];
+  english: boolean;
+  disabled: boolean;
+  onChange: (capabilities: readonly string[]) => void;
+}) => {
+  const capabilityIds = available ?? selected;
+  const options = [
+    ...MODEL_CAPABILITIES,
+    ...capabilityIds
+      .filter((capability) => !MODEL_CAPABILITIES.some((item) => item.id === capability))
+      .map((id) => ({ id, zh: id, en: id, detail: "自定义能力声明" })),
+  ].filter((capability) => available === undefined || available.includes(capability.id));
+  return (
+    <div className="capability-picker">
+      {options.map((capability) => {
+        const checked = selected.includes(capability.id);
+        return (
+          <label className={checked ? "selected" : ""} key={capability.id}>
+            <input
+              type="checkbox"
+              checked={checked}
+              disabled={disabled}
+              onChange={() =>
+                onChange(
+                  checked
+                    ? selected.filter((item) => item !== capability.id)
+                    : [...selected, capability.id],
+                )
+              }
+            />
+            <span>
+              <strong>{english ? capability.en : capability.zh}</strong>
+              <small>{english ? capability.id : capability.detail}</small>
+            </span>
+          </label>
+        );
+      })}
+    </div>
+  );
+};
+
+export const CapabilityCompletionPanel = ({
+  locale,
+  onEdit,
+}: {
+  locale: "en-US" | "zh-CN";
+  onEdit: (host: AgentHostId) => void;
+}) => {
+  const english = locale === "en-US";
+  const [status, setStatus] = useState<CapabilityCompletionStatusResponse>();
+  const [message, setMessage] = useState(english ? "Loading…" : "正在读取…");
+  const refresh = useCallback(async () => {
+    try {
+      const response = await fetch("/api/capability-completion", {
+        cache: "no-store",
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setStatus((await response.json()) as CapabilityCompletionStatusResponse);
+      setMessage("");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : english ? "Unavailable" : "读取失败");
+    }
+  }, [english]);
+  useEffect(() => void refresh(), [refresh]);
+  return (
+    <section className="capability-completion-panel">
+      <div className="configuration-heading">
+        <div>
+          <p className="card-label">AGENT CAPABILITY COMPLETION</p>
+          <h2>{english ? "Capability completion" : "能力互补"}</h2>
+          <p>
+            {english
+              ? "Codex, Cursor, CLI, and compatible APIs are entry points to one policy. The Agent invokes configured specialists only for capabilities the primary model lacks, then verifies the combined result."
+              : "Codex、Cursor、CLI 与兼容 API 只是同一策略的入口。主模型缺少任务能力时，Agent 才调用已配置的专家模型补位，并对合并结果独立验收。"}
+          </p>
+        </div>
+        <div className="configuration-view-actions">
+          <button type="button" onClick={() => void refresh()}>
+            {english ? "Refresh" : "刷新"}
+          </button>
+        </div>
+      </div>
+      {message ? <p role="status">{message}</p> : null}
+      {status ? (
+        <>
+          <div className="capability-host-policies">
+            {(["codex", "cursor", "ollama", "openai-compatible"] as const).map((host) => {
+              const configuredPolicy = status.configuration.hostPolicies?.[host];
+              const policy =
+                configuredPolicy ??
+                (status.activeHost === host
+                  ? {
+                      mainModel: status.mainModel,
+                      mainCapabilities: status.configuration.mainCapabilities,
+                      specialists: status.configuration.specialists,
+                      maximumSpecialists: status.configuration.maximumSpecialists,
+                    }
+                  : undefined);
+              const enabled = status.configuration.enabled && policy !== undefined;
+              return (
+                <article key={host}>
+                  <div className="capability-host-policy-heading">
+                    <div>
+                      <strong>{host}</strong>
+                      <span className={enabled ? "enabled" : "disabled"}>
+                        {enabled
+                          ? english
+                            ? "Completion enabled"
+                            : "互补已开启"
+                          : english
+                            ? "Completion disabled"
+                            : "互补已关闭"}
+                      </span>
+                    </div>
+                    <button type="button" onClick={() => onEdit(host)}>
+                      {english ? "Quick configure" : "快速配置"}
+                    </button>
+                  </div>
+                  {enabled && policy ? (
+                    <div className="capability-host-policy-details">
+                      <p>
+                        {english ? "Primary" : "主模型"}：{policy.mainModel.source} ·{" "}
+                        {policy.mainModel.model}
+                      </p>
+                      <p>
+                        {english ? "Specialists" : "副模型"}：
+                        {policy.specialists
+                          .map((model) => `${model.host} · ${model.model}`)
+                          .filter(Boolean)
+                          .join(" · ") || (english ? "Not configured" : "未配置")}
+                      </p>
+                      <p>
+                        {english ? "Capabilities" : "已选能力"}：
+                        {policy.mainCapabilities
+                          .map((capability) => capabilityLabel(capability, english))
+                          .join(" · ") || (english ? "Not configured" : "未配置")}
+                      </p>
+                    </div>
+                  ) : null}
+                </article>
+              );
+            })}
+          </div>
+          <div className="capability-records">
+            <div className="capability-records-heading">
+              <h3>{english ? "Recent use" : "最近使用记录"}</h3>
+              <span>{english ? "Latest 50 in this runtime" : "当前运行时最近 50 条"}</span>
+            </div>
+            {status.records.length === 0 ? (
+              <p>{english ? "No routing records yet." : "暂无互补调用记录。"}</p>
+            ) : (
+              status.records.map((record, index) => (
+                <article key={`${record.occurredAt}:${index}`}>
+                  <div>
+                    <strong>
+                      {record.complemented
+                        ? english
+                          ? "Complemented"
+                          : "已补位"
+                        : english
+                          ? "Primary only"
+                          : "仅主模型"}
+                    </strong>
+                    <span>{new Date(record.occurredAt).toLocaleString()}</span>
+                  </div>
+                  <p>
+                    {english ? "Host" : "宿主"}：{record.host} · {english ? "Role" : "阶段"}：
+                    {record.role} · {english ? "Required" : "所需能力"}：
+                    {record.requiredCapabilities.join(", ")}
+                  </p>
+                  <p>
+                    {english ? "Specialists" : "专家模型"}：
+                    {record.specialistModelIds.join(", ") || "—"} ·{" "}
+                    {record.outcome === "succeeded"
+                      ? english
+                        ? "Succeeded"
+                        : "成功"
+                      : english
+                        ? "Failed"
+                        : "失败"}
+                  </p>
+                </article>
+              ))
+            )}
+          </div>
+        </>
+      ) : null}
+    </section>
+  );
+};
 
 export interface ConfigurationImpactPreview {
   /** Whether the configuration passed validation. */
@@ -127,7 +447,10 @@ const impactChangeLabel = (
       : `虚拟模型 → ${form.virtualModelName}`,
     modelSelection: english
       ? `Upstream model → ${form.modelSelection.source} · ${form.modelSelection.model}`
-      : `上游模型 → ${form.modelSelection.source === "official" ? "官方" : "公司"} · ${form.modelSelection.model}`,
+      : `上游模型 → ${form.modelSelection.source === "official" ? "宿主" : form.modelSelection.source === "company" ? "公司" : "自定义"} · ${form.modelSelection.model}`,
+    capabilityCompletion: english
+      ? `Capability completion → ${form.capabilityCompletion.enabled ? "enabled" : "disabled"} · ${form.capabilityCompletion.specialists.length} specialists`
+      : `能力互补 → ${form.capabilityCompletion.enabled ? "开启" : "关闭"} · ${form.capabilityCompletion.specialists.length} 个专家模型`,
     "expertServices.host": english
       ? `Listen host → ${service?.host ?? "-"}`
       : `监听地址 → ${service?.host ?? "-"}`,
@@ -419,7 +742,16 @@ export const DEFAULT_EXPERT_SERVICES: ExpertServiceConfiguration = {
 export const toForm = (configuration: TiduConfiguration): ConfigurationForm => ({
   activeProfileId: configuration.activeProfileId,
   virtualModelName: configuration.virtualModelName,
-  modelSelection: configuration.modelSelection ?? { source: "official", model: "current" },
+  modelSelection: configuration.modelSelection ?? {
+    source: "official",
+    model: "current",
+  },
+  capabilityCompletion: configuration.capabilityCompletion ?? {
+    enabled: false,
+    mainCapabilities: ["text", "structured-output"],
+    specialists: [],
+    maximumSpecialists: 2,
+  },
   ...(configuration.activeMode === "expert"
     ? {
         expertServices: configuration.expertServices ?? DEFAULT_EXPERT_SERVICES,
@@ -808,7 +1140,9 @@ export const EnterpriseReadOnlyPanel = ({
         headers: { "content-type": "application/json" },
         body: action === "connect" ? JSON.stringify({ endpoint: endpoint.trim() }) : "{}",
       });
-      const result = (await response.json()) as ConfigCenterBootstrap & { message?: string };
+      const result = (await response.json()) as ConfigCenterBootstrap & {
+        message?: string;
+      };
       if (!response.ok) {
         throw new Error(
           result.message ??
@@ -1128,6 +1462,8 @@ interface QuickStartWizardProps {
   providerType: string | null;
   /** Sanitized active upstream model name. */
   providerModel: string | null;
+  /** Host selected by a capability-card quick configuration action. */
+  targetHost?: AgentHostId;
   /** Currently selected isolated draft. */
   selectedMode: ConfigurationMode;
   /** Editable entry identity. */
@@ -1164,10 +1500,19 @@ interface UpstreamModelCatalog {
   /** Concrete company adapter hidden behind the runtime router. */
   companyProviderType: "ollama" | "openai-compatible" | null;
   /** Company-provider models available behind the virtual model. */
-  company: readonly { id: string; name: string }[];
+  company: readonly CatalogModel[];
   /** Official Codex models available to the signed-in account. */
-  official: readonly { id: string; name: string }[];
+  official: readonly CatalogModel[];
+  /** Models grouped by the host that can actually execute them. */
+  hosts: Record<AgentHostId, { available: boolean; models: readonly CatalogModel[] }>;
 }
+
+const createEmptyHostCatalog = (): UpstreamModelCatalog["hosts"] => ({
+  codex: { available: false, models: [] },
+  cursor: { available: false, models: [] },
+  ollama: { available: false, models: [] },
+  "openai-compatible": { available: false, models: [] },
+});
 
 export const QuickStartWizard = ({
   locale,
@@ -1175,6 +1520,7 @@ export const QuickStartWizard = ({
   providerConfigured,
   providerType,
   providerModel,
+  targetHost,
   selectedMode,
   form,
   isDirty,
@@ -1191,20 +1537,32 @@ export const QuickStartWizard = ({
   onOpenClients,
 }: QuickStartWizardProps) => {
   const english = locale === "en-US";
-  const [step, setStep] = useState(0);
+  const [step, setStep] = useState(targetHost === undefined ? 0 : 2);
   const [providerChoice, setProviderChoice] = useState<
     "codex-host" | "cursor-host" | "ollama" | "compatible"
   >(() =>
-    providerType === "cursor-host"
-      ? "cursor-host"
-      : providerType === "ollama"
-        ? "ollama"
-        : providerType === "openai-compatible"
-          ? "compatible"
-          : "codex-host",
+    targetHost === "codex"
+      ? "codex-host"
+      : targetHost === "cursor"
+        ? "cursor-host"
+        : targetHost === "ollama"
+          ? "ollama"
+          : targetHost === "openai-compatible"
+            ? "compatible"
+            : providerType === "cursor-host"
+              ? "cursor-host"
+              : providerType === "ollama"
+                ? "ollama"
+                : providerType === "openai-compatible"
+                  ? "compatible"
+                  : "codex-host",
   );
   const [modelChoiceMode, setModelChoiceMode] = useState<"company" | "custom" | "host">(
-    form.modelSelection.source === "company" ? "company" : "host",
+    form.modelSelection.source === "company"
+      ? "company"
+      : form.modelSelection.source === "custom"
+        ? "custom"
+        : "host",
   );
   const modelChoiceTouchedRef = useRef(false);
   const providerChoiceTouchedRef = useRef(false);
@@ -1226,14 +1584,15 @@ export const QuickStartWizard = ({
     companyProviderType: null,
     company: [],
     official: [],
+    hosts: createEmptyHostCatalog(),
   });
   const [upstreamCatalogStatus, setUpstreamCatalogStatus] = useState<"error" | "loading" | "ready">(
     "loading",
   );
   useEffect(() => {
-    setStep(selectedMode === "expert" ? 1 : 0);
+    setStep(targetHost === undefined ? (selectedMode === "expert" ? 1 : 0) : 2);
     setProviderCheck({ status: "idle" });
-  }, [selectedMode]);
+  }, [selectedMode, targetHost]);
   const stepLabels = english
     ? ["Deployment", "Entry", "Model", "Activate", "Clients (optional)"]
     : ["部署", "入口", "模型", "启用", "客户端（可选）"];
@@ -1280,8 +1639,14 @@ export const QuickStartWizard = ({
               ? "Unconfigured"
               : "未配置";
   const customModel = modelChoiceMode === "custom" ? form.modelSelection.model : "";
-  const providerUsesOfficialCatalog = providerChoice === "codex-host";
-  const hostModelOptions = providerUsesOfficialCatalog ? upstreamCatalog.official : [];
+  const hostModelOptions =
+    providerChoice === "codex-host"
+      ? upstreamCatalog.official
+      : providerChoice === "cursor-host"
+        ? upstreamCatalog.hosts.cursor.models
+        : providerChoice === "ollama"
+          ? upstreamCatalog.hosts.ollama.models
+          : upstreamCatalog.hosts["openai-compatible"].models;
   const providerModelOptions =
     modelChoiceMode === "company"
       ? upstreamCatalog.company
@@ -1290,35 +1655,188 @@ export const QuickStartWizard = ({
         : [];
   const hostModelSource =
     providerChoice === "codex-host" || providerChoice === "cursor-host" ? "official" : "company";
+  const hostIdByProvider = {
+    "codex-host": "codex",
+    "cursor-host": "cursor",
+    ollama: "ollama",
+    compatible: "openai-compatible",
+  } as const satisfies Record<typeof providerChoice, AgentHostId>;
+  const activeHostId = hostIdByProvider[providerChoice];
+  const hostLabel = (host: AgentHostId): string =>
+    host === "codex"
+      ? "Codex"
+      : host === "cursor"
+        ? "Cursor"
+        : host === "ollama"
+          ? "Ollama"
+          : english
+            ? "Compatible service"
+            : "兼容服务";
+  const modelSourceForHost = (host: AgentHostId): "company" | "official" =>
+    host === "codex" || host === "cursor" ? "official" : "company";
+  const activeHostPolicy = form.capabilityCompletion.hostPolicies?.[activeHostId] ?? {
+    mainModel: form.modelSelection,
+    mainCapabilities: form.capabilityCompletion.mainCapabilities,
+    specialists: form.capabilityCompletion.specialists,
+    maximumSpecialists: form.capabilityCompletion.maximumSpecialists,
+  };
+  const updateActiveHostPolicy = (
+    policy: typeof activeHostPolicy,
+    nextModelSelection = policy.mainModel,
+  ): void => {
+    onFormChange({
+      ...form,
+      modelSelection: nextModelSelection,
+      capabilityCompletion: {
+        ...form.capabilityCompletion,
+        mainCapabilities: policy.mainCapabilities,
+        specialists: policy.specialists,
+        maximumSpecialists: policy.maximumSpecialists,
+        hostPolicies: {
+          ...form.capabilityCompletion.hostPolicies,
+          [activeHostId]: { ...policy, mainModel: nextModelSelection },
+        },
+      },
+    });
+  };
+  const hostCatalogModels = upstreamCatalog.hosts[activeHostId]?.models ?? [];
+  const capabilitiesForMainModel = (selection: ModelSelection): readonly string[] => {
+    const resolvedModel =
+      selection.model === "current"
+        ? providerCheck.provider === providerChoice
+          ? providerCheck.model
+          : providerModel
+        : selection.model;
+    return (
+      hostCatalogModels.find((model) => model.id === resolvedModel)?.capabilities ??
+      MODEL_CAPABILITIES.map((capability) => capability.id)
+    );
+  };
+  const selectMainModel = (selection: ModelSelection): void =>
+    updateActiveHostPolicy(
+      {
+        ...activeHostPolicy,
+        mainModel: selection,
+        ...(form.capabilityCompletion.enabled
+          ? { mainCapabilities: capabilitiesForMainModel(selection) }
+          : {}),
+      },
+      selection,
+    );
+  const specialistHostCandidates = (
+    ["codex", "cursor", "ollama", "openai-compatible"] as const
+  ).filter((host) => host !== activeHostId);
+  const usableSpecialistModels = (host: AgentHostId) =>
+    (upstreamCatalog.hosts[host]?.models ?? []).filter(
+      (model) => (model.capabilities?.length ?? 0) > 0,
+    );
+  const availableSpecialistHosts = specialistHostCandidates.filter(
+    (host) =>
+      upstreamCatalog.hosts[host]?.available === true && usableSpecialistModels(host).length > 0,
+  );
+  const detectedPrimaryModel =
+    form.modelSelection.model === "current"
+      ? providerCheck.provider === providerChoice
+        ? providerCheck.model
+        : choiceMatchesRuntime
+          ? providerModel
+          : undefined
+      : form.modelSelection.model;
+  const modelSelectOptions =
+    modelChoiceMode === "host" &&
+    detectedPrimaryModel &&
+    !providerModelOptions.some((model) => model.id === detectedPrimaryModel)
+      ? [{ id: detectedPrimaryModel, name: detectedPrimaryModel }, ...providerModelOptions]
+      : providerModelOptions;
+  const selectedModelId =
+    form.modelSelection.model === "current"
+      ? (detectedPrimaryModel ?? "")
+      : form.modelSelection.model;
+  const primaryCatalogModel = hostCatalogModels.find((model) => model.id === detectedPrimaryModel);
+  const updateSpecialists = (specialists: readonly CapabilitySpecialistConfiguration[]): void =>
+    updateActiveHostPolicy({
+      ...activeHostPolicy,
+      specialists,
+      maximumSpecialists: Math.max(1, specialists.length),
+    });
   const selectProvider = (choice: "codex-host" | "cursor-host" | "ollama" | "compatible"): void => {
     modelChoiceTouchedRef.current = true;
     providerChoiceTouchedRef.current = true;
     setProviderChoice(choice);
     setModelChoiceMode("host");
+    const nextHostId = hostIdByProvider[choice];
+    const savedPolicy = form.capabilityCompletion.hostPolicies?.[nextHostId];
+    const nextModelSelection = savedPolicy?.mainModel ?? {
+      source: choice === "codex-host" || choice === "cursor-host" ? "official" : "company",
+      model: "current",
+    };
+    const nextPolicy = savedPolicy ?? {
+      mainModel: nextModelSelection,
+      mainCapabilities: ["text", "structured-output"],
+      specialists: [],
+      maximumSpecialists: 2,
+    };
     onFormChange({
       ...form,
-      modelSelection: {
-        source: choice === "codex-host" || choice === "cursor-host" ? "official" : "company",
-        model: "current",
-      },
-    });
-  };
-  const selectModelChoiceMode = (choice: "company" | "custom" | "host"): void => {
-    modelChoiceTouchedRef.current = true;
-    setModelChoiceMode(choice);
-    onFormChange({
-      ...form,
-      modelSelection: {
-        source:
-          choice === "company" ? "company" : choice === "custom" ? "official" : hostModelSource,
-        model: choice === "host" ? "current" : "",
+      modelSelection: nextModelSelection,
+      capabilityCompletion: {
+        ...form.capabilityCompletion,
+        mainCapabilities: nextPolicy.mainCapabilities,
+        specialists: nextPolicy.specialists,
+        maximumSpecialists: nextPolicy.maximumSpecialists,
+        hostPolicies: {
+          ...form.capabilityCompletion.hostPolicies,
+          [nextHostId]: nextPolicy,
+        },
       },
     });
   };
   useEffect(() => {
+    if (targetHost === undefined) return;
+    selectProvider(
+      targetHost === "codex"
+        ? "codex-host"
+        : targetHost === "cursor"
+          ? "cursor-host"
+          : targetHost === "ollama"
+            ? "ollama"
+            : "compatible",
+    );
+  }, [targetHost]);
+  const selectModelChoiceMode = (choice: "company" | "custom" | "host"): void => {
+    modelChoiceTouchedRef.current = true;
+    setModelChoiceMode(choice);
+    selectMainModel({
+      source: choice === "company" ? "company" : choice === "custom" ? "custom" : hostModelSource,
+      model: choice === "host" ? "current" : "",
+    });
+  };
+  useEffect(() => {
+    if (
+      step !== 2 ||
+      upstreamCatalogStatus !== "ready" ||
+      modelChoiceMode !== "host" ||
+      form.modelSelection.model !== "current" ||
+      !detectedPrimaryModel
+    ) {
+      return;
+    }
+    selectMainModel({ source: hostModelSource, model: detectedPrimaryModel });
+  }, [
+    detectedPrimaryModel,
+    form.modelSelection.model,
+    modelChoiceMode,
+    step,
+    upstreamCatalogStatus,
+  ]);
+  useEffect(() => {
     if (upstreamCatalogStatus !== "ready" || modelChoiceTouchedRef.current) return;
     if (form.modelSelection.source === "company") {
       setModelChoiceMode("company");
+      return;
+    }
+    if (form.modelSelection.source === "custom") {
+      setModelChoiceMode("custom");
       return;
     }
     setModelChoiceMode(
@@ -1327,7 +1845,7 @@ export const QuickStartWizard = ({
         ? "host"
         : "custom",
     );
-  }, [form.modelSelection, upstreamCatalog.official, upstreamCatalogStatus]);
+  }, [form.modelSelection, upstreamCatalog.hosts, upstreamCatalogStatus]);
   useEffect(() => {
     if (
       upstreamCatalogStatus !== "ready" ||
@@ -1348,7 +1866,25 @@ export const QuickStartWizard = ({
     void fetch("/api/models/upstreams", { cache: "no-store" })
       .then(async (response) => {
         if (!response.ok) throw new Error("Model catalog unavailable");
-        setUpstreamCatalog((await response.json()) as UpstreamModelCatalog);
+        const catalog = (await response.json()) as Omit<UpstreamModelCatalog, "hosts"> & {
+          hosts?: UpstreamModelCatalog["hosts"];
+        };
+        const fallbackHosts = createEmptyHostCatalog();
+        fallbackHosts.codex = {
+          available: catalog.official.length > 0,
+          models: catalog.official,
+        };
+        if (catalog.companyProviderType !== null) {
+          const companyHost = catalog.companyProviderType;
+          fallbackHosts[companyHost] = {
+            available: catalog.companyConfigured,
+            models: catalog.company,
+          };
+        }
+        setUpstreamCatalog({
+          ...catalog,
+          hosts: catalog.hosts ?? fallbackHosts,
+        });
         setUpstreamCatalogStatus("ready");
       })
       .catch(() => {
@@ -1357,6 +1893,7 @@ export const QuickStartWizard = ({
           companyProviderType: null,
           company: [],
           official: [],
+          hosts: createEmptyHostCatalog(),
         });
         setUpstreamCatalogStatus("error");
       });
@@ -1516,7 +2053,10 @@ export const QuickStartWizard = ({
                   aria-required="true"
                   aria-invalid={entryValidationMessages.activeProfileId !== undefined}
                   onChange={(event) =>
-                    onFormChange({ ...form, activeProfileId: event.target.value })
+                    onFormChange({
+                      ...form,
+                      activeProfileId: event.target.value,
+                    })
                   }
                   maxLength={64}
                   disabled={isPending || readOnly}
@@ -1538,7 +2078,10 @@ export const QuickStartWizard = ({
                   aria-required="true"
                   aria-invalid={entryValidationMessages.virtualModelName !== undefined}
                   onChange={(event) =>
-                    onFormChange({ ...form, virtualModelName: event.target.value })
+                    onFormChange({
+                      ...form,
+                      virtualModelName: event.target.value,
+                    })
                   }
                   maxLength={64}
                   disabled={isPending || readOnly}
@@ -1677,8 +2220,8 @@ export const QuickStartWizard = ({
                 <button
                   className={
                     providerChoice === "codex-host"
-                      ? "mode-button mode-button-active"
-                      : "mode-button"
+                      ? "mode-button provider-host-tab mode-button-active"
+                      : "mode-button provider-host-tab"
                   }
                   type="button"
                   onClick={() => selectProvider("codex-host")}
@@ -1689,8 +2232,8 @@ export const QuickStartWizard = ({
                 <button
                   className={
                     providerChoice === "cursor-host"
-                      ? "mode-button mode-button-active"
-                      : "mode-button"
+                      ? "mode-button provider-host-tab mode-button-active"
+                      : "mode-button provider-host-tab"
                   }
                   type="button"
                   onClick={() => selectProvider("cursor-host")}
@@ -1700,7 +2243,9 @@ export const QuickStartWizard = ({
                 </button>
                 <button
                   className={
-                    providerChoice === "ollama" ? "mode-button mode-button-active" : "mode-button"
+                    providerChoice === "ollama"
+                      ? "mode-button provider-host-tab mode-button-active"
+                      : "mode-button provider-host-tab"
                   }
                   type="button"
                   onClick={() => selectProvider("ollama")}
@@ -1711,8 +2256,8 @@ export const QuickStartWizard = ({
                 <button
                   className={
                     providerChoice === "compatible"
-                      ? "mode-button mode-button-active"
-                      : "mode-button"
+                      ? "mode-button provider-host-tab mode-button-active"
+                      : "mode-button provider-host-tab"
                   }
                   type="button"
                   onClick={() => selectProvider("compatible")}
@@ -1725,7 +2270,9 @@ export const QuickStartWizard = ({
                 <legend>{english ? "Model source" : "模型来源"}</legend>
                 <button
                   className={
-                    modelChoiceMode === "host" ? "mode-button mode-button-active" : "mode-button"
+                    modelChoiceMode === "host"
+                      ? "mode-button model-source-button mode-button-active"
+                      : "mode-button model-source-button"
                   }
                   type="button"
                   onClick={() => selectModelChoiceMode("host")}
@@ -1735,7 +2282,9 @@ export const QuickStartWizard = ({
                 </button>
                 <button
                   className={
-                    modelChoiceMode === "company" ? "mode-button mode-button-active" : "mode-button"
+                    modelChoiceMode === "company"
+                      ? "mode-button model-source-button mode-button-active"
+                      : "mode-button model-source-button"
                   }
                   type="button"
                   onClick={() => selectModelChoiceMode("company")}
@@ -1745,7 +2294,9 @@ export const QuickStartWizard = ({
                 </button>
                 <button
                   className={
-                    modelChoiceMode === "custom" ? "mode-button mode-button-active" : "mode-button"
+                    modelChoiceMode === "custom"
+                      ? "mode-button model-source-button mode-button-active"
+                      : "mode-button model-source-button"
                   }
                   type="button"
                   onClick={() => selectModelChoiceMode("custom")}
@@ -1768,25 +2319,8 @@ export const QuickStartWizard = ({
                         ? `${providerLabel} host models`
                         : `${providerLabel} 宿主模型`}
                 </span>
-                <small>
-                  {modelChoiceMode === "company"
-                    ? english
-                      ? "Fetched from the configured company service"
-                      : "从已配置的公司服务获取"
-                    : modelChoiceMode === "custom"
-                      ? english
-                        ? "Manual model identifier"
-                        : "手动填写模型标识"
-                      : choiceMatchesRuntime
-                        ? english
-                          ? "Current runtime host"
-                          : "当前运行宿主"
-                        : english
-                          ? "Restart required before this host catalog can be loaded"
-                          : "切换并重启后才能读取该宿主目录"}
-                </small>
               </div>
-              <div className="upstream-model-list" aria-live="polite">
+              <div className="upstream-model-control" aria-live="polite">
                 {modelChoiceMode !== "custom" && upstreamCatalogStatus === "loading" ? (
                   <p>{english ? "Loading available models…" : "正在读取可用模型…"}</p>
                 ) : modelChoiceMode !== "custom" && upstreamCatalogStatus === "error" ? (
@@ -1800,63 +2334,33 @@ export const QuickStartWizard = ({
                         : `${providerLabel} 模型信息读取失败。`}
                   </p>
                 ) : null}
-                {modelChoiceMode === "host" ? (
-                  <button
-                    type="button"
-                    className={
-                      form.modelSelection.model === "current"
-                        ? "upstream-model-option selected"
-                        : "upstream-model-option"
-                    }
-                    onClick={() =>
-                      onFormChange({
-                        ...form,
-                        modelSelection: { source: hostModelSource, model: "current" },
-                      })
-                    }
-                    disabled={isPending || readOnly}
-                  >
-                    <strong>
-                      {english
-                        ? `Follow current ${providerLabel} model`
-                        : `跟随当前 ${providerLabel} 模型`}
-                    </strong>
-                    <span>
-                      {(providerCheck.provider === providerChoice
-                        ? providerCheck.model
-                        : undefined) ??
-                        (choiceMatchesRuntime ? providerModel : undefined) ??
-                        (english ? "Automatically detected" : "自动识别")}
-                    </span>
-                  </button>
-                ) : null}
-                {providerModelOptions.map((model) => (
-                  <button
-                    type="button"
-                    className={
-                      form.modelSelection.model === model.id
-                        ? "upstream-model-option selected"
-                        : "upstream-model-option"
-                    }
-                    key={model.id}
-                    onClick={() =>
-                      onFormChange({
-                        ...form,
-                        modelSelection: {
+                {modelChoiceMode !== "custom" && upstreamCatalogStatus === "ready" ? (
+                  <label className="upstream-model-select">
+                    <span>{english ? "Model" : "模型"}</span>
+                    <select
+                      value={selectedModelId}
+                      onChange={(event) =>
+                        selectMainModel({
                           source: modelChoiceMode === "company" ? "company" : hostModelSource,
-                          model: model.id,
-                        },
-                      })
-                    }
-                    disabled={isPending || readOnly}
-                  >
-                    <strong>{model.name}</strong>
-                    <code>{model.id}</code>
-                  </button>
-                ))}
+                          model: event.target.value,
+                        })
+                      }
+                      disabled={isPending || readOnly || modelSelectOptions.length === 0}
+                    >
+                      {modelSelectOptions.length === 0 ? (
+                        <option value="">{english ? "No available models" : "暂无可用模型"}</option>
+                      ) : null}
+                      {modelSelectOptions.map((model) => (
+                        <option key={model.id} value={model.id}>
+                          {model.name === model.id ? model.id : `${model.name} · ${model.id}`}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : null}
                 {upstreamCatalogStatus === "ready" &&
                 modelChoiceMode === "company" &&
-                providerModelOptions.length === 0 ? (
+                modelSelectOptions.length === 0 ? (
                   <p className="upstream-model-empty">
                     {english
                       ? "No company models were returned. Configure the company service, then refresh and select a fetched model."
@@ -1871,13 +2375,7 @@ export const QuickStartWizard = ({
                     value={customModel}
                     onChange={(event) => {
                       const customModel = event.target.value;
-                      onFormChange({
-                        ...form,
-                        modelSelection: {
-                          source: "official",
-                          model: customModel,
-                        },
-                      });
+                      selectMainModel({ source: "custom", model: customModel });
                     }}
                     placeholder={english ? "Enter a custom model ID" : "输入自定义模型 ID"}
                     disabled={isPending || readOnly}
@@ -1889,6 +2387,385 @@ export const QuickStartWizard = ({
                   </small>
                 </label>
               ) : null}
+              <section className="capability-completion-editor">
+                <div className="capability-completion-editor-heading">
+                  <div>
+                    <p className="card-label">CAPABILITY COMPLETION</p>
+                    <h3>{english ? "Model capability completion" : "模型能力互补"}</h3>
+                    <p>
+                      {english
+                        ? "The selected host is the primary. Specialists must come from other hosts and run only for missing capabilities."
+                        : "当前选择的宿主就是主模型入口；副模型必须来自其他宿主，仅在主模型缺少任务能力时补位。"}
+                    </p>
+                  </div>
+                  <label className="capability-toggle">
+                    <input
+                      type="checkbox"
+                      checked={form.capabilityCompletion.enabled}
+                      onChange={(event) => {
+                        const enabled = event.target.checked;
+                        const mainCapabilities = enabled
+                          ? capabilitiesForMainModel(activeHostPolicy.mainModel)
+                          : activeHostPolicy.mainCapabilities;
+                        const maximumSpecialists = Math.max(1, activeHostPolicy.specialists.length);
+                        onFormChange({
+                          ...form,
+                          capabilityCompletion: {
+                            ...form.capabilityCompletion,
+                            enabled,
+                            mainCapabilities,
+                            maximumSpecialists,
+                            hostPolicies: {
+                              ...form.capabilityCompletion.hostPolicies,
+                              [activeHostId]: {
+                                ...activeHostPolicy,
+                                mainCapabilities,
+                                maximumSpecialists,
+                              },
+                            },
+                          },
+                        });
+                      }}
+                      disabled={isPending || readOnly}
+                    />
+                    <span className="capability-toggle-track" aria-hidden="true" />
+                    <span className="capability-toggle-label">
+                      {form.capabilityCompletion.enabled
+                        ? english
+                          ? "Enabled"
+                          : "已开启"
+                        : english
+                          ? "Disabled"
+                          : "已关闭"}
+                    </span>
+                  </label>
+                </div>
+                {form.capabilityCompletion.enabled ? (
+                  <>
+                    <section className="capability-primary-card">
+                      <div className="capability-section-heading">
+                        <div>
+                          <h4>
+                            {english ? "1. Declare primary capabilities" : "1. 勾选主模型真实能力"}
+                          </h4>
+                          <p>
+                            {english
+                              ? "Only select capabilities verified for this model."
+                              : "只勾选已确认可用的能力；路由会把未勾选能力视为缺口。"}
+                          </p>
+                        </div>
+                      </div>
+                      <CapabilityPicker
+                        selected={activeHostPolicy.mainCapabilities}
+                        available={primaryCatalogModel?.capabilities}
+                        english={english}
+                        disabled={isPending || readOnly}
+                        onChange={(mainCapabilities) =>
+                          updateActiveHostPolicy({
+                            ...activeHostPolicy,
+                            mainCapabilities,
+                          })
+                        }
+                      />
+                    </section>
+                    <div className="capability-specialists">
+                      <div className="capability-section-heading">
+                        <div>
+                          <h4>{english ? "2. Select specialist models" : "2. 选择副模型"}</h4>
+                          <p>
+                            {english
+                              ? "Specialists come from other hosts. Selecting at most two usually minimizes cost."
+                              : "副模型来自其他宿主；建议最多选择 2 个，通常更省成本。"}
+                          </p>
+                        </div>
+                      </div>
+                      {activeHostPolicy.specialists.map((specialist, index) => {
+                        const hostAvailable = availableSpecialistHosts.includes(specialist.host);
+                        const modelOptions = usableSpecialistModels(specialist.host);
+                        const selectedCatalogModel = modelOptions.find(
+                          (model) => model.id === specialist.model,
+                        );
+                        const addedCapabilities = specialist.capabilities.filter(
+                          (capability) => !activeHostPolicy.mainCapabilities.includes(capability),
+                        );
+                        const knownCost =
+                          specialist.inputCostPerMillionTokens != null ||
+                          specialist.outputCostPerMillionTokens != null;
+                        if (!hostAvailable) {
+                          return (
+                            <article
+                              className="capability-specialist-card"
+                              key={`${specialist.host}:${specialist.model}:${index}`}
+                            >
+                              <div className="capability-specialist-heading">
+                                <div>
+                                  <span>
+                                    {english ? "Unavailable specialist" : "不可用的副模型配置"}
+                                  </span>
+                                  <strong>{hostLabel(specialist.host)}</strong>
+                                </div>
+                                <span className="warning">
+                                  {english ? "Not selectable" : "不参与选择与路由"}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    updateSpecialists(
+                                      activeHostPolicy.specialists.filter(
+                                        (_, specialistIndex) => specialistIndex !== index,
+                                      ),
+                                    )
+                                  }
+                                  disabled={isPending || readOnly}
+                                >
+                                  {english ? "Remove" : "移除"}
+                                </button>
+                              </div>
+                              <p className="capability-evidence">
+                                {english
+                                  ? "This saved host is currently unavailable or exposes no models. It has no capability controls."
+                                  : "该已保存宿主当前不可用或未提供模型，因此不展示能力项，也不会参与互补路由。"}
+                              </p>
+                            </article>
+                          );
+                        }
+                        return (
+                          <article
+                            className="capability-specialist-card"
+                            key={`${specialist.host}:${specialist.model}:${index}`}
+                          >
+                            <div className="capability-specialist-heading">
+                              <div>
+                                <span>
+                                  {english ? `Specialist ${index + 1}` : `副模型 ${index + 1}`}
+                                </span>
+                                <strong>
+                                  {specialist.model ||
+                                    (english ? "Model not selected" : "尚未选择模型")}
+                                </strong>
+                              </div>
+                              <span className={addedCapabilities.length > 0 ? "gain" : "warning"}>
+                                {addedCapabilities.length > 0
+                                  ? `${english ? "Adds" : "新增"} ${addedCapabilities.length}`
+                                  : english
+                                    ? "No added capability"
+                                    : "无新增能力"}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  updateSpecialists(
+                                    activeHostPolicy.specialists.filter(
+                                      (_, specialistIndex) => specialistIndex !== index,
+                                    ),
+                                  )
+                                }
+                                disabled={isPending || readOnly}
+                              >
+                                {english ? "Remove" : "移除"}
+                              </button>
+                            </div>
+                            <div className="capability-specialist-fields">
+                              <select
+                                aria-label={english ? "Specialist host" : "副模型宿主"}
+                                value={specialist.host}
+                                onChange={(event) => {
+                                  const host = event.target.value as AgentHostId;
+                                  const specialists = [...activeHostPolicy.specialists];
+                                  specialists[index] = {
+                                    host,
+                                    source: modelSourceForHost(host),
+                                    model: "",
+                                    capabilities: [],
+                                    inputCostPerMillionTokens: null,
+                                    outputCostPerMillionTokens: null,
+                                  };
+                                  updateSpecialists(specialists);
+                                }}
+                                disabled={isPending || readOnly}
+                              >
+                                {availableSpecialistHosts.map((host) => (
+                                  <option key={host} value={host}>
+                                    {hostLabel(host)}
+                                    {upstreamCatalog.hosts[host]?.available
+                                      ? ""
+                                      : english
+                                        ? " · unavailable"
+                                        : " · 不可用"}
+                                  </option>
+                                ))}
+                              </select>
+                              <select
+                                aria-label={english ? "Specialist model" : "副模型"}
+                                value={specialist.model}
+                                onChange={(event) => {
+                                  const selectedModel = modelOptions.find(
+                                    (model) => model.id === event.target.value,
+                                  );
+                                  const specialists = [...activeHostPolicy.specialists];
+                                  specialists[index] = {
+                                    ...specialist,
+                                    model: event.target.value,
+                                    capabilities: selectedModel?.capabilities ?? [],
+                                    inputCostPerMillionTokens:
+                                      selectedModel?.inputCostPerMillionTokens ?? null,
+                                    outputCostPerMillionTokens:
+                                      selectedModel?.outputCostPerMillionTokens ?? null,
+                                  };
+                                  updateSpecialists(specialists);
+                                }}
+                                disabled={isPending || readOnly || modelOptions.length === 0}
+                              >
+                                <option value="">
+                                  {modelOptions.length === 0
+                                    ? english
+                                      ? "No models discovered for this host"
+                                      : "该宿主未发现可用模型"
+                                    : english
+                                      ? "Select from this host"
+                                      : "从该宿主模型中选择"}
+                                </option>
+                                {modelOptions.map((model) => (
+                                  <option key={model.id} value={model.id}>
+                                    {model.name} · {model.id}
+                                  </option>
+                                ))}
+                              </select>
+                              <div className="capability-cost-status">
+                                <span>{english ? "Cost" : "费用"}</span>
+                                <strong>
+                                  {knownCost
+                                    ? `${specialist.inputCostPerMillionTokens ?? "?"} / ${specialist.outputCostPerMillionTokens ?? "?"} / 1M tokens`
+                                    : specialist.host === "codex" || specialist.host === "cursor"
+                                      ? english
+                                        ? "Account quota · unit price unavailable"
+                                        : "宿主账号额度 · 未提供单价"
+                                      : english
+                                        ? "Unknown · excluded from cheapest ranking"
+                                        : "价格未知 · 不参与最省钱排序"}
+                                </strong>
+                              </div>
+                            </div>
+                            {selectedCatalogModel?.capabilities?.length ? (
+                              <p className="capability-evidence">
+                                {english
+                                  ? "Capabilities published by catalog"
+                                  : "模型目录已发布能力"}
+                                ：
+                                {selectedCatalogModel.capabilities
+                                  .map((item) => capabilityLabel(item, english))
+                                  .join("、")}
+                              </p>
+                            ) : null}
+                            {selectedCatalogModel === undefined ? null : selectedCatalogModel
+                                .capabilities?.length ? (
+                              <CapabilityPicker
+                                selected={specialist.capabilities}
+                                available={selectedCatalogModel.capabilities}
+                                english={english}
+                                disabled={isPending || readOnly}
+                                onChange={(capabilities) => {
+                                  const specialists = [...activeHostPolicy.specialists];
+                                  specialists[index] = {
+                                    ...specialist,
+                                    capabilities,
+                                  };
+                                  updateSpecialists(specialists);
+                                }}
+                              />
+                            ) : (
+                              <p className="capability-evidence warning">
+                                {english
+                                  ? "This model did not publish capability metadata and cannot be used for capability completion."
+                                  : "该模型未发布能力信息，不能用于能力互补。"}
+                              </p>
+                            )}
+                            {specialist.host === "ollama" ||
+                            specialist.host === "openai-compatible" ? (
+                              <div className="capability-cost-inputs">
+                                <label>
+                                  {english ? "Input / 1M tokens" : "输入价 / 百万 Token"}
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    step="0.01"
+                                    value={specialist.inputCostPerMillionTokens ?? ""}
+                                    placeholder={english ? "Unknown" : "未知"}
+                                    onChange={(event) => {
+                                      const specialists = [...activeHostPolicy.specialists];
+                                      specialists[index] = {
+                                        ...specialist,
+                                        inputCostPerMillionTokens:
+                                          event.target.value === ""
+                                            ? null
+                                            : Number(event.target.value),
+                                      };
+                                      updateSpecialists(specialists);
+                                    }}
+                                    disabled={isPending || readOnly}
+                                  />
+                                </label>
+                                <label>
+                                  {english ? "Output / 1M tokens" : "输出价 / 百万 Token"}
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    step="0.01"
+                                    value={specialist.outputCostPerMillionTokens ?? ""}
+                                    placeholder={english ? "Unknown" : "未知"}
+                                    onChange={(event) => {
+                                      const specialists = [...activeHostPolicy.specialists];
+                                      specialists[index] = {
+                                        ...specialist,
+                                        outputCostPerMillionTokens:
+                                          event.target.value === ""
+                                            ? null
+                                            : Number(event.target.value),
+                                      };
+                                      updateSpecialists(specialists);
+                                    }}
+                                    disabled={isPending || readOnly}
+                                  />
+                                </label>
+                              </div>
+                            ) : null}
+                          </article>
+                        );
+                      })}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const host =
+                            availableSpecialistHosts.find(
+                              (candidate) => usableSpecialistModels(candidate).length > 0,
+                            ) ?? availableSpecialistHosts[0];
+                          if (host === undefined) return;
+                          updateSpecialists([
+                            ...activeHostPolicy.specialists,
+                            {
+                              host,
+                              source: modelSourceForHost(host),
+                              model: "",
+                              capabilities: [],
+                              inputCostPerMillionTokens: null,
+                              outputCostPerMillionTokens: null,
+                            },
+                          ]);
+                        }}
+                        disabled={isPending || readOnly || availableSpecialistHosts.length === 0}
+                      >
+                        {availableSpecialistHosts.length === 0
+                          ? english
+                            ? "No available specialist host"
+                            : "没有可用的副模型"
+                          : english
+                            ? "Add specialist model"
+                            : "添加副模型"}
+                      </button>
+                    </div>
+                  </>
+                ) : null}
+              </section>
               {!providerConfigured || !choiceMatchesRuntime ? (
                 <>
                   <textarea

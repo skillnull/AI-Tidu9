@@ -484,7 +484,7 @@ test("starts and stops the local runtime automatically with the MCP host session
   const [exitCode] = (await once(child, "exit")) as [number | null];
 
   assert.equal(exitCode, 0, standardError);
-  assert.match(standardOutput, /AI-Tidu9 is the default collaboration gateway/u);
+  assert.match(standardOutput, /AI-Tidu9 is an Agent runtime/u);
 });
 
 test("normalizes safe management endpoints and rejects embedded credentials", () => {

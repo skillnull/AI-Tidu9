@@ -1,4 +1,10 @@
 import type {
+  AgentHostId,
+  CapabilityCompletionConfiguration,
+  CapabilitySpecialistConfiguration,
+  ModelSelection,
+} from "../config/index.js";
+import type {
   ModelProvider,
   ProviderExecutionRequest,
   ProviderExecutionResult,
@@ -84,6 +90,38 @@ export interface RoutingDecision {
 export interface DynamicModelRouter extends ModelProvider {
   /** Returns the latest non-secret routing decision. */
   inspect: () => RoutingDecision | undefined;
+}
+
+export interface CapabilityCompletionUsageRecord extends RoutingDecision {
+  /** Host entry whose isolated policy produced this route. */
+  host: AgentHostId;
+  /** ISO timestamp for the completed routing attempt. */
+  occurredAt: string;
+  /** Agent role that requested the route. */
+  role: string;
+  /** Whether at least one specialist actually contributed. */
+  complemented: boolean;
+  /** Upstream request outcome after routing. */
+  outcome: "failed" | "succeeded";
+}
+
+export interface CapabilityCompletionStatus {
+  /** Active policy snapshot. */
+  configuration: CapabilityCompletionConfiguration;
+  /** Primary upstream selected by the active configuration. */
+  mainModel: ModelSelection;
+  /** Recent bounded usage, newest first. */
+  records: readonly CapabilityCompletionUsageRecord[];
+}
+
+export interface CapabilityCompletionProvider extends ModelProvider {
+  /** Returns the active policy and bounded non-secret usage records. */
+  inspectCapabilityCompletion: () => Promise<CapabilityCompletionStatus>;
+}
+
+export interface CapabilityCompletionProviderOptions {
+  /** Resolves the concrete provider owned by a host; no cross-host fallback is allowed. */
+  resolveProviderForHost?: (host: AgentHostId) => Promise<ModelProvider | undefined>;
 }
 
 const ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/u;
@@ -419,5 +457,196 @@ export const createDynamicModelRouter = (
     descriptor: { type: "tidu-router", model: policy.mainModelId },
     execute,
     inspect: () => (latestDecision === undefined ? undefined : structuredClone(latestDecision)),
+  };
+};
+
+export const createCapabilityCompletionProvider = (
+  provider: ModelProvider,
+  loadConfiguration: () => Promise<{
+    modelSelection: ModelSelection;
+    capabilityCompletion: CapabilityCompletionConfiguration;
+  }>,
+  options: CapabilityCompletionProviderOptions = {},
+): CapabilityCompletionProvider => {
+  const records: CapabilityCompletionUsageRecord[] = [];
+  const resolvedProviders = new Set<ModelProvider>([provider]);
+  const bindModel = (
+    host: AgentHostId,
+    selection: ModelSelection,
+    capabilities: readonly string[],
+    id: string,
+    costs?: Pick<
+      CapabilitySpecialistConfiguration,
+      "inputCostPerMillionTokens" | "outputCostPerMillionTokens"
+    >,
+  ): RoutableModel => ({
+    profile: {
+      id,
+      capabilities,
+      inputCostPerMillionTokens: costs?.inputCostPerMillionTokens ?? Number.MAX_SAFE_INTEGER,
+      outputCostPerMillionTokens: costs?.outputCostPerMillionTokens ?? Number.MAX_SAFE_INTEGER,
+      averageLatencyMilliseconds: 0,
+      availability: 1,
+      privacy: selection.source === "company" ? "private" : "external",
+      remainingRequests: null,
+      enabled: true,
+    },
+    provider: {
+      descriptor: provider.descriptor,
+      execute: async (request) => {
+        const selectedProvider =
+          options.resolveProviderForHost === undefined
+            ? provider
+            : await options.resolveProviderForHost(host);
+        if (selectedProvider === undefined) {
+          return {
+            kind: "json",
+            statusCode: 503,
+            body: {
+              error: {
+                code: "specialist_host_unavailable",
+                message: `The ${host} host is unavailable for capability completion.`,
+                type: "server_error",
+              },
+            },
+          };
+        }
+        resolvedProviders.add(selectedProvider);
+        return selectedProvider.execute({
+          ...request,
+          routing: {
+            ...request.routing,
+            host,
+            modelSource: selection.source,
+            ...(selection.model === "current" ? {} : { targetModel: selection.model }),
+          },
+        });
+      },
+    },
+  });
+  const resolveHostPolicy = (
+    active: Awaited<ReturnType<typeof loadConfiguration>>,
+    host: AgentHostId | undefined,
+  ) => {
+    const policy =
+      host === undefined ? undefined : active.capabilityCompletion.hostPolicies?.[host];
+    return policy === undefined
+      ? {
+          modelSelection: active.modelSelection,
+          mainCapabilities: active.capabilityCompletion.mainCapabilities,
+          specialists: active.capabilityCompletion.specialists.filter(
+            (specialist) => specialist.host !== host,
+          ),
+          maximumSpecialists: active.capabilityCompletion.maximumSpecialists,
+        }
+      : {
+          modelSelection: policy.mainModel,
+          mainCapabilities: policy.mainCapabilities,
+          specialists: policy.specialists.filter((specialist) => specialist.host !== host),
+          maximumSpecialists: policy.maximumSpecialists,
+        };
+  };
+  const readStatus = async (): Promise<CapabilityCompletionStatus> => {
+    const configuration = await loadConfiguration();
+    return {
+      configuration: structuredClone(configuration.capabilityCompletion),
+      mainModel: structuredClone(configuration.modelSelection),
+      records: structuredClone(records),
+    };
+  };
+  return {
+    descriptor: provider.descriptor,
+    listModels: provider.listModels?.bind(provider),
+    close: async () => {
+      await Promise.all([...resolvedProviders].map((item) => item.close?.()));
+    },
+    inspectCapabilityCompletion: readStatus,
+    execute: async (request) => {
+      const active = await loadConfiguration();
+      const requestHost = request.routing?.host ?? "openai-compatible";
+      const hostPolicy = resolveHostPolicy(active, requestHost);
+      const mainId = `main:${requestHost}:${hostPolicy.modelSelection.source}:${hostPolicy.modelSelection.model}`;
+      const specialists = hostPolicy.specialists.map((specialist, index) =>
+        bindModel(
+          specialist.host,
+          specialist,
+          specialist.capabilities,
+          `specialist-${index}:${specialist.host}:${specialist.source}:${specialist.model}`,
+          specialist,
+        ),
+      );
+      if (!active.capabilityCompletion.enabled || specialists.length === 0) {
+        const requiredCapabilities = inferCapabilities(request);
+        const result = await bindModel(
+          requestHost,
+          hostPolicy.modelSelection,
+          hostPolicy.mainCapabilities,
+          mainId,
+        ).provider.execute(request);
+        records.unshift({
+          host: requestHost,
+          mainModelId: mainId,
+          specialistModelIds: [],
+          requiredCapabilities,
+          missingCapabilities: requiredCapabilities.filter(
+            (capability) => !hostPolicy.mainCapabilities.includes(capability),
+          ),
+          score: 0,
+          estimatedCostPerMillionTokens: 0,
+          occurredAt: new Date().toISOString(),
+          role: request.routing?.role ?? "main",
+          complemented: false,
+          outcome: result.statusCode >= 200 && result.statusCode < 300 ? "succeeded" : "failed",
+        });
+        records.splice(50);
+        return result;
+      }
+      const router = createDynamicModelRouter(
+        [
+          bindModel(requestHost, hostPolicy.modelSelection, hostPolicy.mainCapabilities, mainId),
+          ...specialists,
+        ],
+        {
+          enabled: active.capabilityCompletion.enabled,
+          mainModelId: mainId,
+          weights: { capability: 10, cost: 1, privacy: 2, latency: 1, availability: 3 },
+          capabilityCompletion: {
+            enabled: active.capabilityCompletion.enabled,
+            poolModelIds: specialists.map((specialist) => specialist.profile.id),
+            maximumSpecialists: hostPolicy.maximumSpecialists,
+          },
+        },
+      );
+      try {
+        const result = await router.execute(request);
+        const decision = router.inspect();
+        if (decision !== undefined) {
+          records.unshift({
+            host: requestHost,
+            ...decision,
+            occurredAt: new Date().toISOString(),
+            role: request.routing?.role ?? "main",
+            complemented: decision.specialistModelIds.length > 0,
+            outcome: "succeeded",
+          });
+          records.splice(50);
+        }
+        return result;
+      } catch (error) {
+        const decision = router.inspect();
+        if (decision !== undefined) {
+          records.unshift({
+            host: requestHost,
+            ...decision,
+            occurredAt: new Date().toISOString(),
+            role: request.routing?.role ?? "main",
+            complemented: decision.specialistModelIds.length > 0,
+            outcome: "failed",
+          });
+          records.splice(50);
+        }
+        throw error;
+      }
+    },
   };
 };

@@ -32,6 +32,10 @@ const writeOfficialModelCache = (codexHomeDirectory: string): void => {
           slug: "user-default",
           display_name: "Official Default",
           description: "Official Codex model",
+          input_modalities: ["text", "image"],
+          supported_reasoning_levels: [{ effort: "medium" }],
+          supports_search_tool: true,
+          context_window: 128000,
           visibility: "list",
           supported_in_api: true,
         },
@@ -83,8 +87,18 @@ test("lists current and retained official Codex models without managed entries",
     );
 
     assert.deepEqual(listCodexOfficialModels(codexHomeDirectory), [
-      { id: "user-default", name: "Official Default" },
-      { id: "gpt-retained", name: "Retained official model" },
+      {
+        id: "user-default",
+        name: "Official Default",
+        capabilities: ["text", "vision", "reasoning", "web-research", "long-context"],
+        capabilitySource: "host-catalog",
+      },
+      {
+        id: "gpt-retained",
+        name: "Retained official model",
+        capabilities: [],
+        capabilitySource: "host-catalog",
+      },
     ]);
   } finally {
     rmSync(temporaryDirectory, { force: true, recursive: true });
@@ -119,7 +133,7 @@ test("writes an isolated Codex profile and switches back to the official configu
     assert.equal(result.model, "ai-tidu9-config");
     assert.match(profile, /model_provider = "ai_tidu9"/u);
     assert.match(profile, /requires_openai_auth = false/u);
-    assert.match(profile, new RegExp(`base_url = "${runtime.origin}/v1"`, "u"));
+    assert.match(profile, new RegExp(`base_url = "${runtime.origin}/v1/hosts/codex"`, "u"));
     assert.doesNotMatch(profile, /api[_-]?key|token|secret/iu);
     const activeDefaultConfiguration = readFileSync(defaultConfiguration, "utf8");
     assert.equal(activeDefaultConfiguration, 'model = "user-default"\n');
@@ -132,7 +146,7 @@ test("writes an isolated Codex profile and switches back to the official configu
     ) as { models: { slug: string }[] };
     assert.deepEqual(
       catalog.models.map(({ slug }) => slug),
-      ["ai-tidu9-config", "user-default"],
+      ["ai-tidu9-config"],
     );
 
     await switchCodexClientConfiguration({
@@ -140,7 +154,7 @@ test("writes an isolated Codex profile and switches back to the official configu
       codexHomeDirectory,
       request: async (input, init) => {
         const url = String(input);
-        if (url.endsWith("/v1/responses") && init?.method === "POST") {
+        if (url.endsWith("/v1/hosts/codex/responses") && init?.method === "POST") {
           return Response.json({
             id: "verified",
             object: "response",
@@ -151,9 +165,11 @@ test("writes an isolated Codex profile and switches back to the official configu
       },
     });
     const tiduDefaultConfiguration = readFileSync(defaultConfiguration, "utf8");
-    assert.match(tiduDefaultConfiguration, /model = "user-default"/u);
+    assert.match(tiduDefaultConfiguration, /model = "ai-tidu9-config"/u);
     assert.match(tiduDefaultConfiguration, /model_provider = "ai_tidu9"/u);
     assert.match(tiduDefaultConfiguration, /\[model_providers\.ai_tidu9\]/u);
+    assert.match(tiduDefaultConfiguration, /name = "九门赛博提督"/u);
+    assert.doesNotMatch(tiduDefaultConfiguration, /requires_openai_auth = true/u);
 
     await switchCodexClientConfiguration({
       mode: "official",
@@ -262,7 +278,7 @@ test("retains only the original baseline and latest managed Codex snapshot", asy
   }
 });
 
-test("does not shrink the unified catalog when an older Codex cache omits official models", async () => {
+test("keeps the native AI-Tidu9 catalog isolated from changing official model caches", async () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-catalog-"));
   const codexHomeDirectory = join(temporaryDirectory, ".codex");
   const runtime = await startLocalRuntime({ databasePath: ":memory:", port: 0 });
@@ -297,7 +313,7 @@ test("does not shrink the unified catalog when an older Codex cache omits offici
     ) as { models: { slug: string }[] };
     assert.deepEqual(
       catalog.models.map(({ slug }) => slug),
-      ["ai-tidu9-config", "official-current", "official-newer", "user-default"],
+      ["ai-tidu9-config"],
     );
   } finally {
     await runtime.close();

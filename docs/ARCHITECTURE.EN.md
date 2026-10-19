@@ -34,6 +34,8 @@ flowchart LR
 
 The core does not replace model reasoning or hard-code domain logic. It selects capabilities, limits cost and risk, retains minimal recovery state, and verifies the outcome against the goal.
 
+Capability completion sits after host entry and before model Providers. Hosts submit both goals and host identity to the same Agent kernel. Each host independently declares its primary model, capabilities, cross-host specialists, capability labels, cost evidence, and per-request limit. The entry host fixes the primary; every specialist must come from another host and execute through that host's Provider. An unavailable specialist host fails closed instead of falling back to the primary host. Routing invokes only specialists that fill a gap and prefers lower known cost. History retains only non-secret host and model identifiers, required capabilities, outcomes, and timestamps for local, personal, and enterprise status views.
+
 ## 🧱 Module map: responsibilities and exclusions
 
 | Area | Code modules | Owns | Does not own |
@@ -133,8 +135,8 @@ AI-Tidu9 retains only the data required for its own operation. Full conversation
 
 | Client | Preferred entry | Capability owner | Current boundary |
 | --- | --- | --- | --- |
-| Codex app, CLI, and IDE | MCP + app-server / unified model catalog | Official Codex account, session, and permissions | Official models use the official process; the AI-Tidu9 model uses the local router |
-| Cursor Desktop and Agent CLI | User-level MCP; authorized CLI through ACP | Cursor host and CLI account | Desktop login cannot be copied into CLI credentials |
+| Codex app, CLI, and IDE | Native exclusive modes + Responses | Official Codex account, session, and permissions | AI-Tidu9 mode exposes only the AI-Tidu9 Agent; Official mode fully restores direct official access |
+| Cursor Desktop and Agent CLI | Host connector; authorized CLI through ACP | Cursor host and CLI account | Goals enter the same Agent kernel; desktop login cannot be copied into CLI credentials |
 | Generic OpenAI client | `/v1/models`, Chat Completions, Responses | AI-Tidu9 model pool and Agent kernel | Client-specific extensions require separate verification |
 | Browser | Configuration center or enterprise gateway | AI-Tidu9 runtime | Cross-device access requires HTTPS and identity control |
 | Ollama | Upstream model adapter | Local model | It is a provider, not a host client |

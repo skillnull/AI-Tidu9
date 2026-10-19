@@ -24,8 +24,11 @@ import {
   switchCodexClientConfiguration,
 } from "../clients/configuration.js";
 import {
+  type AgentHostId,
+  type CapabilitySpecialistConfiguration,
   CONFIG_SCHEMA_VERSION,
   type ConfigurationMode,
+  createDefaultConfiguration,
   type TiduConfiguration,
 } from "../config/index.js";
 import { createConfigCenterBootstrap } from "../config-center/index.js";
@@ -52,10 +55,15 @@ import {
 } from "../providers/codex-host.js";
 import {
   createCatalogModelRouter,
+  createOllamaProvider,
   createProviderFromEnvironment,
   discoverOllamaModels,
   type ModelProvider,
 } from "../providers/index.js";
+import {
+  type CapabilityCompletionProvider,
+  createCapabilityCompletionProvider,
+} from "../routing/index.js";
 import type { ScalingControlPlane, ScalingTaskRequest } from "../scaling/index.js";
 import { createSecretGate, guardModelProvider, type SecretGate } from "../security/index.js";
 import {
@@ -114,7 +122,11 @@ const createRuntimeLogger = (storageLocation: string): RuntimeLogger => {
       : join(dirname(storageLocation), "logs", "runtime.log"),
   );
   if (process.env.NODE_TEST_CONTEXT !== undefined) {
-    return { location: logPath, write: () => undefined, close: async () => undefined };
+    return {
+      location: logPath,
+      write: () => undefined,
+      close: async () => undefined,
+    };
   }
 
   mkdirSync(dirname(logPath), { recursive: true, mode: 0o700 });
@@ -517,12 +529,147 @@ const providerResponseFailureReason = (body: unknown, statusCode: number): strin
   return `The configured upstream returned HTTP ${statusCode}.`;
 };
 
+const collectAgentInputText = (value: unknown, output: string[]): void => {
+  if (typeof value === "string") {
+    if (value.trim() !== "") output.push(value.trim());
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectAgentInputText(item, output);
+    return;
+  }
+  if (!isRecord(value)) return;
+  for (const key of ["text", "content", "input", "output_text"]) {
+    if (key in value) collectAgentInputText(value[key], output);
+  }
+};
+
+const createAgentObjective = (body: Record<string, unknown>): string => {
+  const inputParts: string[] = [];
+  collectAgentInputText(body.input, inputParts);
+  collectAgentInputText(body.messages, inputParts);
+  const instructions = typeof body.instructions === "string" ? body.instructions.trim() : "";
+  const objective = [instructions, ...inputParts].filter((part) => part !== "").join("\n\n");
+  return objective.slice(0, MAXIMUM_INFERENCE_JSON_BODY_BYTES);
+};
+
+const createAgentResponsesBody = (
+  model: string,
+  text: string,
+  responseId = `resp_${randomUUID()}`,
+): Record<string, unknown> => ({
+  id: responseId,
+  object: "response",
+  status: "completed",
+  model,
+  output: [
+    {
+      id: `${responseId}_message`,
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text, annotations: [] }],
+    },
+  ],
+});
+
+const createAgentChatBody = (
+  model: string,
+  text: string,
+  responseId = `chatcmpl_${randomUUID()}`,
+): Record<string, unknown> => ({
+  id: responseId,
+  object: "chat.completion",
+  created: Math.floor(Date.now() / 1_000),
+  model,
+  choices: [
+    {
+      index: 0,
+      message: { role: "assistant", content: text },
+      finish_reason: "stop",
+    },
+  ],
+});
+
+const createAgentResponsesStream = (
+  model: string,
+  run: () => Promise<string>,
+): ReadableStream<Uint8Array> => {
+  const responseId = `resp_${randomUUID()}`;
+  const encoder = new TextEncoder();
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      const write = (event: string): void => controller.enqueue(encoder.encode(event));
+      void run()
+        .then((text) => {
+          write(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n`,
+          );
+          write(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: createAgentResponsesBody(model, text, responseId) })}\n\n`,
+          );
+          write("data: [DONE]\n\n");
+          controller.close();
+        })
+        .catch((error: unknown) => controller.error(error));
+    },
+  });
+};
+
+const createAgentChatStream = (
+  model: string,
+  run: () => Promise<string>,
+): ReadableStream<Uint8Array> => {
+  const responseId = `chatcmpl_${randomUUID()}`;
+  const encoder = new TextEncoder();
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      const write = (event: string): void => controller.enqueue(encoder.encode(event));
+      void run()
+        .then((text) => {
+          write(
+            `data: ${JSON.stringify({ id: responseId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1_000), model, choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] })}\n\n`,
+          );
+          write(
+            `data: ${JSON.stringify({ id: responseId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1_000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+          );
+          write("data: [DONE]\n\n");
+          controller.close();
+        })
+        .catch((error: unknown) => controller.error(error));
+    },
+  });
+};
+
+const runAgentResponsesTask = async (
+  agentKernel: AgentKernel,
+  body: Record<string, unknown>,
+  originHost: AgentHostId,
+): Promise<string> => {
+  const objective = createAgentObjective(body);
+  if (objective === "") throw new Error("The Agent request does not contain a usable goal.");
+  const created = await agentKernel.createTask({
+    goal: {
+      objective,
+      acceptanceCriteria: ["The response addresses the requested goal."],
+    },
+    originHost,
+  });
+  const completed = await agentKernel.runTask(created.task.taskId);
+  if (completed.task.status !== "completed" || completed.result?.accepted !== true) {
+    throw new Error(`The Agent task ended with status ${completed.task.status}.`);
+  }
+  return completed.result.summary;
+};
+
 const handleOpenAiInference = async (
   request: import("node:http").IncomingMessage,
   response: import("node:http").ServerResponse,
   storage: StorageAdapter,
   protocol: "chat-completions" | "responses",
   provider: ModelProvider | undefined,
+  agentKernel: AgentKernel | undefined,
+  originHost: AgentHostId,
 ): Promise<void> => {
   const requestId = randomUUID();
   let body: unknown;
@@ -547,13 +694,60 @@ const handleOpenAiInference = async (
   if (sendOpenAiValidation(response, validation, requestId)) {
     return;
   }
+  const requestBody = body as Record<string, unknown>;
+  const probe = isRecord(requestBody.metadata) && requestBody.metadata.ai_tidu9_probe === true;
+  if (!probe) {
+    if (agentKernel === undefined) {
+      sendOpenAiJson(
+        response,
+        503,
+        createOpenAiError(
+          "agent_kernel_not_configured",
+          "The AI-Tidu9 Agent kernel is not configured.",
+          "server_error",
+        ),
+        requestId,
+      );
+      return;
+    }
+    const model = typeof requestBody.model === "string" ? requestBody.model : "ai-tidu9-config";
+    const run = () => runAgentResponsesTask(agentKernel, requestBody, originHost);
+    try {
+      if (requestBody.stream === true) {
+        const stream =
+          protocol === "responses"
+            ? createAgentResponsesStream(model, run)
+            : createAgentChatStream(model, run);
+        await sendOpenAiStream(response, 200, stream, requestId);
+      } else {
+        const text = await run();
+        sendOpenAiJson(
+          response,
+          200,
+          protocol === "responses"
+            ? createAgentResponsesBody(model, text)
+            : createAgentChatBody(model, text),
+          requestId,
+        );
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "The Agent task failed.";
+      sendOpenAiJson(
+        response,
+        502,
+        createOpenAiError("agent_task_failed", reason, "server_error"),
+        requestId,
+      );
+    }
+    return;
+  }
   if (provider !== undefined) {
     const modelSelection = workspace.active.configuration.modelSelection ?? {
       source: "official" as const,
       model: "current",
     };
     if (
-      modelSelection.source === "company" &&
+      (modelSelection.source === "company" || modelSelection.source === "custom") &&
       provider.descriptor.type !== "tidu-router" &&
       provider.descriptor.type !== "openai-compatible" &&
       provider.descriptor.type !== "ollama"
@@ -562,8 +756,8 @@ const handleOpenAiInference = async (
         response,
         503,
         createOpenAiError(
-          "company_provider_not_configured",
-          "The selected company model source is not configured.",
+          "upstream_provider_not_configured",
+          "The selected company or custom model source is not configured.",
           "server_error",
         ),
         requestId,
@@ -581,6 +775,7 @@ const handleOpenAiInference = async (
         virtualModelId: activeModelId,
         signal: controller.signal,
         routing: {
+          host: originHost,
           modelSource: modelSelection.source,
           ...(modelSelection.model === "current" ? {} : { targetModel: modelSelection.model }),
         },
@@ -777,6 +972,85 @@ const readDraftConfiguration = (
     throw new TiduError("CONFIGURATION_INVALID", "Configuration payload is invalid.");
   }
 
+  const parseSpecialists = (value: unknown): CapabilitySpecialistConfiguration[] | undefined => {
+    if (!Array.isArray(value)) return undefined;
+    const specialists: CapabilitySpecialistConfiguration[] = [];
+    for (const specialist of value) {
+      if (
+        !isRecord(specialist) ||
+        (specialist.source !== "official" &&
+          specialist.source !== "company" &&
+          specialist.source !== "custom") ||
+        (specialist.host !== "codex" &&
+          specialist.host !== "cursor" &&
+          specialist.host !== "ollama" &&
+          specialist.host !== "openai-compatible") ||
+        typeof specialist.model !== "string" ||
+        !Array.isArray(specialist.capabilities) ||
+        !specialist.capabilities.every((capability) => typeof capability === "string")
+      ) {
+        return undefined;
+      }
+      specialists.push({
+        host: specialist.host,
+        source: specialist.source,
+        model: specialist.model,
+        capabilities: specialist.capabilities as string[],
+        inputCostPerMillionTokens:
+          typeof specialist.inputCostPerMillionTokens === "number"
+            ? specialist.inputCostPerMillionTokens
+            : null,
+        outputCostPerMillionTokens:
+          typeof specialist.outputCostPerMillionTokens === "number"
+            ? specialist.outputCostPerMillionTokens
+            : null,
+      });
+    }
+    return specialists;
+  };
+  const completionCandidate = isRecord(candidate.capabilityCompletion)
+    ? candidate.capabilityCompletion
+    : undefined;
+  const specialists = parseSpecialists(completionCandidate?.specialists);
+  const hostPolicies: Partial<
+    Record<
+      AgentHostId,
+      {
+        mainModel: TiduConfiguration["modelSelection"];
+        mainCapabilities: readonly string[];
+        specialists: readonly CapabilitySpecialistConfiguration[];
+        maximumSpecialists: number;
+      }
+    >
+  > = {};
+  if (isRecord(completionCandidate?.hostPolicies)) {
+    for (const host of ["codex", "cursor", "ollama", "openai-compatible"] as const) {
+      const policy = completionCandidate.hostPolicies[host];
+      if (!isRecord(policy) || !isRecord(policy.mainModel)) continue;
+      const policySpecialists = parseSpecialists(policy.specialists);
+      if (
+        (policy.mainModel.source !== "official" &&
+          policy.mainModel.source !== "company" &&
+          policy.mainModel.source !== "custom") ||
+        typeof policy.mainModel.model !== "string" ||
+        !Array.isArray(policy.mainCapabilities) ||
+        !policy.mainCapabilities.every((capability) => typeof capability === "string") ||
+        policySpecialists === undefined ||
+        typeof policy.maximumSpecialists !== "number"
+      ) {
+        continue;
+      }
+      hostPolicies[host] = {
+        mainModel: {
+          source: policy.mainModel.source,
+          model: policy.mainModel.model,
+        },
+        mainCapabilities: policy.mainCapabilities as string[],
+        specialists: policySpecialists,
+        maximumSpecialists: policy.maximumSpecialists,
+      };
+    }
+  }
   const configuration: TiduConfiguration = {
     schemaVersion: CONFIG_SCHEMA_VERSION,
     activeMode: mode,
@@ -785,13 +1059,29 @@ const readDraftConfiguration = (
     modelSelection:
       isRecord(candidate.modelSelection) &&
       (candidate.modelSelection.source === "official" ||
-        candidate.modelSelection.source === "company") &&
+        candidate.modelSelection.source === "company" ||
+        candidate.modelSelection.source === "custom") &&
       typeof candidate.modelSelection.model === "string"
         ? {
             source: candidate.modelSelection.source,
             model: candidate.modelSelection.model,
           }
         : { source: "official", model: "current" },
+    capabilityCompletion:
+      completionCandidate !== undefined &&
+      typeof completionCandidate.enabled === "boolean" &&
+      Array.isArray(completionCandidate.mainCapabilities) &&
+      completionCandidate.mainCapabilities.every((capability) => typeof capability === "string") &&
+      specialists !== undefined &&
+      typeof completionCandidate.maximumSpecialists === "number"
+        ? {
+            enabled: completionCandidate.enabled,
+            mainCapabilities: completionCandidate.mainCapabilities as string[],
+            specialists,
+            maximumSpecialists: completionCandidate.maximumSpecialists,
+            hostPolicies,
+          }
+        : createDefaultConfiguration(mode).capabilityCompletion,
   };
   if (mode === "expert") {
     const expertServices = candidate.expertServices;
@@ -887,6 +1177,8 @@ const handleRequest = async (
   response: import("node:http").ServerResponse,
   storage: StorageAdapter,
   provider: ModelProvider | undefined,
+  getCatalogProviderForHost: (host: AgentHostId) => Promise<ModelProvider | undefined>,
+  capabilityCompletionProvider: CapabilityCompletionProvider | undefined,
   agentKernel: AgentKernel | undefined,
   enterprise: EnterpriseControlPlane | undefined,
   scaling: ScalingControlPlane | undefined,
@@ -918,6 +1210,46 @@ const handleRequest = async (
         status: "ok",
       },
       version: PRODUCT.version,
+    });
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/api/capability-completion") {
+    const workspace = await storage.configurationStore.loadWorkspace();
+    const status = await capabilityCompletionProvider?.inspectCapabilityCompletion();
+    const enterpriseState = await enterprise?.snapshot();
+    const remoteCompany = await storage.enterpriseConnectionStore?.load();
+    const activeHost: AgentHostId | null =
+      provider?.descriptor.type === "codex-host"
+        ? "codex"
+        : provider?.descriptor.type === "cursor-host"
+          ? "cursor"
+          : provider?.descriptor.type === "ollama"
+            ? "ollama"
+            : provider?.descriptor.type === "openai-compatible"
+              ? "openai-compatible"
+              : workspace.active.configuration.modelSelection.source === "official"
+                ? "codex"
+                : null;
+    sendJson(response, 200, {
+      activeHost,
+      available: capabilityCompletionProvider !== undefined,
+      operational:
+        capabilityCompletionProvider !== undefined &&
+        workspace.active.configuration.capabilityCompletion.enabled &&
+        (workspace.active.configuration.capabilityCompletion.specialists.length > 0 ||
+          Object.values(
+            workspace.active.configuration.capabilityCompletion.hostPolicies ?? {},
+          ).some((policy) => policy.specialists.length > 0)),
+      configuration: workspace.active.configuration.capabilityCompletion,
+      mainModel: workspace.active.configuration.modelSelection,
+      records: status?.records ?? [],
+      company: {
+        connected: enterpriseState !== undefined || remoteCompany !== null,
+        publishedCapabilityCount:
+          enterpriseState?.capabilities.length ?? remoteCompany?.capabilityCount ?? 0,
+      },
+      hosts: ["codex", "cursor", "cli", "ollama", "openai-compatible"],
     });
     return;
   }
@@ -1222,18 +1554,12 @@ const handleRequest = async (
         await configureCodexClient({
           endpoint,
         });
-        const report = setupConnectors({
-          action: "install",
+        setupConnectors({
+          action: "uninstall",
           endpoint,
           targets: ["codex"],
           cliEntry: process.env.TIDU_CONNECTOR_CLI_ENTRY,
         });
-        if (!report.healthy) {
-          throw new TiduError(
-            "CONFIGURATION_INVALID",
-            report.connectors[0]?.detail ?? "Codex connector registration failed.",
-          );
-        }
       } else {
         setupConnectors({
           action: "uninstall",
@@ -1700,6 +2026,13 @@ const handleRequest = async (
             ? (body.acceptanceCriteria as string[])
             : [],
         },
+        originHost:
+          body.originHost === "codex" ||
+          body.originHost === "cursor" ||
+          body.originHost === "ollama" ||
+          body.originHost === "openai-compatible"
+            ? body.originHost
+            : "openai-compatible",
       };
       const created = await agentKernel.createTask(input);
       const capsule = body.run === true ? await agentKernel.runTask(created.task.taskId) : created;
@@ -1783,22 +2116,60 @@ const handleRequest = async (
 
   if (request.method === "GET" && pathname === "/api/models/upstreams") {
     const workspace = await storage.configurationStore.loadWorkspace();
-    const companyModels = await provider?.listModels?.().catch(() => []);
+    const [cursorProvider, ollamaProvider, compatibleProvider] = await Promise.all([
+      getCatalogProviderForHost("cursor"),
+      getCatalogProviderForHost("ollama"),
+      getCatalogProviderForHost("openai-compatible"),
+    ]);
+    const [cursorCatalogModels, ollamaModels, compatibleModels] = await Promise.all([
+      cursorProvider?.listModels?.().catch(() => []) ?? [],
+      ollamaProvider?.listModels?.().catch(() => []) ?? [],
+      compatibleProvider?.listModels?.().catch(() => []) ?? [],
+    ]);
+    const officialModels = listCodexOfficialModels();
+    const cursorLogin = inspectCursorHostLogin();
+    const cursorModels =
+      cursorCatalogModels.length > 0
+        ? cursorCatalogModels
+        : cursorLogin.reusable
+          ? [
+              {
+                id: cursorProvider?.descriptor.model ?? "current",
+                name: cursorProvider?.descriptor.model ?? "跟随 Cursor 当前模型",
+                capabilities: ["text", "code", "tool-use"],
+                capabilitySource: "provider-catalog" as const,
+              },
+            ]
+          : [];
+    const companyProvider = ollamaProvider ?? compatibleProvider;
+    const companyModels = ollamaProvider === undefined ? compatibleModels : ollamaModels;
     sendJson(response, 200, {
       selection: workspace.active.configuration.modelSelection ?? {
         source: "official",
         model: "current",
       },
-      official: listCodexOfficialModels(),
+      official: officialModels,
       company: companyModels ?? [],
-      companyConfigured:
-        provider?.descriptor.type === "tidu-router" ||
-        provider?.descriptor.type === "openai-compatible" ||
-        provider?.descriptor.type === "ollama",
+      hosts: {
+        codex: {
+          available: inspectCodexHostLogin().reusable,
+          models: officialModels,
+        },
+        cursor: { available: cursorLogin.reusable, models: cursorModels },
+        ollama: {
+          available: ollamaProvider !== undefined,
+          models: ollamaModels,
+        },
+        "openai-compatible": {
+          available: compatibleProvider !== undefined,
+          models: compatibleModels,
+        },
+      },
+      companyConfigured: companyProvider !== undefined,
       companyProviderType:
-        resolveRuntimeProviderType(provider) === "ollama" ||
-        resolveRuntimeProviderType(provider) === "openai-compatible"
-          ? resolveRuntimeProviderType(provider)
+        companyProvider?.descriptor.type === "ollama" ||
+        companyProvider?.descriptor.type === "openai-compatible"
+          ? companyProvider.descriptor.type
           : null,
     });
     return;
@@ -1831,21 +2202,49 @@ const handleRequest = async (
     return;
   }
 
-  if (request.method === "POST" && pathname === "/v1/chat/completions") {
+  const hostInferenceRoute =
+    /^\/v1\/hosts\/(codex|cursor|ollama|openai-compatible)\/(chat\/completions|responses)$/u.exec(
+      pathname,
+    );
+  const inferenceHost = (hostInferenceRoute?.[1] as AgentHostId | undefined) ?? "openai-compatible";
+  const inferenceRoute = hostInferenceRoute?.[2];
+  if (
+    request.method === "POST" &&
+    (pathname === "/v1/chat/completions" || inferenceRoute === "chat/completions")
+  ) {
     if (!(await isExpertServiceEnabled(storage, "chatCompletionsApiEnabled"))) {
       sendJson(response, 404, { error: "SERVICE_DISABLED" });
       return;
     }
-    await handleOpenAiInference(request, response, storage, "chat-completions", provider);
+    await handleOpenAiInference(
+      request,
+      response,
+      storage,
+      "chat-completions",
+      provider,
+      agentKernel,
+      inferenceHost,
+    );
     return;
   }
 
-  if (request.method === "POST" && pathname === "/v1/responses") {
+  if (
+    request.method === "POST" &&
+    (pathname === "/v1/responses" || inferenceRoute === "responses")
+  ) {
     if (!(await isExpertServiceEnabled(storage, "responsesApiEnabled"))) {
       sendJson(response, 404, { error: "SERVICE_DISABLED" });
       return;
     }
-    await handleOpenAiInference(request, response, storage, "responses", provider);
+    await handleOpenAiInference(
+      request,
+      response,
+      storage,
+      "responses",
+      provider,
+      agentKernel,
+      inferenceHost,
+    );
     return;
   }
 
@@ -2039,10 +2438,61 @@ export const startLocalRuntime = async (
           officialProvider,
         })
       : selectedProvider;
-  const provider =
-    configuredProvider === undefined
-      ? undefined
-      : guardModelProvider(configuredProvider, secretGate);
+  const hostProviderPromises = new Map<AgentHostId, Promise<ModelProvider | undefined>>();
+  const registerHostProvider = (candidate: ModelProvider | undefined): void => {
+    const host =
+      candidate?.descriptor.type === "codex-host"
+        ? "codex"
+        : candidate?.descriptor.type === "cursor-host"
+          ? "cursor"
+          : candidate?.descriptor.type === "ollama"
+            ? "ollama"
+            : candidate?.descriptor.type === "openai-compatible"
+              ? "openai-compatible"
+              : undefined;
+    if (host !== undefined) hostProviderPromises.set(host, Promise.resolve(candidate));
+  };
+  registerHostProvider(selectedProvider);
+  registerHostProvider(officialProvider);
+  const resolveProviderForHost = (host: AgentHostId): Promise<ModelProvider | undefined> => {
+    const existing = hostProviderPromises.get(host);
+    if (existing !== undefined) return existing;
+    const discovered =
+      host === "codex"
+        ? createCodexHostModelProvider()
+        : host === "cursor"
+          ? createCursorHostModelProvider()
+          : host === "ollama"
+            ? discoverOllamaModels({
+                baseUrl:
+                  process.env.TIDU_PROVIDER === "ollama"
+                    ? process.env.TIDU_PROVIDER_BASE_URL
+                    : undefined,
+                timeoutMilliseconds: 750,
+              })
+                .then((models) =>
+                  models[0] === undefined
+                    ? undefined
+                    : createOllamaProvider({
+                        baseUrl:
+                          process.env.TIDU_PROVIDER === "ollama"
+                            ? (process.env.TIDU_PROVIDER_BASE_URL ?? "http://127.0.0.1:11434")
+                            : "http://127.0.0.1:11434",
+                        model: models[0],
+                      }),
+                )
+                .catch(() => undefined)
+            : Promise.resolve(undefined);
+    hostProviderPromises.set(host, discovered);
+    void discovered.then((candidate) => {
+      if (candidate === undefined) hostProviderPromises.delete(host);
+    });
+    return discovered;
+  };
+  const getConnectedProviderForHost = (host: AgentHostId): Promise<ModelProvider | undefined> =>
+    hostProviderPromises.get(host) ?? Promise.resolve(undefined);
+  const getCatalogProviderForHost = (host: AgentHostId): Promise<ModelProvider | undefined> =>
+    host === "ollama" ? resolveProviderForHost(host) : getConnectedProviderForHost(host);
   const scalingControlPlane =
     options.scalingControlPlane ?? environmentEnterpriseRuntime?.scalingControlPlane;
   const defaultDatabasePath = resolveDefaultDatabasePath();
@@ -2057,10 +2507,29 @@ export const startLocalRuntime = async (
         options.databasePath ?? (deployment === "enterprise" ? enterpriseDatabasePath : undefined),
     });
   } catch (error) {
-    await provider?.close?.();
+    await configuredProvider?.close?.();
     await environmentEnterpriseRuntime?.close();
     throw error;
   }
+  const capabilityCompletionProvider =
+    configuredProvider === undefined
+      ? undefined
+      : createCapabilityCompletionProvider(
+          configuredProvider,
+          async () => {
+            const configuration = (await storage.configurationStore.loadWorkspace()).active
+              .configuration;
+            return {
+              modelSelection: configuration.modelSelection,
+              capabilityCompletion: configuration.capabilityCompletion,
+            };
+          },
+          { resolveProviderForHost },
+        );
+  const provider =
+    capabilityCompletionProvider === undefined
+      ? undefined
+      : guardModelProvider(capabilityCompletionProvider, secretGate);
   const activeConfiguration = (await storage.configurationStore.loadWorkspace()).active
     .configuration;
   const activeExpertServices =
@@ -2116,6 +2585,8 @@ export const startLocalRuntime = async (
       response,
       storage,
       provider,
+      getCatalogProviderForHost,
+      capabilityCompletionProvider,
       agentKernel,
       enterpriseControlPlane,
       scalingControlPlane,

@@ -1,6 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
 
 import {
+  type AgentHostId,
+  type CapabilitySpecialistConfiguration,
   type ConfigurationMode,
   createDefaultConfiguration,
   DEFAULT_VIRTUAL_MODEL_ID,
@@ -16,6 +18,29 @@ import type {
   ConfigurationWorkspace,
   SaveConfigurationDraftInput,
 } from "./types.js";
+
+const isAgentHostId = (value: unknown): value is AgentHostId =>
+  value === "codex" || value === "cursor" || value === "ollama" || value === "openai-compatible";
+
+const normalizeSpecialists = (
+  specialists: readonly CapabilitySpecialistConfiguration[],
+  mainHost?: AgentHostId,
+): CapabilitySpecialistConfiguration[] =>
+  specialists.flatMap((specialist) => {
+    if (!isAgentHostId(specialist.host) || specialist.host === mainHost) return [];
+    return [
+      {
+        host: specialist.host,
+        source: specialist.source,
+        model: specialist.model.trim(),
+        capabilities: [
+          ...new Set(specialist.capabilities.map((capability) => capability.trim())),
+        ].filter(Boolean),
+        inputCostPerMillionTokens: specialist.inputCostPerMillionTokens ?? null,
+        outputCostPerMillionTokens: specialist.outputCostPerMillionTokens ?? null,
+      },
+    ];
+  });
 
 interface ConfigurationRow {
   /** Stored configuration mode. */
@@ -43,6 +68,36 @@ const normalizeConfiguration = (configuration: TiduConfiguration): TiduConfigura
   modelSelection: {
     source: configuration.modelSelection?.source ?? "official",
     model: configuration.modelSelection?.model.trim() || "current",
+  },
+  capabilityCompletion: {
+    enabled: configuration.capabilityCompletion?.enabled ?? false,
+    mainCapabilities: [
+      ...new Set(
+        (configuration.capabilityCompletion?.mainCapabilities ?? ["text", "structured-output"])
+          .map((capability) => capability.trim())
+          .filter(Boolean),
+      ),
+    ],
+    specialists: normalizeSpecialists(configuration.capabilityCompletion?.specialists ?? []),
+    maximumSpecialists: configuration.capabilityCompletion?.maximumSpecialists ?? 2,
+    hostPolicies: Object.fromEntries(
+      Object.entries(configuration.capabilityCompletion?.hostPolicies ?? {}).map(
+        ([host, policy]) => [
+          host,
+          {
+            mainModel: {
+              source: policy.mainModel.source,
+              model: policy.mainModel.model.trim(),
+            },
+            mainCapabilities: [
+              ...new Set(policy.mainCapabilities.map((item) => item.trim())),
+            ].filter(Boolean),
+            specialists: normalizeSpecialists(policy.specialists, host as AgentHostId),
+            maximumSpecialists: policy.maximumSpecialists,
+          },
+        ],
+      ),
+    ),
   },
   ...(configuration.expertServices
     ? {
@@ -84,6 +139,9 @@ const readSharedConfiguration = (row: ConfigurationRow): TiduConfiguration => {
     activeProfileId: storedConfiguration.activeProfileId ?? DEFAULT_VIRTUAL_MODEL_ID,
     virtualModelName: storedConfiguration.virtualModelName ?? "九门赛博提督",
     modelSelection: storedConfiguration.modelSelection ?? { source: "official", model: "current" },
+    capabilityCompletion:
+      storedConfiguration.capabilityCompletion ??
+      createDefaultConfiguration("managed").capabilityCompletion,
   };
   return assertValidConfiguration(sharedConfiguration, "managed");
 };
@@ -217,6 +275,7 @@ export const createSqliteConfigurationStore = (database: DatabaseSync): Configur
       activeProfileId: configuration.activeProfileId,
       virtualModelName: configuration.virtualModelName,
       modelSelection: configuration.modelSelection,
+      capabilityCompletion: configuration.capabilityCompletion,
     };
     const expertPayload: ExpertDraftPayload = {
       expertServices: configuration.expertServices ?? readExpertServices(draftRows.expert),

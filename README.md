@@ -148,10 +148,12 @@ tidu uninstall             # 清理全部 AI-Tidu9 自有内容
 
 完整卸载会保留宿主账号、会话、无关插件、无关配置和自定义数据库路径。
 
-通用客户端通过同一基址使用 `/v1/models`、`/v1/chat/completions` 和 `/v1/responses`；Codex 与 Cursor 等宿主优先使用各自的原生 Agent 或 MCP 连接器，以保留宿主能力边界。
-`tidu setup` 会安装 MCP 连接器，并生成一个可回滚的 Codex 九门配置，但不会自动切走官方配置。Codex 中只增加一个九门虚拟模型；配置页列出账号可用的官方模型与公司 Provider 模型，支持选择或填写自定义模型 ID 作为九门上游。公司模型不会成为独立 Codex 模型项。客户端页只切换“九门”和“官方直连”。官方账号、套餐和额度信息仍由官方 Codex 管理。服务页按当前运行形态二选一展示开发服务或本地安装服务，并提供状态刷新与可用操作。九门只保留首次安装基线与最新回滚点两份自有快照。
+通用客户端通过同一基址使用 `/v1/models`、`/v1/chat/completions` 和 `/v1/responses`；这些入口与宿主连接器都进入同一个九门 Agent 内核，统一执行目标分解、能力补全、有界执行和独立验收。
 
-双通道入口使用 `tidu channel run <channel>`。`tidu` 走九门虚拟模型，`codex` 与 `cursor` 由官方宿主进程执行；CI可使用 `openai`、`deepseek`、`qwen`、`glm`、`kimi`、`doubao`、`hunyuan` 或 `custom` 厂商通道。Codex插件与Cursor通过同一MCP连接器获得 `list_tidu_channels` 和 `route_tidu_channel`，无需替换宿主官方模型列表。
+配置中心的“能力互补”栏目统一展示本地、个人和企业运行时的生效开关、各宿主主模型、跨宿主副模型池、公司发布能力、价格证据与最近路由记录。Codex、Cursor、Ollama 和兼容服务共享同一 Agent 内核，但分别保存自己的互补策略；请求入口宿主固定为主模型来源，副模型只能从其他宿主选择并由对应 Provider 执行。模型能力改为目录多选，价格未知时明确标注且不参与最省钱排序。策略修改仍通过草稿、模拟和确认启用流程生效。
+`tidu setup` 会生成一个可回滚的 Codex 九门配置，但不会自动切走官方配置。Codex 使用互斥的原生双模式：九门模式只显示一个“九门赛博提督”Agent，官方模式只显示官方模型。两套提供方与模型目录不混用。配置页可在宿主、公司和自定义上游之间互斥选择；公司模型不会成为独立 Codex 模型项。服务页按当前运行形态二选一展示开发服务或本地安装服务，并提供状态刷新与可用操作。九门只保留首次安装基线与最新回滚点两份自有快照。
+
+双通道入口使用 `tidu channel run <channel>`。`tidu` 进入九门 Agent 内核，`codex` 与 `cursor` 作为可调度的官方宿主能力；CI可使用 `openai`、`deepseek`、`qwen`、`glm`、`kimi`、`doubao`、`hunyuan` 或 `custom` 厂商通道。Cursor 等只支持连接器协议的宿主也必须把目标交给同一 Agent 内核，不能绕过规划、能力补全和验收。
 
 ## 🛡️ 信任边界与安全承诺
 

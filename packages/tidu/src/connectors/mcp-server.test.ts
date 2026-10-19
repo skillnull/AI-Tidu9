@@ -43,7 +43,7 @@ test("MCP server negotiates and lists bounded tools", async () => {
   );
   assert.match(
     (responses[0] as { result: { instructions: string } }).result.instructions,
-    /default collaboration gateway/u,
+    /Agent runtime, not an MCP tool collection/u,
   );
   assert.deepEqual(
     (responses[1] as { result: { tools: Array<{ name: string }> } }).result.tools.map(

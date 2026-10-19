@@ -1,3 +1,4 @@
+import type { AgentHostId } from "../config/index.js";
 import type { ModelProvider } from "../providers/index.js";
 import type {
   AgentPlan,
@@ -67,6 +68,9 @@ export const createModelProviderAgentAdapters = (
     payload: unknown,
     signal: AbortSignal,
     securityScopeId: string,
+    routingRole: "planning" | "verification" | "worker",
+    requiredCapabilities: readonly string[] = [],
+    host?: AgentHostId,
   ): Promise<TValue> => {
     const resolvedVirtualModelId =
       typeof virtualModelId === "string" ? virtualModelId : await virtualModelId();
@@ -74,7 +78,7 @@ export const createModelProviderAgentAdapters = (
       protocol: "chat-completions",
       virtualModelId: resolvedVirtualModelId,
       signal,
-      routing: { role: "worker", securityScopeId },
+      routing: { role: routingRole, securityScopeId, requiredCapabilities, host },
       body: {
         model: resolvedVirtualModelId,
         stream: false,
@@ -106,6 +110,9 @@ export const createModelProviderAgentAdapters = (
         },
         signal,
         task.taskId,
+        "planning",
+        [],
+        task.originHost,
       ),
     plan: async (input, signal) =>
       executeJson<AgentPlan>(
@@ -120,6 +127,9 @@ export const createModelProviderAgentAdapters = (
         },
         signal,
         input.task.taskId,
+        "planning",
+        input.understanding.requiredCapabilities,
+        input.task.originHost,
       ),
     replan: async (input, signal) =>
       executeJson<AgentPlan>(
@@ -138,6 +148,9 @@ export const createModelProviderAgentAdapters = (
         },
         signal,
         input.task.taskId,
+        "planning",
+        input.understanding.requiredCapabilities,
+        input.task.originHost,
       ),
   };
 
@@ -147,7 +160,7 @@ export const createModelProviderAgentAdapters = (
         "bounded execution adapter",
         {
           instruction:
-            "Execute only this non-tool step. Return a concise summary and optional minimal evidence records with kind, integrity, summary, and supportsCriteria.",
+            "Execute only this non-tool step. Return a substantive result in summary, not a progress label. Include optional minimal evidence records with kind, integrity, summary, and supportsCriteria.",
           goal: input.task.goal,
           understanding: input.understanding,
           step: input.step,
@@ -155,6 +168,9 @@ export const createModelProviderAgentAdapters = (
         },
         input.signal,
         input.task.taskId,
+        "worker",
+        input.understanding.requiredCapabilities,
+        input.task.originHost,
       ),
   };
 
@@ -164,13 +180,16 @@ export const createModelProviderAgentAdapters = (
         "independent acceptance verifier",
         {
           instruction:
-            "Return summary and exactly one criteria item for every acceptance criterion. Each item needs criterionIndex, accepted, reason, and evidenceIds chosen only from supplied evidence. Do not accept unsupported claims.",
+            "Return a self-contained final answer in summary by synthesizing the completed step results. Also return exactly one criteria item for every acceptance criterion. Each item needs criterionIndex, accepted, reason, and evidenceIds chosen only from supplied evidence. Do not accept unsupported claims.",
           goal: input.task.goal,
           stepResults: input.stepResults,
           evidence: input.evidence,
         },
         signal,
         input.task.taskId,
+        "verification",
+        [],
+        input.task.originHost,
       ),
   };
 

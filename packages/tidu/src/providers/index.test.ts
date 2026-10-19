@@ -170,6 +170,45 @@ test("preserves provider-specific API versions in compatible base URLs", async (
   }
 });
 
+test("preserves capabilities and prices published by a compatible model catalog", async () => {
+  const server = await startTestServer((request, response) => {
+    assert.equal(request.url, "/v1/models");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({
+        data: [
+          {
+            id: "company-vision",
+            name: "Company Vision",
+            capabilities: ["text", "vision"],
+            inputCostPerMillionTokens: 0.2,
+            outputCostPerMillionTokens: 0.8,
+          },
+        ],
+      }),
+    );
+  });
+
+  try {
+    const provider = createOpenAiCompatibleProvider({
+      baseUrl: server.origin,
+      model: "company-vision",
+    });
+    assert.deepEqual(await provider.listModels?.(), [
+      {
+        id: "company-vision",
+        name: "Company Vision",
+        capabilities: ["text", "vision"],
+        capabilitySource: "company-published",
+        inputCostPerMillionTokens: 0.2,
+        outputCostPerMillionTokens: 0.8,
+      },
+    ]);
+  } finally {
+    await server.close();
+  }
+});
+
 test("translates Ollama chat and Responses payloads into the virtual model contract", async () => {
   const receivedBodies: Record<string, unknown>[] = [];
   const server = await startTestServer((request, response) => {
@@ -189,7 +228,10 @@ test("translates Ollama chat and Responses payloads into the virtual model contr
   });
 
   try {
-    const provider = createOllamaProvider({ baseUrl: server.origin, model: "qwen-test" });
+    const provider = createOllamaProvider({
+      baseUrl: server.origin,
+      model: "qwen-test",
+    });
     const chat = await provider.execute({
       protocol: "chat-completions",
       body: {
@@ -241,7 +283,10 @@ test("normalizes Ollama function calls and tool-result continuation messages", a
             role: "assistant",
             content: "",
             tool_calls: [
-              { id: "call-next", function: { name: "lookup", arguments: { city: "Beijing" } } },
+              {
+                id: "call-next",
+                function: { name: "lookup", arguments: { city: "Beijing" } },
+              },
             ],
           },
         }),
@@ -250,7 +295,10 @@ test("normalizes Ollama function calls and tool-result continuation messages", a
   });
 
   try {
-    const provider = createOllamaProvider({ baseUrl: server.origin, model: "qwen-test" });
+    const provider = createOllamaProvider({
+      baseUrl: server.origin,
+      model: "qwen-test",
+    });
     const result = await provider.execute({
       protocol: "chat-completions",
       body: {
@@ -286,7 +334,10 @@ test("normalizes Ollama function calls and tool-result continuation messages", a
     const resultBody = result.body as {
       choices: Array<{
         finish_reason: string;
-        message: { content: null; tool_calls: Array<{ function: { arguments: string } }> };
+        message: {
+          content: null;
+          tool_calls: Array<{ function: { arguments: string } }>;
+        };
       }>;
     };
     assert.equal(resultBody.choices[0]?.finish_reason, "tool_calls");
@@ -368,7 +419,10 @@ test("streams Ollama text and function calls as Chat Completions SSE", async () 
   });
 
   try {
-    const provider = createOllamaProvider({ baseUrl: server.origin, model: "qwen-test" });
+    const provider = createOllamaProvider({
+      baseUrl: server.origin,
+      model: "qwen-test",
+    });
     const result = await provider.execute({
       protocol: "chat-completions",
       body: {
@@ -380,7 +434,10 @@ test("streams Ollama text and function calls as Chat Completions SSE", async () 
             type: "function",
             function: {
               name: "lookup",
-              parameters: { type: "object", properties: { city: { type: "string" } } },
+              parameters: {
+                type: "object",
+                properties: { city: { type: "string" } },
+              },
             },
           },
         ],
@@ -421,7 +478,10 @@ test("streams Ollama text as Responses events", async () => {
   });
 
   try {
-    const provider = createOllamaProvider({ baseUrl: server.origin, model: "qwen-test" });
+    const provider = createOllamaProvider({
+      baseUrl: server.origin,
+      model: "qwen-test",
+    });
     const result = await provider.execute({
       protocol: "responses",
       body: { model: "ai-tidu9-config", input: "hello", stream: true },
@@ -479,6 +539,43 @@ test("discovers installed models from a running Ollama service", async () => {
     assert.deepEqual(await discoverOllamaModels({ baseUrl: server.origin }), [
       "qwen3:30b",
       "qwen2.5-coder:1.5b-base",
+    ]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("reads model capabilities published by Ollama", async () => {
+  const server = await startTestServer((request, response) => {
+    if (request.url === "/api/tags") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ models: [{ model: "qwen-vision" }] }));
+      return;
+    }
+    assert.equal(request.url, "/api/show");
+    void readBody(request).then((body) => {
+      assert.equal(body.model, "qwen-vision");
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          capabilities: ["completion", "vision", "tools", "thinking"],
+        }),
+      );
+    });
+  });
+
+  try {
+    const provider = createOllamaProvider({
+      baseUrl: server.origin,
+      model: "qwen-vision",
+    });
+    assert.deepEqual(await provider.listModels?.(), [
+      {
+        id: "qwen-vision",
+        name: "qwen-vision",
+        capabilities: ["text", "vision", "tool-use", "reasoning"],
+        capabilitySource: "provider-catalog",
+      },
     ]);
   } finally {
     await server.close();

@@ -304,8 +304,8 @@ Actions / 动作:
   update      Refresh launch metadata / 更新启动信息
   uninstall   Remove connectors and managed virtual model / 移除连接器与九门虚拟模型
 
-The default setup preserves official Codex defaults, installs an isolated ai-tidu9 profile, then offers to restart running hosts for MCP discovery.
-默认setup会保留官方Codex配置，安装隔离的九门Profile，并询问是否重启宿主以加载MCP。`,
+The default setup preserves official Codex defaults, prepares an isolated native AI-Tidu9 Agent mode, configures supported connector transports for other hosts, then offers to restart running hosts.
+默认setup会保留官方Codex配置，为Codex准备隔离的九门原生Agent模式，为其他受支持宿主配置连接器传输，并询问是否重启宿主。`,
   start: `Start / 启动
 
 Usage / 用法:

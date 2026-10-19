@@ -1,3 +1,5 @@
+import type { AgentHostId } from "../config/index.js";
+
 export const TASK_CONTRACT_VERSION = "tidu-task/1" as const;
 export const AGENT_PROTOCOL_VERSION = "tidu-agent-protocol/2" as const;
 
@@ -73,6 +75,8 @@ export interface CanonicalTask {
   updatedAt: string;
   /** Optional parent identifier for explicitly delegated child work. */
   parentTaskId?: string;
+  /** Host entry that owns this task's isolated model-completion policy. */
+  originHost?: AgentHostId;
 }
 
 export interface CreateTaskInput {
@@ -84,6 +88,8 @@ export interface CreateTaskInput {
   createdAt?: string;
   /** Optional parent identifier for explicitly delegated child work. */
   parentTaskId?: string;
+  /** Host entry that owns this task's isolated model-completion policy. */
+  originHost?: AgentHostId;
 }
 
 export interface AgentEventSource {
@@ -175,6 +181,7 @@ export const createTask = (input: CreateTaskInput): CanonicalTask => {
     ...(input.parentTaskId === undefined
       ? {}
       : { parentTaskId: normalizeIdentifier(input.parentTaskId, "parentTaskId") }),
+    ...(input.originHost === undefined ? {} : { originHost: input.originHost }),
   };
 };
 

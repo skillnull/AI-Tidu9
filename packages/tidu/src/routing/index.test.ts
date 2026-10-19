@@ -3,11 +3,128 @@ import test from "node:test";
 
 import type { ModelProvider, ProviderExecutionRequest } from "../providers/index.js";
 import {
+  createCapabilityCompletionProvider,
   createDynamicModelRouter,
   type DynamicRoutingPolicy,
   type ModelRouteProfile,
   type RoutableModel,
 } from "./index.js";
+
+test("records a configured specialist contribution for the shared Agent policy", async () => {
+  const calls: string[] = [];
+  const provider: ModelProvider = {
+    descriptor: { type: "openai-compatible", model: "main-model" },
+    execute: async (request) => {
+      calls.push(request.routing?.targetModel ?? "current");
+      return {
+        kind: "json",
+        statusCode: 200,
+        body:
+          request.routing?.role === "specialist"
+            ? { choices: [{ message: { content: "visual evidence" } }] }
+            : { choices: [{ message: { content: "combined answer" } }] },
+      };
+    },
+  };
+  const completion = createCapabilityCompletionProvider(provider, async () => ({
+    modelSelection: { source: "official", model: "main-model" },
+    capabilityCompletion: {
+      enabled: true,
+      mainCapabilities: ["text", "structured-output"],
+      specialists: [
+        { host: "cursor", source: "official", model: "vision-model", capabilities: ["vision"] },
+      ],
+      maximumSpecialists: 1,
+    },
+  }));
+
+  await completion.execute({
+    protocol: "chat-completions",
+    virtualModelId: "ai-tidu9-config",
+    body: { messages: [{ role: "user", content: "inspect image" }] },
+    routing: { requiredCapabilities: ["vision"], role: "worker" },
+  });
+
+  assert.deepEqual(calls, ["vision-model", "main-model"]);
+  const status = await completion.inspectCapabilityCompletion();
+  assert.equal(status.records[0]?.complemented, true);
+  assert.deepEqual(status.records[0]?.specialistModelIds, [
+    "specialist-0:cursor:official:vision-model",
+  ]);
+  assert.equal(status.records[0]?.outcome, "succeeded");
+});
+
+test("isolates primary and specialist models by request host", async () => {
+  const calls: string[] = [];
+  const createHostProvider = (host: "codex" | "cursor"): ModelProvider => ({
+    descriptor: { type: host === "codex" ? "codex-host" : "cursor-host", model: "default" },
+    execute: async (request) => {
+      calls.push(`${host}:${request.routing?.targetModel ?? "current"}`);
+      return {
+        kind: "json",
+        statusCode: 200,
+        body: { choices: [{ message: { content: "{}" } }] },
+      };
+    },
+  });
+  const providers = {
+    codex: createHostProvider("codex"),
+    cursor: createHostProvider("cursor"),
+  };
+  const completion = createCapabilityCompletionProvider(
+    providers.codex,
+    async () => ({
+      modelSelection: { source: "official", model: "default-main" },
+      capabilityCompletion: {
+        enabled: true,
+        mainCapabilities: ["text"],
+        specialists: [],
+        maximumSpecialists: 1,
+        hostPolicies: {
+          codex: {
+            mainModel: { source: "official", model: "codex-main" },
+            mainCapabilities: ["text"],
+            specialists: [
+              {
+                host: "cursor",
+                source: "official",
+                model: "cursor-vision",
+                capabilities: ["vision"],
+              },
+            ],
+            maximumSpecialists: 1,
+          },
+          cursor: {
+            mainModel: { source: "official", model: "cursor-main" },
+            mainCapabilities: ["text"],
+            specialists: [
+              {
+                host: "codex",
+                source: "official",
+                model: "codex-vision",
+                capabilities: ["vision"],
+              },
+            ],
+            maximumSpecialists: 1,
+          },
+        },
+      },
+    }),
+    {
+      resolveProviderForHost: async (host) =>
+        host === "codex" || host === "cursor" ? providers[host] : undefined,
+    },
+  );
+
+  await completion.execute({
+    protocol: "chat-completions",
+    virtualModelId: "ai-tidu9-config",
+    body: { messages: [{ role: "user", content: "inspect image" }] },
+    routing: { host: "cursor", requiredCapabilities: ["vision"], role: "worker" },
+  });
+
+  assert.deepEqual(calls, ["codex:codex-vision", "cursor:cursor-main"]);
+});
 
 const policy: DynamicRoutingPolicy = {
   enabled: true,

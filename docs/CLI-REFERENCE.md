@@ -38,7 +38,7 @@ tidu <命令> --help             # 任意命令的专属帮助
 | `tidu mcp` | 运行供Agent宿主调用的stdio MCP桥 | 否 |
 | `tidu doctor` | 检查运行时、配置API和页面；可输出隐私安全报告 | 否 |
 | `tidu clients` | 发现本机支持的客户端 | 否 |
-| `tidu clients connect/switch/rollback codex` | 创建统一模型目录，或恢复、回滚 Codex 配置 | 是；官方账号不变，所有托管项均可恢复 |
+| `tidu clients connect/switch/rollback codex` | 准备、切换或回滚 Codex 的互斥原生模式 | 是；官方账号不变，所有托管项均可恢复 |
 | `tidu channel list/run` | 查看或显式调用九门、官方宿主与厂商通道 | 否；调用会消耗所选通道额度 |
 | `tidu account` | 查看Codex和Cursor的可复用登录状态 | 否 |
 | `tidu account relogin/switch` | 调用宿主官方登录或切换流程 | 是，需要主动执行 |
@@ -92,9 +92,9 @@ tidu clients switch codex <official|ai-tidu9> [--yes] [--endpoint <url>]
 tidu clients rollback codex [--yes]
 ```
 
-`setup` 默认动作是 `install`，不要求预先启动运行时。它会安装连接器、准备九门配置并自动启动当前版型的全部服务，但保持官方直连生效。`clients switch codex ai-tidu9` 只在 Codex 中增加一个九门虚拟模型；官方或公司上游模型在九门配置页选择，公司模型不会成为独立 Codex 模型项。`clients switch codex official` 恢复仅显示官方模型。官方账号、套餐和额度仍由官方 Codex 管理。九门自有备份只保留首次安装基线与最新回滚点。
+`setup` 默认动作是 `install`，不要求预先启动运行时。它会为 Codex 准备互斥的九门原生 Agent 模式、为其他宿主安装所需连接器，并自动启动当前版型的全部服务，但保持官方直连生效。`clients switch codex ai-tidu9` 使 Codex 只显示“九门赛博提督”，任务进入规划、能力补位、执行和独立验收的同一 Agent 内核；官方、公司或自定义上游只在九门配置页三选一，不会成为独立 Codex 模型项。`clients switch codex official` 精确恢复原始官方配置和官方模型列表。官方账号、套餐和额度始终由官方 Codex 管理。九门自有备份只保留首次安装基线与最新回滚点。
 
-安装后的同一个 MCP 连接器会向 Codex 插件和 Cursor 提供 `list_tidu_channels` 与 `route_tidu_channel`。宿主自己的模型列表不被覆盖；选择 `codex` 或 `cursor` 时由官方宿主进程执行，选择 `tidu` 时走九门运行时，选择厂商ID时读取当前连接器进程的环境变量。
+Codex 使用原生 Provider 接入，不注册九门 MCP；切换模式后需要重启 Codex 才会重新载入 Provider 和模型目录。Cursor 可使用 stdio 连接器作为传输层，但 `route_tidu_task` 仍进入与 Codex、CLI 和 OpenAI 兼容入口相同的 Agent 内核，传输协议不会绕过九门的规划、能力补位和验收。
 
 企业服务器不执行员工电脑上的 `setup`，也不提供独立员工页面。员工安装个人版后，在本地页面的“企业接入”中填写管理员提供的公司链接。正式企业入口必须使用 HTTPS；本地开发仅允许回环地址使用 HTTP。企业配置在个人版中只读，并与个人草稿和生效配置分开保存。
 
@@ -131,7 +131,7 @@ CI建议使用厂商API通道，并把密钥保存在CI Secret中。以下示例
     DASHSCOPE_MODEL: qwen-plus
 ```
 
-Codex和Cursor宿主通道适合已有官方登录的开发机。无交互CI不复用桌面端凭据，应使用独立API通道。Cursor执行 `tidu setup` 并重启后，可直接通过MCP工具发现和调用这些通道。
+Codex和Cursor宿主通道适合已有官方登录的开发机。无交互CI不复用桌面端凭据，应使用独立API通道。Cursor执行 `tidu setup` 并重启后，可通过其连接器传输进入同一个九门 Agent 内核。
 
 ## ⚙️ 配置管理
 

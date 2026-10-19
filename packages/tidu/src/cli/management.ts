@@ -132,6 +132,7 @@ export const saveConfiguration = async (
     activeProfileId: update.activeProfileId ?? draft.configuration.activeProfileId,
     virtualModelName: update.virtualModelName ?? draft.configuration.virtualModelName,
     modelSelection: draft.configuration.modelSelection,
+    capabilityCompletion: draft.configuration.capabilityCompletion,
     ...(update.mode === "expert" && draft.configuration.expertServices !== undefined
       ? { expertServices: draft.configuration.expertServices }
       : {}),
