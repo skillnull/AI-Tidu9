@@ -8,7 +8,6 @@ Thank you for helping make AI-Tidu9 more reliable. Code, tests, documentation, c
 
 ```bash
 npm run tidu:setup
-npm run tidu:dev-p
 npm run check
 ```
 

@@ -817,7 +817,6 @@ const App = () => {
               onActivate={activateDraft}
               onRollback={rollbackConfiguration}
               onOpenClients={() => setActiveSection("clients")}
-              onConnectCursor={connectCursor}
             />
             {!bootstrap.configuration.editable ? (
               <p className="read-only-notice">

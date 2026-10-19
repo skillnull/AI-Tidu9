@@ -18,7 +18,6 @@ flowchart LR
 
 ```bash
 npm run tidu:setup
-npm run tidu:dev-p
 npm run check
 ```
 

@@ -32,7 +32,8 @@ tidu <command> --help         # Command-specific help
 
 | Command | Purpose | State change |
 | --- | --- | --- |
-| `tidu start [--cli] [--edition personal|enterprise]` | Start the personal or enterprise runtime; optionally enter the five-step terminal wizard | Starts a process; enterprise control is read-only in the personal edition |
+| `tidu start [--cli]` | Start the service group for the installed edition; optionally enter the terminal wizard | Starts processes; an installed edition cannot switch to the other edition |
+| `tidu service [status|start|stop|restart] [service-id|all]` | Inspect or control frontend, CLI, and API services | `status` is read-only; other actions change service state |
 | `tidu setup [action]` | Install, verify, repair, update, or uninstall client connectors offline | All actions except `verify` can change client configuration |
 | `tidu mcp` | Run the stdio MCP bridge for Agent hosts | No |
 | `tidu doctor` | Check runtime, configuration API, and page; optionally print a privacy-safe report | No |
@@ -50,13 +51,14 @@ tidu <command> --help         # Command-specific help
 ## 🩺 Start and diagnose
 
 ```bash
-tidu start --edition personal [--cli]
-tidu start --edition enterprise [--cli]
+tidu start [--cli]
+tidu service status [--endpoint <url>]
+tidu service <start|stop|restart> <service-id|all> [--endpoint <url>]
 tidu doctor [--json] [--endpoint <url>]
 tidu mcp [--endpoint <url>]
 ```
 
-Choose the personal or enterprise edition during installation/deployment with `--edition`; the default is personal. Enterprise edition requires `TIDU_POSTGRES_URL` injected through the deployment environment and uses a separate data file. Set different `TIDU_PORT` values when both editions run at once. A personal edition connected to enterprise control can view enterprise information, while the server rejects enterprise administration requests. With `--cli`, `start` checks the runtime, selects a mode, configures the unified entry, confirms activation, and installs detected connectors step by step. `doctor` makes no changes; `--json` prints a shareable summary without hostnames, credentials, paths, or conversation content. `mcp` is normally started by a configured host connector.
+The installed CLI is fixed to its installed edition: personal installations expose personal commands only, while enterprise installations expose enterprise commands only. Only a local repository checkout provides both `-p` and `-e` npm commands. Enterprise edition requires `TIDU_POSTGRES_URL` from the deployment environment. A personal edition connected to enterprise control remains read-only. `doctor` makes no changes; `--json` prints a privacy-safe summary.
 
 Common startup environment variables:
 
@@ -67,7 +69,7 @@ Common startup environment variables:
 | `TIDU_PROVIDER`, `TIDU_PROVIDER_MODEL` | Optional provider/model override; defaults to the current signed-in Codex or Cursor host model |
 | `TIDU_PROVIDER_API_KEY`, `TIDU_PROVIDER_BASE_URL` | Runtime key and endpoint for an OpenAI-compatible provider override |
 | `TIDU_POSTGRES_URL` | Enable the enterprise control plane and PostgreSQL task state |
-| `TIDU_EDITION` | Runtime edition (`personal` or `enterprise`); can also be set with `tidu start --edition` |
+| `TIDU_EDITION` | Installed runtime edition (`personal` or `enterprise`) |
 | `TIDU_ENDPOINT` | Default CLI management URL, equivalent to `--endpoint` |
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | Direct OpenAI API channel for CI or hostless environments |
 | `DEEPSEEK_API_KEY`, `DEEPSEEK_MODEL` | DeepSeek-compatible channel |
@@ -90,7 +92,7 @@ tidu clients switch codex <official|ai-tidu9> [--yes] [--endpoint <url>]
 tidu clients rollback codex [--yes]
 ```
 
-The default setup action is `install` and does not require a prestarted runtime. It installs the connectors and prepares the AI-Tidu9 configuration while leaving direct Official mode active. `clients switch codex ai-tidu9` adds one AI-Tidu9 virtual-model entry to Codex. Its official or company upstream is selected on the AI-Tidu9 configuration page; company models are never separate Codex entries. `clients switch codex official` restores an official-only list. Official Codex remains the authority for account identity, plan, and quota data. AI-Tidu9 keeps only its original installation baseline and latest rollback point.
+The default setup action is `install` and does not require a prestarted runtime. It installs connectors, prepares the AI-Tidu9 configuration, and automatically starts every service in the installed edition while leaving direct Official mode active. `clients switch codex ai-tidu9` adds one AI-Tidu9 virtual-model entry to Codex. Its official or company upstream is selected on the AI-Tidu9 configuration page; company models are never separate Codex entries. `clients switch codex official` restores an official-only list. Official Codex remains the authority for account identity, plan, and quota data. AI-Tidu9 keeps only its original installation baseline and latest rollback point.
 
 The installed MCP connector exposes `list_tidu_channels` and `route_tidu_channel` to both the Codex plugin and Cursor. It does not replace the host model list. The `codex` and `cursor` channels delegate to official host processes, `tidu` uses the AI-Tidu9 runtime, and provider channels read only their connector-process environment variables.
 

@@ -111,25 +111,58 @@ test("starts a loopback runtime with a verifiable health endpoint", async () => 
     });
     const services = (await (await fetch(`${runtime.origin}/api/services`)).json()) as {
       mode: string;
-      services: Array<{ id: string; status: string }>;
+      services: Array<{
+        actions: string[];
+        command: string;
+        endpoint: string;
+        id: string;
+        lifecycle: string;
+        processId: number | null;
+        status: string;
+        version: string;
+      }>;
     };
     assert.equal(services.mode, "installed");
     assert.deepEqual(
       services.services.map(({ id, status }) => [id, status]),
       [
-        ["tidu-service", "running"],
-        ["tidu-cli", "ready"],
+        ["tidu:frontend-p", "running"],
+        ["tidu:cli-p", "running"],
+        ["tidu:api-p", "running"],
       ],
     );
-    assert.equal(
-      (
-        await fetch(`${runtime.origin}/api/services/tidu-cli/check`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: "{}",
-        })
-      ).status,
-      200,
+    assert.deepEqual(services.services[0]?.actions, ["refresh", "start", "restart", "stop"]);
+    assert.deepEqual(
+      services.services.map(({ command, endpoint, lifecycle, processId, version }) => ({
+        command,
+        endpoint,
+        lifecycle,
+        processId,
+        version,
+      })),
+      [
+        {
+          command: "tidu service start tidu:frontend-p",
+          endpoint: runtime.origin,
+          lifecycle: "managed",
+          processId: process.pid,
+          version: PRODUCT.version,
+        },
+        {
+          command: "tidu service start tidu:cli-p",
+          endpoint: runtime.origin,
+          lifecycle: "managed",
+          processId: process.pid,
+          version: PRODUCT.version,
+        },
+        {
+          command: "tidu service start tidu:api-p",
+          endpoint: runtime.origin,
+          lifecycle: "managed",
+          processId: process.pid,
+          version: PRODUCT.version,
+        },
+      ],
     );
   } finally {
     await runtime.close();
@@ -772,13 +805,29 @@ test("publishes company models only through the upstream-selection API", async (
     assert.equal((await fetch(`${runtime.origin}/v1/models/company-company-model-v2`)).status, 404);
     const upstreams = (await (await fetch(`${runtime.origin}/api/models/upstreams`)).json()) as {
       companyConfigured: boolean;
+      companyProviderType: string | null;
       company: Array<{ id: string; name: string }>;
     };
     assert.equal(upstreams.companyConfigured, true);
+    assert.equal(upstreams.companyProviderType, "openai-compatible");
     assert.deepEqual(upstreams.company, [
       { id: "company-model/v2", name: "Company Model V2" },
       { id: "company-model/v3", name: "Company Model V3" },
     ]);
+    const providerDetection = await fetch(`${runtime.origin}/api/provider/detect`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provider: "openai-compatible" }),
+    });
+    assert.equal(providerDetection.status, 200);
+    assert.deepEqual(await providerDetection.json(), {
+      detected: true,
+      matchesRuntime: true,
+      model: "company-model/v2",
+      provider: "openai-compatible",
+      account: null,
+      reason: null,
+    });
   } finally {
     await runtime.close();
   }

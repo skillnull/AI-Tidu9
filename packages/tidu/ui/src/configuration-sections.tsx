@@ -1156,13 +1156,13 @@ interface QuickStartWizardProps {
   onRollback: () => Promise<void>;
   /** Open client connection guidance. */
   onOpenClients: () => void;
-  /** Start the official Cursor browser sign-in flow. */
-  onConnectCursor: () => Promise<void>;
 }
 
 interface UpstreamModelCatalog {
   /** Whether a company provider is active in this runtime. */
   companyConfigured: boolean;
+  /** Concrete company adapter hidden behind the runtime router. */
+  companyProviderType: "ollama" | "openai-compatible" | null;
   /** Company-provider models available behind the virtual model. */
   company: readonly { id: string; name: string }[];
   /** Official Codex models available to the signed-in account. */
@@ -1189,11 +1189,9 @@ export const QuickStartWizard = ({
   onActivate,
   onRollback,
   onOpenClients,
-  onConnectCursor,
 }: QuickStartWizardProps) => {
   const english = locale === "en-US";
   const [step, setStep] = useState(0);
-  const [showProviderOverride, setShowProviderOverride] = useState(false);
   const [providerChoice, setProviderChoice] = useState<
     "codex-host" | "cursor-host" | "ollama" | "compatible"
   >(() =>
@@ -1205,6 +1203,11 @@ export const QuickStartWizard = ({
           ? "compatible"
           : "codex-host",
   );
+  const [modelChoiceMode, setModelChoiceMode] = useState<"company" | "custom" | "host">(
+    form.modelSelection.source === "company" ? "company" : "host",
+  );
+  const modelChoiceTouchedRef = useRef(false);
+  const providerChoiceTouchedRef = useRef(false);
   const [providerCheck, setProviderCheck] = useState<{
     status: "idle" | "checking" | "ready" | "unavailable" | "restart-required";
     provider?: string;
@@ -1220,6 +1223,7 @@ export const QuickStartWizard = ({
   const [providerCheckRevision, setProviderCheckRevision] = useState(0);
   const [upstreamCatalog, setUpstreamCatalog] = useState<UpstreamModelCatalog>({
     companyConfigured: false,
+    companyProviderType: null,
     company: [],
     official: [],
   });
@@ -1236,12 +1240,21 @@ export const QuickStartWizard = ({
   const entryIsValid = Object.keys(entryValidationMessages).length === 0;
   const entryIsComplete = entryIsValid && !isDirty;
   const clientSetupIsAvailable = isActive && !isDirty;
-  const isCurrentHostProvider = providerType === "codex-host" || providerType === "cursor-host";
+  const effectiveProviderType =
+    providerType === "tidu-router" ? upstreamCatalog.companyProviderType : providerType;
+  const activeProviderChoice =
+    effectiveProviderType === "codex-host" ||
+    effectiveProviderType === "cursor-host" ||
+    effectiveProviderType === "ollama"
+      ? effectiveProviderType
+      : effectiveProviderType === "openai-compatible"
+        ? "compatible"
+        : null;
   const choiceMatchesRuntime =
-    (providerChoice === "codex-host" && providerType === "codex-host") ||
-    (providerChoice === "cursor-host" && providerType === "cursor-host") ||
-    (providerChoice === "ollama" && providerType === "ollama") ||
-    (providerChoice === "compatible" && providerType === "openai-compatible");
+    (providerChoice === "codex-host" && effectiveProviderType === "codex-host") ||
+    (providerChoice === "cursor-host" && effectiveProviderType === "cursor-host") ||
+    (providerChoice === "ollama" && effectiveProviderType === "ollama") ||
+    (providerChoice === "compatible" && effectiveProviderType === "openai-compatible");
   const providerLabel =
     providerChoice === "codex-host"
       ? "Codex"
@@ -1252,6 +1265,83 @@ export const QuickStartWizard = ({
           : english
             ? "Compatible provider"
             : "兼容服务";
+  const activeProviderLabel =
+    activeProviderChoice === "codex-host"
+      ? "Codex"
+      : activeProviderChoice === "cursor-host"
+        ? "Cursor"
+        : activeProviderChoice === "ollama"
+          ? "Ollama"
+          : activeProviderChoice === "compatible"
+            ? english
+              ? "Compatible provider"
+              : "兼容服务"
+            : english
+              ? "Unconfigured"
+              : "未配置";
+  const customModel = modelChoiceMode === "custom" ? form.modelSelection.model : "";
+  const providerUsesOfficialCatalog = providerChoice === "codex-host";
+  const hostModelOptions = providerUsesOfficialCatalog ? upstreamCatalog.official : [];
+  const providerModelOptions =
+    modelChoiceMode === "company"
+      ? upstreamCatalog.company
+      : modelChoiceMode === "host"
+        ? hostModelOptions
+        : [];
+  const hostModelSource =
+    providerChoice === "codex-host" || providerChoice === "cursor-host" ? "official" : "company";
+  const selectProvider = (choice: "codex-host" | "cursor-host" | "ollama" | "compatible"): void => {
+    modelChoiceTouchedRef.current = true;
+    providerChoiceTouchedRef.current = true;
+    setProviderChoice(choice);
+    setModelChoiceMode("host");
+    onFormChange({
+      ...form,
+      modelSelection: {
+        source: choice === "codex-host" || choice === "cursor-host" ? "official" : "company",
+        model: "current",
+      },
+    });
+  };
+  const selectModelChoiceMode = (choice: "company" | "custom" | "host"): void => {
+    modelChoiceTouchedRef.current = true;
+    setModelChoiceMode(choice);
+    onFormChange({
+      ...form,
+      modelSelection: {
+        source:
+          choice === "company" ? "company" : choice === "custom" ? "official" : hostModelSource,
+        model: choice === "host" ? "current" : "",
+      },
+    });
+  };
+  useEffect(() => {
+    if (upstreamCatalogStatus !== "ready" || modelChoiceTouchedRef.current) return;
+    if (form.modelSelection.source === "company") {
+      setModelChoiceMode("company");
+      return;
+    }
+    setModelChoiceMode(
+      form.modelSelection.model === "current" ||
+        upstreamCatalog.official.some((model) => model.id === form.modelSelection.model)
+        ? "host"
+        : "custom",
+    );
+  }, [form.modelSelection, upstreamCatalog.official, upstreamCatalogStatus]);
+  useEffect(() => {
+    if (
+      upstreamCatalogStatus !== "ready" ||
+      providerType !== "tidu-router" ||
+      providerChoiceTouchedRef.current
+    ) {
+      return;
+    }
+    if (upstreamCatalog.companyProviderType === "ollama") {
+      setProviderChoice("ollama");
+    } else if (upstreamCatalog.companyProviderType === "openai-compatible") {
+      setProviderChoice("compatible");
+    }
+  }, [providerType, upstreamCatalog.companyProviderType, upstreamCatalogStatus]);
   useEffect(() => {
     if (step !== 2) return;
     setUpstreamCatalogStatus("loading");
@@ -1262,15 +1352,29 @@ export const QuickStartWizard = ({
         setUpstreamCatalogStatus("ready");
       })
       .catch(() => {
-        setUpstreamCatalog({ companyConfigured: false, company: [], official: [] });
+        setUpstreamCatalog({
+          companyConfigured: false,
+          companyProviderType: null,
+          company: [],
+          official: [],
+        });
         setUpstreamCatalogStatus("error");
       });
+  }, [step, providerCheckRevision]);
+  useEffect(() => {
+    if (step !== 2 || activeProviderChoice === null) {
+      setProviderCheck({ status: "idle" });
+      return;
+    }
     let current = true;
-    setProviderCheck({ status: "checking", provider: providerChoice });
+    setProviderCheck({ status: "checking", provider: activeProviderChoice });
     void fetch("/api/provider/detect", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ provider: providerChoice }),
+      body: JSON.stringify({
+        provider:
+          activeProviderChoice === "compatible" ? "openai-compatible" : activeProviderChoice,
+      }),
       cache: "no-store",
       credentials: "same-origin",
     })
@@ -1292,7 +1396,7 @@ export const QuickStartWizard = ({
       .then((result) => {
         if (!current) return;
         setProviderCheck({
-          provider: providerChoice,
+          provider: activeProviderChoice,
           status: !result.detected
             ? "unavailable"
             : result.matchesRuntime
@@ -1307,23 +1411,19 @@ export const QuickStartWizard = ({
         if (current)
           setProviderCheck({
             status: "unavailable",
-            provider: providerChoice,
+            provider: activeProviderChoice,
             reason: "detection-failed",
           });
       });
     return () => {
       current = false;
     };
-  }, [step, providerChoice, providerCheckRevision]);
+  }, [step, activeProviderChoice, providerCheckRevision]);
   const canAdvance =
     step === 1
       ? entryIsValid
       : step === 2
-        ? entryIsComplete &&
-          providerConfigured &&
-          choiceMatchesRuntime &&
-          providerCheck.status === "ready" &&
-          providerCheck.provider === providerChoice
+        ? entryIsComplete && providerConfigured && choiceMatchesRuntime
         : step === 3
           ? clientSetupIsAvailable
           : true;
@@ -1559,65 +1659,148 @@ export const QuickStartWizard = ({
           </>
         ) : step === 2 ? (
           <>
-            <section className="provider-monitor">
+            <section className="provider-monitor provider-draft-configuration">
               <div className="provider-monitor-heading">
-                <strong>{english ? "Virtual-model upstream" : "九门虚拟模型上游"}</strong>
+                <div>
+                  <span className="configuration-scope-badge">
+                    {english ? "Pending configuration" : "待应用配置"}
+                  </span>
+                  <strong>{english ? "Model host and models" : "模型宿主与模型"}</strong>
+                </div>
               </div>
               <p>
                 {english
-                  ? "Codex shows one AI-Tidu9 model entry. Choose the official or company model used behind it."
-                  : "Codex 只显示一个九门虚拟模型；在这里选择它实际调用的官方模型或公司模型。"}
+                  ? "Choose a host first. The model list below belongs to that host and changes with it."
+                  : "先选择模型宿主；下方模型列表属于该宿主，并随宿主切换。"}
               </p>
-              <div className="onboarding-choice-row">
+              <div className="onboarding-choice-row provider-host-options">
                 <button
                   className={
-                    form.modelSelection.source === "official"
+                    providerChoice === "codex-host"
                       ? "mode-button mode-button-active"
                       : "mode-button"
                   }
                   type="button"
-                  onClick={() =>
-                    onFormChange({
-                      ...form,
-                      modelSelection: { source: "official", model: "current" },
-                    })
-                  }
+                  onClick={() => selectProvider("codex-host")}
                   disabled={isPending || readOnly}
                 >
-                  {english ? "Official models" : "官方模型"}
+                  Codex
                 </button>
                 <button
                   className={
-                    form.modelSelection.source === "company"
+                    providerChoice === "cursor-host"
                       ? "mode-button mode-button-active"
                       : "mode-button"
                   }
                   type="button"
-                  onClick={() =>
-                    onFormChange({
-                      ...form,
-                      modelSelection: {
-                        source: "company",
-                        model: upstreamCatalog.company[0]?.id ?? providerModel ?? "",
-                      },
-                    })
+                  onClick={() => selectProvider("cursor-host")}
+                  disabled={isPending || readOnly}
+                >
+                  Cursor
+                </button>
+                <button
+                  className={
+                    providerChoice === "ollama" ? "mode-button mode-button-active" : "mode-button"
                   }
+                  type="button"
+                  onClick={() => selectProvider("ollama")}
+                  disabled={isPending || readOnly}
+                >
+                  Ollama
+                </button>
+                <button
+                  className={
+                    providerChoice === "compatible"
+                      ? "mode-button mode-button-active"
+                      : "mode-button"
+                  }
+                  type="button"
+                  onClick={() => selectProvider("compatible")}
+                  disabled={isPending || readOnly}
+                >
+                  {english ? "Compatible service" : "其他兼容服务"}
+                </button>
+              </div>
+              <fieldset className="model-source-options">
+                <legend>{english ? "Model source" : "模型来源"}</legend>
+                <button
+                  className={
+                    modelChoiceMode === "host" ? "mode-button mode-button-active" : "mode-button"
+                  }
+                  type="button"
+                  onClick={() => selectModelChoiceMode("host")}
+                  disabled={isPending || readOnly}
+                >
+                  {english ? "Host models" : "宿主模型"}
+                </button>
+                <button
+                  className={
+                    modelChoiceMode === "company" ? "mode-button mode-button-active" : "mode-button"
+                  }
+                  type="button"
+                  onClick={() => selectModelChoiceMode("company")}
                   disabled={isPending || readOnly}
                 >
                   {english ? "Company models" : "公司模型"}
                 </button>
+                <button
+                  className={
+                    modelChoiceMode === "custom" ? "mode-button mode-button-active" : "mode-button"
+                  }
+                  type="button"
+                  onClick={() => selectModelChoiceMode("custom")}
+                  disabled={isPending || readOnly}
+                >
+                  {english ? "Custom model" : "自定义模型"}
+                </button>
+              </fieldset>
+              <div className="provider-model-heading">
+                <span>
+                  {modelChoiceMode === "company"
+                    ? english
+                      ? "Company models"
+                      : "公司模型"
+                    : modelChoiceMode === "custom"
+                      ? english
+                        ? "Custom model ID"
+                        : "自定义模型 ID"
+                      : english
+                        ? `${providerLabel} host models`
+                        : `${providerLabel} 宿主模型`}
+                </span>
+                <small>
+                  {modelChoiceMode === "company"
+                    ? english
+                      ? "Fetched from the configured company service"
+                      : "从已配置的公司服务获取"
+                    : modelChoiceMode === "custom"
+                      ? english
+                        ? "Manual model identifier"
+                        : "手动填写模型标识"
+                      : choiceMatchesRuntime
+                        ? english
+                          ? "Current runtime host"
+                          : "当前运行宿主"
+                        : english
+                          ? "Restart required before this host catalog can be loaded"
+                          : "切换并重启后才能读取该宿主目录"}
+                </small>
               </div>
               <div className="upstream-model-list" aria-live="polite">
-                {upstreamCatalogStatus === "loading" ? (
+                {modelChoiceMode !== "custom" && upstreamCatalogStatus === "loading" ? (
                   <p>{english ? "Loading available models…" : "正在读取可用模型…"}</p>
-                ) : upstreamCatalogStatus === "error" ? (
+                ) : modelChoiceMode !== "custom" && upstreamCatalogStatus === "error" ? (
                   <p className="upstream-model-empty">
-                    {english
-                      ? "The model catalog could not be loaded. You can still enter a custom model ID below."
-                      : "模型列表读取失败，仍可在下方填写自定义模型 ID。"}
+                    {modelChoiceMode === "company"
+                      ? english
+                        ? "The company service did not return a model catalog. Check it and try again."
+                        : "公司服务未返回模型目录，请检查服务后重试。"
+                      : english
+                        ? `${providerLabel} model information could not be loaded.`
+                        : `${providerLabel} 模型信息读取失败。`}
                   </p>
                 ) : null}
-                {form.modelSelection.source === "official" ? (
+                {modelChoiceMode === "host" ? (
                   <button
                     type="button"
                     className={
@@ -1628,23 +1811,26 @@ export const QuickStartWizard = ({
                     onClick={() =>
                       onFormChange({
                         ...form,
-                        modelSelection: { source: "official", model: "current" },
+                        modelSelection: { source: hostModelSource, model: "current" },
                       })
                     }
                     disabled={isPending || readOnly}
                   >
                     <strong>
-                      {english ? "Follow current official model" : "跟随当前官方模型"}
+                      {english
+                        ? `Follow current ${providerLabel} model`
+                        : `跟随当前 ${providerLabel} 模型`}
                     </strong>
                     <span>
-                      {providerModel ?? (english ? "Automatically detected" : "自动识别")}
+                      {(providerCheck.provider === providerChoice
+                        ? providerCheck.model
+                        : undefined) ??
+                        (choiceMatchesRuntime ? providerModel : undefined) ??
+                        (english ? "Automatically detected" : "自动识别")}
                     </span>
                   </button>
                 ) : null}
-                {(form.modelSelection.source === "official"
-                  ? upstreamCatalog.official
-                  : upstreamCatalog.company
-                ).map((model) => (
+                {providerModelOptions.map((model) => (
                   <button
                     type="button"
                     className={
@@ -1656,7 +1842,10 @@ export const QuickStartWizard = ({
                     onClick={() =>
                       onFormChange({
                         ...form,
-                        modelSelection: { source: form.modelSelection.source, model: model.id },
+                        modelSelection: {
+                          source: modelChoiceMode === "company" ? "company" : hostModelSource,
+                          model: model.id,
+                        },
                       })
                     }
                     disabled={isPending || readOnly}
@@ -1666,150 +1855,83 @@ export const QuickStartWizard = ({
                   </button>
                 ))}
                 {upstreamCatalogStatus === "ready" &&
-                form.modelSelection.source === "company" &&
-                upstreamCatalog.company.length === 0 ? (
+                modelChoiceMode === "company" &&
+                providerModelOptions.length === 0 ? (
                   <p className="upstream-model-empty">
                     {english
-                      ? "No company models were returned. Configure a company provider or enter a custom model ID."
-                      : "公司服务尚未返回模型，请先配置公司服务，或填写自定义模型 ID。"}
+                      ? "No company models were returned. Configure the company service, then refresh and select a fetched model."
+                      : "公司服务尚未返回模型，请完成公司服务配置，刷新后从获取结果中选择。"}
                   </p>
                 ) : null}
               </div>
-              <label className="upstream-custom-model">
-                {english ? "Custom model ID" : "自定义模型 ID"}
-                <input
-                  value={form.modelSelection.model}
-                  onChange={(event) =>
-                    onFormChange({
-                      ...form,
-                      modelSelection: {
-                        ...form.modelSelection,
-                        model: event.target.value,
-                      },
-                    })
-                  }
-                  placeholder={english ? "Enter a model ID" : "输入模型 ID"}
-                  disabled={isPending || readOnly}
-                />
-              </label>
-            </section>
-            <p className="onboarding-kicker">
-              {english ? `Selected provider · ${providerLabel}` : `当前检测 · ${providerLabel}`}
-            </p>
-            {providerConfigured ? (
-              <>
-                <h3>
-                  {isCurrentHostProvider
-                    ? english
-                      ? `Current host model · ${providerModel ?? "default"}`
-                      : `当前宿主模型 · ${providerModel ?? "默认"}`
-                    : `${providerType ?? "Provider"} · ${providerModel ?? ""}`}
-                </h3>
-                <p>
-                  {isCurrentHostProvider
-                    ? english
-                      ? "The host's current model is detected automatically. You can override it with another provider below."
-                      : "模型由宿主自动识别；如需切换，可选择其他供应商。"
-                    : english
-                      ? "A provider override is active. Select another service below to change it."
-                      : "当前使用的是手动指定的模型服务；可在下方切换。"}
-                </p>
-                <div className="onboarding-choice-row">
-                  <button
-                    type="button"
-                    onClick={() => setShowProviderOverride((current) => !current)}
-                  >
-                    {showProviderOverride
-                      ? english
-                        ? "Use current model"
-                        : "继续使用当前模型"
-                      : english
-                        ? "Change model source"
-                        : "切换模型来源"}
-                  </button>
-                </div>
-              </>
-            ) : null}
-            {!providerConfigured || showProviderOverride ? (
-              <>
-                <div className="onboarding-choice-row">
-                  <button
-                    className={
+              {modelChoiceMode === "custom" ? (
+                <label className="upstream-custom-model">
+                  {english ? "Custom model ID" : "自定义模型 ID"}
+                  <input
+                    value={customModel}
+                    onChange={(event) => {
+                      const customModel = event.target.value;
+                      onFormChange({
+                        ...form,
+                        modelSelection: {
+                          source: "official",
+                          model: customModel,
+                        },
+                      });
+                    }}
+                    placeholder={english ? "Enter a custom model ID" : "输入自定义模型 ID"}
+                    disabled={isPending || readOnly}
+                  />
+                  <small>
+                    {english
+                      ? "Custom input is exclusive with host and company model selections."
+                      : "自定义输入与宿主模型、公司模型选择互斥。"}
+                  </small>
+                </label>
+              ) : null}
+              {!providerConfigured || !choiceMatchesRuntime ? (
+                <>
+                  <textarea
+                    className="onboarding-command"
+                    aria-label={english ? "Provider startup command" : "模型服务启动命令"}
+                    readOnly
+                    wrap="soft"
+                    rows={providerChoice === "compatible" ? 3 : 2}
+                    value={
                       providerChoice === "codex-host"
-                        ? "mode-button mode-button-active"
-                        : "mode-button"
+                        ? "TIDU_PROVIDER=codex-host\ntidu start  # follows the current Codex model"
+                        : providerChoice === "cursor-host"
+                          ? "TIDU_PROVIDER=cursor-host\ntidu start  # follows the current Cursor model"
+                          : providerChoice === "ollama"
+                            ? "TIDU_PROVIDER=ollama\nTIDU_PROVIDER_MODEL=<installed-model> tidu start"
+                            : "TIDU_PROVIDER=openai-compatible\nTIDU_PROVIDER_BASE_URL=<service-url>\nTIDU_PROVIDER_MODEL=<model> TIDU_PROVIDER_API_KEY=<runtime-key> tidu start"
                     }
-                    type="button"
-                    onClick={() => {
-                      setProviderChoice("codex-host");
-                    }}
-                  >
-                    Codex
-                  </button>
-                  <button
-                    className={
-                      providerChoice === "cursor-host"
-                        ? "mode-button mode-button-active"
-                        : "mode-button"
-                    }
-                    type="button"
-                    onClick={() => {
-                      setProviderChoice("cursor-host");
-                    }}
-                  >
-                    Cursor
-                  </button>
-                  <button
-                    className={
-                      providerChoice === "ollama" ? "mode-button mode-button-active" : "mode-button"
-                    }
-                    type="button"
-                    onClick={() => {
-                      setProviderChoice("ollama");
-                    }}
-                  >
-                    Ollama
-                  </button>
-                  <button
-                    className={
-                      providerChoice === "compatible"
-                        ? "mode-button mode-button-active"
-                        : "mode-button"
-                    }
-                    type="button"
-                    onClick={() => {
-                      setProviderChoice("compatible");
-                    }}
-                  >
-                    {english ? "Other compatible services" : "其他兼容服务"}
-                  </button>
+                  />
+                  <p>
+                    {providerChoice === "compatible"
+                      ? english
+                        ? "Set the compatible service URL and model, then restart. Secrets stay in the process environment."
+                        : "填写兼容服务地址和模型名后重启；密钥只从进程环境读取。"
+                      : english
+                        ? `Restart AI-Tidu9 with ${providerLabel} to load this host and its model catalog.`
+                        : `使用 ${providerLabel} 重启九门后，才会加载该宿主及其模型目录。`}
+                  </p>
+                </>
+              ) : null}
+            </section>
+            <aside className="active-runtime-snapshot" role="status" aria-live="polite">
+              <div className="active-runtime-snapshot-heading">
+                <div>
+                  <span className="configuration-scope-badge">
+                    {english ? "Active · Read only" : "当前生效 · 只读"}
+                  </span>
+                  <strong>{activeProviderLabel}</strong>
+                  <small>
+                    {english
+                      ? "This snapshot stays unchanged until a new configuration is activated."
+                      : "新配置启用前，此处始终展示当前运行状态。"}
+                  </small>
                 </div>
-                <textarea
-                  className="onboarding-command"
-                  aria-label={english ? "Provider startup command" : "模型服务启动命令"}
-                  readOnly
-                  wrap="soft"
-                  rows={providerChoice === "compatible" ? 3 : 2}
-                  value={
-                    providerChoice === "codex-host"
-                      ? "TIDU_PROVIDER=codex-host\ntidu start  # follows the current Codex model"
-                      : providerChoice === "cursor-host"
-                        ? "TIDU_PROVIDER=cursor-host\ntidu start  # follows the current Cursor model"
-                        : providerChoice === "ollama"
-                          ? "TIDU_PROVIDER=ollama\nTIDU_PROVIDER_MODEL=<installed-model> tidu start"
-                          : "TIDU_PROVIDER=openai-compatible\nTIDU_PROVIDER_BASE_URL=<service-url>\nTIDU_PROVIDER_MODEL=<model> TIDU_PROVIDER_API_KEY=<runtime-key> tidu start"
-                  }
-                />
-                <p>
-                  {english
-                    ? "Compatible services include OpenAI and other providers offering the OpenAI API format. Set the service URL and model. Secrets stay in the process environment."
-                    : "可接入 OpenAI 及其他提供 OpenAI 兼容接口的服务；填写服务地址和模型名后重启。密钥只从进程环境读取。"}
-                </p>
-              </>
-            ) : null}
-            <div className="provider-monitor" role="status" aria-live="polite">
-              <div className="provider-monitor-heading">
-                <strong>{providerLabel}</strong>
                 <button
                   type="button"
                   onClick={() => setProviderCheckRevision((revision) => revision + 1)}
@@ -1827,42 +1949,29 @@ export const QuickStartWizard = ({
               <p>
                 {providerCheck.status === "checking"
                   ? english
-                    ? `Reading ${providerLabel} model configuration…`
-                    : `正在读取 ${providerLabel} 的模型配置…`
+                    ? `Reading active ${activeProviderLabel} model configuration…`
+                    : `正在读取当前生效的 ${activeProviderLabel} 模型配置…`
                   : providerCheck.status === "ready"
                     ? english
-                      ? `Detected ${providerCheck.model}; it matches the active runtime configuration.`
-                      : `已获取模型配置：${providerCheck.model}，与当前运行配置一致。`
+                      ? `Active model configuration: ${providerCheck.model}.`
+                      : `当前生效模型：${providerCheck.model}。`
                     : providerCheck.status === "restart-required"
                       ? english
-                        ? `Detected ${providerCheck.model}, but this runtime is using another provider. Restart with ${providerLabel} to continue.`
-                        : `已获取模型配置：${providerCheck.model}，但当前运行使用其他服务；切换并重启后才能继续。`
+                        ? "The active runtime provider and its detected configuration do not match."
+                        : "当前运行宿主与检测到的配置不一致。"
                       : providerCheck.status === "unavailable"
                         ? english
-                          ? `${providerLabel} model configuration was not found: ${providerReasonLabel(providerCheck.reason, locale)}.`
-                          : `${providerLabel} 未获取到模型配置：${providerReasonLabel(providerCheck.reason, locale)}。`
+                          ? `The active ${activeProviderLabel} configuration was not found: ${providerReasonLabel(providerCheck.reason, locale)}.`
+                          : `未获取到当前 ${activeProviderLabel} 配置：${providerReasonLabel(providerCheck.reason, locale)}。`
                         : english
-                          ? "Select a provider to read its current model configuration."
-                          : "选择服务后读取该服务当前模型配置。"}
+                          ? "No active model provider is configured."
+                          : "当前没有已生效的模型宿主。"}
               </p>
               <p className="provider-monitor-note">
                 {english
                   ? "Configuration lookup only. It does not send a model request."
                   : "仅读取配置，不会发送模型请求。"}
               </p>
-              {providerChoice === "cursor-host" &&
-              providerCheck.reason === "cursor-not-authenticated" ? (
-                <button
-                  type="button"
-                  onClick={() =>
-                    void onConnectCursor().then(() =>
-                      setProviderCheckRevision((revision) => revision + 1),
-                    )
-                  }
-                >
-                  {english ? "Connect Cursor account" : "连接 Cursor 账号"}
-                </button>
-              ) : null}
               {providerCheck.account ? (
                 <div className="provider-account">
                   <p>
@@ -1892,7 +2001,7 @@ export const QuickStartWizard = ({
                   ) : null}
                 </div>
               ) : null}
-            </div>
+            </aside>
           </>
         ) : step === 3 ? (
           <>

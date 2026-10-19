@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { createServer as createHttpServer } from "node:http";
-import { createServer as createNetServer } from "node:net";
+import { request as createHttpRequest, createServer as createHttpServer } from "node:http";
+import { connect as createNetConnection, createServer as createNetServer } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -15,6 +15,7 @@ const productVersion = JSON.parse(
 const developmentStartedAt = Date.now();
 const defaultPublicPort = 9639;
 const edition = process.env.TIDU_DEV_EDITION ?? "personal";
+const editionSuffix = edition === "enterprise" ? "e" : "p";
 const publicPortSetting = process.env.TIDU_PORT?.trim();
 const configuredPublicPort =
   publicPortSetting === undefined ? undefined : Number(publicPortSetting);
@@ -101,14 +102,14 @@ const internalRuntimePort = await new Promise((resolve, reject) => {
     });
   });
 });
-const managerPort = await new Promise((resolve, reject) => {
+const internalFrontendPort = await new Promise((resolve, reject) => {
   const server = createNetServer();
   server.once("error", reject);
   server.listen(0, "127.0.0.1", () => {
     const address = server.address();
     if (address === null || typeof address === "string") {
       server.close();
-      reject(new Error("Unable to allocate the development manager port."));
+      reject(new Error("Unable to allocate the internal development frontend port."));
       return;
     }
     server.close((error) => (error ? reject(error) : resolve(address.port)));
@@ -210,6 +211,19 @@ const spawnRuntimeProcess = () =>
     },
   );
 let runtimeProcess = spawnRuntimeProcess();
+let frontendProcess;
+const spawnCliServiceProcess = () =>
+  spawn(
+    process.execPath,
+    [
+      "-e",
+      "process.title='ai-tidu9-cli-service';const timer=setInterval(()=>{},2147483647);const stop=()=>{clearInterval(timer);process.exit(0)};process.once('SIGINT',stop);process.once('SIGTERM',stop)",
+    ],
+    { cwd: repositoryRoot, stdio: "ignore" },
+  );
+let cliServiceProcess = spawnCliServiceProcess();
+const processIsRunning = (childProcess) =>
+  childProcess !== undefined && childProcess.exitCode === null && childProcess.signalCode === null;
 
 let runtimeReady = false;
 for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -228,14 +242,17 @@ for (let attempt = 0; attempt < 100; attempt += 1) {
 
 if (!runtimeReady) {
   runtimeProcess.kill("SIGTERM");
+  cliServiceProcess.kill("SIGTERM");
   process.stderr.write("Development runtime did not become ready within 10 seconds.\n");
   process.exit(1);
 }
 
-let runtimePaused = false;
+const intentionallyStoppedProcesses = new WeakSet();
 let registerManagedProcess = () => undefined;
 const createDevelopmentInventory = async () => {
-  const runtimeRunning = runtimeProcess.exitCode === null;
+  const runtimeRunning = processIsRunning(runtimeProcess);
+  const frontendRunning = processIsRunning(frontendProcess);
+  const cliRunning = processIsRunning(cliServiceProcess);
   let runtimeHealth;
   let upstreamCatalog;
   if (runtimeRunning) {
@@ -298,26 +315,69 @@ const createDevelopmentInventory = async () => {
     ],
     services: [
       {
-        id: "tidu:dev-p",
-        name: "tidu:dev-p",
-        kind: "runtime",
-        status: runtimeRunning ? "running" : "stopped",
-        processId: runtimeProcess.pid ?? null,
+        id: `tidu:dev-frontend-${editionSuffix}`,
+        name: "前端开发服务",
+        kind: "frontend",
+        lifecycle: "managed",
+        status: frontendRunning ? "running" : "stopped",
+        processId: frontendRunning ? (frontendProcess?.pid ?? null) : null,
+        command: `npm run tidu:dev-frontend-${editionSuffix}`,
+        endpoint: `http://127.0.0.1:${publicPort}`,
+        version: productVersion,
         actions: ["refresh", "start", "restart", "stop"],
       },
       {
-        id: "tidu:cli-p",
-        name: "tidu:cli-p",
+        id: `tidu:dev-cli-${editionSuffix}`,
+        name: "CLI 服务",
         kind: "cli",
-        status: "ready",
-        processId: null,
-        actions: ["refresh", "check"],
+        lifecycle: "managed",
+        status: cliRunning ? "running" : "stopped",
+        processId: cliRunning ? (cliServiceProcess.pid ?? null) : null,
+        command: `npm run tidu:dev-cli-${editionSuffix}`,
+        endpoint: `http://127.0.0.1:${publicPort}`,
+        version: productVersion,
+        actions: ["refresh", "start", "restart", "stop"],
+      },
+      {
+        id: `tidu:dev-api-${editionSuffix}`,
+        name: "接口服务",
+        kind: "api",
+        lifecycle: "managed",
+        status: runtimeRunning ? "running" : "stopped",
+        processId: runtimeRunning ? (runtimeProcess.pid ?? null) : null,
+        command: `npm run tidu:dev-api-${editionSuffix}`,
+        endpoint: `http://127.0.0.1:${publicPort}/api`,
+        version: productVersion,
+        actions: ["refresh", "start", "restart", "stop"],
       },
     ],
   };
 };
 
-const managerServer = createHttpServer(async (request, response) => {
+const proxyRequest = (request, response, targetPort) => {
+  const upstreamRequest = createHttpRequest(
+    {
+      headers: request.headers,
+      host: "127.0.0.1",
+      method: request.method,
+      path: request.url,
+      port: targetPort,
+    },
+    (upstreamResponse) => {
+      response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+      upstreamResponse.pipe(response);
+    },
+  );
+  upstreamRequest.once("error", () => {
+    if (!response.headersSent) {
+      response.writeHead(503, { "content-type": "application/json; charset=utf-8" });
+    }
+    response.end('{"error":"SERVICE_UNAVAILABLE"}\n');
+  });
+  request.pipe(upstreamRequest);
+};
+
+const handleManagerRequest = async (request, response) => {
   const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
   const sendJson = (statusCode, body) => {
     response.writeHead(statusCode, {
@@ -330,34 +390,45 @@ const managerServer = createHttpServer(async (request, response) => {
     sendJson(200, await createDevelopmentInventory());
     return;
   }
-  const actionRoute = /^\/api\/services\/([^/]+)\/(refresh|check|start|stop|restart)$/u.exec(
-    pathname,
-  );
+  const actionRoute = /^\/api\/services\/([^/]+)\/(refresh|start|stop|restart)$/u.exec(pathname);
   if (request.method !== "POST" || actionRoute === null) {
-    sendJson(404, { error: "NOT_FOUND" });
+    const apiRequest =
+      pathname === "/health" || pathname.startsWith("/api/") || pathname.startsWith("/v1/");
+    const targetProcess = apiRequest ? runtimeProcess : frontendProcess;
+    if (!processIsRunning(targetProcess)) {
+      sendJson(503, { error: "SERVICE_UNAVAILABLE" });
+      return;
+    }
+    proxyRequest(request, response, apiRequest ? internalRuntimePort : internalFrontendPort);
     return;
   }
   const serviceId = decodeURIComponent(actionRoute[1] ?? "");
   const action = actionRoute[2];
-  if (serviceId === "tidu:cli-p" && (action === "refresh" || action === "check")) {
-    const cliCheck = spawnSync(
-      process.execPath,
-      [join(repositoryRoot, "packages/tidu/dist/cli/launcher.js"), "--help"],
-      { cwd: repositoryRoot, encoding: "utf8", timeout: 5_000 },
-    );
-    sendJson(cliCheck.status === 0 ? 200 : 503, {
-      accepted: cliCheck.status === 0,
-      action,
-      serviceId,
-      result: {
-        checkedAt: new Date().toISOString(),
-        message: cliCheck.status === 0 ? "CLI launcher check passed" : "CLI launcher check failed",
-        status: cliCheck.status === 0 ? "passed" : "failed",
+  const serviceProcesses = {
+    [`tidu:dev-api-${editionSuffix}`]: {
+      get: () => runtimeProcess,
+      set: (childProcess) => {
+        runtimeProcess = childProcess;
       },
-    });
-    return;
-  }
-  if (serviceId !== "tidu:dev-p") {
+      spawn: spawnRuntimeProcess,
+    },
+    [`tidu:dev-cli-${editionSuffix}`]: {
+      get: () => cliServiceProcess,
+      set: (childProcess) => {
+        cliServiceProcess = childProcess;
+      },
+      spawn: spawnCliServiceProcess,
+    },
+    [`tidu:dev-frontend-${editionSuffix}`]: {
+      get: () => frontendProcess,
+      set: (childProcess) => {
+        frontendProcess = childProcess;
+      },
+      spawn: () => spawnFrontendProcess(),
+    },
+  };
+  const managedService = serviceProcesses[serviceId];
+  if (managedService === undefined) {
     sendJson(404, { error: "SERVICE_NOT_FOUND" });
     return;
   }
@@ -365,31 +436,55 @@ const managerServer = createHttpServer(async (request, response) => {
     sendJson(200, { accepted: true, action, serviceId });
     return;
   }
-  if (action === "start" && runtimeProcess.exitCode === null) {
+  const activeProcess = managedService.get();
+  if (action === "start" && processIsRunning(activeProcess)) {
     sendJson(409, { error: "SERVICE_ALREADY_RUNNING" });
     return;
   }
   if (action === "start") {
-    runtimePaused = false;
-    runtimeProcess = spawnRuntimeProcess();
-    registerManagedProcess(runtimeProcess);
+    const childProcess = managedService.spawn();
+    managedService.set(childProcess);
+    registerManagedProcess(childProcess);
     sendJson(202, { accepted: true, action, serviceId });
     return;
   }
-  runtimePaused = true;
   sendJson(202, { accepted: true, action, serviceId });
-  runtimeProcess.kill("SIGTERM");
+  if (activeProcess !== undefined) {
+    intentionallyStoppedProcesses.add(activeProcess);
+    activeProcess.kill("SIGTERM");
+  }
   if (action === "restart") {
     setTimeout(() => {
-      runtimePaused = false;
-      runtimeProcess = spawnRuntimeProcess();
-      registerManagedProcess(runtimeProcess);
+      const childProcess = managedService.spawn();
+      managedService.set(childProcess);
+      registerManagedProcess(childProcess);
     }, 500);
   }
+};
+const managerServer = createHttpServer((request, response) => {
+  void handleManagerRequest(request, response);
+});
+managerServer.on("upgrade", (request, socket, head) => {
+  if (!processIsRunning(frontendProcess)) {
+    socket.destroy();
+    return;
+  }
+  const upstreamSocket = createNetConnection(internalFrontendPort, "127.0.0.1", () => {
+    const headerLines = [];
+    for (let index = 0; index < request.rawHeaders.length; index += 2) {
+      headerLines.push(`${request.rawHeaders[index]}: ${request.rawHeaders[index + 1]}`);
+    }
+    upstreamSocket.write(
+      `${request.method ?? "GET"} ${request.url ?? "/"} HTTP/${request.httpVersion}\r\n${headerLines.join("\r\n")}\r\n\r\n`,
+    );
+    if (head.length > 0) upstreamSocket.write(head);
+    socket.pipe(upstreamSocket).pipe(socket);
+  });
+  upstreamSocket.once("error", () => socket.destroy());
 });
 await new Promise((resolve, reject) => {
   managerServer.once("error", reject);
-  managerServer.listen(managerPort, "127.0.0.1", () => {
+  managerServer.listen(publicPort, "127.0.0.1", () => {
     managerServer.off("error", reject);
     resolve();
   });
@@ -432,6 +527,21 @@ if (typeCheckerProcess.stdout !== null) {
   });
 }
 
+const spawnFrontendProcess = () =>
+  spawn(
+    "../../node_modules/.bin/vite",
+    ["--host", "127.0.0.1", "--port", String(internalFrontendPort)],
+    {
+      cwd: workspaceRoot,
+      env: {
+        ...process.env,
+        TIDU_RUNTIME_PORT: String(internalRuntimePort),
+      },
+      stdio: "inherit",
+    },
+  );
+frontendProcess = spawnFrontendProcess();
+
 const processes = [
   runtimeProcess,
   spawn(
@@ -446,15 +556,8 @@ const processes = [
     { cwd: repositoryRoot, stdio: "ignore" },
   ),
   typeCheckerProcess,
-  spawn("../../node_modules/.bin/vite", ["--host", "127.0.0.1", "--port", String(publicPort)], {
-    cwd: workspaceRoot,
-    env: {
-      ...process.env,
-      TIDU_MANAGER_PORT: String(managerPort),
-      TIDU_RUNTIME_PORT: String(internalRuntimePort),
-    },
-    stdio: "inherit",
-  }),
+  frontendProcess,
+  cliServiceProcess,
 ];
 
 let stopping = false;
@@ -464,7 +567,7 @@ const stop = (signal = "SIGTERM") => {
   }
   stopping = true;
   for (const childProcess of processes) {
-    if (childProcess.exitCode === null) {
+    if (processIsRunning(childProcess)) {
       childProcess.kill(signal);
     }
   }
@@ -481,7 +584,7 @@ const registerProcess = (childProcess) => {
     process.exitCode = 1;
   });
   childProcess.once("exit", (code, signal) => {
-    if (childProcess === runtimeProcess && runtimePaused) {
+    if (intentionallyStoppedProcesses.has(childProcess)) {
       return;
     }
     if (!stopping) {

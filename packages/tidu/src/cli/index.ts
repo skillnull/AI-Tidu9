@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -53,7 +53,61 @@ import {
   saveConfiguration,
 } from "./management.js";
 
-const HELP_TEXT = `${PRODUCT.explanation}
+type CliEdition = "development" | "enterprise" | "personal";
+
+const resolveCliEdition = (): CliEdition => {
+  if (process.env.TIDU_DEV_EDITION !== undefined || process.env.NODE_ENV === "development") {
+    return "development";
+  }
+  return process.env.TIDU_EDITION === "enterprise" ? "enterprise" : "personal";
+};
+
+const PERSONAL_COMMANDS = new Set([
+  "account",
+  "channel",
+  "clients",
+  "config",
+  "doctor",
+  "mcp",
+  "restore",
+  "service",
+  "setup",
+  "start",
+  "uninstall",
+  "version",
+]);
+const ENTERPRISE_COMMANDS = new Set([
+  "channel",
+  "config",
+  "doctor",
+  "enterprise",
+  "service",
+  "start",
+  "version",
+]);
+const ALL_COMMANDS = new Set([...PERSONAL_COMMANDS, ...ENTERPRISE_COMMANDS]);
+
+const commandIsAvailable = (command: string): boolean => {
+  const edition = resolveCliEdition();
+  return (
+    edition === "development" ||
+    (edition === "enterprise" ? ENTERPRISE_COMMANDS : PERSONAL_COMMANDS).has(command)
+  );
+};
+
+const assertCommandIsAvailable = (command: string): void => {
+  if (!ALL_COMMANDS.has(command)) {
+    return;
+  }
+  if (!commandIsAvailable(command)) {
+    throw new TiduError(
+      "UNSUPPORTED_COMMAND",
+      `${command} is not available in the ${resolveCliEdition()} edition.`,
+    );
+  }
+};
+
+const createHelpText = (): string => `${PRODUCT.explanation}
 
 Usage / 用法:
   tidu <command> [options]
@@ -61,18 +115,27 @@ Usage / 用法:
 
 Commands / 命令:
   tidu start        Start the runtime / 启动运行时
-    --edition personal|enterprise  Select installation edition / 选择安装版型
-  tidu setup        Install clients and virtual model / 安装客户端与虚拟模型
   tidu service      Inspect or control the runtime / 查看或控制运行服务
-  tidu mcp          Run the MCP connector / 运行MCP连接器
   tidu doctor       Diagnose the service / 诊断服务
-  tidu clients      Discover or configure clients / 发现或配置客户端
   tidu channel      List or run model channels / 查看或调用模型通道
-  tidu account      Inspect or change host login / 检查或切换宿主账号
   tidu config       View or edit configuration / 查看或编辑配置
-  tidu uninstall    Archive or remove AI-Tidu9 / 归档或卸载九门赛博提督
-  tidu restore      Restore personal data / 恢复个人数据
-  tidu enterprise   Enterprise host operations / 企业服务器操作
+${
+  resolveCliEdition() === "enterprise"
+    ? "  tidu enterprise   Enterprise host operations / 企业服务器操作"
+    : [
+        "  tidu setup        Install clients and virtual model / 安装客户端与虚拟模型",
+        "  tidu mcp          Run the MCP connector / 运行MCP连接器",
+        "  tidu clients      Discover or configure clients / 发现或配置客户端",
+        "  tidu account      Inspect or change host login / 检查或切换宿主账号",
+        "  tidu uninstall    Archive or remove AI-Tidu9 / 归档或卸载九门赛博提督",
+        "  tidu restore      Restore personal data / 恢复个人数据",
+        resolveCliEdition() === "development"
+          ? "  tidu enterprise   Enterprise host operations / 企业服务器操作"
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n")
+}
   tidu version      Show package version / 显示版本
 
 Help / 帮助:
@@ -261,10 +324,10 @@ Starts the runtime and prints the management URL. Secrets are read from the proc
   service: `Service / 服务
 
 Usage / 用法:
-  tidu service [status|stop|restart] [--endpoint <url>]
+  tidu service [status|start|stop|restart] [service-id|all] [--endpoint <url>]
 
-Reads the active runtime shape and controls only its runtime service. Use tidu start when stopped.
-读取当前运行形态并只控制对应运行时服务；停止后使用 tidu start 启动。`,
+Lists every service and controls one service or the complete service group.
+列出全部服务，并可操作单个服务或整个服务组。`,
   uninstall: `Uninstall / 卸载
 
 Usage / 用法:
@@ -295,10 +358,11 @@ const resolveHelpText = (argumentsList: readonly string[]): string | undefined =
     argumentsList[0] === "help" ? argumentsList.slice(1) : argumentsList
   ).filter((argument) => !HELP_FLAGS.has(argument));
   if (topicArguments.length === 0) {
-    return HELP_TEXT;
+    return createHelpText();
   }
   const detailedTopic = topicArguments.slice(0, 2).join(" ");
   const topLevelTopic = topicArguments[0] ?? "";
+  assertCommandIsAvailable(topLevelTopic);
   const helpText = COMMAND_HELP[detailedTopic] ?? COMMAND_HELP[topLevelTopic];
   if (helpText === undefined) {
     throw new TiduError("UNSUPPORTED_COMMAND", `Unknown help topic: ${topLevelTopic}`);
@@ -620,47 +684,111 @@ const runClientConfiguration = async (argumentsList: readonly string[]): Promise
 
 const runServiceControl = async (argumentsList: readonly string[]): Promise<string> => {
   const action = argumentsList[1] ?? "status";
-  if (action !== "status" && action !== "stop" && action !== "restart") {
+  if (action !== "status" && action !== "start" && action !== "stop" && action !== "restart") {
     throw new TiduError(
       "CONFIGURATION_INVALID",
-      "service requires status, stop, or restart; use tidu start when stopped.",
+      "service requires status, start, stop, or restart.",
     );
   }
   const endpoint = resolveEndpoint(argumentsList);
-  const inventoryResponse = await fetch(`${endpoint}/api/services`, {
-    headers: { accept: "application/json" },
-    signal: AbortSignal.timeout(5_000),
-  });
+  let inventoryResponse: Response;
+  try {
+    inventoryResponse = await fetch(`${endpoint}/api/services`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(5_000),
+    });
+  } catch {
+    if (action === "start") {
+      return startInstalledServiceGroup(endpoint);
+    }
+    throw new TiduError("INTERNAL_ERROR", "AI-Tidu9 service manager is unavailable.");
+  }
   if (!inventoryResponse.ok) {
     throw new TiduError("INTERNAL_ERROR", "AI-Tidu9 service inventory is unavailable.");
   }
   const inventory = (await inventoryResponse.json()) as {
     mode: "development" | "installed";
-    services: Array<{ id: string; kind: "cli" | "runtime"; name: string; status: string }>;
+    services: Array<{
+      id: string;
+      kind: "api" | "cli" | "frontend";
+      name: string;
+      status: string;
+    }>;
   };
   if (action === "status") {
-    return inventory.services.map((service) => `${service.name}: ${service.status}`).join("\n");
+    return inventory.services
+      .map((service) => `${service.id}\t${service.status}\t${service.name}`)
+      .join("\n");
   }
-  const runtimeService = inventory.services.find((service) => service.kind === "runtime");
-  if (runtimeService === undefined) {
-    throw new TiduError("INTERNAL_ERROR", "AI-Tidu9 runtime service was not found.");
+  const requestedServiceId = argumentsList[2] ?? "all";
+  const selectedServices =
+    requestedServiceId === "all"
+      ? inventory.services
+      : inventory.services.filter((service) => service.id === requestedServiceId);
+  if (selectedServices.length === 0) {
+    throw new TiduError("CONFIGURATION_INVALID", `Unknown service: ${requestedServiceId}`);
   }
-  const response = await fetch(
-    `${endpoint}/api/services/${encodeURIComponent(runtimeService.id)}/${action}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: "{}",
-      signal: AbortSignal.timeout(5_000),
-    },
-  );
-  if (!response.ok) {
-    throw new TiduError("INTERNAL_ERROR", `AI-Tidu9 service ${action} was rejected.`);
+  const results: string[] = [];
+  for (const service of selectedServices) {
+    const response = await fetch(
+      `${endpoint}/api/services/${encodeURIComponent(service.id)}/${action}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+        signal: AbortSignal.timeout(5_000),
+      },
+    );
+    if (!response.ok) {
+      throw new TiduError(
+        "INTERNAL_ERROR",
+        `AI-Tidu9 service ${service.id} ${action} was rejected.`,
+      );
+    }
+    results.push(`${service.id}: ${action} accepted.`);
+    if (action === "stop" || action === "restart") {
+      break;
+    }
   }
   if (action === "stop") {
     await new Promise((resolveWait) => setTimeout(resolveWait, 300));
   }
-  return `${runtimeService.name}: ${action} accepted.`;
+  return results.join("\n");
+};
+
+const startInstalledServiceGroup = async (endpoint: string): Promise<string> => {
+  if (await endpointIsHealthy(endpoint)) {
+    return "Service group: already running.";
+  }
+  if (process.env.NODE_TEST_CONTEXT !== undefined) {
+    return "Service group: automatic start skipped in the test environment.";
+  }
+  const endpointUrl = new URL(endpoint);
+  const cliEntry = process.argv[1];
+  if (cliEntry === undefined) {
+    throw new TiduError("INTERNAL_ERROR", "Cannot resolve the AI-Tidu9 CLI entry.");
+  }
+  const startArguments = [cliEntry, "start"];
+  if (process.env.TIDU_EDITION === "enterprise") {
+    startArguments.push("--edition", "enterprise");
+  }
+  const childProcess = spawn(process.execPath, startArguments, {
+    detached: true,
+    env: {
+      ...process.env,
+      TIDU_HOST: endpointUrl.hostname,
+      TIDU_PORT: endpointUrl.port || "9639",
+    },
+    stdio: "ignore",
+  });
+  childProcess.unref();
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    if (await endpointIsHealthy(endpoint)) {
+      return "Service group: started automatically.";
+    }
+  }
+  throw new TiduError("INTERNAL_ERROR", "AI-Tidu9 services did not become ready after setup.");
 };
 
 const runSetup = async (argumentsList: readonly string[]): Promise<string> => {
@@ -741,7 +869,10 @@ const runSetup = async (argumentsList: readonly string[]): Promise<string> => {
       : restartRequested
         ? restartResults.map((result) => result.detail).join("\n")
         : "Host restart: pending; restart the detected host to activate AI-Tidu9.";
-  return [formatConnectorSetupReport(report), profileSummary, restartSummary].join("\n");
+  const serviceSummary = await startInstalledServiceGroup(endpoint);
+  return [formatConnectorSetupReport(report), profileSummary, serviceSummary, restartSummary].join(
+    "\n",
+  );
 };
 
 const endpointIsHealthy = async (endpoint: string): Promise<boolean> => {
@@ -932,6 +1063,7 @@ export const runCli = (argumentsList: readonly string[]): string => {
   if (helpText !== undefined) {
     return helpText;
   }
+  assertCommandIsAvailable(command === "--version" || command === "-v" ? "version" : command);
 
   if (command === "version" || command === "--version" || command === "-v") {
     return PRODUCT.version;
@@ -956,120 +1088,139 @@ if (isDirectExecution) {
     const helpText = resolveHelpText(argumentsList);
     if (helpText !== undefined) {
       process.stdout.write(`${helpText}\n`);
-    } else if (argumentsList[0] === "start") {
-      const editionIndex = argumentsList.indexOf("--edition");
-      const editionArgument = editionIndex === -1 ? undefined : argumentsList[editionIndex + 1];
-      const configuredEdition = editionArgument ?? process.env.TIDU_EDITION;
-      if (
-        configuredEdition !== undefined &&
-        configuredEdition !== "personal" &&
-        configuredEdition !== "enterprise"
-      ) {
-        throw new TiduError("CONFIGURATION_INVALID", "--edition must be personal or enterprise.");
-      }
-      const { startLocalRuntime } = await import("../runtime/index.js");
-      const configuredPort = process.env.TIDU_PORT;
-      const port = configuredPort === undefined ? undefined : Number(configuredPort);
-      if (port !== undefined && (!Number.isInteger(port) || port < 0 || port > 65_535)) {
-        throw new TiduError(
-          "CONFIGURATION_INVALID",
-          "TIDU_PORT must be an integer from 0 to 65535.",
-        );
-      }
-
-      const runtime = await startLocalRuntime({
-        deployment: configuredEdition,
-        databasePath: process.env.TIDU_DATABASE_PATH,
-        host: process.env.TIDU_HOST,
-        port,
-      });
-      const silentDevelopmentRuntime = process.env.TIDU_DEV_SILENT === "1";
-      if (!silentDevelopmentRuntime) {
-        process.stdout.write(
-          `${PRODUCT.explanation}\nRunning at ${runtime.origin}\nConfiguration center: ${runtime.origin}\n`,
-        );
-      }
-
-      if (argumentsList.includes("--cli")) {
-        process.stdout.write(`${await runInteractiveConfiguration(runtime.origin)}\n`);
-      } else if (!silentDevelopmentRuntime) {
-        process.stdout.write(
-          "Guided setup: open the configuration center. Terminal setup: tidu start --cli\n",
-        );
-      }
-
-      let runtimeStopping = false;
-      const stopRuntime = async () => {
-        if (runtimeStopping) {
-          return;
-        }
-        runtimeStopping = true;
-        await runtime.close();
-        process.exitCode = 0;
-      };
-      process.once("SIGINT", stopRuntime);
-      process.once("SIGTERM", stopRuntime);
-    } else if (argumentsList[0] === "mcp") {
-      const endpoint = resolveEndpoint(argumentsList);
-      const ownedRuntime = await ensureMcpRuntime(endpoint);
-      const server = startTiduMcpServer({ endpoint });
-      try {
-        await server.completed;
-      } finally {
-        await ownedRuntime?.close();
-      }
-    } else if (argumentsList[0] === "enterprise" && argumentsList[1] === "recover-admin") {
-      const reasonIndex = argumentsList.indexOf("--reason");
-      const reason = reasonIndex === -1 ? undefined : argumentsList[reasonIndex + 1];
-      if (reason === undefined) {
-        throw new TiduError(
-          "CONFIGURATION_INVALID",
-          "Host recovery requires --reason with a non-secret audit explanation.",
-        );
-      }
-      const { createEnterpriseRuntimeFromEnvironment } = await import("../enterprise/runtime.js");
-      const enterpriseRuntime = await createEnterpriseRuntimeFromEnvironment();
-      if (enterpriseRuntime === undefined) {
-        throw new TiduError(
-          "CONFIGURATION_INVALID",
-          "TIDU_POSTGRES_URL is required for enterprise host recovery.",
-        );
-      }
-      try {
-        const recovered = await enterpriseRuntime.controlPlane.recoverAdministratorKey(
-          true,
-          reason,
-        );
-        process.stdout.write(
-          `Administrator key recovered. Save it now; it cannot be retrieved again.\n${recovered.key}\n`,
-        );
-      } finally {
-        await enterpriseRuntime.close();
-      }
-    } else if (argumentsList[0] === "setup") {
-      process.stdout.write(`${await runSetup(argumentsList)}\n`);
-    } else if (argumentsList[0] === "service") {
-      process.stdout.write(`${await runServiceControl(argumentsList)}\n`);
-    } else if (argumentsList[0] === "doctor") {
-      const output = await runDoctor(argumentsList);
-      process.stdout.write(`${output}\n`);
-      if (output.includes("Some checks failed.")) {
-        process.exitCode = 1;
-      }
-    } else if (argumentsList[0] === "channel") {
-      process.stdout.write(`${await runChannel(argumentsList)}\n`);
-    } else if (argumentsList[0] === "clients" && argumentsList[1] !== undefined) {
-      process.stdout.write(`${await runClientConfiguration(argumentsList)}\n`);
-    } else if (argumentsList[0] === "account") {
-      process.stdout.write(`${await runAccount(argumentsList)}\n`);
-    } else if (argumentsList[0] === "config") {
-      process.stdout.write(`${await runConfiguration(argumentsList)}\n`);
-    } else if (argumentsList[0] === "uninstall") {
-      process.stdout.write(`${await runPersonalUninstall(argumentsList)}\n`);
-    } else if (argumentsList[0] === "restore") {
-      process.stdout.write(`${await runPersonalRestore(argumentsList)}\n`);
     } else {
-      process.stdout.write(`${runCli(argumentsList)}\n`);
+      const requestedCommand = argumentsList[0] ?? "help";
+      assertCommandIsAvailable(
+        requestedCommand === "--version" || requestedCommand === "-v"
+          ? "version"
+          : requestedCommand,
+      );
+      if (argumentsList[0] === "start") {
+        const editionIndex = argumentsList.indexOf("--edition");
+        const editionArgument = editionIndex === -1 ? undefined : argumentsList[editionIndex + 1];
+        const configuredEdition = editionArgument ?? process.env.TIDU_EDITION;
+        if (
+          configuredEdition !== undefined &&
+          configuredEdition !== "personal" &&
+          configuredEdition !== "enterprise"
+        ) {
+          throw new TiduError("CONFIGURATION_INVALID", "--edition must be personal or enterprise.");
+        }
+        const cliEdition = resolveCliEdition();
+        if (
+          cliEdition !== "development" &&
+          configuredEdition !== undefined &&
+          configuredEdition !== cliEdition
+        ) {
+          throw new TiduError(
+            "UNSUPPORTED_COMMAND",
+            `The ${cliEdition} edition cannot start the ${configuredEdition} runtime.`,
+          );
+        }
+        const { startLocalRuntime } = await import("../runtime/index.js");
+        const configuredPort = process.env.TIDU_PORT;
+        const port = configuredPort === undefined ? undefined : Number(configuredPort);
+        if (port !== undefined && (!Number.isInteger(port) || port < 0 || port > 65_535)) {
+          throw new TiduError(
+            "CONFIGURATION_INVALID",
+            "TIDU_PORT must be an integer from 0 to 65535.",
+          );
+        }
+
+        const runtime = await startLocalRuntime({
+          deployment: configuredEdition,
+          databasePath: process.env.TIDU_DATABASE_PATH,
+          host: process.env.TIDU_HOST,
+          port,
+        });
+        const silentDevelopmentRuntime = process.env.TIDU_DEV_SILENT === "1";
+        if (!silentDevelopmentRuntime) {
+          process.stdout.write(
+            `${PRODUCT.explanation}\nRunning at ${runtime.origin}\nConfiguration center: ${runtime.origin}\n`,
+          );
+        }
+
+        if (argumentsList.includes("--cli")) {
+          process.stdout.write(`${await runInteractiveConfiguration(runtime.origin)}\n`);
+        } else if (!silentDevelopmentRuntime) {
+          process.stdout.write(
+            "Guided setup: open the configuration center. Terminal setup: tidu start --cli\n",
+          );
+        }
+
+        let runtimeStopping = false;
+        const stopRuntime = async () => {
+          if (runtimeStopping) {
+            return;
+          }
+          runtimeStopping = true;
+          await runtime.close();
+          process.exitCode = 0;
+        };
+        process.once("SIGINT", stopRuntime);
+        process.once("SIGTERM", stopRuntime);
+      } else if (argumentsList[0] === "mcp") {
+        const endpoint = resolveEndpoint(argumentsList);
+        const ownedRuntime = await ensureMcpRuntime(endpoint);
+        const server = startTiduMcpServer({ endpoint });
+        try {
+          await server.completed;
+        } finally {
+          await ownedRuntime?.close();
+        }
+      } else if (argumentsList[0] === "enterprise" && argumentsList[1] === "recover-admin") {
+        const reasonIndex = argumentsList.indexOf("--reason");
+        const reason = reasonIndex === -1 ? undefined : argumentsList[reasonIndex + 1];
+        if (reason === undefined) {
+          throw new TiduError(
+            "CONFIGURATION_INVALID",
+            "Host recovery requires --reason with a non-secret audit explanation.",
+          );
+        }
+        const { createEnterpriseRuntimeFromEnvironment } = await import("../enterprise/runtime.js");
+        const enterpriseRuntime = await createEnterpriseRuntimeFromEnvironment();
+        if (enterpriseRuntime === undefined) {
+          throw new TiduError(
+            "CONFIGURATION_INVALID",
+            "TIDU_POSTGRES_URL is required for enterprise host recovery.",
+          );
+        }
+        try {
+          const recovered = await enterpriseRuntime.controlPlane.recoverAdministratorKey(
+            true,
+            reason,
+          );
+          process.stdout.write(
+            `Administrator key recovered. Save it now; it cannot be retrieved again.\n${recovered.key}\n`,
+          );
+        } finally {
+          await enterpriseRuntime.close();
+        }
+      } else if (argumentsList[0] === "setup") {
+        process.stdout.write(`${await runSetup(argumentsList)}\n`);
+      } else if (argumentsList[0] === "service") {
+        process.stdout.write(`${await runServiceControl(argumentsList)}\n`);
+      } else if (argumentsList[0] === "doctor") {
+        const output = await runDoctor(argumentsList);
+        process.stdout.write(`${output}\n`);
+        if (output.includes("Some checks failed.")) {
+          process.exitCode = 1;
+        }
+      } else if (argumentsList[0] === "channel") {
+        process.stdout.write(`${await runChannel(argumentsList)}\n`);
+      } else if (argumentsList[0] === "clients" && argumentsList[1] !== undefined) {
+        process.stdout.write(`${await runClientConfiguration(argumentsList)}\n`);
+      } else if (argumentsList[0] === "account") {
+        process.stdout.write(`${await runAccount(argumentsList)}\n`);
+      } else if (argumentsList[0] === "config") {
+        process.stdout.write(`${await runConfiguration(argumentsList)}\n`);
+      } else if (argumentsList[0] === "uninstall") {
+        process.stdout.write(`${await runPersonalUninstall(argumentsList)}\n`);
+      } else if (argumentsList[0] === "restore") {
+        process.stdout.write(`${await runPersonalRestore(argumentsList)}\n`);
+      } else {
+        process.stdout.write(`${runCli(argumentsList)}\n`);
+      }
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown CLI error";

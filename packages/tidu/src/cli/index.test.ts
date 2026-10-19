@@ -69,13 +69,42 @@ test("provides side-effect-free help for every command group", () => {
     ["config", "set", "--help"],
     ["uninstall", "--help"],
     ["restore", "--help"],
-    ["enterprise", "recover-admin", "--help"],
     ["version", "--help"],
     ["help", "config", "set"],
   ] as const;
 
   for (const invocation of helpInvocations) {
     assert.match(runCli(invocation), /Usage \/ 用法:/u, invocation.join(" "));
+  }
+});
+
+test("keeps installed edition commands mutually exclusive", () => {
+  const originalEdition = process.env.TIDU_EDITION;
+  const originalNodeEnvironment = process.env.NODE_ENV;
+  const originalDevelopmentEdition = process.env.TIDU_DEV_EDITION;
+  try {
+    delete process.env.NODE_ENV;
+    delete process.env.TIDU_DEV_EDITION;
+    delete process.env.TIDU_EDITION;
+    assert.doesNotMatch(runCli([]), /tidu enterprise/u);
+    assert.throws(() => runCli(["help", "enterprise"]), /not available in the personal edition/u);
+
+    process.env.TIDU_EDITION = "enterprise";
+    assert.match(runCli([]), /tidu enterprise/u);
+    assert.doesNotMatch(runCli([]), /tidu setup/u);
+    assert.throws(() => runCli(["help", "setup"]), /not available in the enterprise edition/u);
+
+    process.env.TIDU_DEV_EDITION = "personal";
+    assert.match(runCli([]), /tidu enterprise/u);
+    assert.match(runCli([]), /tidu setup/u);
+    assert.match(runCli(["enterprise", "recover-admin", "--help"]), /Usage \/ 用法:/u);
+  } finally {
+    if (originalEdition === undefined) delete process.env.TIDU_EDITION;
+    else process.env.TIDU_EDITION = originalEdition;
+    if (originalNodeEnvironment === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnvironment;
+    if (originalDevelopmentEdition === undefined) delete process.env.TIDU_DEV_EDITION;
+    else process.env.TIDU_DEV_EDITION = originalDevelopmentEdition;
   }
 });
 

@@ -125,17 +125,25 @@ interface ServiceInventory {
   /** Runtime and CLI entries belonging to the active mode. */
   services: readonly {
     /** Actions currently accepted for this service. */
-    actions: readonly ("check" | "refresh" | "restart" | "start" | "stop")[];
+    actions: readonly ("refresh" | "restart" | "start" | "stop")[];
+    /** Command used to enter or manage this service. */
+    command: string;
+    /** HTTP runtime endpoint used by this service. */
+    endpoint: string;
     /** Stable service identifier. */
     id: string;
     /** Service role. */
-    kind: "cli" | "runtime";
+    kind: "api" | "cli" | "frontend";
+    /** Whether the service is persistent or invoked on demand. */
+    lifecycle: "managed" | "on-demand";
     /** User-facing service name. */
     name: string;
     /** Active process identifier, or null for command entries. */
     processId: number | null;
     /** Current service state. */
     status: "ready" | "running" | "stopped";
+    /** Service package version. */
+    version: string;
   }[];
 }
 
@@ -143,6 +151,7 @@ const createServiceInventory = async (
   storage: StorageAdapter,
   provider: ModelProvider | undefined,
   runtimeNetwork: { host: string; port: number },
+  deployment: "personal" | "enterprise",
 ): Promise<ServiceInventory> => {
   const development = runtimeProcessKind() === "development";
   const workspace = await storage.configurationStore.loadWorkspace();
@@ -151,6 +160,15 @@ const createServiceInventory = async (
     ? `[${runtimeNetwork.host}]`
     : runtimeNetwork.host;
   const endpoint = `http://${endpointHost}:${runtimeNetwork.port}`;
+  const editionSuffix = deployment === "enterprise" ? "e" : "p";
+  const serviceDefaults = {
+    actions: ["refresh", "start", "restart", "stop"] as const,
+    endpoint,
+    lifecycle: "managed" as const,
+    processId: process.pid,
+    status: "running" as const,
+    version: PRODUCT.version,
+  };
   return {
     checkedAt: new Date().toISOString(),
     environment: {
@@ -187,20 +205,25 @@ const createServiceInventory = async (
     ],
     services: [
       {
-        id: development ? "tidu:dev-p" : "tidu-service",
-        name: development ? "tidu:dev-p" : "tidu 服务",
-        kind: "runtime" as const,
-        status: "running" as const,
-        processId: process.pid,
-        actions: ["refresh", "restart", "stop"] as const,
+        ...serviceDefaults,
+        id: development ? `tidu:dev-frontend-${editionSuffix}` : `tidu:frontend-${editionSuffix}`,
+        name: "前端服务",
+        kind: "frontend" as const,
+        command: `tidu service start ${development ? "tidu:dev-frontend" : "tidu:frontend"}-${editionSuffix}`,
       },
       {
-        id: development ? "tidu:cli-p" : "tidu-cli",
-        name: development ? "tidu:cli-p" : "tidu CLI",
+        ...serviceDefaults,
+        id: development ? `tidu:dev-cli-${editionSuffix}` : `tidu:cli-${editionSuffix}`,
+        name: "CLI 服务",
         kind: "cli" as const,
-        status: "ready" as const,
-        processId: null,
-        actions: ["refresh", "check"] as const,
+        command: `tidu service start ${development ? "tidu:dev-cli" : "tidu:cli"}-${editionSuffix}`,
+      },
+      {
+        ...serviceDefaults,
+        id: development ? `tidu:dev-api-${editionSuffix}` : `tidu:api-${editionSuffix}`,
+        name: "接口服务",
+        kind: "api" as const,
+        command: `tidu service start ${development ? "tidu:dev-api" : "tidu:api"}-${editionSuffix}`,
       },
     ],
   };
@@ -390,6 +413,14 @@ const sendOpenAiValidation = (
 
 const providerFailureSource = (provider: ModelProvider): "ai-tidu9" | "official-codex" =>
   provider.descriptor.type === "codex-host" ? "official-codex" : "ai-tidu9";
+
+const resolveRuntimeProviderType = (provider: ModelProvider | undefined): string | undefined => {
+  if (provider?.descriptor.type !== "tidu-router") return provider?.descriptor.type;
+  const configuredProvider = process.env.TIDU_PROVIDER?.trim();
+  return configuredProvider === "ollama" || configuredProvider === "openai-compatible"
+    ? configuredProvider
+    : provider.descriptor.type;
+};
 
 const providerRecoverySteps = (failureSource: "ai-tidu9" | "official-codex"): readonly string[] =>
   failureSource === "official-codex"
@@ -826,36 +857,36 @@ const handleRequest = async (
   }
 
   if (request.method === "GET" && pathname === "/api/services") {
-    sendJson(response, 200, await createServiceInventory(storage, provider, runtimeNetwork));
+    sendJson(
+      response,
+      200,
+      await createServiceInventory(storage, provider, runtimeNetwork, deployment),
+    );
     return;
   }
 
-  const serviceActionRoute = /^\/api\/services\/([^/]+)\/(refresh|check|start|stop|restart)$/u.exec(
+  const serviceActionRoute = /^\/api\/services\/([^/]+)\/(refresh|start|stop|restart)$/u.exec(
     pathname,
   );
   if (request.method === "POST" && serviceActionRoute !== null) {
     validateMutationRequest(request);
     const serviceId = decodeURIComponent(serviceActionRoute[1] ?? "");
     const action = serviceActionRoute[2];
-    const inventory = await createServiceInventory(storage, provider, runtimeNetwork);
+    const inventory = await createServiceInventory(storage, provider, runtimeNetwork, deployment);
     const service = inventory.services.find((candidate) => candidate.id === serviceId);
     if (service === undefined) {
       sendJson(response, 404, { error: "SERVICE_NOT_FOUND" });
       return;
     }
-    if (action === "refresh" || (service.kind === "cli" && action === "check")) {
+    if (action === "refresh") {
       sendJson(response, 200, {
         ...inventory,
         result: {
           checkedAt: new Date().toISOString(),
-          message: service.kind === "cli" ? "CLI entry check passed" : "Service status refreshed",
+          message: "Service status refreshed",
           status: "passed",
         },
       });
-      return;
-    }
-    if (service.kind !== "runtime") {
-      sendJson(response, 409, { error: "ACTION_NOT_SUPPORTED" });
       return;
     }
     if (action === "start") {
@@ -1262,14 +1293,14 @@ const handleRequest = async (
         } catch {
           reason = "ollama-unavailable";
         }
-      } else if (provider?.descriptor.type === selected) {
-        discoveredModel = provider.descriptor.model;
+      } else if (resolveRuntimeProviderType(provider) === selected) {
+        discoveredModel = provider?.descriptor.model;
       } else {
         reason = "compatible-provider-not-active";
       }
 
       const detected = discoveredModel !== undefined;
-      const matchesRuntime = detected && provider?.descriptor.type === selected;
+      const matchesRuntime = detected && resolveRuntimeProviderType(provider) === selected;
       sendJson(response, detected ? 200 : 409, {
         detected,
         matchesRuntime,
@@ -1692,6 +1723,11 @@ const handleRequest = async (
         provider?.descriptor.type === "tidu-router" ||
         provider?.descriptor.type === "openai-compatible" ||
         provider?.descriptor.type === "ollama",
+      companyProviderType:
+        resolveRuntimeProviderType(provider) === "ollama" ||
+        resolveRuntimeProviderType(provider) === "openai-compatible"
+          ? resolveRuntimeProviderType(provider)
+          : null,
     });
     return;
   }

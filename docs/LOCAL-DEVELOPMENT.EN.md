@@ -10,10 +10,9 @@ Node.js 22.14 or newer is required:
 
 ```bash
 npm run tidu:setup
-npm run tidu:dev-p
 ```
 
-`tidu:setup` installs repository development dependencies. `tidu:dev-p` starts the personal local development environment. The terminal prints one Vite URL shared by the page, API, and hot reload. The default port is `9639`; the next port is selected automatically when it is occupied.
+`tidu:setup` installs dependencies, builds the CLI, and automatically starts the personal frontend, CLI, and API services. Use `tidu:dev-p` to start the personal service group again, or `tidu:dev-e` for the enterprise group. The browser always uses port `9639`; frontend and API processes use isolated internal ports so stopping one service does not remove the control endpoint.
 
 Development data is stored in `.tidu-dev/tidu.sqlite`, isolated from globally installed data. Vite hot-reloads frontend source, and backend TypeScript changes restart the local runtime automatically.
 
@@ -26,7 +25,9 @@ The configuration page is the single upstream selector for the AI-Tidu9 virtual 
 
 AI-Tidu9 keeps only its original installation baseline and latest rollback point in its own backup directory; unrelated Codex configuration backups are never removed.
 
-In development mode, the Services page shows only `tidu:dev-p` and `tidu:cli-p`, never the locally installed service rows. Before starting, `tidu:dev-p` checks the installed-runtime lock and default port. On conflict it stops and asks for `tidu service stop && tidu uninstall --confirm DELETE`; it never removes data automatically.
+The Services page separately shows `tidu:dev-frontend-p`, `tidu:dev-cli-p`, and `tidu:dev-api-p`. Every service has its own PID, status, command, and start, stop, and restart actions. Enterprise development uses the matching `-e` commands. Installed and remote runtimes use the same service contract and list only the active edition. Personal installations do not expose enterprise commands; enterprise installations do not expose personal commands. Use `tidu service status` or `tidu service <start|stop|restart> <service-id|all>` from the CLI.
+
+Before starting, `tidu:dev-p` checks the installed-runtime lock and default port. On conflict it stops and asks for `tidu service stop all && tidu uninstall --confirm DELETE`; it never removes data automatically.
 
 Before switching to AI-Tidu9, the local runtime must be reachable and pass a minimal inference check. A failed check leaves or restores Official mode and reports the concrete error. A normal local development shutdown also restores Official mode when AI-Tidu9 mode is active.
 

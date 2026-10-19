@@ -32,7 +32,8 @@ tidu <命令> --help             # 任意命令的专属帮助
 
 | 命令 | 用途 | 是否修改状态 |
 | --- | --- | --- |
-| `tidu start [--cli] [--edition personal|enterprise]` | 启动个人版或企业版运行时；可进入终端五步向导 | 启动进程；个人版对企业控制面只读 |
+| `tidu start [--cli]` | 启动当前安装版型的服务组；可进入终端向导 | 启动进程；安装版不能切换到另一版型 |
+| `tidu service [status|start|stop|restart] [service-id|all]` | 查看或操作前端、CLI 与接口服务 | `status` 不修改；其他动作修改服务状态 |
 | `tidu setup [动作]` | 离线安装、验证、修复、更新或卸载客户端连接器 | 除 `verify` 外会修改客户端配置 |
 | `tidu mcp` | 运行供Agent宿主调用的stdio MCP桥 | 否 |
 | `tidu doctor` | 检查运行时、配置API和页面；可输出隐私安全报告 | 否 |
@@ -50,13 +51,14 @@ tidu <命令> --help             # 任意命令的专属帮助
 ## 🩺 启动与诊断
 
 ```bash
-tidu start --edition personal [--cli]
-tidu start --edition enterprise [--cli]
+tidu start [--cli]
+tidu service status [--endpoint <url>]
+tidu service <start|stop|restart> <service-id|all> [--endpoint <url>]
 tidu doctor [--json] [--endpoint <url>]
 tidu mcp [--endpoint <url>]
 ```
 
-`start` 输出配置中心地址。安装/部署时用 `--edition` 选择个人版或企业版；默认版型为个人版。企业版要求通过部署环境注入 `TIDU_POSTGRES_URL`，并使用独立的数据文件。两版同时运行时还要设置不同的 `TIDU_PORT`。个人版连接企业控制面时只读企业信息，企业管理接口由服务端拒绝。增加 `--cli` 后，会依次检查运行环境、选择模式、配置统一入口、确认启用并安装已发现的连接器。`doctor` 不修改配置；`--json` 生成不含主机名、凭据、路径或会话的公开诊断摘要。`mcp` 通常由连接器自动启动，无需日常手动运行。
+`start` 输出配置中心地址。已安装 CLI 固定为安装时选择的版型：个人版只提供个人命令，企业版只提供企业命令。本地仓库开发才同时提供 `-p` 与 `-e` 两套 npm 命令。企业版要求通过部署环境注入 `TIDU_POSTGRES_URL`。个人版连接企业控制面时只读企业信息。`doctor` 不修改配置；`--json` 生成隐私安全摘要。
 
 常用启动环境变量：
 
@@ -67,7 +69,7 @@ tidu mcp [--endpoint <url>]
 | `TIDU_PROVIDER`、`TIDU_PROVIDER_MODEL` | 可选的供应商与模型覆盖；默认使用当前已登录的 Codex 或 Cursor 宿主模型 |
 | `TIDU_PROVIDER_API_KEY`、`TIDU_PROVIDER_BASE_URL` | OpenAI 兼容服务覆盖的运行时密钥和服务地址 |
 | `TIDU_POSTGRES_URL` | 启用企业控制平面和PostgreSQL任务状态 |
-| `TIDU_EDITION` | 运行版型；可用 `personal` 或 `enterprise`，也可通过 `tidu start --edition` 指定 |
+| `TIDU_EDITION` | 安装时确定的运行版型；可用 `personal` 或 `enterprise` |
 | `TIDU_ENDPOINT` | CLI默认管理地址，等价于 `--endpoint` |
 | `OPENAI_API_KEY`、`OPENAI_MODEL` | CI或无宿主环境中的OpenAI官方API通道 |
 | `DEEPSEEK_API_KEY`、`DEEPSEEK_MODEL` | DeepSeek兼容通道 |
@@ -90,7 +92,7 @@ tidu clients switch codex <official|ai-tidu9> [--yes] [--endpoint <url>]
 tidu clients rollback codex [--yes]
 ```
 
-`setup` 默认动作是 `install`，不要求预先启动运行时。它会安装连接器并准备九门配置，但保持官方直连生效。`clients switch codex ai-tidu9` 只在 Codex 中增加一个九门虚拟模型；官方或公司上游模型在九门配置页选择，公司模型不会成为独立 Codex 模型项。`clients switch codex official` 恢复仅显示官方模型。官方账号、套餐和额度仍由官方 Codex 管理。九门自有备份只保留首次安装基线与最新回滚点。
+`setup` 默认动作是 `install`，不要求预先启动运行时。它会安装连接器、准备九门配置并自动启动当前版型的全部服务，但保持官方直连生效。`clients switch codex ai-tidu9` 只在 Codex 中增加一个九门虚拟模型；官方或公司上游模型在九门配置页选择，公司模型不会成为独立 Codex 模型项。`clients switch codex official` 恢复仅显示官方模型。官方账号、套餐和额度仍由官方 Codex 管理。九门自有备份只保留首次安装基线与最新回滚点。
 
 安装后的同一个 MCP 连接器会向 Codex 插件和 Cursor 提供 `list_tidu_channels` 与 `route_tidu_channel`。宿主自己的模型列表不被覆盖；选择 `codex` 或 `cursor` 时由官方宿主进程执行，选择 `tidu` 时走九门运行时，选择厂商ID时读取当前连接器进程的环境变量。
 
