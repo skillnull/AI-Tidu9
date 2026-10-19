@@ -32,6 +32,15 @@ export interface CursorHostLoginState {
   accountPlan?: string | null;
 }
 
+export interface CursorHostModel {
+  /** Cursor-owned model identifier accepted by the Agent CLI. */
+  id: string;
+  /** Human-readable model name published by Cursor. */
+  name: string;
+  /** Whether Cursor marks this entry as the account's default model. */
+  default: boolean;
+}
+
 export interface CursorHostInspectionOptions {
   /** Optional official Cursor Agent executable override used by packaged environments and tests. */
   command?: string;
@@ -123,6 +132,34 @@ const parseAccountPlan = (output: string): string | null => {
   } catch {
     return null;
   }
+};
+
+const parseCursorModels = (output: string): CursorHostModel[] =>
+  output
+    .split(/\r?\n/u)
+    .map((line) => line.replace(/\p{Cf}/gu, "").trim())
+    .flatMap((line) => {
+      const match = /^(\S+)\s+-\s+(.+?)(\s+\(default\))?$/u.exec(line);
+      if (match === null) return [];
+      const [, id, name, defaultMarker] = match;
+      if (id === undefined || name === undefined) return [];
+      return [{ id, name: name.trim(), default: defaultMarker !== undefined }];
+    });
+
+export const listCursorHostModels = (
+  options: CursorHostInspectionOptions = {},
+): CursorHostModel[] => {
+  for (const command of resolveCursorCommands(options)) {
+    const result = spawnSync(command, ["--list-models"], {
+      encoding: "utf8",
+      env: resolveEnvironment(options),
+      timeout: options.timeoutMilliseconds ?? DEFAULT_STATUS_TIMEOUT_MILLISECONDS,
+    });
+    if ((result.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") continue;
+    if (result.status !== 0) return [];
+    return parseCursorModels(result.stdout ?? "");
+  }
+  return [];
 };
 
 const supportsCursorAcp = (command: string, options: CursorHostInspectionOptions): boolean => {

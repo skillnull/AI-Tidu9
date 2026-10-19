@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { inspectCodexHostLogin } from "../accounts/codex-host.js";
-import { inspectCursorHostLogin } from "../accounts/cursor-host.js";
+import { inspectCursorHostLogin, listCursorHostModels } from "../accounts/cursor-host.js";
 import {
   type CodexAccountSummary,
   type CodexAgentClient,
@@ -342,10 +342,10 @@ export const createCursorHostModelProvider = async (): Promise<ModelProvider | u
   }
   const workingDirectory = await mkdtemp(join(tmpdir(), "tidu-cursor-model-discovery-"));
   const client = createCursorAcpClient({ workingDirectory, mode: "ask" });
-  let model: string | undefined;
+  let reportedModel: string | undefined;
   try {
     await client.initialize();
-    model = (await client.createSession()).model ?? undefined;
+    reportedModel = (await client.createSession()).model ?? undefined;
   } catch {
     return undefined;
   } finally {
@@ -355,17 +355,32 @@ export const createCursorHostModelProvider = async (): Promise<ModelProvider | u
       await rm(workingDirectory, { recursive: true, force: true }).catch(() => undefined);
     }
   }
+  const catalog = listCursorHostModels();
+  const model =
+    reportedModel !== undefined && reportedModel !== "current"
+      ? reportedModel
+      : catalog.find((candidate) => candidate.default)?.id;
   if (model === undefined) return undefined;
+  const publishedCatalog = catalog.map((candidate) => ({
+    id: candidate.id,
+    name: candidate.name,
+    capabilities: ["text", "code", "tool-use"],
+    capabilitySource: "provider-catalog" as const,
+  }));
+  const models = publishedCatalog.some((candidate) => candidate.id === model)
+    ? publishedCatalog
+    : [
+        {
+          id: model,
+          name: model,
+          capabilities: ["text", "code", "tool-use"],
+          capabilitySource: "provider-catalog" as const,
+        },
+        ...publishedCatalog,
+      ];
   return {
     descriptor: { type: "cursor-host", model },
-    listModels: async () => [
-      {
-        id: model,
-        name: model,
-        capabilities: ["text", "code", "tool-use"],
-        capabilitySource: "provider-catalog" as const,
-      },
-    ],
+    listModels: async () => models,
     execute: async (request): Promise<ProviderExecutionResult> => {
       const workingDirectory = await mkdtemp(join(tmpdir(), "tidu-model-"));
       const client = createCursorAcpClient({ workingDirectory, mode: "ask" });

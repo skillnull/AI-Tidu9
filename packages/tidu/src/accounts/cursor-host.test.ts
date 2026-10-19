@@ -8,6 +8,7 @@ import {
   createCursorAcpLaunch,
   formatCursorHostLogin,
   inspectCursorHostLogin,
+  listCursorHostModels,
   reloginCursorHost,
   switchCursorHostAccount,
 } from "./cursor-host.js";
@@ -28,6 +29,10 @@ const createFakeCursorAgent = (directory: string): string => {
       "fi",
       'if [ "$1" = "acp" ] && [ "$2" = "--help" ]; then',
       '  printf "Start Agent Client Protocol server\\n"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "--list-models" ]; then',
+      '  printf "Available models\\n\\nauto - Auto (default)\\ngpt-test - GPT Test\\n"',
       "  exit 0",
       "fi",
       'printf "%s\\n" "$*" >> "$CURSOR_TEST_LOG"',
@@ -64,6 +69,22 @@ test("reuses Cursor login through the official full-capability ACP process", () 
     assert.deepEqual(launch.arguments, ["acp"]);
     assert.equal("CURSOR_API_KEY" in launch.environment, false);
     assert.equal("CURSOR_AUTH_TOKEN" in launch.environment, false);
+  } finally {
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
+test("lists concrete Cursor models and marks the default", () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-cursor-models-"));
+  try {
+    const models = listCursorHostModels({
+      command: createFakeCursorAgent(temporaryDirectory),
+      environment: {},
+    });
+    assert.deepEqual(models, [
+      { id: "auto", name: "Auto", default: true },
+      { id: "gpt-test", name: "GPT Test", default: false },
+    ]);
   } finally {
     rmSync(temporaryDirectory, { force: true, recursive: true });
   }

@@ -204,6 +204,7 @@ const MODEL_CAPABILITIES = [
 type CatalogModel = {
   id: string;
   name: string;
+  isDefault?: boolean;
   capabilities?: readonly string[];
   capabilitySource?: "company-published" | "host-catalog" | "provider-catalog";
   inputCostPerMillionTokens?: number | null;
@@ -767,41 +768,6 @@ export const modeLabel = (mode: ConfigurationMode, locale: "en-US" | "zh-CN" = "
     : mode === "managed"
       ? "Normal"
       : "Expert";
-
-const providerReasonLabel = (reason: string | undefined, locale: "en-US" | "zh-CN"): string => {
-  const chinese: Record<string, string> = {
-    "codex-cli-unavailable": "Codex CLI 未安装或命令不可用",
-    "codex-not-authenticated": "Codex CLI 尚未登录",
-    "codex-model-undiscovered": "Codex CLI 未返回当前模型配置",
-    "cursor-cli-unavailable": "Cursor Agent CLI 未安装或命令不可用",
-    "cursor-not-authenticated": "Cursor Agent CLI 尚未登录",
-    "cursor-acp-unavailable": "Cursor Agent CLI 未提供 ACP 模型配置",
-    "cursor-model-undiscovered": "Cursor ACP 未返回当前模型配置",
-    "ollama-unavailable": "无法连接本机 Ollama 服务",
-    "ollama-no-models": "Ollama 服务已启动，但尚未安装模型",
-    "compatible-provider-not-active": "当前运行未使用兼容服务；切换并重启后可重新检测",
-    "detection-failed": "读取配置失败，请稍后重新检测",
-  };
-  const englishLabels: Record<string, string> = {
-    "codex-cli-unavailable": "Codex CLI is unavailable",
-    "codex-not-authenticated": "Codex CLI is not signed in",
-    "codex-model-undiscovered": "Codex CLI did not report its current model configuration",
-    "cursor-cli-unavailable": "Cursor Agent CLI is unavailable",
-    "cursor-not-authenticated": "Cursor Agent CLI is not signed in",
-    "cursor-acp-unavailable": "Cursor Agent CLI does not expose model configuration over ACP",
-    "cursor-model-undiscovered": "Cursor ACP did not report its current model configuration",
-    "ollama-unavailable": "The local Ollama service is unreachable",
-    "ollama-no-models": "Ollama is running but has no installed models",
-    "compatible-provider-not-active":
-      "The compatible service is not active; switch and restart to detect it",
-    "detection-failed": "Configuration lookup failed; try again",
-  };
-  const labels = locale === "zh-CN" ? chinese : englishLabels;
-  return (
-    labels[reason ?? ""] ??
-    (locale === "zh-CN" ? "未发现该服务的模型配置" : "No model configuration found")
-  );
-};
 
 export const clientReadinessLabel = (
   readiness: ConfigCenterBootstrap["clients"]["clients"][number]["readiness"],
@@ -1570,7 +1536,6 @@ export const QuickStartWizard = ({
     status: "idle" | "checking" | "ready" | "unavailable" | "restart-required";
     provider?: string;
     model?: string;
-    reason?: string;
     account?: {
       status: string;
       type: string | null;
@@ -1578,7 +1543,6 @@ export const QuickStartWizard = ({
       plan: string | null;
     } | null;
   }>({ status: "idle" });
-  const [providerCheckRevision, setProviderCheckRevision] = useState(0);
   const [upstreamCatalog, setUpstreamCatalog] = useState<UpstreamModelCatalog>({
     companyConfigured: false,
     companyProviderType: null,
@@ -1624,20 +1588,6 @@ export const QuickStartWizard = ({
           : english
             ? "Compatible provider"
             : "兼容服务";
-  const activeProviderLabel =
-    activeProviderChoice === "codex-host"
-      ? "Codex"
-      : activeProviderChoice === "cursor-host"
-        ? "Cursor"
-        : activeProviderChoice === "ollama"
-          ? "Ollama"
-          : activeProviderChoice === "compatible"
-            ? english
-              ? "Compatible provider"
-              : "兼容服务"
-            : english
-              ? "Unconfigured"
-              : "未配置";
   const customModel = modelChoiceMode === "custom" ? form.modelSelection.model : "";
   const hostModelOptions =
     providerChoice === "codex-host"
@@ -1759,6 +1709,22 @@ export const QuickStartWizard = ({
       specialists,
       maximumSpecialists: Math.max(1, specialists.length),
     });
+  useEffect(() => {
+    if (upstreamCatalogStatus !== "ready") return;
+    let changed = false;
+    const specialists = activeHostPolicy.specialists.map((specialist) => {
+      if (specialist.host !== "cursor" || specialist.model !== "current") return specialist;
+      const defaultModel = upstreamCatalog.hosts.cursor.models.find((model) => model.isDefault);
+      if (defaultModel === undefined) return specialist;
+      changed = true;
+      return {
+        ...specialist,
+        model: defaultModel.id,
+        capabilities: defaultModel.capabilities ?? [],
+      };
+    });
+    if (changed) updateSpecialists(specialists);
+  }, [activeHostPolicy.specialists, upstreamCatalog.hosts.cursor.models, upstreamCatalogStatus]);
   const selectProvider = (choice: "codex-host" | "cursor-host" | "ollama" | "compatible"): void => {
     modelChoiceTouchedRef.current = true;
     providerChoiceTouchedRef.current = true;
@@ -1897,7 +1863,7 @@ export const QuickStartWizard = ({
         });
         setUpstreamCatalogStatus("error");
       });
-  }, [step, providerCheckRevision]);
+  }, [step]);
   useEffect(() => {
     if (step !== 2 || activeProviderChoice === null) {
       setProviderCheck({ status: "idle" });
@@ -1921,7 +1887,6 @@ export const QuickStartWizard = ({
             detected?: boolean;
             matchesRuntime?: boolean;
             model?: string | null;
-            reason?: string | null;
             account?: {
               status: string;
               type: string | null;
@@ -1940,7 +1905,6 @@ export const QuickStartWizard = ({
               ? "ready"
               : "restart-required",
           ...(result.model ? { model: result.model } : {}),
-          ...(result.reason ? { reason: result.reason } : {}),
           account: result.account ?? null,
         });
       })
@@ -1949,13 +1913,12 @@ export const QuickStartWizard = ({
           setProviderCheck({
             status: "unavailable",
             provider: activeProviderChoice,
-            reason: "detection-failed",
           });
       });
     return () => {
       current = false;
     };
-  }, [step, activeProviderChoice, providerCheckRevision]);
+  }, [step, activeProviderChoice]);
   const canAdvance =
     step === 1
       ? entryIsValid
@@ -2201,8 +2164,27 @@ export const QuickStartWizard = ({
             )}
           </>
         ) : step === 2 ? (
-          <>
+          <div className="provider-model-step">
             <section className="provider-monitor provider-draft-configuration">
+              {providerCheck.account ? (
+                <div className="provider-account-summary">
+                  <span>
+                    {english ? "Account" : "账号"} ·{" "}
+                    {providerCheck.account.status === "authenticated"
+                      ? english
+                        ? "Signed in"
+                        : "已登录"
+                      : english
+                        ? "Not signed in"
+                        : "未登录"}
+                  </span>
+                  {providerCheck.account.email ? (
+                    <strong>{providerCheck.account.email}</strong>
+                  ) : null}
+                  {providerCheck.account.type ? <span>{providerCheck.account.type}</span> : null}
+                  {providerCheck.account.plan ? <span>{providerCheck.account.plan}</span> : null}
+                </div>
+              ) : null}
               <div className="provider-monitor-heading">
                 <div>
                   <span className="configuration-scope-badge">
@@ -2352,7 +2334,7 @@ export const QuickStartWizard = ({
                       ) : null}
                       {modelSelectOptions.map((model) => (
                         <option key={model.id} value={model.id}>
-                          {model.name === model.id ? model.id : `${model.name} · ${model.id}`}
+                          {model.name}
                         </option>
                       ))}
                     </select>
@@ -2540,7 +2522,8 @@ export const QuickStartWizard = ({
                                   {english ? `Specialist ${index + 1}` : `副模型 ${index + 1}`}
                                 </span>
                                 <strong>
-                                  {specialist.model ||
+                                  {selectedCatalogModel?.name ||
+                                    specialist.model ||
                                     (english ? "Model not selected" : "尚未选择模型")}
                                 </strong>
                               </div>
@@ -2627,7 +2610,7 @@ export const QuickStartWizard = ({
                                 </option>
                                 {modelOptions.map((model) => (
                                   <option key={model.id} value={model.id}>
-                                    {model.name} · {model.id}
+                                    {model.name}
                                   </option>
                                 ))}
                               </select>
@@ -2796,90 +2779,7 @@ export const QuickStartWizard = ({
                 </>
               ) : null}
             </section>
-            <aside className="active-runtime-snapshot" role="status" aria-live="polite">
-              <div className="active-runtime-snapshot-heading">
-                <div>
-                  <span className="configuration-scope-badge">
-                    {english ? "Active · Read only" : "当前生效 · 只读"}
-                  </span>
-                  <strong>{activeProviderLabel}</strong>
-                  <small>
-                    {english
-                      ? "This snapshot stays unchanged until a new configuration is activated."
-                      : "新配置启用前，此处始终展示当前运行状态。"}
-                  </small>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setProviderCheckRevision((revision) => revision + 1)}
-                  disabled={providerCheck.status === "checking"}
-                >
-                  {providerCheck.status === "checking"
-                    ? english
-                      ? "Reading configuration…"
-                      : "正在读取配置…"
-                    : english
-                      ? "Check again"
-                      : "重新检测"}
-                </button>
-              </div>
-              <p>
-                {providerCheck.status === "checking"
-                  ? english
-                    ? `Reading active ${activeProviderLabel} model configuration…`
-                    : `正在读取当前生效的 ${activeProviderLabel} 模型配置…`
-                  : providerCheck.status === "ready"
-                    ? english
-                      ? `Active model configuration: ${providerCheck.model}.`
-                      : `当前生效模型：${providerCheck.model}。`
-                    : providerCheck.status === "restart-required"
-                      ? english
-                        ? "The active runtime provider and its detected configuration do not match."
-                        : "当前运行宿主与检测到的配置不一致。"
-                      : providerCheck.status === "unavailable"
-                        ? english
-                          ? `The active ${activeProviderLabel} configuration was not found: ${providerReasonLabel(providerCheck.reason, locale)}.`
-                          : `未获取到当前 ${activeProviderLabel} 配置：${providerReasonLabel(providerCheck.reason, locale)}。`
-                        : english
-                          ? "No active model provider is configured."
-                          : "当前没有已生效的模型宿主。"}
-              </p>
-              <p className="provider-monitor-note">
-                {english
-                  ? "Configuration lookup only. It does not send a model request."
-                  : "仅读取配置，不会发送模型请求。"}
-              </p>
-              {providerCheck.account ? (
-                <div className="provider-account">
-                  <p>
-                    {english ? "Account status" : "账号状态"}：
-                    {providerCheck.account.status === "authenticated"
-                      ? english
-                        ? "Signed in"
-                        : "已登录"
-                      : english
-                        ? "Not signed in"
-                        : "未登录"}
-                  </p>
-                  {providerCheck.account.type ? (
-                    <p>
-                      {english ? "Account type" : "账号类型"}：{providerCheck.account.type}
-                    </p>
-                  ) : null}
-                  {providerCheck.account.email ? (
-                    <p>
-                      {english ? "Account" : "当前账号"}：{providerCheck.account.email}
-                    </p>
-                  ) : null}
-                  {providerCheck.account.plan ? (
-                    <p>
-                      {english ? "Plan" : "账号套餐"}：{providerCheck.account.plan}
-                    </p>
-                  ) : null}
-                </div>
-              ) : null}
-            </aside>
-          </>
+          </div>
         ) : step === 3 ? (
           <>
             <p className="onboarding-kicker">{english ? "Safe activation" : "安全启用"}</p>

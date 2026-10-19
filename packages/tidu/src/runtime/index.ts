@@ -2130,16 +2130,20 @@ const handleRequest = async (
     const cursorLogin = inspectCursorHostLogin();
     const cursorModels =
       cursorCatalogModels.length > 0
-        ? cursorCatalogModels
+        ? cursorCatalogModels.map((model) => ({
+            ...model,
+            isDefault: model.id === cursorProvider?.descriptor.model,
+          }))
         : cursorLogin.reusable
           ? [
               {
-                id: cursorProvider?.descriptor.model ?? "current",
-                name: cursorProvider?.descriptor.model ?? "跟随 Cursor 当前模型",
+                id: cursorProvider?.descriptor.model ?? "",
+                name: cursorProvider?.descriptor.model ?? "",
                 capabilities: ["text", "code", "tool-use"],
                 capabilitySource: "provider-catalog" as const,
+                isDefault: true,
               },
-            ]
+            ].filter((model) => model.id !== "")
           : [];
     const companyProvider = ollamaProvider ?? compatibleProvider;
     const companyModels = ollamaProvider === undefined ? compatibleModels : ollamaModels;
