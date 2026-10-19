@@ -1219,7 +1219,20 @@ const handleRequest = async (
     const status = await capabilityCompletionProvider?.inspectCapabilityCompletion();
     const enterpriseState = await enterprise?.snapshot();
     const remoteCompany = await storage.enterpriseConnectionStore?.load();
+    const activeHost: AgentHostId | null =
+      provider?.descriptor.type === "codex-host"
+        ? "codex"
+        : provider?.descriptor.type === "cursor-host"
+          ? "cursor"
+          : provider?.descriptor.type === "ollama"
+            ? "ollama"
+            : provider?.descriptor.type === "openai-compatible"
+              ? "openai-compatible"
+              : workspace.active.configuration.modelSelection.source === "official"
+                ? "codex"
+                : null;
     sendJson(response, 200, {
+      activeHost,
       available: capabilityCompletionProvider !== undefined,
       operational:
         capabilityCompletionProvider !== undefined &&

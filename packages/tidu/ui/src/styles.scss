@@ -2257,51 +2257,21 @@ h2 {
   margin-top: 8px;
 }
 
-.capability-status-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
-  margin-top: 22px;
-}
-
-.capability-status-grid article,
 .capability-records article {
   border: 1px solid #24303c;
   border-radius: 12px;
   padding: 16px;
 }
 
-.capability-status-grid span,
-.capability-status-grid small,
 .capability-records span,
 .capability-records p {
   color: #8794a5;
 }
 
-.capability-status-grid strong,
-.capability-status-grid small {
-  display: block;
-  margin-top: 8px;
-  overflow-wrap: anywhere;
-}
-
-.host-agent-flow {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 16px;
-  margin: 18px 0;
-  padding: 16px;
-  border-radius: 12px;
-  background: #101820;
-  color: #73d8cc;
-  text-align: center;
-}
-
 .capability-host-policies {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  margin: 0 -5px 18px;
+  margin: 14px -5px 18px;
 
   article {
     margin: 5px;
@@ -2309,13 +2279,27 @@ h2 {
     border: 1px solid #24303c;
     border-radius: 10px;
 
-    > div {
+    .capability-host-policy-heading {
       display: flex;
+      align-items: center;
       justify-content: space-between;
       column-gap: 12px;
 
-      span {
-        color: #6fcbbf;
+      > div {
+        display: grid;
+        row-gap: 4px;
+
+        span {
+          font-size: 11px;
+
+          &.enabled {
+            color: #6fcbbf;
+          }
+
+          &.disabled {
+            color: #8794a5;
+          }
+        }
       }
     }
 
@@ -2337,10 +2321,6 @@ h2 {
 }
 
 @media (max-width: 900px) {
-  .capability-status-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .capability-host-policies {
     grid-template-columns: minmax(0, 1fr);
   }

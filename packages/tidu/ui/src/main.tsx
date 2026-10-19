@@ -1,6 +1,10 @@
 import { StrictMode, useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { type ConfigurationMode, validateConfiguration } from "../../src/config/index.js";
+import {
+  type AgentHostId,
+  type ConfigurationMode,
+  validateConfiguration,
+} from "../../src/config/index.js";
 import type { ConfigCenterBootstrap } from "../../src/config-center/contracts.js";
 import "./styles.scss";
 import {
@@ -134,6 +138,7 @@ const App = () => {
   const [locale, setLocale] = useState<"en-US" | "zh-CN">("zh-CN");
   const [selectedMode, setSelectedMode] = useState<ConfigurationMode>("managed");
   const [configurationView, setConfigurationView] = useState<"active" | "edit">("active");
+  const [configurationTargetHost, setConfigurationTargetHost] = useState<AgentHostId>();
   const selectedModeRef = useRef<ConfigurationMode>("managed");
   const hasLoadedWorkspace = useRef(false);
   const [configurationForm, setConfigurationForm] = useState<ConfigurationForm>({
@@ -673,7 +678,10 @@ const App = () => {
           }
           type="button"
           aria-current={activeSection === "configuration" ? "page" : undefined}
-          onClick={() => setActiveSection("configuration")}
+          onClick={() => {
+            setConfigurationTargetHost(undefined);
+            setActiveSection("configuration");
+          }}
         >
           {locale === "zh-CN" ? "配置" : "Configuration"}
         </button>
@@ -746,7 +754,8 @@ const App = () => {
       {activeSection === "capabilities" ? (
         <CapabilityCompletionPanel
           locale={locale}
-          onEdit={() => {
+          onEdit={(host) => {
+            setConfigurationTargetHost(host);
             setActiveSection("configuration");
             setConfigurationView("edit");
           }}
@@ -895,6 +904,7 @@ const App = () => {
               providerConfigured={bootstrap.runtime.provider.configured}
               providerType={bootstrap.runtime.provider.type}
               providerModel={bootstrap.runtime.provider.model}
+              targetHost={configurationTargetHost}
               selectedMode={selectedMode}
               form={form}
               isDirty={isDirty}

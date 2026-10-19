@@ -100,22 +100,40 @@ interface TaskListResponse {
 }
 
 interface CapabilityCompletionStatusResponse {
+  /** Host currently backing the active primary model, when identifiable. */
+  activeHost: AgentHostId | null;
+  /** Whether capability completion can be executed by this runtime. */
   available: boolean;
+  /** Whether the active policy has at least one usable specialist. */
   operational: boolean;
+  /** Active capability-completion configuration. */
   configuration: CapabilityCompletionConfiguration;
+  /** Active primary-model selection. */
   mainModel: ModelSelection;
+  /** Recent bounded routing records. */
   records: readonly {
+    /** Host that originated the request. */
     host: AgentHostId;
+    /** ISO timestamp for this routing decision. */
     occurredAt: string;
+    /** Agent role handled by the request. */
     role: string;
+    /** Whether a specialist was invoked. */
     complemented: boolean;
+    /** Final routing outcome. */
     outcome: "failed" | "succeeded";
+    /** Primary model used for the request. */
     mainModelId: string;
+    /** Specialist models used for the request. */
     specialistModelIds: readonly string[];
+    /** Capabilities required by the request. */
     requiredCapabilities: readonly string[];
+    /** Capabilities the primary model did not provide. */
     missingCapabilities: readonly string[];
   }[];
+  /** Connected company capability summary. */
   company: { connected: boolean; publishedCapabilityCount: number };
+  /** Host entry points exposed by the runtime. */
   hosts: readonly string[];
 }
 
@@ -251,7 +269,7 @@ export const CapabilityCompletionPanel = ({
   onEdit,
 }: {
   locale: "en-US" | "zh-CN";
-  onEdit: () => void;
+  onEdit: (host: AgentHostId) => void;
 }) => {
   const english = locale === "en-US";
   const [status, setStatus] = useState<CapabilityCompletionStatusResponse>();
@@ -285,99 +303,65 @@ export const CapabilityCompletionPanel = ({
           <button type="button" onClick={() => void refresh()}>
             {english ? "Refresh" : "刷新"}
           </button>
-          <button type="button" className="primary-button" onClick={onEdit}>
-            {english ? "Edit policy" : "配置互补"}
-          </button>
         </div>
       </div>
       {message ? <p role="status">{message}</p> : null}
       {status ? (
         <>
-          <div className="capability-status-grid">
-            <article>
-              <span>{english ? "Runtime" : "运行状态"}</span>
-              <strong>
-                {!status.available
-                  ? english
-                    ? "Provider unavailable"
-                    : "模型服务不可用"
-                  : status.operational
-                    ? english
-                      ? "Enabled · Ready"
-                      : "已开启"
-                    : status.configuration.enabled
-                      ? english
-                        ? "Enabled · Needs specialists"
-                        : "已开启 · 待配置专家"
-                      : english
-                        ? "Disabled"
-                        : "已关闭"}
-              </strong>
-            </article>
-            <article>
-              <span>{english ? "Primary model" : "主模型"}</span>
-              <strong>
-                {status.mainModel.source} · {status.mainModel.model}
-              </strong>
-              <small>{status.configuration.mainCapabilities.join(" · ")}</small>
-            </article>
-            <article>
-              <span>{english ? "Specialist pool" : "专家模型池"}</span>
-              <strong>{status.configuration.specialists.length}</strong>
-              <small>
-                {status.configuration.specialists.map((model) => model.model).join(" · ") ||
-                  (english ? "Not configured" : "尚未配置")}
-              </small>
-            </article>
-            <article>
-              <span>{english ? "Company capabilities" : "公司能力"}</span>
-              <strong>
-                {status.company.connected
-                  ? status.company.publishedCapabilityCount
-                  : english
-                    ? "Not connected"
-                    : "未接入"}
-              </strong>
-              <small>{english ? "Published by company service" : "由公司服务发布"}</small>
-            </article>
-          </div>
-          <div className="host-agent-flow">
-            <span>{status.hosts.join(" · ")}</span>
-            <b>→</b>
-            <strong>{english ? "AI-Tidu9 Agent" : "九门 Agent"}</strong>
-            <b>→</b>
-            <span>
-              {english ? "Primary + specialists + verifier" : "主模型 + 专家模型 + 验收器"}
-            </span>
-          </div>
           <div className="capability-host-policies">
             {(["codex", "cursor", "ollama", "openai-compatible"] as const).map((host) => {
-              const policy = status.configuration.hostPolicies?.[host];
+              const configuredPolicy = status.configuration.hostPolicies?.[host];
+              const policy =
+                configuredPolicy ??
+                (status.activeHost === host
+                  ? {
+                      mainModel: status.mainModel,
+                      mainCapabilities: status.configuration.mainCapabilities,
+                      specialists: status.configuration.specialists,
+                      maximumSpecialists: status.configuration.maximumSpecialists,
+                    }
+                  : undefined);
+              const enabled = status.configuration.enabled && policy !== undefined;
               return (
                 <article key={host}>
-                  <div>
-                    <strong>{host}</strong>
-                    <span>
-                      {policy
-                        ? english
-                          ? "Independent policy configured"
-                          : "已配置独立策略"
-                        : english
-                          ? "Uses default policy"
-                          : "使用默认策略"}
-                    </span>
+                  <div className="capability-host-policy-heading">
+                    <div>
+                      <strong>{host}</strong>
+                      <span className={enabled ? "enabled" : "disabled"}>
+                        {enabled
+                          ? english
+                            ? "Completion enabled"
+                            : "互补已开启"
+                          : english
+                            ? "Completion disabled"
+                            : "互补已关闭"}
+                      </span>
+                    </div>
+                    <button type="button" onClick={() => onEdit(host)}>
+                      {english ? "Quick configure" : "快速配置"}
+                    </button>
                   </div>
-                  <p>
-                    {english ? "Primary" : "主模型"}：
-                    {policy ? `${policy.mainModel.source} · ${policy.mainModel.model}` : "—"}
-                  </p>
-                  <p>
-                    {english ? "Specialists" : "副模型"}：
-                    {policy?.specialists
-                      .map((model) => `${model.host} · ${model.model}`)
-                      .filter(Boolean)
-                      .join(" · ") || (english ? "None" : "未配置")}
-                  </p>
+                  {enabled && policy ? (
+                    <div className="capability-host-policy-details">
+                      <p>
+                        {english ? "Primary" : "主模型"}：{policy.mainModel.source} ·{" "}
+                        {policy.mainModel.model}
+                      </p>
+                      <p>
+                        {english ? "Specialists" : "副模型"}：
+                        {policy.specialists
+                          .map((model) => `${model.host} · ${model.model}`)
+                          .filter(Boolean)
+                          .join(" · ") || (english ? "Not configured" : "未配置")}
+                      </p>
+                      <p>
+                        {english ? "Capabilities" : "已选能力"}：
+                        {policy.mainCapabilities
+                          .map((capability) => capabilityLabel(capability, english))
+                          .join(" · ") || (english ? "Not configured" : "未配置")}
+                      </p>
+                    </div>
+                  ) : null}
                 </article>
               );
             })}
@@ -1478,6 +1462,8 @@ interface QuickStartWizardProps {
   providerType: string | null;
   /** Sanitized active upstream model name. */
   providerModel: string | null;
+  /** Host selected by a capability-card quick configuration action. */
+  targetHost?: AgentHostId;
   /** Currently selected isolated draft. */
   selectedMode: ConfigurationMode;
   /** Editable entry identity. */
@@ -1534,6 +1520,7 @@ export const QuickStartWizard = ({
   providerConfigured,
   providerType,
   providerModel,
+  targetHost,
   selectedMode,
   form,
   isDirty,
@@ -1550,17 +1537,25 @@ export const QuickStartWizard = ({
   onOpenClients,
 }: QuickStartWizardProps) => {
   const english = locale === "en-US";
-  const [step, setStep] = useState(0);
+  const [step, setStep] = useState(targetHost === undefined ? 0 : 2);
   const [providerChoice, setProviderChoice] = useState<
     "codex-host" | "cursor-host" | "ollama" | "compatible"
   >(() =>
-    providerType === "cursor-host"
-      ? "cursor-host"
-      : providerType === "ollama"
-        ? "ollama"
-        : providerType === "openai-compatible"
-          ? "compatible"
-          : "codex-host",
+    targetHost === "codex"
+      ? "codex-host"
+      : targetHost === "cursor"
+        ? "cursor-host"
+        : targetHost === "ollama"
+          ? "ollama"
+          : targetHost === "openai-compatible"
+            ? "compatible"
+            : providerType === "cursor-host"
+              ? "cursor-host"
+              : providerType === "ollama"
+                ? "ollama"
+                : providerType === "openai-compatible"
+                  ? "compatible"
+                  : "codex-host",
   );
   const [modelChoiceMode, setModelChoiceMode] = useState<"company" | "custom" | "host">(
     form.modelSelection.source === "company"
@@ -1595,9 +1590,9 @@ export const QuickStartWizard = ({
     "loading",
   );
   useEffect(() => {
-    setStep(selectedMode === "expert" ? 1 : 0);
+    setStep(targetHost === undefined ? (selectedMode === "expert" ? 1 : 0) : 2);
     setProviderCheck({ status: "idle" });
-  }, [selectedMode]);
+  }, [selectedMode, targetHost]);
   const stepLabels = english
     ? ["Deployment", "Entry", "Model", "Activate", "Clients (optional)"]
     : ["部署", "入口", "模型", "启用", "客户端（可选）"];
@@ -1796,6 +1791,18 @@ export const QuickStartWizard = ({
       },
     });
   };
+  useEffect(() => {
+    if (targetHost === undefined) return;
+    selectProvider(
+      targetHost === "codex"
+        ? "codex-host"
+        : targetHost === "cursor"
+          ? "cursor-host"
+          : targetHost === "ollama"
+            ? "ollama"
+            : "compatible",
+    );
+  }, [targetHost]);
   const selectModelChoiceMode = (choice: "company" | "custom" | "host"): void => {
     modelChoiceTouchedRef.current = true;
     setModelChoiceMode(choice);

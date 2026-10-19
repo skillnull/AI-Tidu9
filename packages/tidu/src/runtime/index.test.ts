@@ -199,12 +199,14 @@ test("exposes the shared capability-completion policy and bounded usage status",
     const response = await fetch(`${runtime.origin}/api/capability-completion`);
     assert.equal(response.status, 200);
     const status = (await response.json()) as {
+      activeHost: string | null;
       available: boolean;
       operational: boolean;
       configuration: { enabled: boolean; specialists: unknown[] };
       hosts: string[];
       records: unknown[];
     };
+    assert.equal(status.activeHost, "openai-compatible");
     assert.equal(status.available, true);
     assert.equal(status.operational, false);
     assert.equal(status.configuration.enabled, false);
