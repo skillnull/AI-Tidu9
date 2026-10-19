@@ -125,13 +125,9 @@ test("starts a loopback runtime with a verifiable health endpoint", async () => 
     assert.equal(services.mode, "installed");
     assert.deepEqual(
       services.services.map(({ id, status }) => [id, status]),
-      [
-        ["tidu:frontend-p", "running"],
-        ["tidu:cli-p", "running"],
-        ["tidu:api-p", "running"],
-      ],
+      [["tidu:runtime-p", "running"]],
     );
-    assert.deepEqual(services.services[0]?.actions, ["refresh", "start", "restart", "stop"]);
+    assert.deepEqual(services.services[0]?.actions, ["refresh", "restart", "stop"]);
     assert.deepEqual(
       services.services.map(({ command, endpoint, lifecycle, processId, version }) => ({
         command,
@@ -142,21 +138,7 @@ test("starts a loopback runtime with a verifiable health endpoint", async () => 
       })),
       [
         {
-          command: "tidu service start tidu:frontend-p",
-          endpoint: runtime.origin,
-          lifecycle: "managed",
-          processId: process.pid,
-          version: PRODUCT.version,
-        },
-        {
-          command: "tidu service start tidu:cli-p",
-          endpoint: runtime.origin,
-          lifecycle: "managed",
-          processId: process.pid,
-          version: PRODUCT.version,
-        },
-        {
-          command: "tidu service start tidu:api-p",
+          command: "tidu service start tidu:runtime-p",
           endpoint: runtime.origin,
           lifecycle: "managed",
           processId: process.pid,

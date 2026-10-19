@@ -161,14 +161,7 @@ const createServiceInventory = async (
     : runtimeNetwork.host;
   const endpoint = `http://${endpointHost}:${runtimeNetwork.port}`;
   const editionSuffix = deployment === "enterprise" ? "e" : "p";
-  const serviceDefaults = {
-    actions: ["refresh", "start", "restart", "stop"] as const,
-    endpoint,
-    lifecycle: "managed" as const,
-    processId: process.pid,
-    status: "running" as const,
-    version: PRODUCT.version,
-  };
+  const serviceId = development ? `tidu:dev-api-${editionSuffix}` : `tidu:runtime-${editionSuffix}`;
   return {
     checkedAt: new Date().toISOString(),
     environment: {
@@ -205,25 +198,18 @@ const createServiceInventory = async (
     ],
     services: [
       {
-        ...serviceDefaults,
-        id: development ? `tidu:dev-frontend-${editionSuffix}` : `tidu:frontend-${editionSuffix}`,
-        name: "前端服务",
-        kind: "frontend" as const,
-        command: `tidu service start ${development ? "tidu:dev-frontend" : "tidu:frontend"}-${editionSuffix}`,
-      },
-      {
-        ...serviceDefaults,
-        id: development ? `tidu:dev-cli-${editionSuffix}` : `tidu:cli-${editionSuffix}`,
-        name: "CLI 服务",
-        kind: "cli" as const,
-        command: `tidu service start ${development ? "tidu:dev-cli" : "tidu:cli"}-${editionSuffix}`,
-      },
-      {
-        ...serviceDefaults,
-        id: development ? `tidu:dev-api-${editionSuffix}` : `tidu:api-${editionSuffix}`,
-        name: "接口服务",
+        actions: ["refresh", "restart", "stop"],
+        command: development
+          ? `npm run tidu:dev-api-${editionSuffix}`
+          : `tidu service start ${serviceId}`,
+        endpoint,
+        id: serviceId,
         kind: "api" as const,
-        command: `tidu service start ${development ? "tidu:dev-api" : "tidu:api"}-${editionSuffix}`,
+        lifecycle: "managed" as const,
+        name: development ? "接口服务" : "九门运行时",
+        processId: process.pid,
+        status: "running" as const,
+        version: PRODUCT.version,
       },
     ],
   };

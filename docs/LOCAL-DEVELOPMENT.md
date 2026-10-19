@@ -12,9 +12,9 @@
 npm run tidu:setup
 ```
 
-`tidu:setup` 安装依赖、构建 CLI，并自动启动个人版前端、CLI 与接口服务。后续可用 `tidu:dev-p` 再次启动个人版服务组，或用 `tidu:dev-e` 启动企业版服务组。浏览器统一访问 `9639`；前端和接口使用隔离的内部端口，因此停止单个服务不会关闭服务控制入口。
+`tidu:setup` 安装依赖、构建 CLI，并自动启动个人版前端、CLI 控制服务与接口服务。三个进程互相独立：`tidu:dev-p` 只启动前端（`9639`），`tidu:dev-api-p` 只启动接口（`9640`），`tidu:dev-cli-p` 只启动 CLI 控制服务（`9641`）。企业版本地开发使用对应的 `-e` 命令和 `9739`、`9740`、`9741` 端口。
 
-开发数据保存在 `.tidu-dev/tidu.sqlite`，与全局安装版数据隔离。前端源码由 Vite 热更新，后端 TypeScript 修改会自动重启本地运行时。
+开发数据保存在 `.tidu-dev/tidu.sqlite`，与全局安装版数据隔离。前端源码由 Vite 热更新；后端 TypeScript 修改后通过页面或命令重启独立接口服务。
 
 ## 本地 Codex 配置验收
 
@@ -25,7 +25,7 @@ npm run tidu:setup
 
 九门自有备份目录只保留首次安装基线与最新回滚点；不会删除来源不明的 Codex 配置备份。
 
-服务页分别显示 `tidu:dev-frontend-p`、`tidu:dev-cli-p` 与 `tidu:dev-api-p`。三类服务都有独立 PID、状态、命令和启动、停止、重启操作。企业版本地开发使用对应的 `-e` 命令。安装或远程运行时采用相同的服务信息与操作契约，只列出当前版型；个人安装版不暴露企业命令，企业安装版不暴露个人命令。CLI 可执行 `tidu service status` 或 `tidu service <start|stop|restart> <service-id|all>`。
+服务页分别显示 `tidu:dev-p`、`tidu:dev-cli-p` 与 `tidu:dev-api-p`。每项都来自对应的真实进程，具有独立 PID、端口、状态、启动命令以及启动、停止、重启操作，不再把前端代理地址显示成接口或 CLI 地址。安装或远程运行时只展示实际运行单元；个人安装版不暴露企业命令，企业安装版不暴露个人命令。CLI 可执行 `tidu service status` 或 `tidu service <start|stop|restart> <service-id|all>`。
 
 `tidu:dev-p` 启动前会检查安装版运行锁和默认端口。检测到安装版冲突时停止启动，并提示先执行 `tidu service stop all && tidu uninstall --confirm DELETE`，不会自动删除数据。
 
@@ -37,6 +37,6 @@ npm run tidu:setup
 npm run check
 ```
 
-开发或测试结束后，在运行 `tidu:dev-p` 的终端按 `Ctrl+C`。确认本地开发进程与其端口已经退出，不把测试服务留在后台。
+开发或测试结束后，在运行 `tidu:setup` 的终端按 `Ctrl+C` 可停止由它启动的三个开发进程；单独启动的服务则在各自终端停止。确认对应 PID 与端口已经退出，不把测试服务留在后台。
 
 本地功能变更若同时影响服务器部署，只同步更新独立的远程部署文档；不要把远程操作写入本地开发流程。
