@@ -3,6 +3,7 @@ export const DEFAULT_VIRTUAL_MODEL_ID = "ai-tidu9-config";
 
 export type ConfigurationMode = "managed" | "expert";
 export type ModelSource = "company" | "custom" | "official";
+export type AgentHostId = "codex" | "cursor" | "ollama" | "openai-compatible";
 
 export interface ModelSelection {
   /** Provider group used behind the single AI-Tidu9 virtual-model entry. */
@@ -14,6 +15,21 @@ export interface ModelSelection {
 export interface CapabilitySpecialistConfiguration extends ModelSelection {
   /** Capabilities this specialist is explicitly allowed to complete. */
   capabilities: readonly string[];
+  /** Configured input price per million tokens, or null when unknown or account-funded. */
+  inputCostPerMillionTokens?: number | null;
+  /** Configured output price per million tokens, or null when unknown or account-funded. */
+  outputCostPerMillionTokens?: number | null;
+}
+
+export interface HostCapabilityCompletionPolicy {
+  /** Primary model used when requests enter through this host. */
+  mainModel: ModelSelection;
+  /** Capabilities explicitly declared for this host's primary model. */
+  mainCapabilities: readonly string[];
+  /** Specialist pool isolated to this host. */
+  specialists: readonly CapabilitySpecialistConfiguration[];
+  /** Hard upper bound for specialist calls in one request. */
+  maximumSpecialists: number;
 }
 
 export interface CapabilityCompletionConfiguration {
@@ -25,6 +41,8 @@ export interface CapabilityCompletionConfiguration {
   specialists: readonly CapabilitySpecialistConfiguration[];
   /** Hard upper bound for specialist calls in one model request. */
   maximumSpecialists: number;
+  /** Host-isolated policies; legacy top-level fields remain the default fallback. */
+  hostPolicies?: Partial<Record<AgentHostId, HostCapabilityCompletionPolicy>>;
 }
 
 export interface ExpertServiceConfiguration {
@@ -94,6 +112,7 @@ export const createDefaultConfiguration = (
       mainCapabilities: ["text", "structured-output"],
       specialists: [],
       maximumSpecialists: 2,
+      hostPolicies: {},
     },
   };
   if (mode === "expert") {
@@ -157,21 +176,39 @@ export const validateConfiguration = (
   }
   const completion = configuration.capabilityCompletion;
   const safeCapability = /^[a-z0-9][a-z0-9._:-]{0,63}$/iu;
+  const policies = [
+    {
+      mainModel: configuration.modelSelection,
+      mainCapabilities: completion.mainCapabilities,
+      specialists: completion.specialists,
+      maximumSpecialists: completion.maximumSpecialists,
+    },
+    ...Object.values(completion.hostPolicies ?? {}),
+  ];
   if (
     typeof completion?.enabled !== "boolean" ||
-    !Number.isInteger(completion.maximumSpecialists) ||
-    completion.maximumSpecialists < 1 ||
-    completion.maximumSpecialists > 8 ||
-    completion.mainCapabilities.length === 0 ||
-    completion.mainCapabilities.some((capability) => !safeCapability.test(capability)) ||
-    completion.specialists.some(
-      (specialist) =>
-        (specialist.source !== "official" &&
-          specialist.source !== "company" &&
-          specialist.source !== "custom") ||
-        !/^[a-z0-9][a-z0-9._:-]{0,127}$/iu.test(specialist.model) ||
-        specialist.capabilities.length === 0 ||
-        specialist.capabilities.some((capability) => !safeCapability.test(capability)),
+    policies.some(
+      (policy) =>
+        !Number.isInteger(policy.maximumSpecialists) ||
+        policy.maximumSpecialists < 1 ||
+        policy.maximumSpecialists > 8 ||
+        policy.mainCapabilities.length === 0 ||
+        policy.mainCapabilities.some((capability) => !safeCapability.test(capability)) ||
+        policy.specialists.some(
+          (specialist) =>
+            (specialist.source !== "official" &&
+              specialist.source !== "company" &&
+              specialist.source !== "custom") ||
+            !/^[a-z0-9][a-z0-9._:-]{0,127}$/iu.test(specialist.model) ||
+            specialist.capabilities.length === 0 ||
+            specialist.capabilities.some((capability) => !safeCapability.test(capability)) ||
+            (specialist.inputCostPerMillionTokens != null &&
+              (!Number.isFinite(specialist.inputCostPerMillionTokens) ||
+                specialist.inputCostPerMillionTokens < 0)) ||
+            (specialist.outputCostPerMillionTokens != null &&
+              (!Number.isFinite(specialist.outputCostPerMillionTokens) ||
+                specialist.outputCostPerMillionTokens < 0)),
+        ),
     )
   ) {
     issues.push({

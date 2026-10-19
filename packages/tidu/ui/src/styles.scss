@@ -1968,6 +1968,225 @@ h2 {
 
 .capability-completion-editor {
   margin-top: 24px;
+
+  .capability-host-scope,
+  .capability-benefit-summary {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    margin-top: 18px;
+    border: 1px solid #24303c;
+    border-radius: 12px;
+    background: #0e151d;
+
+    > div,
+    > label {
+      display: grid;
+      min-width: 0;
+      padding: 14px 16px;
+      border-right: 1px solid #24303c;
+
+      &:last-child {
+        border-right: 0;
+      }
+
+      span,
+      small {
+        color: #8794a5;
+      }
+
+      strong {
+        margin: 5px 0;
+        overflow-wrap: anywhere;
+      }
+    }
+  }
+
+  .capability-primary-card,
+  .capability-specialists,
+  .capability-model-matrix {
+    margin-top: 18px;
+    padding: 18px;
+    border: 1px solid #24303c;
+    border-radius: 12px;
+  }
+
+  .capability-section-heading,
+  .capability-specialist-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    column-gap: 16px;
+
+    h4,
+    p {
+      margin: 0;
+    }
+
+    p {
+      margin-top: 5px;
+      color: #8794a5;
+    }
+  }
+
+  .capability-picker {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    margin: 14px -4px -4px;
+
+    label {
+      display: flex;
+      min-width: 0;
+      margin: 4px;
+      padding: 10px;
+      border: 1px solid #283542;
+      border-radius: 9px;
+      background: #101821;
+      cursor: pointer;
+
+      &.selected {
+        border-color: #65cabc;
+        background: #102523;
+      }
+
+      input {
+        width: auto;
+        margin: 2px 9px 0 0;
+      }
+
+      span {
+        display: grid;
+        min-width: 0;
+      }
+
+      small {
+        margin-top: 3px;
+        color: #7f8c9c;
+      }
+    }
+  }
+
+  .capability-benefit-summary {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+
+    p {
+      grid-column: 1 / -1;
+      margin: 0;
+      padding: 12px 16px;
+      border-top: 1px solid #24303c;
+      color: #77d4c8;
+    }
+  }
+
+  .capability-specialist-card {
+    margin-top: 14px;
+    padding: 16px;
+    border: 1px solid #2a3744;
+    border-radius: 11px;
+    background: #0c131a;
+
+    .capability-specialist-heading {
+      align-items: center;
+
+      > div {
+        display: grid;
+      }
+
+      span {
+        color: #8794a5;
+
+        &.gain {
+          color: #70d5c8;
+        }
+
+        &.warning {
+          color: #e2b96c;
+        }
+      }
+    }
+
+    .capability-specialist-fields {
+      display: grid;
+      grid-template-columns: 150px minmax(220px, 1fr) minmax(260px, 1fr);
+      margin-top: 14px;
+
+      > * {
+        margin-right: 10px;
+
+        &:last-child {
+          margin-right: 0;
+        }
+      }
+    }
+
+    .capability-cost-status {
+      display: grid;
+      align-content: center;
+      padding: 8px 12px;
+      border: 1px solid #27333f;
+      border-radius: 8px;
+
+      span {
+        color: #7f8c9c;
+        font-size: 11px;
+      }
+    }
+
+    .capability-evidence {
+      margin: 12px 0 0;
+      color: #7fbfb7;
+    }
+
+    .capability-cost-inputs {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin: 12px -5px 0;
+
+      label {
+        display: grid;
+        margin: 0 5px;
+      }
+    }
+  }
+
+  .capability-model-matrix {
+    article {
+      display: grid;
+      grid-template-columns: minmax(180px, 0.8fr) minmax(280px, 1.6fr) minmax(180px, 0.8fr);
+      align-items: center;
+      padding: 12px 0;
+      border-top: 1px solid #24303c;
+
+      &:first-of-type {
+        margin-top: 14px;
+      }
+
+      > div:first-child {
+        display: grid;
+      }
+
+      small {
+        color: #8794a5;
+        text-align: right;
+      }
+    }
+
+    .capability-inline-list {
+      span {
+        display: inline-block;
+        margin: 3px;
+        padding: 3px 7px;
+        border-radius: 999px;
+        background: #14231f;
+        color: #70d5c8;
+        font-size: 11px;
+      }
+
+      em {
+        color: #a78e68;
+        font-style: normal;
+      }
+    }
+  }
 }
 
 .capability-completion-editor-heading,
@@ -2049,6 +2268,34 @@ h2 {
   text-align: center;
 }
 
+.capability-host-policies {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0 -5px 18px;
+
+  article {
+    margin: 5px;
+    padding: 14px;
+    border: 1px solid #24303c;
+    border-radius: 10px;
+
+    > div {
+      display: flex;
+      justify-content: space-between;
+      column-gap: 12px;
+
+      span {
+        color: #6fcbbf;
+      }
+    }
+
+    p {
+      margin: 7px 0 0;
+      color: #8794a5;
+    }
+  }
+}
+
 .capability-records article + article {
   margin-top: 10px;
 }
@@ -2064,9 +2311,31 @@ h2 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .capability-host-policies {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .capability-specialist-row,
   .capability-policy-fields {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .capability-completion-editor {
+    .capability-host-scope,
+    .capability-benefit-summary,
+    .capability-specialist-card .capability-specialist-fields,
+    .capability-model-matrix article {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .capability-picker {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .capability-model-matrix article small {
+      margin-top: 6px;
+      text-align: left;
+    }
   }
 }
 

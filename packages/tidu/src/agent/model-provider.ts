@@ -1,3 +1,4 @@
+import type { AgentHostId } from "../config/index.js";
 import type { ModelProvider } from "../providers/index.js";
 import type {
   AgentPlan,
@@ -69,6 +70,7 @@ export const createModelProviderAgentAdapters = (
     securityScopeId: string,
     routingRole: "planning" | "verification" | "worker",
     requiredCapabilities: readonly string[] = [],
+    host?: AgentHostId,
   ): Promise<TValue> => {
     const resolvedVirtualModelId =
       typeof virtualModelId === "string" ? virtualModelId : await virtualModelId();
@@ -76,7 +78,7 @@ export const createModelProviderAgentAdapters = (
       protocol: "chat-completions",
       virtualModelId: resolvedVirtualModelId,
       signal,
-      routing: { role: routingRole, securityScopeId, requiredCapabilities },
+      routing: { role: routingRole, securityScopeId, requiredCapabilities, host },
       body: {
         model: resolvedVirtualModelId,
         stream: false,
@@ -109,6 +111,8 @@ export const createModelProviderAgentAdapters = (
         signal,
         task.taskId,
         "planning",
+        [],
+        task.originHost,
       ),
     plan: async (input, signal) =>
       executeJson<AgentPlan>(
@@ -125,6 +129,7 @@ export const createModelProviderAgentAdapters = (
         input.task.taskId,
         "planning",
         input.understanding.requiredCapabilities,
+        input.task.originHost,
       ),
     replan: async (input, signal) =>
       executeJson<AgentPlan>(
@@ -145,6 +150,7 @@ export const createModelProviderAgentAdapters = (
         input.task.taskId,
         "planning",
         input.understanding.requiredCapabilities,
+        input.task.originHost,
       ),
   };
 
@@ -164,6 +170,7 @@ export const createModelProviderAgentAdapters = (
         input.task.taskId,
         "worker",
         input.understanding.requiredCapabilities,
+        input.task.originHost,
       ),
   };
 
@@ -181,6 +188,8 @@ export const createModelProviderAgentAdapters = (
         signal,
         input.task.taskId,
         "verification",
+        [],
+        input.task.originHost,
       ),
   };
 

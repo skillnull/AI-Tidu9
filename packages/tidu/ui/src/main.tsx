@@ -145,6 +145,7 @@ const App = () => {
       mainCapabilities: ["text", "structured-output"],
       specialists: [],
       maximumSpecialists: 2,
+      hostPolicies: {},
     },
     expertServices: DEFAULT_EXPERT_SERVICES,
   });

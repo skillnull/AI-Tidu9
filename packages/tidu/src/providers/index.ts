@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import type { AgentHostId } from "../config/index.js";
 import { TiduError } from "../core/index.js";
 import { createOpenAiError } from "../openai/index.js";
 import {
@@ -18,6 +19,8 @@ export type ProviderProtocol = "chat-completions" | "responses";
 export type ProviderPrivacy = "external" | "local" | "private";
 
 export interface ProviderRoutingContext {
+  /** Host entry whose isolated capability policy must be used. */
+  host?: AgentHostId;
   /** Capabilities required by the caller in addition to those inferred from the request. */
   requiredCapabilities?: readonly string[];
   /** Most permissive data boundary allowed for this request. */
@@ -78,7 +81,18 @@ export interface ModelProvider {
   /** Executes one validated inference request as JSON or Server-Sent Events. */
   execute: (request: ProviderExecutionRequest) => Promise<ProviderExecutionResult>;
   /** Lists safe upstream model identifiers when the provider supports discovery. */
-  listModels?: () => Promise<readonly { id: string; name: string }[]>;
+  listModels?: () => Promise<
+    readonly {
+      /** Provider-owned model identifier. */
+      id: string;
+      /** Provider-owned model display name. */
+      name: string;
+      /** Capabilities explicitly published by the provider, when available. */
+      capabilities?: readonly string[];
+      /** Evidence source for the capability declaration. */
+      capabilitySource?: "company-published" | "provider-catalog";
+    }[]
+  >;
   /** Releases persistent provider processes and connections owned by this adapter. */
   close?: () => Promise<void>;
 }

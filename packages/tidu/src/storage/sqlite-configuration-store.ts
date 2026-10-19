@@ -59,8 +59,36 @@ const normalizeConfiguration = (configuration: TiduConfiguration): TiduConfigura
       capabilities: [
         ...new Set(specialist.capabilities.map((capability) => capability.trim())),
       ].filter(Boolean),
+      inputCostPerMillionTokens: specialist.inputCostPerMillionTokens ?? null,
+      outputCostPerMillionTokens: specialist.outputCostPerMillionTokens ?? null,
     })),
     maximumSpecialists: configuration.capabilityCompletion?.maximumSpecialists ?? 2,
+    hostPolicies: Object.fromEntries(
+      Object.entries(configuration.capabilityCompletion?.hostPolicies ?? {}).map(
+        ([host, policy]) => [
+          host,
+          {
+            mainModel: {
+              source: policy.mainModel.source,
+              model: policy.mainModel.model.trim(),
+            },
+            mainCapabilities: [
+              ...new Set(policy.mainCapabilities.map((item) => item.trim())),
+            ].filter(Boolean),
+            specialists: policy.specialists.map((specialist) => ({
+              source: specialist.source,
+              model: specialist.model.trim(),
+              capabilities: [...new Set(specialist.capabilities.map((item) => item.trim()))].filter(
+                Boolean,
+              ),
+              inputCostPerMillionTokens: specialist.inputCostPerMillionTokens ?? null,
+              outputCostPerMillionTokens: specialist.outputCostPerMillionTokens ?? null,
+            })),
+            maximumSpecialists: policy.maximumSpecialists,
+          },
+        ],
+      ),
+    ),
   },
   ...(configuration.expertServices
     ? {

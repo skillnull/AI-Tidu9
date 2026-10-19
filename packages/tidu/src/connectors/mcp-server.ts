@@ -182,7 +182,7 @@ const handleToolCall = async (
     if (model === undefined) {
       throw new Error("AI-Tidu9 did not expose an active virtual model.");
     }
-    const response = await requestJson(request, endpoint, "/v1/responses", {
+    const response = await requestJson(request, endpoint, "/v1/hosts/cursor/responses", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ model, input, stream: false }),

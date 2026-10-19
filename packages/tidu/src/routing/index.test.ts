@@ -50,6 +50,53 @@ test("records a configured specialist contribution for the shared Agent policy",
   assert.equal(status.records[0]?.outcome, "succeeded");
 });
 
+test("isolates primary and specialist models by request host", async () => {
+  const calls: string[] = [];
+  const provider: ModelProvider = {
+    descriptor: { type: "openai-compatible", model: "default" },
+    execute: async (request) => {
+      calls.push(request.routing?.targetModel ?? "current");
+      return {
+        kind: "json",
+        statusCode: 200,
+        body: { choices: [{ message: { content: "{}" } }] },
+      };
+    },
+  };
+  const completion = createCapabilityCompletionProvider(provider, async () => ({
+    modelSelection: { source: "official", model: "default-main" },
+    capabilityCompletion: {
+      enabled: true,
+      mainCapabilities: ["text"],
+      specialists: [],
+      maximumSpecialists: 1,
+      hostPolicies: {
+        codex: {
+          mainModel: { source: "official", model: "codex-main" },
+          mainCapabilities: ["text"],
+          specialists: [{ source: "company", model: "codex-vision", capabilities: ["vision"] }],
+          maximumSpecialists: 1,
+        },
+        cursor: {
+          mainModel: { source: "official", model: "cursor-main" },
+          mainCapabilities: ["text"],
+          specialists: [{ source: "company", model: "cursor-vision", capabilities: ["vision"] }],
+          maximumSpecialists: 1,
+        },
+      },
+    },
+  }));
+
+  await completion.execute({
+    protocol: "chat-completions",
+    virtualModelId: "ai-tidu9-config",
+    body: { messages: [{ role: "user", content: "inspect image" }] },
+    routing: { host: "cursor", requiredCapabilities: ["vision"], role: "worker" },
+  });
+
+  assert.deepEqual(calls, ["cursor-vision", "cursor-main"]);
+});
+
 const policy: DynamicRoutingPolicy = {
   enabled: true,
   mainModelId: "cheap-main",

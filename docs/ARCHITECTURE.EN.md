@@ -34,7 +34,7 @@ flowchart LR
 
 The core does not replace model reasoning or hard-code domain logic. It selects capabilities, limits cost and risk, retains minimal recovery state, and verifies the outcome against the goal.
 
-Capability completion sits after host entry and before model Providers. Hosts only submit goals to the same Agent kernel; the effective configuration explicitly declares primary-model capabilities, specialist sources and capability labels, and the per-request specialist limit. Routing history retains only non-secret model identifiers, required capabilities, outcomes, and timestamps for local, personal, and enterprise status views.
+Capability completion sits after host entry and before model Providers. Hosts submit both goals and host identity to the same Agent kernel. Each host independently declares its primary model, capabilities, specialist sources, capability labels, cost evidence, and per-request limit. Routing invokes only specialists that fill a gap and prefers lower known cost. History retains only non-secret host and model identifiers, required capabilities, outcomes, and timestamps for local, personal, and enterprise status views.
 
 ## 🧱 Module map: responsibilities and exclusions
 

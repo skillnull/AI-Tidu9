@@ -24,6 +24,8 @@ import {
   switchCodexClientConfiguration,
 } from "../clients/configuration.js";
 import {
+  type AgentHostId,
+  type CapabilitySpecialistConfiguration,
   CONFIG_SCHEMA_VERSION,
   type ConfigurationMode,
   createDefaultConfiguration,
@@ -637,6 +639,7 @@ const createAgentChatStream = (
 const runAgentResponsesTask = async (
   agentKernel: AgentKernel,
   body: Record<string, unknown>,
+  originHost: AgentHostId,
 ): Promise<string> => {
   const objective = createAgentObjective(body);
   if (objective === "") throw new Error("The Agent request does not contain a usable goal.");
@@ -645,6 +648,7 @@ const runAgentResponsesTask = async (
       objective,
       acceptanceCriteria: ["The response addresses the requested goal."],
     },
+    originHost,
   });
   const completed = await agentKernel.runTask(created.task.taskId);
   if (completed.task.status !== "completed" || completed.result?.accepted !== true) {
@@ -660,6 +664,7 @@ const handleOpenAiInference = async (
   protocol: "chat-completions" | "responses",
   provider: ModelProvider | undefined,
   agentKernel: AgentKernel | undefined,
+  originHost: AgentHostId,
 ): Promise<void> => {
   const requestId = randomUUID();
   let body: unknown;
@@ -701,7 +706,7 @@ const handleOpenAiInference = async (
       return;
     }
     const model = typeof requestBody.model === "string" ? requestBody.model : "ai-tidu9-config";
-    const run = () => runAgentResponsesTask(agentKernel, requestBody);
+    const run = () => runAgentResponsesTask(agentKernel, requestBody, originHost);
     try {
       if (requestBody.stream === true) {
         const stream =
@@ -765,6 +770,7 @@ const handleOpenAiInference = async (
         virtualModelId: activeModelId,
         signal: controller.signal,
         routing: {
+          host: originHost,
           modelSource: modelSelection.source,
           ...(modelSelection.model === "current" ? {} : { targetModel: modelSelection.model }),
         },
@@ -961,6 +967,77 @@ const readDraftConfiguration = (
     throw new TiduError("CONFIGURATION_INVALID", "Configuration payload is invalid.");
   }
 
+  const parseSpecialists = (value: unknown): CapabilitySpecialistConfiguration[] | undefined => {
+    if (!Array.isArray(value)) return undefined;
+    const specialists: CapabilitySpecialistConfiguration[] = [];
+    for (const specialist of value) {
+      if (
+        !isRecord(specialist) ||
+        (specialist.source !== "official" &&
+          specialist.source !== "company" &&
+          specialist.source !== "custom") ||
+        typeof specialist.model !== "string" ||
+        !Array.isArray(specialist.capabilities) ||
+        !specialist.capabilities.every((capability) => typeof capability === "string")
+      ) {
+        return undefined;
+      }
+      specialists.push({
+        source: specialist.source,
+        model: specialist.model,
+        capabilities: specialist.capabilities as string[],
+        inputCostPerMillionTokens:
+          typeof specialist.inputCostPerMillionTokens === "number"
+            ? specialist.inputCostPerMillionTokens
+            : null,
+        outputCostPerMillionTokens:
+          typeof specialist.outputCostPerMillionTokens === "number"
+            ? specialist.outputCostPerMillionTokens
+            : null,
+      });
+    }
+    return specialists;
+  };
+  const completionCandidate = isRecord(candidate.capabilityCompletion)
+    ? candidate.capabilityCompletion
+    : undefined;
+  const specialists = parseSpecialists(completionCandidate?.specialists);
+  const hostPolicies: Partial<
+    Record<
+      AgentHostId,
+      {
+        mainModel: TiduConfiguration["modelSelection"];
+        mainCapabilities: readonly string[];
+        specialists: readonly CapabilitySpecialistConfiguration[];
+        maximumSpecialists: number;
+      }
+    >
+  > = {};
+  if (isRecord(completionCandidate?.hostPolicies)) {
+    for (const host of ["codex", "cursor", "ollama", "openai-compatible"] as const) {
+      const policy = completionCandidate.hostPolicies[host];
+      if (!isRecord(policy) || !isRecord(policy.mainModel)) continue;
+      const policySpecialists = parseSpecialists(policy.specialists);
+      if (
+        (policy.mainModel.source !== "official" &&
+          policy.mainModel.source !== "company" &&
+          policy.mainModel.source !== "custom") ||
+        typeof policy.mainModel.model !== "string" ||
+        !Array.isArray(policy.mainCapabilities) ||
+        !policy.mainCapabilities.every((capability) => typeof capability === "string") ||
+        policySpecialists === undefined ||
+        typeof policy.maximumSpecialists !== "number"
+      ) {
+        continue;
+      }
+      hostPolicies[host] = {
+        mainModel: { source: policy.mainModel.source, model: policy.mainModel.model },
+        mainCapabilities: policy.mainCapabilities as string[],
+        specialists: policySpecialists,
+        maximumSpecialists: policy.maximumSpecialists,
+      };
+    }
+  }
   const configuration: TiduConfiguration = {
     schemaVersion: CONFIG_SCHEMA_VERSION,
     activeMode: mode,
@@ -978,33 +1055,18 @@ const readDraftConfiguration = (
           }
         : { source: "official", model: "current" },
     capabilityCompletion:
-      isRecord(candidate.capabilityCompletion) &&
-      typeof candidate.capabilityCompletion.enabled === "boolean" &&
-      Array.isArray(candidate.capabilityCompletion.mainCapabilities) &&
-      candidate.capabilityCompletion.mainCapabilities.every(
-        (capability) => typeof capability === "string",
-      ) &&
-      Array.isArray(candidate.capabilityCompletion.specialists) &&
-      candidate.capabilityCompletion.specialists.every(
-        (specialist) =>
-          isRecord(specialist) &&
-          (specialist.source === "official" ||
-            specialist.source === "company" ||
-            specialist.source === "custom") &&
-          typeof specialist.model === "string" &&
-          Array.isArray(specialist.capabilities) &&
-          specialist.capabilities.every((capability) => typeof capability === "string"),
-      ) &&
-      typeof candidate.capabilityCompletion.maximumSpecialists === "number"
+      completionCandidate !== undefined &&
+      typeof completionCandidate.enabled === "boolean" &&
+      Array.isArray(completionCandidate.mainCapabilities) &&
+      completionCandidate.mainCapabilities.every((capability) => typeof capability === "string") &&
+      specialists !== undefined &&
+      typeof completionCandidate.maximumSpecialists === "number"
         ? {
-            enabled: candidate.capabilityCompletion.enabled,
-            mainCapabilities: candidate.capabilityCompletion.mainCapabilities as string[],
-            specialists: candidate.capabilityCompletion.specialists as {
-              source: "company" | "custom" | "official";
-              model: string;
-              capabilities: string[];
-            }[],
-            maximumSpecialists: candidate.capabilityCompletion.maximumSpecialists,
+            enabled: completionCandidate.enabled,
+            mainCapabilities: completionCandidate.mainCapabilities as string[],
+            specialists,
+            maximumSpecialists: completionCandidate.maximumSpecialists,
+            hostPolicies,
           }
         : createDefaultConfiguration(mode).capabilityCompletion,
   };
@@ -1148,7 +1210,10 @@ const handleRequest = async (
       operational:
         capabilityCompletionProvider !== undefined &&
         workspace.active.configuration.capabilityCompletion.enabled &&
-        workspace.active.configuration.capabilityCompletion.specialists.length > 0,
+        (workspace.active.configuration.capabilityCompletion.specialists.length > 0 ||
+          Object.values(
+            workspace.active.configuration.capabilityCompletion.hostPolicies ?? {},
+          ).some((policy) => policy.specialists.length > 0)),
       configuration: workspace.active.configuration.capabilityCompletion,
       mainModel: workspace.active.configuration.modelSelection,
       records: status?.records ?? [],
@@ -1157,7 +1222,7 @@ const handleRequest = async (
         publishedCapabilityCount:
           enterpriseState?.capabilities.length ?? remoteCompany?.capabilityCount ?? 0,
       },
-      hosts: ["codex", "cursor", "cli", "openai-compatible"],
+      hosts: ["codex", "cursor", "cli", "ollama", "openai-compatible"],
     });
     return;
   }
@@ -1934,6 +1999,13 @@ const handleRequest = async (
             ? (body.acceptanceCriteria as string[])
             : [],
         },
+        originHost:
+          body.originHost === "codex" ||
+          body.originHost === "cursor" ||
+          body.originHost === "ollama" ||
+          body.originHost === "openai-compatible"
+            ? body.originHost
+            : "openai-compatible",
       };
       const created = await agentKernel.createTask(input);
       const capsule = body.run === true ? await agentKernel.runTask(created.task.taskId) : created;
@@ -2065,7 +2137,16 @@ const handleRequest = async (
     return;
   }
 
-  if (request.method === "POST" && pathname === "/v1/chat/completions") {
+  const hostInferenceRoute =
+    /^\/v1\/hosts\/(codex|cursor|ollama|openai-compatible)\/(chat\/completions|responses)$/u.exec(
+      pathname,
+    );
+  const inferenceHost = (hostInferenceRoute?.[1] as AgentHostId | undefined) ?? "openai-compatible";
+  const inferenceRoute = hostInferenceRoute?.[2];
+  if (
+    request.method === "POST" &&
+    (pathname === "/v1/chat/completions" || inferenceRoute === "chat/completions")
+  ) {
     if (!(await isExpertServiceEnabled(storage, "chatCompletionsApiEnabled"))) {
       sendJson(response, 404, { error: "SERVICE_DISABLED" });
       return;
@@ -2077,16 +2158,28 @@ const handleRequest = async (
       "chat-completions",
       provider,
       agentKernel,
+      inferenceHost,
     );
     return;
   }
 
-  if (request.method === "POST" && pathname === "/v1/responses") {
+  if (
+    request.method === "POST" &&
+    (pathname === "/v1/responses" || inferenceRoute === "responses")
+  ) {
     if (!(await isExpertServiceEnabled(storage, "responsesApiEnabled"))) {
       sendJson(response, 404, { error: "SERVICE_DISABLED" });
       return;
     }
-    await handleOpenAiInference(request, response, storage, "responses", provider, agentKernel);
+    await handleOpenAiInference(
+      request,
+      response,
+      storage,
+      "responses",
+      provider,
+      agentKernel,
+      inferenceHost,
+    );
     return;
   }
 

@@ -337,6 +337,8 @@ export interface CreateAgentTaskInput extends Omit<CreateTaskInput, "taskId"> {
 export interface TaskControlView {
   /** Stable task identifier. */
   taskId: string;
+  /** Host entry whose isolated model policy owns this task. */
+  originHost?: CanonicalTask["originHost"];
   /** Concise objective safe for the local control view. */
   objective: string;
   /** Current task lifecycle state. */
@@ -570,6 +572,7 @@ export const createTaskControlView = (capsule: TaskCapsule): TaskControlView => 
       : undefined;
   return {
     taskId: capsule.task.taskId,
+    ...(capsule.task.originHost === undefined ? {} : { originHost: capsule.task.originHost }),
     objective: capsule.task.goal.objective,
     status: capsule.task.status,
     completedSteps: capsule.checkpoint.completedStepIds.length,

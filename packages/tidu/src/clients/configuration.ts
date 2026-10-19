@@ -45,6 +45,10 @@ export interface CodexOfficialModel {
   id: string;
   /** Human-readable official model name. */
   name: string;
+  /** Capabilities derived only from fields published by the Codex model catalog. */
+  capabilities: readonly string[];
+  /** Evidence source for the displayed capability declaration. */
+  capabilitySource: "host-catalog";
 }
 
 export interface CodexClientRollbackOptions {
@@ -280,7 +284,7 @@ const activateDefaultCodexConfiguration = (
     "# Local Agent runtime only. Official Codex credentials are never sent to this endpoint.",
     "[model_providers.ai_tidu9]",
     'name = "九门赛博提督"',
-    `base_url = ${JSON.stringify(`${endpoint}/v1`)}`,
+    `base_url = ${JSON.stringify(`${endpoint}/v1/hosts/codex`)}`,
     'wire_api = "responses"',
     "requires_openai_auth = false",
     "supports_websockets = false",
@@ -483,7 +487,7 @@ const verifyInference = async (
 ): Promise<void> => {
   let response: Response;
   try {
-    response = await request(`${endpoint}/v1/responses`, {
+    response = await request(`${endpoint}/v1/hosts/codex/responses`, {
       method: "POST",
       headers: {
         accept: "application/json",
@@ -560,7 +564,7 @@ const createCodexProfile = (endpoint: string, model: string, modelCatalogPath: s
     "",
     "[model_providers.ai_tidu9]",
     'name = "AI-Tidu9"',
-    `base_url = ${JSON.stringify(`${endpoint}/v1`)}`,
+    `base_url = ${JSON.stringify(`${endpoint}/v1/hosts/codex`)}`,
     'wire_api = "responses"',
     "requires_openai_auth = false",
     "supports_websockets = false",
@@ -695,7 +699,41 @@ export const listCodexOfficialModels = (
   for (const model of [...currentModels, ...historicalModels]) {
     const id = String(model.slug);
     if (!modelsById.has(id)) {
-      modelsById.set(id, { id, name: String(model.display_name) });
+      const inputModalities = Array.isArray(model.input_modalities)
+        ? model.input_modalities.filter((value): value is string => typeof value === "string")
+        : [];
+      const contextWindow =
+        typeof model.context_window === "number"
+          ? model.context_window
+          : typeof model.max_context_window === "number"
+            ? model.max_context_window
+            : 0;
+      const capabilities = new Set<string>();
+      if (inputModalities.includes("text")) capabilities.add("text");
+      if (inputModalities.includes("image")) capabilities.add("vision");
+      if (
+        Array.isArray(model.supported_reasoning_levels) &&
+        model.supported_reasoning_levels.length > 0
+      ) {
+        capabilities.add("reasoning");
+      }
+      if (model.supports_search_tool === true || typeof model.web_search_tool_type === "string") {
+        capabilities.add("web-research");
+      }
+      if (
+        typeof model.tool_mode === "string" ||
+        (Array.isArray(model.experimental_supported_tools) &&
+          model.experimental_supported_tools.length > 0)
+      ) {
+        capabilities.add("tool-use");
+      }
+      if (contextWindow >= 100_000) capabilities.add("long-context");
+      modelsById.set(id, {
+        id,
+        name: String(model.display_name),
+        capabilities: [...capabilities],
+        capabilitySource: "host-catalog",
+      });
     }
   }
   return [...modelsById.values()];

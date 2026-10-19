@@ -1,4 +1,9 @@
-import type { CapabilityCompletionConfiguration, ModelSelection } from "../config/index.js";
+import type {
+  AgentHostId,
+  CapabilityCompletionConfiguration,
+  CapabilitySpecialistConfiguration,
+  ModelSelection,
+} from "../config/index.js";
 import type {
   ModelProvider,
   ProviderExecutionRequest,
@@ -88,6 +93,8 @@ export interface DynamicModelRouter extends ModelProvider {
 }
 
 export interface CapabilityCompletionUsageRecord extends RoutingDecision {
+  /** Host entry whose isolated policy produced this route. */
+  host: AgentHostId;
   /** ISO timestamp for the completed routing attempt. */
   occurredAt: string;
   /** Agent role that requested the route. */
@@ -460,12 +467,16 @@ export const createCapabilityCompletionProvider = (
     selection: ModelSelection,
     capabilities: readonly string[],
     id: string,
+    costs?: Pick<
+      CapabilitySpecialistConfiguration,
+      "inputCostPerMillionTokens" | "outputCostPerMillionTokens"
+    >,
   ): RoutableModel => ({
     profile: {
       id,
       capabilities,
-      inputCostPerMillionTokens: 0,
-      outputCostPerMillionTokens: 0,
+      inputCostPerMillionTokens: costs?.inputCostPerMillionTokens ?? Number.MAX_SAFE_INTEGER,
+      outputCostPerMillionTokens: costs?.outputCostPerMillionTokens ?? Number.MAX_SAFE_INTEGER,
       averageLatencyMilliseconds: 0,
       availability: 1,
       privacy: selection.source === "company" ? "private" : "external",
@@ -485,6 +496,26 @@ export const createCapabilityCompletionProvider = (
         }),
     },
   });
+  const resolveHostPolicy = (
+    active: Awaited<ReturnType<typeof loadConfiguration>>,
+    host: AgentHostId | undefined,
+  ) => {
+    const policy =
+      host === undefined ? undefined : active.capabilityCompletion.hostPolicies?.[host];
+    return policy === undefined
+      ? {
+          modelSelection: active.modelSelection,
+          mainCapabilities: active.capabilityCompletion.mainCapabilities,
+          specialists: active.capabilityCompletion.specialists,
+          maximumSpecialists: active.capabilityCompletion.maximumSpecialists,
+        }
+      : {
+          modelSelection: policy.mainModel,
+          mainCapabilities: policy.mainCapabilities,
+          specialists: policy.specialists,
+          maximumSpecialists: policy.maximumSpecialists,
+        };
+  };
   const readStatus = async (): Promise<CapabilityCompletionStatus> => {
     const configuration = await loadConfiguration();
     return {
@@ -500,27 +531,30 @@ export const createCapabilityCompletionProvider = (
     inspectCapabilityCompletion: readStatus,
     execute: async (request) => {
       const active = await loadConfiguration();
-      const mainId = `main:${active.modelSelection.source}:${active.modelSelection.model}`;
-      const specialists = active.capabilityCompletion.specialists.map((specialist, index) =>
+      const hostPolicy = resolveHostPolicy(active, request.routing?.host);
+      const mainId = `main:${hostPolicy.modelSelection.source}:${hostPolicy.modelSelection.model}`;
+      const specialists = hostPolicy.specialists.map((specialist, index) =>
         bindModel(
           specialist,
           specialist.capabilities,
           `specialist-${index}:${specialist.source}:${specialist.model}`,
+          specialist,
         ),
       );
       if (!active.capabilityCompletion.enabled || specialists.length === 0) {
         const requiredCapabilities = inferCapabilities(request);
         const result = await bindModel(
-          active.modelSelection,
-          active.capabilityCompletion.mainCapabilities,
+          hostPolicy.modelSelection,
+          hostPolicy.mainCapabilities,
           mainId,
         ).provider.execute(request);
         records.unshift({
+          host: request.routing?.host ?? "openai-compatible",
           mainModelId: mainId,
           specialistModelIds: [],
           requiredCapabilities,
           missingCapabilities: requiredCapabilities.filter(
-            (capability) => !active.capabilityCompletion.mainCapabilities.includes(capability),
+            (capability) => !hostPolicy.mainCapabilities.includes(capability),
           ),
           score: 0,
           estimatedCostPerMillionTokens: 0,
@@ -533,10 +567,7 @@ export const createCapabilityCompletionProvider = (
         return result;
       }
       const router = createDynamicModelRouter(
-        [
-          bindModel(active.modelSelection, active.capabilityCompletion.mainCapabilities, mainId),
-          ...specialists,
-        ],
+        [bindModel(hostPolicy.modelSelection, hostPolicy.mainCapabilities, mainId), ...specialists],
         {
           enabled: active.capabilityCompletion.enabled,
           mainModelId: mainId,
@@ -544,7 +575,7 @@ export const createCapabilityCompletionProvider = (
           capabilityCompletion: {
             enabled: active.capabilityCompletion.enabled,
             poolModelIds: specialists.map((specialist) => specialist.profile.id),
-            maximumSpecialists: active.capabilityCompletion.maximumSpecialists,
+            maximumSpecialists: hostPolicy.maximumSpecialists,
           },
         },
       );
@@ -553,6 +584,7 @@ export const createCapabilityCompletionProvider = (
         const decision = router.inspect();
         if (decision !== undefined) {
           records.unshift({
+            host: request.routing?.host ?? "openai-compatible",
             ...decision,
             occurredAt: new Date().toISOString(),
             role: request.routing?.role ?? "main",
@@ -566,6 +598,7 @@ export const createCapabilityCompletionProvider = (
         const decision = router.inspect();
         if (decision !== undefined) {
           records.unshift({
+            host: request.routing?.host ?? "openai-compatible",
             ...decision,
             occurredAt: new Date().toISOString(),
             role: request.routing?.role ?? "main",

@@ -156,13 +156,26 @@ test("routes Responses and Chat Completions hosts through the same Agent kernel"
     assert.equal(chatResponse.status, 200);
     assert.match(await chatResponse.text(), /Shared Agent result verified/u);
 
+    const cursorResponse = await fetch(`${runtime.origin}/v1/hosts/cursor/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "ai-tidu9-config", input: "Cursor host goal" }),
+    });
+    assert.equal(cursorResponse.status, 200);
+    assert.match(await cursorResponse.text(), /Shared Agent result verified/u);
+
     const taskList = (await (await fetch(`${runtime.origin}/api/tasks`)).json()) as {
-      tasks: Array<{ objective: string }>;
+      tasks: Array<{ objective: string; originHost?: string }>;
     };
     assert.deepEqual(taskList.tasks.map((task) => task.objective).sort(), [
       "Chat host goal",
+      "Cursor host goal",
       "Responses host goal",
     ]);
+    assert.equal(
+      taskList.tasks.find((task) => task.objective === "Cursor host goal")?.originHost,
+      "cursor",
+    );
   } finally {
     await runtime.close();
   }
@@ -196,7 +209,7 @@ test("exposes the shared capability-completion policy and bounded usage status",
     assert.equal(status.operational, false);
     assert.equal(status.configuration.enabled, true);
     assert.deepEqual(status.configuration.specialists, []);
-    assert.deepEqual(status.hosts, ["codex", "cursor", "cli", "openai-compatible"]);
+    assert.deepEqual(status.hosts, ["codex", "cursor", "cli", "ollama", "openai-compatible"]);
     assert.deepEqual(status.records, []);
   } finally {
     await runtime.close();
