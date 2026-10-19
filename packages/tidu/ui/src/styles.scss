@@ -1051,7 +1051,8 @@ h2 {
     }
 
     &-running,
-    &-ready {
+    &-ready,
+    &-pending {
       color: #71d6b7;
 
       &::before {

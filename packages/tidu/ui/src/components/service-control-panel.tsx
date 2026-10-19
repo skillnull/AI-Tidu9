@@ -85,6 +85,11 @@ const actionLabels = {
   zh: { refresh: "刷新", restart: "重启", start: "启动", stop: "停止" },
 } as const;
 
+const actionProgressLabels = {
+  en: { restart: "Restarting…", start: "Starting…", stop: "Stopping…" },
+  zh: { restart: "重启中…", start: "启动中…", stop: "停止中…" },
+} as const;
+
 const formatUptime = (seconds: number, english: boolean): string => {
   const hours = Math.floor(seconds / 3_600);
   const minutes = Math.floor((seconds % 3_600) / 60);
@@ -94,6 +99,7 @@ const formatUptime = (seconds: number, english: boolean): string => {
 export const ServiceControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
   const english = locale === "en-US";
   const labels = english ? actionLabels.en : actionLabels.zh;
+  const progressLabels = english ? actionProgressLabels.en : actionProgressLabels.zh;
   const [inventory, setInventory] = useState<ServiceInventory>();
   const [pending, setPending] = useState<string>();
 
@@ -114,6 +120,30 @@ export const ServiceControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) =
     void refresh();
   }, [refresh]);
 
+  const waitForAction = async (
+    service: ServiceEntry,
+    action: Exclude<ServiceAction, "refresh">,
+  ): Promise<ServiceInventory | undefined> => {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+      try {
+        const response = await fetch("/api/services", { cache: "no-store" });
+        if (!response.ok) continue;
+        const nextInventory = (await response.json()) as ServiceInventory;
+        const nextService = nextInventory.services.find((entry) => entry.id === service.id);
+        const actionCompleted =
+          action === "stop"
+            ? nextService?.status === "stopped"
+            : nextService?.status === "running" &&
+              (action !== "restart" || nextService.processId !== service.processId);
+        if (actionCompleted) return nextInventory;
+      } catch {
+        // A restarted frontend can briefly interrupt its own proxy connection.
+      }
+    }
+    return undefined;
+  };
+
   const runAction = async (service: ServiceEntry, action: ServiceAction) => {
     const operationId = `${service.id}:${action}`;
     setPending(operationId);
@@ -126,19 +156,17 @@ export const ServiceControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) =
       const result = (await response.json().catch(() => ({}))) as ServiceActionResponse &
         Partial<ServiceInventory>;
       if (!response.ok) throw new Error(result.command ?? result.error ?? "Service action failed");
-      if (action === "restart" || action === "start") {
-        await new Promise((resolveWait) => setTimeout(resolveWait, 800));
-      } else if (action === "stop") {
-        await new Promise((resolveWait) => setTimeout(resolveWait, 250));
-      }
+      const completedInventory =
+        action === "refresh" ? undefined : await waitForAction(service, action);
       const refreshedInventory =
-        result.services && result.environment
+        completedInventory ??
+        (result.services && result.environment
           ? (result as ServiceInventory)
           : await fetch("/api/services", { cache: "no-store" }).then(async (inventoryResponse) =>
               inventoryResponse.ok
                 ? ((await inventoryResponse.json()) as ServiceInventory)
                 : inventory,
-            );
+            ));
       if (refreshedInventory) setInventory(refreshedInventory);
     } catch {
       // Keep the current snapshot; the next manual refresh can retry the request.
@@ -196,108 +224,115 @@ export const ServiceControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) =
       </div>
 
       <div className="service-control-list">
-        {inventory?.services.map((service) => (
-          <article key={service.id}>
-            <div className="service-control-identity">
-              <h3>{service.name}</h3>
-              <p>
-                {service.id} ·{" "}
-                {service.kind === "frontend"
-                  ? english
-                    ? "Frontend development service"
-                    : "前端开发服务"
-                  : service.kind === "cli"
+        {inventory?.services.map((service) => {
+          const activeAction = service.actions.find(
+            (action) => action !== "refresh" && pending === `${service.id}:${action}`,
+          ) as Exclude<ServiceAction, "refresh"> | undefined;
+          return (
+            <article key={service.id}>
+              <div className="service-control-identity">
+                <h3>{service.name}</h3>
+                <p>
+                  {service.id} ·{" "}
+                  {service.kind === "frontend"
                     ? english
-                      ? "CLI service"
-                      : "CLI 服务"
-                    : inventory.mode === "development"
+                      ? "Frontend development service"
+                      : "前端开发服务"
+                    : service.kind === "cli"
                       ? english
-                        ? "Local API service"
-                        : "本地接口服务"
-                      : english
-                        ? "Installed or remote API service"
-                        : "安装或远程接口服务"}
-              </p>
-              <dl>
-                <div>
-                  <dt>{english ? "Mode" : "运行方式"}</dt>
-                  <dd>
-                    {service.lifecycle === "managed"
-                      ? english
-                        ? "Managed process"
-                        : "常驻进程"
-                      : english
-                        ? "On-demand command"
-                        : "按需命令"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>PID</dt>
-                  <dd>
-                    {service.processId ??
-                      (service.lifecycle === "on-demand"
+                        ? "CLI service"
+                        : "CLI 服务"
+                      : inventory.mode === "development"
                         ? english
-                          ? "On demand"
-                          : "按需执行"
+                          ? "Local API service"
+                          : "本地接口服务"
                         : english
-                          ? "Not running"
-                          : "未运行")}
-                  </dd>
-                </div>
-                <div>
-                  <dt>{english ? "Command" : "命令入口"}</dt>
-                  <dd title={service.command}>{service.command}</dd>
-                </div>
-                <div>
-                  <dt>{english ? "Endpoint" : "服务地址"}</dt>
-                  <dd title={service.endpoint}>{service.endpoint}</dd>
-                </div>
-                <div>
-                  <dt>{english ? "Version" : "版本"}</dt>
-                  <dd>{service.version}</dd>
-                </div>
-              </dl>
-            </div>
-            <span className={`service-control-status service-control-status-${service.status}`}>
-              {service.status === "running"
-                ? english
-                  ? "Running"
-                  : "运行中"
-                : service.status === "ready"
-                  ? english
-                    ? "Ready"
-                    : "可用"
-                  : english
-                    ? "Stopped"
-                    : "已停止"}
-            </span>
-            {service.actions.some((action) => ["restart", "start", "stop"].includes(action)) ? (
-              <div className="service-control-actions">
-                {service.actions
-                  .filter((action) => action !== "refresh")
-                  .map((action) => (
-                    <button
-                      key={action}
-                      type="button"
-                      disabled={
-                        pending !== undefined ||
-                        (action === "start" && service.status !== "stopped") ||
-                        ((action === "stop" || action === "restart") &&
-                          service.status !== "running")
-                      }
-                      onClick={() => void runAction(service, action)}
-                    >
-                      {pending === `${service.id}:${action}`
+                          ? "Installed or remote API service"
+                          : "安装或远程接口服务"}
+                </p>
+                <dl>
+                  <div>
+                    <dt>{english ? "Mode" : "运行方式"}</dt>
+                    <dd>
+                      {service.lifecycle === "managed"
                         ? english
-                          ? "Running…"
-                          : "执行中…"
-                        : labels[action]}
-                    </button>
-                  ))}
+                          ? "Managed process"
+                          : "常驻进程"
+                        : english
+                          ? "On-demand command"
+                          : "按需命令"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>PID</dt>
+                    <dd>
+                      {service.processId ??
+                        (service.lifecycle === "on-demand"
+                          ? english
+                            ? "On demand"
+                            : "按需执行"
+                          : english
+                            ? "Not running"
+                            : "未运行")}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>{english ? "Command" : "命令入口"}</dt>
+                    <dd title={service.command}>{service.command}</dd>
+                  </div>
+                  <div>
+                    <dt>{english ? "Endpoint" : "服务地址"}</dt>
+                    <dd title={service.endpoint}>{service.endpoint}</dd>
+                  </div>
+                  <div>
+                    <dt>{english ? "Version" : "版本"}</dt>
+                    <dd>{service.version}</dd>
+                  </div>
+                </dl>
               </div>
-            ) : null}
-          </article>
-        ))}
+              <span
+                className={`service-control-status service-control-status-${activeAction ? "pending" : service.status}`}
+              >
+                {activeAction
+                  ? progressLabels[activeAction]
+                  : service.status === "running"
+                    ? english
+                      ? "Running"
+                      : "运行中"
+                    : service.status === "ready"
+                      ? english
+                        ? "Ready"
+                        : "可用"
+                      : english
+                        ? "Stopped"
+                        : "已停止"}
+              </span>
+              {service.actions.some((action) => ["restart", "start", "stop"].includes(action)) ? (
+                <div className="service-control-actions">
+                  {service.actions
+                    .filter((action) => action !== "refresh")
+                    .map((action) => (
+                      <button
+                        key={action}
+                        type="button"
+                        disabled={
+                          pending !== undefined ||
+                          (action === "start" && service.status !== "stopped") ||
+                          ((action === "stop" || action === "restart") &&
+                            service.status !== "running")
+                        }
+                        onClick={() => void runAction(service, action)}
+                      >
+                        {pending === `${service.id}:${action}`
+                          ? progressLabels[action]
+                          : labels[action]}
+                      </button>
+                    ))}
+                </div>
+              ) : null}
+            </article>
+          );
+        })}
       </div>
     </section>
   );

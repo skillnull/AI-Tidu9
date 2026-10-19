@@ -51,6 +51,37 @@ interface CodexFailureResponse {
   reasonCode?: string;
 }
 
+type SectionId =
+  | "clients"
+  | "configuration"
+  | "enterprise"
+  | "guide"
+  | "personal"
+  | "services"
+  | "tasks"
+  | "usage";
+
+const ACTIVE_SECTION_STORAGE_KEY = "ai-tidu9:active-section";
+const sectionIds = new Set<SectionId>([
+  "clients",
+  "configuration",
+  "enterprise",
+  "guide",
+  "personal",
+  "services",
+  "tasks",
+  "usage",
+]);
+
+const readActiveSection = (): SectionId | undefined => {
+  try {
+    const storedSection = window.sessionStorage.getItem(ACTIVE_SECTION_STORAGE_KEY);
+    return sectionIds.has(storedSection as SectionId) ? (storedSection as SectionId) : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 const formatCodexFailure = (failure: CodexFailureResponse, locale: "en-US" | "zh-CN"): string => {
   const officialFailure = failure.failureSource === "official-codex";
   const reason = failure.reason ?? failure.message ?? "Unknown failure.";
@@ -86,16 +117,17 @@ const App = () => {
   const [loadingState, setLoadingState] = useState<LoadingState>({
     status: "loading",
   });
-  const [activeSection, setActiveSection] = useState<
-    | "clients"
-    | "configuration"
-    | "enterprise"
-    | "guide"
-    | "personal"
-    | "services"
-    | "tasks"
-    | "usage"
-  >("configuration");
+  const [activeSection, setActiveSectionState] = useState<SectionId>(
+    () => readActiveSection() ?? "configuration",
+  );
+  const setActiveSection = useCallback((section: SectionId) => {
+    setActiveSectionState(section);
+    try {
+      window.sessionStorage.setItem(ACTIVE_SECTION_STORAGE_KEY, section);
+    } catch {
+      // Navigation still works when browser storage is unavailable.
+    }
+  }, []);
   const [locale, setLocale] = useState<"en-US" | "zh-CN">("zh-CN");
   const [selectedMode, setSelectedMode] = useState<ConfigurationMode>("managed");
   const [configurationView, setConfigurationView] = useState<"active" | "edit">("active");
@@ -270,7 +302,20 @@ const App = () => {
 
       if (!hasLoadedWorkspace.current) {
         hasLoadedWorkspace.current = true;
-        setActiveSection(bootstrap.deployment === "enterprise" ? "enterprise" : "personal");
+        const storedSection = readActiveSection();
+        const validStoredSection =
+          bootstrap.deployment === "enterprise"
+            ? storedSection === "enterprise" ||
+              storedSection === "guide" ||
+              storedSection === "tasks"
+            : storedSection !== "enterprise";
+        setActiveSection(
+          storedSection !== undefined && validStoredSection
+            ? storedSection
+            : bootstrap.deployment === "enterprise"
+              ? "enterprise"
+              : "personal",
+        );
         selectedModeRef.current = nextMode;
         setSelectedMode(nextMode);
         setConfigurationForm(toForm(workspace.drafts.expert.configuration));
@@ -280,7 +325,7 @@ const App = () => {
 
       setLoadingState({ status: "ready", bootstrap });
     },
-    [],
+    [setActiveSection],
   );
 
   const refresh = useCallback(async () => {
