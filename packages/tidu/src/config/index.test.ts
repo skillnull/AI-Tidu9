@@ -44,3 +44,50 @@ test("rejects invalid or cross-mode configuration", () => {
     ["activeMode", "virtualModelName"],
   );
 });
+
+test("requires every specialist to use a different host from its primary", () => {
+  const configuration = createDefaultConfiguration();
+  const codexPolicy = {
+    mainModel: { source: "official" as const, model: "current" },
+    mainCapabilities: ["text"],
+    specialists: [
+      {
+        host: "codex" as const,
+        source: "official" as const,
+        model: "gpt-6-sol",
+        capabilities: ["reasoning"],
+      },
+    ],
+    maximumSpecialists: 1,
+  };
+
+  const invalid = validateConfiguration({
+    ...configuration,
+    capabilityCompletion: {
+      ...configuration.capabilityCompletion,
+      hostPolicies: { codex: codexPolicy },
+    },
+  });
+  const valid = validateConfiguration({
+    ...configuration,
+    capabilityCompletion: {
+      ...configuration.capabilityCompletion,
+      hostPolicies: {
+        codex: {
+          ...codexPolicy,
+          specialists: [
+            {
+              host: "cursor" as const,
+              source: "official" as const,
+              model: "gpt-6-sol",
+              capabilities: ["reasoning"],
+            },
+          ],
+        },
+      },
+    },
+  });
+
+  assert.equal(invalid.valid, false);
+  assert.equal(valid.valid, true);
+});

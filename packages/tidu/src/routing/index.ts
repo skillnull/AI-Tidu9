@@ -119,6 +119,11 @@ export interface CapabilityCompletionProvider extends ModelProvider {
   inspectCapabilityCompletion: () => Promise<CapabilityCompletionStatus>;
 }
 
+export interface CapabilityCompletionProviderOptions {
+  /** Resolves the concrete provider owned by a host; no cross-host fallback is allowed. */
+  resolveProviderForHost?: (host: AgentHostId) => Promise<ModelProvider | undefined>;
+}
+
 const ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/u;
 const PRIVACY_RANK: Readonly<Record<ProviderPrivacy, number>> = {
   local: 0,
@@ -461,9 +466,12 @@ export const createCapabilityCompletionProvider = (
     modelSelection: ModelSelection;
     capabilityCompletion: CapabilityCompletionConfiguration;
   }>,
+  options: CapabilityCompletionProviderOptions = {},
 ): CapabilityCompletionProvider => {
   const records: CapabilityCompletionUsageRecord[] = [];
+  const resolvedProviders = new Set<ModelProvider>([provider]);
   const bindModel = (
+    host: AgentHostId,
     selection: ModelSelection,
     capabilities: readonly string[],
     id: string,
@@ -485,15 +493,35 @@ export const createCapabilityCompletionProvider = (
     },
     provider: {
       descriptor: provider.descriptor,
-      execute: (request) =>
-        provider.execute({
+      execute: async (request) => {
+        const selectedProvider =
+          options.resolveProviderForHost === undefined
+            ? provider
+            : await options.resolveProviderForHost(host);
+        if (selectedProvider === undefined) {
+          return {
+            kind: "json",
+            statusCode: 503,
+            body: {
+              error: {
+                code: "specialist_host_unavailable",
+                message: `The ${host} host is unavailable for capability completion.`,
+                type: "server_error",
+              },
+            },
+          };
+        }
+        resolvedProviders.add(selectedProvider);
+        return selectedProvider.execute({
           ...request,
           routing: {
             ...request.routing,
+            host,
             modelSource: selection.source,
             ...(selection.model === "current" ? {} : { targetModel: selection.model }),
           },
-        }),
+        });
+      },
     },
   });
   const resolveHostPolicy = (
@@ -506,13 +534,15 @@ export const createCapabilityCompletionProvider = (
       ? {
           modelSelection: active.modelSelection,
           mainCapabilities: active.capabilityCompletion.mainCapabilities,
-          specialists: active.capabilityCompletion.specialists,
+          specialists: active.capabilityCompletion.specialists.filter(
+            (specialist) => specialist.host !== host,
+          ),
           maximumSpecialists: active.capabilityCompletion.maximumSpecialists,
         }
       : {
           modelSelection: policy.mainModel,
           mainCapabilities: policy.mainCapabilities,
-          specialists: policy.specialists,
+          specialists: policy.specialists.filter((specialist) => specialist.host !== host),
           maximumSpecialists: policy.maximumSpecialists,
         };
   };
@@ -527,29 +557,34 @@ export const createCapabilityCompletionProvider = (
   return {
     descriptor: provider.descriptor,
     listModels: provider.listModels?.bind(provider),
-    close: provider.close?.bind(provider),
+    close: async () => {
+      await Promise.all([...resolvedProviders].map((item) => item.close?.()));
+    },
     inspectCapabilityCompletion: readStatus,
     execute: async (request) => {
       const active = await loadConfiguration();
-      const hostPolicy = resolveHostPolicy(active, request.routing?.host);
-      const mainId = `main:${hostPolicy.modelSelection.source}:${hostPolicy.modelSelection.model}`;
+      const requestHost = request.routing?.host ?? "openai-compatible";
+      const hostPolicy = resolveHostPolicy(active, requestHost);
+      const mainId = `main:${requestHost}:${hostPolicy.modelSelection.source}:${hostPolicy.modelSelection.model}`;
       const specialists = hostPolicy.specialists.map((specialist, index) =>
         bindModel(
+          specialist.host,
           specialist,
           specialist.capabilities,
-          `specialist-${index}:${specialist.source}:${specialist.model}`,
+          `specialist-${index}:${specialist.host}:${specialist.source}:${specialist.model}`,
           specialist,
         ),
       );
       if (!active.capabilityCompletion.enabled || specialists.length === 0) {
         const requiredCapabilities = inferCapabilities(request);
         const result = await bindModel(
+          requestHost,
           hostPolicy.modelSelection,
           hostPolicy.mainCapabilities,
           mainId,
         ).provider.execute(request);
         records.unshift({
-          host: request.routing?.host ?? "openai-compatible",
+          host: requestHost,
           mainModelId: mainId,
           specialistModelIds: [],
           requiredCapabilities,
@@ -567,7 +602,10 @@ export const createCapabilityCompletionProvider = (
         return result;
       }
       const router = createDynamicModelRouter(
-        [bindModel(hostPolicy.modelSelection, hostPolicy.mainCapabilities, mainId), ...specialists],
+        [
+          bindModel(requestHost, hostPolicy.modelSelection, hostPolicy.mainCapabilities, mainId),
+          ...specialists,
+        ],
         {
           enabled: active.capabilityCompletion.enabled,
           mainModelId: mainId,
@@ -584,7 +622,7 @@ export const createCapabilityCompletionProvider = (
         const decision = router.inspect();
         if (decision !== undefined) {
           records.unshift({
-            host: request.routing?.host ?? "openai-compatible",
+            host: requestHost,
             ...decision,
             occurredAt: new Date().toISOString(),
             role: request.routing?.role ?? "main",
@@ -598,7 +636,7 @@ export const createCapabilityCompletionProvider = (
         const decision = router.inspect();
         if (decision !== undefined) {
           records.unshift({
-            host: request.routing?.host ?? "openai-compatible",
+            host: requestHost,
             ...decision,
             occurredAt: new Date().toISOString(),
             role: request.routing?.role ?? "main",

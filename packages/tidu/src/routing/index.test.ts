@@ -31,7 +31,9 @@ test("records a configured specialist contribution for the shared Agent policy",
     capabilityCompletion: {
       enabled: true,
       mainCapabilities: ["text", "structured-output"],
-      specialists: [{ source: "company", model: "vision-model", capabilities: ["vision"] }],
+      specialists: [
+        { host: "cursor", source: "official", model: "vision-model", capabilities: ["vision"] },
+      ],
       maximumSpecialists: 1,
     },
   }));
@@ -46,46 +48,73 @@ test("records a configured specialist contribution for the shared Agent policy",
   assert.deepEqual(calls, ["vision-model", "main-model"]);
   const status = await completion.inspectCapabilityCompletion();
   assert.equal(status.records[0]?.complemented, true);
-  assert.deepEqual(status.records[0]?.specialistModelIds, ["specialist-0:company:vision-model"]);
+  assert.deepEqual(status.records[0]?.specialistModelIds, [
+    "specialist-0:cursor:official:vision-model",
+  ]);
   assert.equal(status.records[0]?.outcome, "succeeded");
 });
 
 test("isolates primary and specialist models by request host", async () => {
   const calls: string[] = [];
-  const provider: ModelProvider = {
-    descriptor: { type: "openai-compatible", model: "default" },
+  const createHostProvider = (host: "codex" | "cursor"): ModelProvider => ({
+    descriptor: { type: host === "codex" ? "codex-host" : "cursor-host", model: "default" },
     execute: async (request) => {
-      calls.push(request.routing?.targetModel ?? "current");
+      calls.push(`${host}:${request.routing?.targetModel ?? "current"}`);
       return {
         kind: "json",
         statusCode: 200,
         body: { choices: [{ message: { content: "{}" } }] },
       };
     },
+  });
+  const providers = {
+    codex: createHostProvider("codex"),
+    cursor: createHostProvider("cursor"),
   };
-  const completion = createCapabilityCompletionProvider(provider, async () => ({
-    modelSelection: { source: "official", model: "default-main" },
-    capabilityCompletion: {
-      enabled: true,
-      mainCapabilities: ["text"],
-      specialists: [],
-      maximumSpecialists: 1,
-      hostPolicies: {
-        codex: {
-          mainModel: { source: "official", model: "codex-main" },
-          mainCapabilities: ["text"],
-          specialists: [{ source: "company", model: "codex-vision", capabilities: ["vision"] }],
-          maximumSpecialists: 1,
-        },
-        cursor: {
-          mainModel: { source: "official", model: "cursor-main" },
-          mainCapabilities: ["text"],
-          specialists: [{ source: "company", model: "cursor-vision", capabilities: ["vision"] }],
-          maximumSpecialists: 1,
+  const completion = createCapabilityCompletionProvider(
+    providers.codex,
+    async () => ({
+      modelSelection: { source: "official", model: "default-main" },
+      capabilityCompletion: {
+        enabled: true,
+        mainCapabilities: ["text"],
+        specialists: [],
+        maximumSpecialists: 1,
+        hostPolicies: {
+          codex: {
+            mainModel: { source: "official", model: "codex-main" },
+            mainCapabilities: ["text"],
+            specialists: [
+              {
+                host: "cursor",
+                source: "official",
+                model: "cursor-vision",
+                capabilities: ["vision"],
+              },
+            ],
+            maximumSpecialists: 1,
+          },
+          cursor: {
+            mainModel: { source: "official", model: "cursor-main" },
+            mainCapabilities: ["text"],
+            specialists: [
+              {
+                host: "codex",
+                source: "official",
+                model: "codex-vision",
+                capabilities: ["vision"],
+              },
+            ],
+            maximumSpecialists: 1,
+          },
         },
       },
+    }),
+    {
+      resolveProviderForHost: async (host) =>
+        host === "codex" || host === "cursor" ? providers[host] : undefined,
     },
-  }));
+  );
 
   await completion.execute({
     protocol: "chat-completions",
@@ -94,7 +123,7 @@ test("isolates primary and specialist models by request host", async () => {
     routing: { host: "cursor", requiredCapabilities: ["vision"], role: "worker" },
   });
 
-  assert.deepEqual(calls, ["cursor-vision", "cursor-main"]);
+  assert.deepEqual(calls, ["codex:codex-vision", "cursor:cursor-main"]);
 });
 
 const policy: DynamicRoutingPolicy = {

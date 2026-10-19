@@ -976,6 +976,10 @@ const readDraftConfiguration = (
         (specialist.source !== "official" &&
           specialist.source !== "company" &&
           specialist.source !== "custom") ||
+        (specialist.host !== "codex" &&
+          specialist.host !== "cursor" &&
+          specialist.host !== "ollama" &&
+          specialist.host !== "openai-compatible") ||
         typeof specialist.model !== "string" ||
         !Array.isArray(specialist.capabilities) ||
         !specialist.capabilities.every((capability) => typeof capability === "string")
@@ -983,6 +987,7 @@ const readDraftConfiguration = (
         return undefined;
       }
       specialists.push({
+        host: specialist.host,
         source: specialist.source,
         model: specialist.model,
         capabilities: specialist.capabilities as string[],
@@ -1164,6 +1169,7 @@ const handleRequest = async (
   response: import("node:http").ServerResponse,
   storage: StorageAdapter,
   provider: ModelProvider | undefined,
+  getConnectedProviderForHost: (host: AgentHostId) => Promise<ModelProvider | undefined>,
   capabilityCompletionProvider: CapabilityCompletionProvider | undefined,
   agentKernel: AgentKernel | undefined,
   enterprise: EnterpriseControlPlane | undefined,
@@ -2089,22 +2095,48 @@ const handleRequest = async (
 
   if (request.method === "GET" && pathname === "/api/models/upstreams") {
     const workspace = await storage.configurationStore.loadWorkspace();
-    const companyModels = await provider?.listModels?.().catch(() => []);
+    const [cursorProvider, ollamaProvider, compatibleProvider] = await Promise.all([
+      getConnectedProviderForHost("cursor"),
+      getConnectedProviderForHost("ollama"),
+      getConnectedProviderForHost("openai-compatible"),
+    ]);
+    const [ollamaModels, compatibleModels] = await Promise.all([
+      ollamaProvider?.listModels?.().catch(() => []) ?? [],
+      compatibleProvider?.listModels?.().catch(() => []) ?? [],
+    ]);
+    const officialModels = listCodexOfficialModels();
+    const cursorLogin = inspectCursorHostLogin();
+    const cursorModels = cursorLogin.reusable
+      ? [
+          {
+            id: cursorProvider?.descriptor.model ?? "current",
+            name: cursorProvider?.descriptor.model ?? "跟随 Cursor 当前模型",
+          },
+        ]
+      : [];
+    const companyProvider = ollamaProvider ?? compatibleProvider;
+    const companyModels = ollamaProvider === undefined ? compatibleModels : ollamaModels;
     sendJson(response, 200, {
       selection: workspace.active.configuration.modelSelection ?? {
         source: "official",
         model: "current",
       },
-      official: listCodexOfficialModels(),
+      official: officialModels,
       company: companyModels ?? [],
-      companyConfigured:
-        provider?.descriptor.type === "tidu-router" ||
-        provider?.descriptor.type === "openai-compatible" ||
-        provider?.descriptor.type === "ollama",
+      hosts: {
+        codex: { available: inspectCodexHostLogin().reusable, models: officialModels },
+        cursor: { available: cursorLogin.reusable, models: cursorModels },
+        ollama: { available: ollamaProvider !== undefined, models: ollamaModels },
+        "openai-compatible": {
+          available: compatibleProvider !== undefined,
+          models: compatibleModels,
+        },
+      },
+      companyConfigured: companyProvider !== undefined,
       companyProviderType:
-        resolveRuntimeProviderType(provider) === "ollama" ||
-        resolveRuntimeProviderType(provider) === "openai-compatible"
-          ? resolveRuntimeProviderType(provider)
+        companyProvider?.descriptor.type === "ollama" ||
+        companyProvider?.descriptor.type === "openai-compatible"
+          ? companyProvider.descriptor.type
           : null,
     });
     return;
@@ -2373,6 +2405,36 @@ export const startLocalRuntime = async (
           officialProvider,
         })
       : selectedProvider;
+  const hostProviderPromises = new Map<AgentHostId, Promise<ModelProvider | undefined>>();
+  const registerHostProvider = (candidate: ModelProvider | undefined): void => {
+    const host =
+      candidate?.descriptor.type === "codex-host"
+        ? "codex"
+        : candidate?.descriptor.type === "cursor-host"
+          ? "cursor"
+          : candidate?.descriptor.type === "ollama"
+            ? "ollama"
+            : candidate?.descriptor.type === "openai-compatible"
+              ? "openai-compatible"
+              : undefined;
+    if (host !== undefined) hostProviderPromises.set(host, Promise.resolve(candidate));
+  };
+  registerHostProvider(selectedProvider);
+  registerHostProvider(officialProvider);
+  const resolveProviderForHost = (host: AgentHostId): Promise<ModelProvider | undefined> => {
+    const existing = hostProviderPromises.get(host);
+    if (existing !== undefined) return existing;
+    const discovered =
+      host === "codex"
+        ? createCodexHostModelProvider()
+        : host === "cursor"
+          ? createCursorHostModelProvider()
+          : Promise.resolve(undefined);
+    hostProviderPromises.set(host, discovered);
+    return discovered;
+  };
+  const getConnectedProviderForHost = (host: AgentHostId): Promise<ModelProvider | undefined> =>
+    hostProviderPromises.get(host) ?? Promise.resolve(undefined);
   const scalingControlPlane =
     options.scalingControlPlane ?? environmentEnterpriseRuntime?.scalingControlPlane;
   const defaultDatabasePath = resolveDefaultDatabasePath();
@@ -2394,14 +2456,18 @@ export const startLocalRuntime = async (
   const capabilityCompletionProvider =
     configuredProvider === undefined
       ? undefined
-      : createCapabilityCompletionProvider(configuredProvider, async () => {
-          const configuration = (await storage.configurationStore.loadWorkspace()).active
-            .configuration;
-          return {
-            modelSelection: configuration.modelSelection,
-            capabilityCompletion: configuration.capabilityCompletion,
-          };
-        });
+      : createCapabilityCompletionProvider(
+          configuredProvider,
+          async () => {
+            const configuration = (await storage.configurationStore.loadWorkspace()).active
+              .configuration;
+            return {
+              modelSelection: configuration.modelSelection,
+              capabilityCompletion: configuration.capabilityCompletion,
+            };
+          },
+          { resolveProviderForHost },
+        );
   const provider =
     capabilityCompletionProvider === undefined
       ? undefined
@@ -2461,6 +2527,7 @@ export const startLocalRuntime = async (
       response,
       storage,
       provider,
+      getConnectedProviderForHost,
       capabilityCompletionProvider,
       agentKernel,
       enterpriseControlPlane,

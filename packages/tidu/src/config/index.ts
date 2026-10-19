@@ -13,6 +13,8 @@ export interface ModelSelection {
 }
 
 export interface CapabilitySpecialistConfiguration extends ModelSelection {
+  /** Different host whose model supplies the missing capability. */
+  host: AgentHostId;
   /** Capabilities this specialist is explicitly allowed to complete. */
   capabilities: readonly string[];
   /** Configured input price per million tokens, or null when unknown or account-funded. */
@@ -178,12 +180,16 @@ export const validateConfiguration = (
   const safeCapability = /^[a-z0-9][a-z0-9._:-]{0,63}$/iu;
   const policies = [
     {
+      host: undefined,
       mainModel: configuration.modelSelection,
       mainCapabilities: completion.mainCapabilities,
       specialists: completion.specialists,
       maximumSpecialists: completion.maximumSpecialists,
     },
-    ...Object.values(completion.hostPolicies ?? {}),
+    ...Object.entries(completion.hostPolicies ?? {}).map(([host, policy]) => ({
+      host: host as AgentHostId,
+      ...policy,
+    })),
   ];
   if (
     typeof completion?.enabled !== "boolean" ||
@@ -199,6 +205,11 @@ export const validateConfiguration = (
             (specialist.source !== "official" &&
               specialist.source !== "company" &&
               specialist.source !== "custom") ||
+            (specialist.host !== "codex" &&
+              specialist.host !== "cursor" &&
+              specialist.host !== "ollama" &&
+              specialist.host !== "openai-compatible") ||
+            specialist.host === policy.host ||
             !/^[a-z0-9][a-z0-9._:-]{0,127}$/iu.test(specialist.model) ||
             specialist.capabilities.length === 0 ||
             specialist.capabilities.some((capability) => !safeCapability.test(capability)) ||

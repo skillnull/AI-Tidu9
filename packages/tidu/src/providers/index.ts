@@ -91,6 +91,10 @@ export interface ModelProvider {
       capabilities?: readonly string[];
       /** Evidence source for the capability declaration. */
       capabilitySource?: "company-published" | "provider-catalog";
+      /** Published input price per million tokens, or null when not published. */
+      inputCostPerMillionTokens?: number | null;
+      /** Published output price per million tokens, or null when not published. */
+      outputCostPerMillionTokens?: number | null;
     }[]
   >;
   /** Releases persistent provider processes and connections owned by this adapter. */
