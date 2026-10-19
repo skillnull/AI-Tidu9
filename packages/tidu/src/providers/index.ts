@@ -109,7 +109,10 @@ export interface CatalogModelRouterOptions {
 }
 
 export const createCatalogModelRouter = (options: CatalogModelRouterOptions): ModelProvider => ({
-  descriptor: { type: "tidu-router", model: options.defaultProvider.descriptor.model },
+  descriptor: {
+    type: "tidu-router",
+    model: options.defaultProvider.descriptor.model,
+  },
   execute: async (request) => {
     if (request.routing?.modelSource === "official" && options.officialProvider === undefined) {
       return {
@@ -270,7 +273,29 @@ export const createOpenAiCompatibleProvider = (
       if (!isRecord(body) || !Array.isArray(body.data)) return [{ id: model, name: model }];
       const models = body.data.flatMap((candidate) =>
         isRecord(candidate) && typeof candidate.id === "string"
-          ? [{ id: candidate.id, name: candidate.id }]
+          ? [
+              {
+                id: candidate.id,
+                name: typeof candidate.name === "string" ? candidate.name : candidate.id,
+                ...(Array.isArray(candidate.capabilities) &&
+                candidate.capabilities.every((capability) => typeof capability === "string")
+                  ? {
+                      capabilities: candidate.capabilities as string[],
+                      capabilitySource: "company-published" as const,
+                    }
+                  : {}),
+                ...(typeof candidate.inputCostPerMillionTokens === "number"
+                  ? {
+                      inputCostPerMillionTokens: candidate.inputCostPerMillionTokens,
+                    }
+                  : {}),
+                ...(typeof candidate.outputCostPerMillionTokens === "number"
+                  ? {
+                      outputCostPerMillionTokens: candidate.outputCostPerMillionTokens,
+                    }
+                  : {}),
+              },
+            ]
           : [],
       );
       return models.length > 0 ? models : [{ id: model, name: model }];
@@ -291,7 +316,10 @@ export const createOpenAiCompatibleProvider = (
       const response = await fetch(endpoint, {
         method: "POST",
         headers,
-        body: JSON.stringify({ ...request.body, model: request.routing?.targetModel ?? model }),
+        body: JSON.stringify({
+          ...request.body,
+          model: request.routing?.targetModel ?? model,
+        }),
         signal: combineSignals(request.signal, timeoutMilliseconds),
       });
       if (streaming && response.ok) {
@@ -508,17 +536,52 @@ export const createOllamaProvider = (options: ProviderAdapterOptions): ModelProv
 
   return {
     descriptor: { type: "ollama", model },
-    listModels: async () =>
-      (await discoverOllamaModels({ baseUrl: baseUrl.origin })).map((modelId) => ({
-        id: modelId,
-        name: modelId,
-      })),
+    listModels: async () => {
+      const modelIds = await discoverOllamaModels({ baseUrl: baseUrl.origin });
+      return Promise.all(
+        modelIds.map(async (modelId) => {
+          const response = await fetch(createEndpoint(baseUrl, "/api/show"), {
+            method: "POST",
+            headers: {
+              accept: "application/json",
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ model: modelId }),
+            signal: AbortSignal.timeout(Math.min(timeoutMilliseconds, 3_000)),
+          }).catch(() => undefined);
+          if (response === undefined || !response.ok) return { id: modelId, name: modelId };
+          const body = await readProviderJson(response).catch(() => undefined);
+          if (!isRecord(body) || !Array.isArray(body.capabilities)) {
+            return { id: modelId, name: modelId };
+          }
+          const published = body.capabilities.filter(
+            (capability): capability is string => typeof capability === "string",
+          );
+          const capabilities = [
+            ...(published.includes("completion") ? ["text"] : []),
+            ...(published.includes("vision") ? ["vision"] : []),
+            ...(published.includes("tools") ? ["tool-use"] : []),
+            ...(published.includes("thinking") ? ["reasoning"] : []),
+          ];
+          return {
+            id: modelId,
+            name: modelId,
+            ...(capabilities.length > 0
+              ? { capabilities, capabilitySource: "provider-catalog" as const }
+              : {}),
+          };
+        }),
+      );
+    },
     execute: async (request) => {
       const streaming = request.body.stream === true;
       const tools = toOllamaTools(request);
       const response = await fetch(createEndpoint(baseUrl, "/api/chat"), {
         method: "POST",
-        headers: { accept: "application/json", "content-type": "application/json" },
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+        },
         body: JSON.stringify({
           model: request.routing?.targetModel ?? model,
           messages: toOllamaMessages(request),
@@ -561,7 +624,13 @@ export const createOllamaProvider = (options: ProviderAdapterOptions): ModelProv
                   type: "message",
                   status: "completed",
                   role: "assistant",
-                  content: [{ type: "output_text", text: body.message.content, annotations: [] }],
+                  content: [
+                    {
+                      type: "output_text",
+                      text: body.message.content,
+                      annotations: [],
+                    },
+                  ],
                 },
               ]),
           ...toolCalls.map((toolCall) => ({

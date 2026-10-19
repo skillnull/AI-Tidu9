@@ -637,24 +637,88 @@ h2 {
   }
 
   .provider-host-options {
-    margin-top: 14px;
+    display: inline-flex;
+    width: fit-content;
+    margin-top: 12px;
+    padding: 4px;
+    border: 1px solid #273440;
+    border-radius: 10px;
+    background: #0a1016;
+
+    .provider-host-tab {
+      min-height: 38px;
+      border-color: transparent;
+      background: transparent;
+      color: #aeb9c5;
+
+      + .provider-host-tab {
+        margin-left: 2px;
+      }
+
+      &.mode-button-active {
+        border-color: #397c75;
+        background: #16302e;
+        color: #79d4c7;
+        box-shadow: inset 0 0 0 1px rgb(105 200 186 / 8%);
+      }
+    }
   }
 
   .model-source-options {
     display: flex;
     min-width: 0;
     flex-wrap: wrap;
-    gap: 8px;
-    margin-top: 14px;
-    padding: 8px 12px 12px;
-    border: 1px solid #202a34;
-    border-radius: 7px;
-    background: #0d141b;
+    gap: 4px;
+    width: fit-content;
+    margin-top: 10px;
+    padding: 5px 8px 8px;
+    border: 0;
+    border-left: 2px solid #344350;
+    border-radius: 0 7px 7px 0;
+    background: #0d131a;
 
     legend {
-      padding: 0 6px;
+      padding: 0 5px;
       color: #758292;
-      font-size: 10px;
+      font-size: 9px;
+    }
+
+    .model-source-button {
+      position: relative;
+      min-height: 30px;
+      padding: 5px 10px 5px 25px;
+      border: 0;
+      background: transparent;
+      color: #909dab;
+      font-size: 11px;
+
+      &::before {
+        position: absolute;
+        top: 50%;
+        left: 9px;
+        width: 8px;
+        height: 8px;
+        border: 1px solid #53616f;
+        border-radius: 50%;
+        background: transparent;
+        content: "";
+        transform: translateY(-50%);
+      }
+
+      + .model-source-button {
+        margin-left: 0;
+      }
+
+      &.mode-button-active {
+        color: #d6e2e1;
+        background: #141e26;
+
+        &::before {
+          border-color: #69c8ba;
+          background: #69c8ba;
+          box-shadow: 0 0 0 3px rgb(105 200 186 / 12%);
+        }
+      }
     }
   }
 
@@ -1961,19 +2025,19 @@ h2 {
 .capability-completion-editor,
 .capability-completion-panel {
   border: 1px solid var(--control-border);
-  border-radius: 16px;
+  border-radius: 14px;
   background: #0b1118;
-  padding: 24px;
+  padding: 18px;
 }
 
 .capability-completion-editor {
-  margin-top: 24px;
+  margin-top: 18px;
 
   .capability-host-scope,
   .capability-benefit-summary {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
-    margin-top: 18px;
+    margin-top: 14px;
     border: 1px solid #24303c;
     border-radius: 12px;
     background: #0e151d;
@@ -1982,7 +2046,7 @@ h2 {
     > label {
       display: grid;
       min-width: 0;
-      padding: 14px 16px;
+      padding: 10px 13px;
       border-right: 1px solid #24303c;
 
       &:last-child {
@@ -2004,10 +2068,20 @@ h2 {
   .capability-primary-card,
   .capability-specialists,
   .capability-model-matrix {
-    margin-top: 18px;
-    padding: 18px;
+    margin-top: 14px;
+    padding: 14px;
     border: 1px solid #24303c;
-    border-radius: 12px;
+    border-radius: 10px;
+  }
+
+  .capability-primary-card {
+    border-color: #2b514e;
+    background: linear-gradient(135deg, rgb(33 79 74 / 22%), rgb(12 20 27 / 45%));
+  }
+
+  .capability-specialists {
+    border-color: #3a3d55;
+    background: linear-gradient(135deg, rgb(48 49 78 / 22%), rgb(12 19 26 / 52%));
   }
 
   .capability-section-heading,
@@ -2023,7 +2097,7 @@ h2 {
     }
 
     p {
-      margin-top: 5px;
+      margin-top: 3px;
       color: #8794a5;
     }
   }
@@ -2031,13 +2105,13 @@ h2 {
   .capability-picker {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
-    margin: 14px -4px -4px;
+    margin: 10px -3px -3px;
 
     label {
       display: flex;
       min-width: 0;
-      margin: 4px;
-      padding: 10px;
+      margin: 3px;
+      padding: 8px;
       border: 1px solid #283542;
       border-radius: 9px;
       background: #101821;
@@ -2078,11 +2152,11 @@ h2 {
   }
 
   .capability-specialist-card {
-    margin-top: 14px;
-    padding: 16px;
-    border: 1px solid #2a3744;
+    margin-top: 10px;
+    padding: 12px;
+    border: 1px solid #41445e;
     border-radius: 11px;
-    background: #0c131a;
+    background: #101522;
 
     .capability-specialist-heading {
       align-items: center;
@@ -2107,7 +2181,7 @@ h2 {
     .capability-specialist-fields {
       display: grid;
       grid-template-columns: 150px minmax(220px, 1fr) minmax(260px, 1fr);
-      margin-top: 14px;
+      margin-top: 10px;
 
       > * {
         margin-right: 10px;
@@ -2132,7 +2206,7 @@ h2 {
     }
 
     .capability-evidence {
-      margin: 12px 0 0;
+      margin: 9px 0 0;
       color: #7fbfb7;
     }
 
@@ -2199,10 +2273,70 @@ h2 {
 }
 
 .capability-toggle {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
+  min-height: 30px;
+  cursor: pointer;
   white-space: nowrap;
+
+  input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+
+    &:checked + .capability-toggle-track {
+      border-color: #69c8ba;
+      background: #3d9489;
+
+      &::after {
+        transform: translateX(18px);
+      }
+    }
+
+    &:focus-visible + .capability-toggle-track {
+      outline: 2px solid #75d6c8;
+      outline-offset: 2px;
+    }
+
+    &:disabled + .capability-toggle-track {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+  }
+
+  .capability-toggle-track {
+    position: relative;
+    width: 40px;
+    height: 22px;
+    border: 1px solid #3a4856;
+    border-radius: 999px;
+    background: #1a242e;
+    transition: background 160ms ease, border-color 160ms ease;
+
+    &::after {
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: #e4eceb;
+      box-shadow: 0 1px 3px rgb(0 0 0 / 35%);
+      content: "";
+      transition: transform 160ms ease;
+    }
+  }
+
+  .capability-toggle-label {
+    color: #aab5c0;
+    font-size: 11px;
+  }
 }
 
 .capability-policy-fields {

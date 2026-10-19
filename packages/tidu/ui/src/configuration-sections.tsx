@@ -120,27 +120,67 @@ interface CapabilityCompletionStatusResponse {
 }
 
 const MODEL_CAPABILITIES = [
-  { id: "text", zh: "文本理解与生成", en: "Text", detail: "阅读、归纳与生成文本" },
+  {
+    id: "text",
+    zh: "文本理解与生成",
+    en: "Text",
+    detail: "阅读、归纳与生成文本",
+  },
   {
     id: "structured-output",
     zh: "结构化输出",
     en: "Structured output",
     detail: "稳定返回 JSON 等结构",
   },
-  { id: "reasoning", zh: "复杂推理", en: "Reasoning", detail: "多步骤分析与决策" },
+  {
+    id: "reasoning",
+    zh: "复杂推理",
+    en: "Reasoning",
+    detail: "多步骤分析与决策",
+  },
   { id: "code", zh: "代码工程", en: "Code", detail: "代码理解、修改与调试" },
-  { id: "vision", zh: "视觉理解", en: "Vision", detail: "读取图片、截图与图表" },
-  { id: "web-research", zh: "联网研究", en: "Web research", detail: "检索并整合外部资料" },
-  { id: "tool-use", zh: "工具调用", en: "Tool use", detail: "调用工具并处理结果" },
-  { id: "long-context", zh: "长上下文", en: "Long context", detail: "处理大型代码库或长文档" },
+  {
+    id: "vision",
+    zh: "视觉理解",
+    en: "Vision",
+    detail: "读取图片、截图与图表",
+  },
+  {
+    id: "web-research",
+    zh: "联网研究",
+    en: "Web research",
+    detail: "检索并整合外部资料",
+  },
+  {
+    id: "tool-use",
+    zh: "工具调用",
+    en: "Tool use",
+    detail: "调用工具并处理结果",
+  },
+  {
+    id: "long-context",
+    zh: "长上下文",
+    en: "Long context",
+    detail: "处理大型代码库或长文档",
+  },
   {
     id: "document-analysis",
     zh: "文档分析",
     en: "Document analysis",
     detail: "解析复杂文档和表格",
   },
-  { id: "domain-context", zh: "领域知识", en: "Domain context", detail: "使用公司或行业专有知识" },
-  { id: "local-private", zh: "本地隐私", en: "Local private", detail: "数据不离开本地边界" },
+  {
+    id: "domain-context",
+    zh: "领域知识",
+    en: "Domain context",
+    detail: "使用公司或行业专有知识",
+  },
+  {
+    id: "local-private",
+    zh: "本地隐私",
+    en: "Local private",
+    detail: "数据不离开本地边界",
+  },
 ] as const;
 
 type CatalogModel = {
@@ -159,21 +199,24 @@ const capabilityLabel = (capability: string, english: boolean): string => {
 
 const CapabilityPicker = ({
   selected,
+  available,
   english,
   disabled,
   onChange,
 }: {
   selected: readonly string[];
+  available?: readonly string[];
   english: boolean;
   disabled: boolean;
   onChange: (capabilities: readonly string[]) => void;
 }) => {
+  const capabilityIds = available ?? selected;
   const options = [
     ...MODEL_CAPABILITIES,
-    ...selected
+    ...capabilityIds
       .filter((capability) => !MODEL_CAPABILITIES.some((item) => item.id === capability))
       .map((id) => ({ id, zh: id, en: id, detail: "自定义能力声明" })),
-  ];
+  ].filter((capability) => available === undefined || available.includes(capability.id));
   return (
     <div className="capability-picker">
       {options.map((capability) => {
@@ -215,7 +258,9 @@ export const CapabilityCompletionPanel = ({
   const [message, setMessage] = useState(english ? "Loading…" : "正在读取…");
   const refresh = useCallback(async () => {
     try {
-      const response = await fetch("/api/capability-completion", { cache: "no-store" });
+      const response = await fetch("/api/capability-completion", {
+        cache: "no-store",
+      });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       setStatus((await response.json()) as CapabilityCompletionStatusResponse);
       setMessage("");
@@ -713,7 +758,10 @@ export const DEFAULT_EXPERT_SERVICES: ExpertServiceConfiguration = {
 export const toForm = (configuration: TiduConfiguration): ConfigurationForm => ({
   activeProfileId: configuration.activeProfileId,
   virtualModelName: configuration.virtualModelName,
-  modelSelection: configuration.modelSelection ?? { source: "official", model: "current" },
+  modelSelection: configuration.modelSelection ?? {
+    source: "official",
+    model: "current",
+  },
   capabilityCompletion: configuration.capabilityCompletion ?? {
     enabled: true,
     mainCapabilities: ["text", "structured-output"],
@@ -1108,7 +1156,9 @@ export const EnterpriseReadOnlyPanel = ({
         headers: { "content-type": "application/json" },
         body: action === "connect" ? JSON.stringify({ endpoint: endpoint.trim() }) : "{}",
       });
-      const result = (await response.json()) as ConfigCenterBootstrap & { message?: string };
+      const result = (await response.json()) as ConfigCenterBootstrap & {
+        message?: string;
+      };
       if (!response.ok) {
         throw new Error(
           result.message ??
@@ -1651,11 +1701,19 @@ export const QuickStartWizard = ({
   const selectMainModel = (selection: ModelSelection): void =>
     updateActiveHostPolicy({ ...activeHostPolicy, mainModel: selection }, selection);
   const hostCatalogModels = upstreamCatalog.hosts[activeHostId]?.models ?? [];
-  const availableSpecialistHosts = (
+  const specialistHostCandidates = (
     ["codex", "cursor", "ollama", "openai-compatible"] as const
   ).filter((host) => host !== activeHostId);
+  const usableSpecialistModels = (host: AgentHostId) =>
+    (upstreamCatalog.hosts[host]?.models ?? []).filter(
+      (model) => (model.capabilities?.length ?? 0) > 0,
+    );
+  const availableSpecialistHosts = specialistHostCandidates.filter(
+    (host) =>
+      upstreamCatalog.hosts[host]?.available === true && usableSpecialistModels(host).length > 0,
+  );
   const specialistCatalogModels = availableSpecialistHosts.flatMap((host) =>
-    (upstreamCatalog.hosts[host]?.models ?? []).map((model) => ({ ...model, host })),
+    usableSpecialistModels(host).map((model) => ({ ...model, host })),
   );
   const detectedPrimaryModel =
     form.modelSelection.model === "current"
@@ -1762,7 +1820,10 @@ export const QuickStartWizard = ({
           hosts?: UpstreamModelCatalog["hosts"];
         };
         const fallbackHosts = createEmptyHostCatalog();
-        fallbackHosts.codex = { available: catalog.official.length > 0, models: catalog.official };
+        fallbackHosts.codex = {
+          available: catalog.official.length > 0,
+          models: catalog.official,
+        };
         if (catalog.companyProviderType !== null) {
           const companyHost = catalog.companyProviderType;
           fallbackHosts[companyHost] = {
@@ -1770,7 +1831,10 @@ export const QuickStartWizard = ({
             models: catalog.company,
           };
         }
-        setUpstreamCatalog({ ...catalog, hosts: catalog.hosts ?? fallbackHosts });
+        setUpstreamCatalog({
+          ...catalog,
+          hosts: catalog.hosts ?? fallbackHosts,
+        });
         setUpstreamCatalogStatus("ready");
       })
       .catch(() => {
@@ -1939,7 +2003,10 @@ export const QuickStartWizard = ({
                   aria-required="true"
                   aria-invalid={entryValidationMessages.activeProfileId !== undefined}
                   onChange={(event) =>
-                    onFormChange({ ...form, activeProfileId: event.target.value })
+                    onFormChange({
+                      ...form,
+                      activeProfileId: event.target.value,
+                    })
                   }
                   maxLength={64}
                   disabled={isPending || readOnly}
@@ -1961,7 +2028,10 @@ export const QuickStartWizard = ({
                   aria-required="true"
                   aria-invalid={entryValidationMessages.virtualModelName !== undefined}
                   onChange={(event) =>
-                    onFormChange({ ...form, virtualModelName: event.target.value })
+                    onFormChange({
+                      ...form,
+                      virtualModelName: event.target.value,
+                    })
                   }
                   maxLength={64}
                   disabled={isPending || readOnly}
@@ -2100,8 +2170,8 @@ export const QuickStartWizard = ({
                 <button
                   className={
                     providerChoice === "codex-host"
-                      ? "mode-button mode-button-active"
-                      : "mode-button"
+                      ? "mode-button provider-host-tab mode-button-active"
+                      : "mode-button provider-host-tab"
                   }
                   type="button"
                   onClick={() => selectProvider("codex-host")}
@@ -2112,8 +2182,8 @@ export const QuickStartWizard = ({
                 <button
                   className={
                     providerChoice === "cursor-host"
-                      ? "mode-button mode-button-active"
-                      : "mode-button"
+                      ? "mode-button provider-host-tab mode-button-active"
+                      : "mode-button provider-host-tab"
                   }
                   type="button"
                   onClick={() => selectProvider("cursor-host")}
@@ -2123,7 +2193,9 @@ export const QuickStartWizard = ({
                 </button>
                 <button
                   className={
-                    providerChoice === "ollama" ? "mode-button mode-button-active" : "mode-button"
+                    providerChoice === "ollama"
+                      ? "mode-button provider-host-tab mode-button-active"
+                      : "mode-button provider-host-tab"
                   }
                   type="button"
                   onClick={() => selectProvider("ollama")}
@@ -2134,8 +2206,8 @@ export const QuickStartWizard = ({
                 <button
                   className={
                     providerChoice === "compatible"
-                      ? "mode-button mode-button-active"
-                      : "mode-button"
+                      ? "mode-button provider-host-tab mode-button-active"
+                      : "mode-button provider-host-tab"
                   }
                   type="button"
                   onClick={() => selectProvider("compatible")}
@@ -2148,7 +2220,9 @@ export const QuickStartWizard = ({
                 <legend>{english ? "Model source" : "模型来源"}</legend>
                 <button
                   className={
-                    modelChoiceMode === "host" ? "mode-button mode-button-active" : "mode-button"
+                    modelChoiceMode === "host"
+                      ? "mode-button model-source-button mode-button-active"
+                      : "mode-button model-source-button"
                   }
                   type="button"
                   onClick={() => selectModelChoiceMode("host")}
@@ -2158,7 +2232,9 @@ export const QuickStartWizard = ({
                 </button>
                 <button
                   className={
-                    modelChoiceMode === "company" ? "mode-button mode-button-active" : "mode-button"
+                    modelChoiceMode === "company"
+                      ? "mode-button model-source-button mode-button-active"
+                      : "mode-button model-source-button"
                   }
                   type="button"
                   onClick={() => selectModelChoiceMode("company")}
@@ -2168,7 +2244,9 @@ export const QuickStartWizard = ({
                 </button>
                 <button
                   className={
-                    modelChoiceMode === "custom" ? "mode-button mode-button-active" : "mode-button"
+                    modelChoiceMode === "custom"
+                      ? "mode-button model-source-button mode-button-active"
+                      : "mode-button model-source-button"
                   }
                   type="button"
                   onClick={() => selectModelChoiceMode("custom")}
@@ -2231,7 +2309,12 @@ export const QuickStartWizard = ({
                         ? "upstream-model-option selected"
                         : "upstream-model-option"
                     }
-                    onClick={() => selectMainModel({ source: hostModelSource, model: "current" })}
+                    onClick={() =>
+                      selectMainModel({
+                        source: hostModelSource,
+                        model: "current",
+                      })
+                    }
                     disabled={isPending || readOnly}
                   >
                     <strong>
@@ -2324,7 +2407,8 @@ export const QuickStartWizard = ({
                       }
                       disabled={isPending || readOnly}
                     />
-                    <span>
+                    <span className="capability-toggle-track" aria-hidden="true" />
+                    <span className="capability-toggle-label">
                       {form.capabilityCompletion.enabled
                         ? english
                           ? "Enabled"
@@ -2410,7 +2494,10 @@ export const QuickStartWizard = ({
                     english={english}
                     disabled={isPending || readOnly}
                     onChange={(mainCapabilities) =>
-                      updateActiveHostPolicy({ ...activeHostPolicy, mainCapabilities })
+                      updateActiveHostPolicy({
+                        ...activeHostPolicy,
+                        mainCapabilities,
+                      })
                     }
                   />
                 </section>
@@ -2446,9 +2533,7 @@ export const QuickStartWizard = ({
                 <div className="capability-specialists">
                   <div className="capability-section-heading">
                     <div>
-                      <h4>
-                        {english ? "2. Select models from other hosts" : "2. 选择其他宿主的副模型"}
-                      </h4>
+                      <h4>{english ? "2. Select specialist models" : "2. 选择副模型"}</h4>
                       <p>
                         {english
                           ? "The current primary host is excluded. Choose another host first, then one of its models."
@@ -2457,7 +2542,8 @@ export const QuickStartWizard = ({
                     </div>
                   </div>
                   {activeHostPolicy.specialists.map((specialist, index) => {
-                    const modelOptions = upstreamCatalog.hosts[specialist.host]?.models ?? [];
+                    const hostAvailable = availableSpecialistHosts.includes(specialist.host);
+                    const modelOptions = usableSpecialistModels(specialist.host);
                     const selectedCatalogModel = modelOptions.find(
                       (model) => model.id === specialist.model,
                     );
@@ -2467,6 +2553,44 @@ export const QuickStartWizard = ({
                     const knownCost =
                       specialist.inputCostPerMillionTokens != null ||
                       specialist.outputCostPerMillionTokens != null;
+                    if (!hostAvailable) {
+                      return (
+                        <article
+                          className="capability-specialist-card"
+                          key={`${specialist.host}:${specialist.model}:${index}`}
+                        >
+                          <div className="capability-specialist-heading">
+                            <div>
+                              <span>
+                                {english ? "Unavailable specialist" : "不可用的副模型配置"}
+                              </span>
+                              <strong>{hostLabel(specialist.host)}</strong>
+                            </div>
+                            <span className="warning">
+                              {english ? "Not selectable" : "不参与选择与路由"}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateSpecialists(
+                                  activeHostPolicy.specialists.filter(
+                                    (_, specialistIndex) => specialistIndex !== index,
+                                  ),
+                                )
+                              }
+                              disabled={isPending || readOnly}
+                            >
+                              {english ? "Remove" : "移除"}
+                            </button>
+                          </div>
+                          <p className="capability-evidence">
+                            {english
+                              ? "This saved host is currently unavailable or exposes no models. It has no capability controls."
+                              : "该已保存宿主当前不可用或未提供模型，因此不展示能力项，也不会参与互补路由。"}
+                          </p>
+                        </article>
+                      );
+                    }
                     return (
                       <article
                         className="capability-specialist-card"
@@ -2592,16 +2716,29 @@ export const QuickStartWizard = ({
                               .join("、")}
                           </p>
                         ) : null}
-                        <CapabilityPicker
-                          selected={specialist.capabilities}
-                          english={english}
-                          disabled={isPending || readOnly}
-                          onChange={(capabilities) => {
-                            const specialists = [...activeHostPolicy.specialists];
-                            specialists[index] = { ...specialist, capabilities };
-                            updateSpecialists(specialists);
-                          }}
-                        />
+                        {selectedCatalogModel === undefined ? null : selectedCatalogModel
+                            .capabilities?.length ? (
+                          <CapabilityPicker
+                            selected={specialist.capabilities}
+                            available={selectedCatalogModel.capabilities}
+                            english={english}
+                            disabled={isPending || readOnly}
+                            onChange={(capabilities) => {
+                              const specialists = [...activeHostPolicy.specialists];
+                              specialists[index] = {
+                                ...specialist,
+                                capabilities,
+                              };
+                              updateSpecialists(specialists);
+                            }}
+                          />
+                        ) : (
+                          <p className="capability-evidence warning">
+                            {english
+                              ? "This model did not publish capability metadata and cannot be used for capability completion."
+                              : "该模型未发布能力信息，不能用于能力互补。"}
+                          </p>
+                        )}
                         {specialist.host === "ollama" || specialist.host === "openai-compatible" ? (
                           <div className="capability-cost-inputs">
                             <label>
@@ -2654,7 +2791,7 @@ export const QuickStartWizard = ({
                     onClick={() => {
                       const host =
                         availableSpecialistHosts.find(
-                          (candidate) => upstreamCatalog.hosts[candidate]?.available,
+                          (candidate) => usableSpecialistModels(candidate).length > 0,
                         ) ?? availableSpecialistHosts[0];
                       if (host === undefined) return;
                       updateSpecialists([
@@ -2669,9 +2806,15 @@ export const QuickStartWizard = ({
                         },
                       ]);
                     }}
-                    disabled={isPending || readOnly}
+                    disabled={isPending || readOnly || availableSpecialistHosts.length === 0}
                   >
-                    {english ? "Add model from another host" : "添加其他宿主的副模型"}
+                    {availableSpecialistHosts.length === 0
+                      ? english
+                        ? "No available specialist host"
+                        : "没有可用的副模型"
+                      : english
+                        ? "Add specialist model"
+                        : "添加副模型"}
                   </button>
                 </div>
                 <section className="capability-model-matrix">

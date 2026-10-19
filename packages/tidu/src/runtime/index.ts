@@ -55,6 +55,7 @@ import {
 } from "../providers/codex-host.js";
 import {
   createCatalogModelRouter,
+  createOllamaProvider,
   createProviderFromEnvironment,
   discoverOllamaModels,
   type ModelProvider,
@@ -121,7 +122,11 @@ const createRuntimeLogger = (storageLocation: string): RuntimeLogger => {
       : join(dirname(storageLocation), "logs", "runtime.log"),
   );
   if (process.env.NODE_TEST_CONTEXT !== undefined) {
-    return { location: logPath, write: () => undefined, close: async () => undefined };
+    return {
+      location: logPath,
+      write: () => undefined,
+      close: async () => undefined,
+    };
   }
 
   mkdirSync(dirname(logPath), { recursive: true, mode: 0o700 });
@@ -1036,7 +1041,10 @@ const readDraftConfiguration = (
         continue;
       }
       hostPolicies[host] = {
-        mainModel: { source: policy.mainModel.source, model: policy.mainModel.model },
+        mainModel: {
+          source: policy.mainModel.source,
+          model: policy.mainModel.model,
+        },
         mainCapabilities: policy.mainCapabilities as string[],
         specialists: policySpecialists,
         maximumSpecialists: policy.maximumSpecialists,
@@ -1169,7 +1177,7 @@ const handleRequest = async (
   response: import("node:http").ServerResponse,
   storage: StorageAdapter,
   provider: ModelProvider | undefined,
-  getConnectedProviderForHost: (host: AgentHostId) => Promise<ModelProvider | undefined>,
+  getCatalogProviderForHost: (host: AgentHostId) => Promise<ModelProvider | undefined>,
   capabilityCompletionProvider: CapabilityCompletionProvider | undefined,
   agentKernel: AgentKernel | undefined,
   enterprise: EnterpriseControlPlane | undefined,
@@ -2096,24 +2104,30 @@ const handleRequest = async (
   if (request.method === "GET" && pathname === "/api/models/upstreams") {
     const workspace = await storage.configurationStore.loadWorkspace();
     const [cursorProvider, ollamaProvider, compatibleProvider] = await Promise.all([
-      getConnectedProviderForHost("cursor"),
-      getConnectedProviderForHost("ollama"),
-      getConnectedProviderForHost("openai-compatible"),
+      getCatalogProviderForHost("cursor"),
+      getCatalogProviderForHost("ollama"),
+      getCatalogProviderForHost("openai-compatible"),
     ]);
-    const [ollamaModels, compatibleModels] = await Promise.all([
+    const [cursorCatalogModels, ollamaModels, compatibleModels] = await Promise.all([
+      cursorProvider?.listModels?.().catch(() => []) ?? [],
       ollamaProvider?.listModels?.().catch(() => []) ?? [],
       compatibleProvider?.listModels?.().catch(() => []) ?? [],
     ]);
     const officialModels = listCodexOfficialModels();
     const cursorLogin = inspectCursorHostLogin();
-    const cursorModels = cursorLogin.reusable
-      ? [
-          {
-            id: cursorProvider?.descriptor.model ?? "current",
-            name: cursorProvider?.descriptor.model ?? "跟随 Cursor 当前模型",
-          },
-        ]
-      : [];
+    const cursorModels =
+      cursorCatalogModels.length > 0
+        ? cursorCatalogModels
+        : cursorLogin.reusable
+          ? [
+              {
+                id: cursorProvider?.descriptor.model ?? "current",
+                name: cursorProvider?.descriptor.model ?? "跟随 Cursor 当前模型",
+                capabilities: ["text", "code", "tool-use"],
+                capabilitySource: "provider-catalog" as const,
+              },
+            ]
+          : [];
     const companyProvider = ollamaProvider ?? compatibleProvider;
     const companyModels = ollamaProvider === undefined ? compatibleModels : ollamaModels;
     sendJson(response, 200, {
@@ -2124,9 +2138,15 @@ const handleRequest = async (
       official: officialModels,
       company: companyModels ?? [],
       hosts: {
-        codex: { available: inspectCodexHostLogin().reusable, models: officialModels },
+        codex: {
+          available: inspectCodexHostLogin().reusable,
+          models: officialModels,
+        },
         cursor: { available: cursorLogin.reusable, models: cursorModels },
-        ollama: { available: ollamaProvider !== undefined, models: ollamaModels },
+        ollama: {
+          available: ollamaProvider !== undefined,
+          models: ollamaModels,
+        },
         "openai-compatible": {
           available: compatibleProvider !== undefined,
           models: compatibleModels,
@@ -2429,12 +2449,37 @@ export const startLocalRuntime = async (
         ? createCodexHostModelProvider()
         : host === "cursor"
           ? createCursorHostModelProvider()
-          : Promise.resolve(undefined);
+          : host === "ollama"
+            ? discoverOllamaModels({
+                baseUrl:
+                  process.env.TIDU_PROVIDER === "ollama"
+                    ? process.env.TIDU_PROVIDER_BASE_URL
+                    : undefined,
+                timeoutMilliseconds: 750,
+              })
+                .then((models) =>
+                  models[0] === undefined
+                    ? undefined
+                    : createOllamaProvider({
+                        baseUrl:
+                          process.env.TIDU_PROVIDER === "ollama"
+                            ? (process.env.TIDU_PROVIDER_BASE_URL ?? "http://127.0.0.1:11434")
+                            : "http://127.0.0.1:11434",
+                        model: models[0],
+                      }),
+                )
+                .catch(() => undefined)
+            : Promise.resolve(undefined);
     hostProviderPromises.set(host, discovered);
+    void discovered.then((candidate) => {
+      if (candidate === undefined) hostProviderPromises.delete(host);
+    });
     return discovered;
   };
   const getConnectedProviderForHost = (host: AgentHostId): Promise<ModelProvider | undefined> =>
     hostProviderPromises.get(host) ?? Promise.resolve(undefined);
+  const getCatalogProviderForHost = (host: AgentHostId): Promise<ModelProvider | undefined> =>
+    host === "ollama" ? resolveProviderForHost(host) : getConnectedProviderForHost(host);
   const scalingControlPlane =
     options.scalingControlPlane ?? environmentEnterpriseRuntime?.scalingControlPlane;
   const defaultDatabasePath = resolveDefaultDatabasePath();
@@ -2527,7 +2572,7 @@ export const startLocalRuntime = async (
       response,
       storage,
       provider,
-      getConnectedProviderForHost,
+      getCatalogProviderForHost,
       capabilityCompletionProvider,
       agentKernel,
       enterpriseControlPlane,

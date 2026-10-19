@@ -94,7 +94,10 @@ const createLiveJsonStream = (
               choices: [
                 {
                   index: 0,
-                  delta: { ...(firstChatDelta ? { role: "assistant" } : {}), content: delta },
+                  delta: {
+                    ...(firstChatDelta ? { role: "assistant" } : {}),
+                    content: delta,
+                  },
                   finish_reason: null,
                 },
               ],
@@ -163,7 +166,11 @@ const createCodexClientSession = async (model?: string): Promise<CodexClientSess
   });
   try {
     await client.initialize();
-    return { client, workingDirectory, initialThread: await client.startThread() };
+    return {
+      client,
+      workingDirectory,
+      initialThread: await client.startThread(),
+    };
   } catch (error) {
     await client.close().catch(() => undefined);
     await rm(workingDirectory, { recursive: true, force: true }).catch(() => undefined);
@@ -351,6 +358,14 @@ export const createCursorHostModelProvider = async (): Promise<ModelProvider | u
   if (model === undefined) return undefined;
   return {
     descriptor: { type: "cursor-host", model },
+    listModels: async () => [
+      {
+        id: model,
+        name: model,
+        capabilities: ["text", "code", "tool-use"],
+        capabilitySource: "provider-catalog" as const,
+      },
+    ],
     execute: async (request): Promise<ProviderExecutionResult> => {
       const workingDirectory = await mkdtemp(join(tmpdir(), "tidu-model-"));
       const client = createCursorAcpClient({ workingDirectory, mode: "ask" });
