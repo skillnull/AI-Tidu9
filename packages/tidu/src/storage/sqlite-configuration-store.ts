@@ -70,7 +70,7 @@ const normalizeConfiguration = (configuration: TiduConfiguration): TiduConfigura
     model: configuration.modelSelection?.model.trim() || "current",
   },
   capabilityCompletion: {
-    enabled: configuration.capabilityCompletion?.enabled ?? true,
+    enabled: configuration.capabilityCompletion?.enabled ?? false,
     mainCapabilities: [
       ...new Set(
         (configuration.capabilityCompletion?.mainCapabilities ?? ["text", "structured-output"])

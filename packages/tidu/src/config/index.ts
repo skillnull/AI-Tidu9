@@ -110,7 +110,7 @@ export const createDefaultConfiguration = (
     virtualModelName: "九门赛博提督",
     modelSelection: { source: "official", model: "current" },
     capabilityCompletion: {
-      enabled: true,
+      enabled: false,
       mainCapabilities: ["text", "structured-output"],
       specialists: [],
       maximumSpecialists: 2,

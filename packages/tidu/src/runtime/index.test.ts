@@ -207,7 +207,7 @@ test("exposes the shared capability-completion policy and bounded usage status",
     };
     assert.equal(status.available, true);
     assert.equal(status.operational, false);
-    assert.equal(status.configuration.enabled, true);
+    assert.equal(status.configuration.enabled, false);
     assert.deepEqual(status.configuration.specialists, []);
     assert.deepEqual(status.hosts, ["codex", "cursor", "cli", "ollama", "openai-compatible"]);
     assert.deepEqual(status.records, []);

@@ -10,6 +10,7 @@ test("creates a safe managed configuration", () => {
   assert.equal(configuration.activeProfileId, "ai-tidu9-config");
   assert.equal(configuration.virtualModelName, "九门赛博提督");
   assert.deepEqual(configuration.modelSelection, { source: "official", model: "current" });
+  assert.equal(configuration.capabilityCompletion.enabled, false);
 });
 
 test("keeps managed and expert defaults isolated", () => {
