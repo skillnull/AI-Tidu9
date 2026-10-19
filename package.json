@@ -7,13 +7,11 @@
     "packages/*"
   ],
   "scripts": {
-    "tidu:setup": "sh -c '. ./scripts/use-project-node.sh && npm install --no-package-lock && npm run build:tidu && exec node scripts/dev-tidu.mjs --service cli --start-all'",
+    "tidu:setup": "sh -c '. ./scripts/use-project-node.sh && npm install --no-package-lock && npm run build:tidu && exec node scripts/dev-tidu.mjs --service controller --start-all'",
     "build": "sh -c '. ./scripts/use-project-node.sh && npm run build --workspaces --if-present'",
     "build:tidu": "sh -c '. ./scripts/use-project-node.sh && npm run build --workspace @skillnull/tidu'",
-    "tidu:dev-p": "sh -c '. ./scripts/use-project-node.sh && exec node scripts/dev-tidu.mjs --service frontend'",
-    "tidu:dev-e": "sh -c '. ./scripts/use-project-node.sh && TIDU_DEV_EDITION=enterprise exec node scripts/dev-tidu.mjs --service frontend'",
-    "tidu:dev-cli-p": "sh -c '. ./scripts/use-project-node.sh && exec node scripts/dev-tidu.mjs --service cli'",
-    "tidu:dev-cli-e": "sh -c '. ./scripts/use-project-node.sh && TIDU_DEV_EDITION=enterprise exec node scripts/dev-tidu.mjs --service cli'",
+    "tidu:dev-p": "sh -c '. ./scripts/use-project-node.sh && exec node scripts/dev-tidu.mjs --service controller --start-frontend'",
+    "tidu:dev-e": "sh -c '. ./scripts/use-project-node.sh && TIDU_DEV_EDITION=enterprise exec node scripts/dev-tidu.mjs --service controller --start-frontend'",
     "tidu:dev-api-p": "sh -c '. ./scripts/use-project-node.sh && exec node scripts/dev-tidu.mjs --service api'",
     "tidu:dev-api-e": "sh -c '. ./scripts/use-project-node.sh && TIDU_DEV_EDITION=enterprise exec node scripts/dev-tidu.mjs --service api'",
     "check": "sh -c '. ./scripts/use-project-node.sh && npm run policy -- versions && npm run lint && npm test'",

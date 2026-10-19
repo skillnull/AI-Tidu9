@@ -13,18 +13,19 @@ const edition = process.env.TIDU_DEV_EDITION === "enterprise" ? "enterprise" : "
 const editionSuffix = edition === "enterprise" ? "e" : "p";
 const requestedServiceIndex = process.argv.indexOf("--service");
 const requestedService =
-  requestedServiceIndex === -1 ? "cli" : (process.argv[requestedServiceIndex + 1] ?? "");
+  requestedServiceIndex === -1 ? "controller" : (process.argv[requestedServiceIndex + 1] ?? "");
 const startAllServices = process.argv.includes("--start-all");
-const validServices = new Set(["api", "cli", "frontend"]);
+const startFrontend = startAllServices || process.argv.includes("--start-frontend");
+const validServices = new Set(["api", "controller", "frontend"]);
 if (!validServices.has(requestedService)) {
-  process.stderr.write("--service must be frontend, cli, or api.\n");
+  process.stderr.write("--service must be frontend, controller, or api.\n");
   process.exit(1);
 }
 
 const defaultPorts =
   edition === "enterprise"
-    ? { api: 9740, cli: 9741, frontend: 9739 }
-    : { api: 9640, cli: 9641, frontend: 9639 };
+    ? { api: 9740, control: 9741, frontend: 9739 }
+    : { api: 9640, control: 9641, frontend: 9639 };
 const parsePort = (setting, fallback, name) => {
   if (setting === undefined || setting.trim() === "") return fallback;
   const port = Number(setting);
@@ -36,7 +37,11 @@ const parsePort = (setting, fallback, name) => {
 };
 const ports = {
   api: parsePort(process.env.TIDU_API_PORT, defaultPorts.api, "TIDU_API_PORT"),
-  cli: parsePort(process.env.TIDU_CLI_PORT, defaultPorts.cli, "TIDU_CLI_PORT"),
+  control: parsePort(
+    process.env.TIDU_CONTROL_PORT ?? process.env.TIDU_CLI_PORT,
+    defaultPorts.control,
+    "TIDU_CONTROL_PORT",
+  ),
   frontend: parsePort(process.env.TIDU_PORT, defaultPorts.frontend, "TIDU_PORT"),
 };
 const productVersion = JSON.parse(
@@ -52,17 +57,15 @@ const databasePath =
   );
 const serviceIds = {
   api: `tidu:dev-api-${editionSuffix}`,
-  cli: `tidu:dev-cli-${editionSuffix}`,
   frontend: `tidu:dev-${editionSuffix}`,
 };
 const commands = {
   api: `npm run tidu:dev-api-${editionSuffix}`,
-  cli: `npm run tidu:dev-cli-${editionSuffix}`,
   frontend: `npm run tidu:dev-${editionSuffix}`,
 };
 const pidPaths = {
   api: join(runtimeDirectory, `api-${editionSuffix}.pid`),
-  cli: join(runtimeDirectory, `cli-${editionSuffix}.pid`),
+  controller: join(runtimeDirectory, `controller-${editionSuffix}.pid`),
   frontend: join(runtimeDirectory, `frontend-${editionSuffix}.pid`),
 };
 
@@ -126,7 +129,8 @@ const assertInstalledRuntimeIsStopped = () => {
 const assertServiceIsNotRunning = (service) => {
   const processId = readServiceProcessId(service);
   if (processId !== null) {
-    process.stderr.write(`${serviceIds[service]} is already running with PID ${processId}.\n`);
+    const serviceName = serviceIds[service] ?? "development controller";
+    process.stderr.write(`${serviceName} is already running with PID ${processId}.\n`);
     process.exit(1);
   }
 };
@@ -188,7 +192,7 @@ const startFrontendService = () => {
       cwd: paths.workspace,
       env: {
         ...process.env,
-        TIDU_MANAGER_PORT: String(ports.cli),
+        TIDU_MANAGER_PORT: String(ports.control),
         TIDU_RUNTIME_PORT: String(ports.api),
       },
       stdio: "inherit",
@@ -231,27 +235,6 @@ const spawnService = (service) =>
     stdio: "ignore",
   });
 
-const scheduleCliRestart = () => {
-  const restartSource = [
-    'const { spawn } = require("node:child_process");',
-    "const args = JSON.parse(process.argv[1]);",
-    "setTimeout(() => {",
-    "  const child = spawn(process.execPath, args, { detached: true, env: process.env, stdio: 'ignore' });",
-    "  child.unref();",
-    "}, 500);",
-  ].join("\n");
-  const helper = spawn(
-    process.execPath,
-    ["-e", restartSource, JSON.stringify([fileURLToPath(import.meta.url), "--service", "cli"])],
-    {
-      detached: true,
-      env: { ...process.env, TIDU_DEV_EDITION: edition },
-      stdio: "ignore",
-    },
-  );
-  helper.unref();
-};
-
 const stopService = (service) => {
   const processId = readServiceProcessId(service);
   if (processId === null) return false;
@@ -270,7 +253,6 @@ const waitForServiceStop = async (service) => {
 const createInventory = async () => {
   const processIds = {
     api: readServiceProcessId("api"),
-    cli: process.pid,
     frontend: readServiceProcessId("frontend"),
   };
   const apiHealth =
@@ -312,18 +294,6 @@ const createInventory = async () => {
       },
       {
         actions: ["refresh", "start", "restart", "stop"],
-        command: commands.cli,
-        endpoint: `http://127.0.0.1:${ports.cli}`,
-        id: serviceIds.cli,
-        kind: "cli",
-        lifecycle: "managed",
-        name: "CLI 控制服务",
-        processId: processIds.cli,
-        status: "running",
-        version: productVersion,
-      },
-      {
-        actions: ["refresh", "start", "restart", "stop"],
         command: commands.api,
         endpoint: `http://127.0.0.1:${ports.api}`,
         id: serviceIds.api,
@@ -338,18 +308,21 @@ const createInventory = async () => {
   };
 };
 
-const startCliService = async () => {
-  assertServiceIsNotRunning("cli");
-  writeServiceProcessId("cli");
+const startController = async () => {
+  assertServiceIsNotRunning("controller");
+  writeServiceProcessId("controller");
   const managedChildren = new Set();
   const registerChild = (childProcess) => {
     managedChildren.add(childProcess);
     childProcess.once("exit", () => managedChildren.delete(childProcess));
     childProcess.unref();
   };
-  let preserveManagedChildren = false;
-  if (startAllServices) {
-    for (const service of ["frontend", "api"]) registerChild(spawnService(service));
+  const startupServices = [
+    startFrontend ? "frontend" : undefined,
+    startAllServices ? "api" : undefined,
+  ];
+  for (const service of startupServices) {
+    if (service !== undefined) registerChild(spawnService(service));
   }
 
   const server = createHttpServer(async (request, response) => {
@@ -362,7 +335,7 @@ const startCliService = async () => {
       response.end(`${JSON.stringify(body)}\n`);
     };
     if (request.method === "GET" && pathname === "/health") {
-      sendJson(200, { product: "九门赛博提督", role: "cli", status: "ok" });
+      sendJson(200, { product: "九门赛博提督", role: "development-controller", status: "ok" });
       return;
     }
     if (request.method === "GET" && pathname === "/api/services") {
@@ -385,17 +358,6 @@ const startCliService = async () => {
     }
     if (action === "refresh") {
       sendJson(200, await createInventory());
-      return;
-    }
-    if (service === "cli") {
-      if (action === "start") {
-        sendJson(409, { error: "SERVICE_ALREADY_RUNNING" });
-        return;
-      }
-      sendJson(202, { accepted: true, action, serviceId: requestedId });
-      preserveManagedChildren = true;
-      if (action === "restart") scheduleCliRestart();
-      setTimeout(() => process.kill(process.pid, "SIGTERM"), 100);
       return;
     }
     const running = readServiceProcessId(service) !== null;
@@ -421,27 +383,25 @@ const startCliService = async () => {
 
   await new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(ports.cli, "127.0.0.1", () => {
+    server.listen(ports.control, "127.0.0.1", () => {
       server.off("error", reject);
       resolve();
     });
   });
   process.stdout.write(
-    `${serviceIds.cli} running at http://127.0.0.1:${ports.cli}${startAllServices ? " · frontend and API started" : ""}\n`,
+    `Development control ready at http://127.0.0.1:${ports.control}${startAllServices ? " · frontend and API started" : startFrontend ? " · frontend started" : ""}\n`,
   );
   let stopping = false;
   const stop = () => {
     if (stopping) return;
     stopping = true;
-    if (!preserveManagedChildren) {
-      for (const childProcess of managedChildren) {
-        if (childProcess.exitCode === null && childProcess.signalCode === null) {
-          childProcess.kill("SIGTERM");
-        }
+    for (const childProcess of managedChildren) {
+      if (childProcess.exitCode === null && childProcess.signalCode === null) {
+        childProcess.kill("SIGTERM");
       }
     }
     server.close(() => {
-      removeServiceProcessId("cli");
+      removeServiceProcessId("controller");
       process.exitCode = 0;
     });
   };
@@ -461,4 +421,4 @@ if (requestedService === "api") {
 
 if (requestedService === "frontend") startFrontendService();
 else if (requestedService === "api") await startApiService();
-else await startCliService();
+else await startController();

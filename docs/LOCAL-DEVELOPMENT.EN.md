@@ -12,7 +12,7 @@ Node.js 22.14 or newer is required:
 npm run tidu:setup
 ```
 
-`tidu:setup` installs dependencies, builds the CLI, and automatically starts the personal frontend, CLI control service, and API service. The processes are independent: `tidu:dev-p` starts only the frontend (`9639`), `tidu:dev-api-p` starts only the API (`9640`), and `tidu:dev-cli-p` starts only the CLI control service (`9641`). Enterprise development uses the matching `-e` commands and ports `9739`, `9740`, and `9741`.
+`tidu:setup` installs dependencies, builds the CLI, and automatically starts the personal frontend and API services. `tidu:dev-p` starts the frontend with built-in development control (`9639`), while `tidu:dev-api-p` independently starts the API (`9640`). The CLI is a command entry, not a separately started or displayed service. Enterprise development uses the matching `-e` commands and ports `9739` and `9740`.
 
 Development data is stored in `.tidu-dev/tidu.sqlite`, isolated from globally installed data. Vite hot-reloads frontend source. After backend TypeScript changes, restart the independent API service from the page or CLI.
 
@@ -25,7 +25,7 @@ The configuration page is the single upstream selector for the AI-Tidu9 virtual 
 
 AI-Tidu9 keeps only its original installation baseline and latest rollback point in its own backup directory; unrelated Codex configuration backups are never removed.
 
-The Services page separately shows `tidu:dev-p`, `tidu:dev-cli-p`, and `tidu:dev-api-p`. Each entry comes from its corresponding real process and has an independent PID, port, status, launch command, and start, stop, and restart actions. The frontend proxy is no longer presented as the API or CLI endpoint. Installed and remote runtimes list only real runtime units. Personal installations do not expose enterprise commands; enterprise installations do not expose personal commands. Use `tidu service status` or `tidu service <start|stop|restart> <service-id|all>` from the CLI.
+The Services page shows only `tidu:dev-p` and `tidu:dev-api-p`. Each entry comes from its corresponding real process and has an independent PID, port, status, launch command, and start, stop, and restart actions. Installed and remote runtimes also list only real runtime units. Personal installations do not expose enterprise commands; enterprise installations do not expose personal commands. Use `tidu service status` or `tidu service <start|stop|restart> <service-id|all>` from the CLI.
 
 Before starting, `tidu:dev-p` checks the installed-runtime lock and default port. On conflict it stops and asks for `tidu service stop all && tidu uninstall --confirm DELETE`; it never removes data automatically.
 
@@ -37,6 +37,6 @@ Before switching to AI-Tidu9, the local runtime must be reachable and pass a min
 npm run check
 ```
 
-After development or testing, press `Ctrl+C` in the terminal running `tidu:setup` to stop all three processes it started. Stop individually launched services in their own terminals. Confirm that the corresponding PIDs and ports have exited.
+After development or testing, press `Ctrl+C` in the terminal running `tidu:setup` to stop the frontend and API processes it started. Stop an individually launched API service in its own terminal. Confirm that the corresponding PIDs and ports have exited.
 
 When a local feature change also affects server deployment, update only the separate remote deployment document with the corresponding remote steps. Do not add remote operations to the local development workflow.
