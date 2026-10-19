@@ -7,6 +7,8 @@ interface ServiceEntry {
   actions: readonly ServiceAction[];
   /** Command used to enter or manage this service. */
   command: string;
+  /** Runtime configuration or persistent configuration-storage path. */
+  configurationPath: string;
   /** HTTP runtime endpoint used by this service. */
   endpoint: string;
   /** Stable service identifier. */
@@ -15,10 +17,14 @@ interface ServiceEntry {
   kind: "api" | "cli" | "frontend";
   /** Whether the service is persistent or invoked on demand. */
   lifecycle: "managed" | "on-demand";
+  /** Current terminal or absolute file receiving this service's logs. */
+  logLocation: string;
   /** User-facing service name. */
   name: string;
   /** Active process identifier, or null when stopped. */
   processId: number | null;
+  /** Active reverse-proxy configuration path, or null when no proxy is configured. */
+  proxyConfigurationPath: string | null;
   /** Current service state. */
   status: "ready" | "running" | "stopped";
   /** Service package version. */
@@ -287,6 +293,20 @@ export const ServiceControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) =
                   <div>
                     <dt>{english ? "Version" : "版本"}</dt>
                     <dd>{service.version}</dd>
+                  </div>
+                  <div>
+                    <dt>{english ? "Logs" : "日志位置"}</dt>
+                    <dd title={service.logLocation}>{service.logLocation}</dd>
+                  </div>
+                  <div>
+                    <dt>{english ? "Configuration" : "配置位置"}</dt>
+                    <dd title={service.configurationPath}>{service.configurationPath}</dd>
+                  </div>
+                  <div>
+                    <dt>{english ? "Proxy configuration" : "代理配置"}</dt>
+                    <dd title={service.proxyConfigurationPath ?? undefined}>
+                      {service.proxyConfigurationPath ?? (english ? "Not configured" : "未配置")}
+                    </dd>
                   </div>
                 </dl>
               </div>

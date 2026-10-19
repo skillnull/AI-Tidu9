@@ -114,10 +114,13 @@ test("starts a loopback runtime with a verifiable health endpoint", async () => 
       services: Array<{
         actions: string[];
         command: string;
+        configurationPath: string;
         endpoint: string;
         id: string;
         lifecycle: string;
+        logLocation: string;
         processId: number | null;
+        proxyConfigurationPath: string | null;
         status: string;
         version: string;
       }>;
@@ -128,6 +131,9 @@ test("starts a loopback runtime with a verifiable health endpoint", async () => 
       [["tidu:runtime-p", "running"]],
     );
     assert.deepEqual(services.services[0]?.actions, ["refresh", "restart", "stop"]);
+    assert.equal(services.services[0]?.configurationPath, IN_MEMORY_DATABASE_PATH);
+    assert.match(services.services[0]?.logLocation ?? "", /logs\/runtime\.log$/u);
+    assert.equal(services.services[0]?.proxyConfigurationPath, null);
     assert.deepEqual(
       services.services.map(({ command, endpoint, lifecycle, processId, version }) => ({
         command,

@@ -25,7 +25,7 @@ The configuration page is the single upstream selector for the AI-Tidu9 virtual 
 
 AI-Tidu9 keeps only its original installation baseline and latest rollback point in its own backup directory; unrelated Codex configuration backups are never removed.
 
-The Services page shows only `tidu:dev-p` and `tidu:dev-api-p`. Each entry comes from its corresponding real process and has an independent PID, port, status, launch command, and start, stop, and restart actions. Installed and remote runtimes also list only real runtime units. Personal installations do not expose enterprise commands; enterprise installations do not expose personal commands. Use `tidu service status` or `tidu service <start|stop|restart> <service-id|all>` from the CLI.
+The Services page shows only `tidu:dev-p` and `tidu:dev-api-p`. Each entry comes from its corresponding real process and has an independent PID, port, status, launch command, log location, configuration location, proxy configuration, and start, stop, and restart actions. Development logs stream to each service's launch terminal; services that do not use Nginx explicitly show “Not configured.” Installed and remote runtimes also list only real runtime units. Personal installations do not expose enterprise commands; enterprise installations do not expose personal commands. Use `tidu service status` or `tidu service <start|stop|restart> <service-id|all>` from the CLI.
 
 Before starting, `tidu:dev-p` checks the installed-runtime lock and default port. On conflict it stops and asks for `tidu service stop all && tidu uninstall --confirm DELETE`; it never removes data automatically.
 

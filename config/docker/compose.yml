@@ -15,8 +15,11 @@ services:
       postgres:
         condition: service_healthy
     environment:
+      TIDU_LOG_PATH: /var/lib/ai-tidu9/logs/runtime.log
+      TIDU_NGINX_CONFIG_PATH: ${TIDU_NGINX_CONFIG_PATH:-}
       TIDU_POSTGRES_URL: postgresql://tidu:${TIDU_POSTGRES_PASSWORD:?set TIDU_POSTGRES_PASSWORD}@postgres:5432/tidu
       TIDU_POSTGRES_SSL: disable
+      TIDU_RUNTIME_CONFIG_PATH: /var/lib/ai-tidu9/tidu.db
     ports:
       - "127.0.0.1:${TIDU_PORT:-9639}:9639"
     volumes:

@@ -20,6 +20,8 @@ curl -fsS http://127.0.0.1:9639/health
 docker compose -f config/docker/compose.yml ps
 ```
 
+服务器运行日志写入持久卷内的 `/var/lib/ai-tidu9/logs/runtime.log`。服务页显示日志、运行配置和反向代理配置的位置；当前部署未提供 Nginx 时显示“未配置”。外接 Nginx 时，通过 `TIDU_NGINX_CONFIG_PATH` 提供运行时可见的配置路径。
+
 ## 跨设备访问边界
 
 - 容器管理端口只映射到服务器回环地址。

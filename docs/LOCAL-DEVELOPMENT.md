@@ -25,7 +25,7 @@ npm run tidu:setup
 
 九门自有备份目录只保留首次安装基线与最新回滚点；不会删除来源不明的 Codex 配置备份。
 
-服务页只显示 `tidu:dev-p` 与 `tidu:dev-api-p`。每项都来自对应的真实进程，具有独立 PID、端口、状态、启动命令以及启动、停止、重启操作。安装或远程运行时也只展示实际运行单元；个人安装版不暴露企业命令，企业安装版不暴露个人命令。CLI 可执行 `tidu service status` 或 `tidu service <start|stop|restart> <service-id|all>`。
+服务页只显示 `tidu:dev-p` 与 `tidu:dev-api-p`。每项都来自对应的真实进程，具有独立 PID、端口、状态、启动命令、日志位置、配置位置和代理配置，以及启动、停止、重启操作。开发日志实时输出到各服务的启动终端；未使用 Nginx 的服务明确显示“未配置”。安装或远程运行时也只展示实际运行单元；个人安装版不暴露企业命令，企业安装版不暴露个人命令。CLI 可执行 `tidu service status` 或 `tidu service <start|stop|restart> <service-id|all>`。
 
 `tidu:dev-p` 启动前会检查安装版运行锁和默认端口。检测到安装版冲突时停止启动，并提示先执行 `tidu service stop all && tidu uninstall --confirm DELETE`，不会自动删除数据。
 

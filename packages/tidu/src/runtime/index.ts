@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { createWriteStream, mkdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
-import { basename, dirname, extname, join } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
@@ -87,6 +88,60 @@ const ENTERPRISE_DISCOVERY_TIMEOUT_MS = 5_000;
 const runtimeProcessKind = (): "development" | "installed" =>
   process.env.NODE_ENV === "development" ? "development" : "installed";
 
+interface RuntimeLogger {
+  /** User-visible destination for this runtime's logs. */
+  location: string;
+  /** Writes one timestamped service event without request bodies or secrets. */
+  write: (message: string) => void;
+  /** Flushes and closes an installed-runtime log stream. */
+  close: () => Promise<void>;
+}
+
+const createRuntimeLogger = (storageLocation: string): RuntimeLogger => {
+  if (runtimeProcessKind() === "development") {
+    return {
+      location: "当前启动终端",
+      write: (message) =>
+        process.stdout.write(`[AI-TIDU9] 接口服务 · ${new Date().toISOString()} · ${message}\n`),
+      close: async () => undefined,
+    };
+  }
+
+  const configuredLogPath = process.env.TIDU_LOG_PATH?.trim();
+  const logPath = resolve(
+    configuredLogPath && configuredLogPath !== ""
+      ? configuredLogPath
+      : join(dirname(storageLocation), "logs", "runtime.log"),
+  );
+  if (process.env.NODE_TEST_CONTEXT !== undefined) {
+    return { location: logPath, write: () => undefined, close: async () => undefined };
+  }
+
+  mkdirSync(dirname(logPath), { recursive: true, mode: 0o700 });
+  const logStream = createWriteStream(logPath, { flags: "a", mode: 0o600 });
+  let logStreamFailed = false;
+  logStream.on("error", (error) => {
+    logStreamFailed = true;
+    process.stderr.write(`[AI-TIDU9] 接口服务日志写入失败 · ${error.message}\n`);
+  });
+  return {
+    location: logPath,
+    write: (message) => {
+      if (!logStreamFailed) {
+        logStream.write(`${new Date().toISOString()} [接口服务] ${message}\n`);
+      }
+    },
+    close: () =>
+      new Promise((resolveClose) => {
+        if (logStreamFailed || logStream.destroyed) {
+          resolveClose();
+          return;
+        }
+        logStream.end(resolveClose);
+      }),
+  };
+};
+
 interface ServiceDiagnostic {
   /** Stable diagnostic identifier. */
   id: "network" | "process" | "provider" | "storage";
@@ -128,6 +183,8 @@ interface ServiceInventory {
     actions: readonly ("refresh" | "restart" | "start" | "stop")[];
     /** Command used to enter or manage this service. */
     command: string;
+    /** Runtime configuration or persistent configuration-storage path. */
+    configurationPath: string;
     /** HTTP runtime endpoint used by this service. */
     endpoint: string;
     /** Stable service identifier. */
@@ -136,10 +193,14 @@ interface ServiceInventory {
     kind: "api" | "cli" | "frontend";
     /** Whether the service is persistent or invoked on demand. */
     lifecycle: "managed" | "on-demand";
+    /** Current terminal or absolute file receiving this service's logs. */
+    logLocation: string;
     /** User-facing service name. */
     name: string;
     /** Active process identifier, or null for command entries. */
     processId: number | null;
+    /** Active reverse-proxy configuration path, or null when no proxy is configured. */
+    proxyConfigurationPath: string | null;
     /** Current service state. */
     status: "ready" | "running" | "stopped";
     /** Service package version. */
@@ -152,6 +213,14 @@ const createServiceInventory = async (
   provider: ModelProvider | undefined,
   runtimeNetwork: { host: string; port: number },
   deployment: "personal" | "enterprise",
+  runtimePaths: {
+    /** Runtime configuration or persistent configuration-storage path. */
+    configurationPath: string;
+    /** Current terminal or absolute file receiving runtime logs. */
+    logLocation: string;
+    /** Active reverse-proxy configuration path, or null when no proxy is configured. */
+    proxyConfigurationPath: string | null;
+  },
 ): Promise<ServiceInventory> => {
   const development = runtimeProcessKind() === "development";
   const workspace = await storage.configurationStore.loadWorkspace();
@@ -202,12 +271,15 @@ const createServiceInventory = async (
         command: development
           ? `npm run tidu:dev-api-${editionSuffix}`
           : `tidu service start ${serviceId}`,
+        configurationPath: runtimePaths.configurationPath,
         endpoint,
         id: serviceId,
         kind: "api" as const,
         lifecycle: "managed" as const,
+        logLocation: runtimePaths.logLocation,
         name: development ? "接口服务" : "九门运行时",
         processId: process.pid,
+        proxyConfigurationPath: runtimePaths.proxyConfigurationPath,
         status: "running" as const,
         version: PRODUCT.version,
       },
@@ -822,6 +894,14 @@ const handleRequest = async (
   capabilityRuntime: CapabilityRuntime | undefined,
   deployment: "personal" | "enterprise",
   runtimeNetwork: { host: string; port: number },
+  runtimePaths: {
+    /** Runtime configuration or persistent configuration-storage path. */
+    configurationPath: string;
+    /** Current terminal or absolute file receiving runtime logs. */
+    logLocation: string;
+    /** Active reverse-proxy configuration path, or null when no proxy is configured. */
+    proxyConfigurationPath: string | null;
+  },
 ): Promise<void> => {
   const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
 
@@ -846,7 +926,7 @@ const handleRequest = async (
     sendJson(
       response,
       200,
-      await createServiceInventory(storage, provider, runtimeNetwork, deployment),
+      await createServiceInventory(storage, provider, runtimeNetwork, deployment, runtimePaths),
     );
     return;
   }
@@ -858,7 +938,13 @@ const handleRequest = async (
     validateMutationRequest(request);
     const serviceId = decodeURIComponent(serviceActionRoute[1] ?? "");
     const action = serviceActionRoute[2];
-    const inventory = await createServiceInventory(storage, provider, runtimeNetwork, deployment);
+    const inventory = await createServiceInventory(
+      storage,
+      provider,
+      runtimeNetwork,
+      deployment,
+      runtimePaths,
+    );
     const service = inventory.services.find((candidate) => candidate.id === serviceId);
     if (service === undefined) {
       sendJson(response, 404, { error: "SERVICE_NOT_FOUND" });
@@ -2005,7 +2091,26 @@ export const startLocalRuntime = async (
     throw error;
   }
   const runtimeNetwork = { host, port };
+  const runtimeLogger = createRuntimeLogger(storage.location);
+  const configuredRuntimePath = process.env.TIDU_RUNTIME_CONFIG_PATH?.trim();
+  const configuredProxyPath = process.env.TIDU_NGINX_CONFIG_PATH?.trim();
+  const runtimePaths = {
+    configurationPath:
+      configuredRuntimePath && configuredRuntimePath !== ""
+        ? resolve(configuredRuntimePath)
+        : storage.location,
+    logLocation: runtimeLogger.location,
+    proxyConfigurationPath:
+      configuredProxyPath && configuredProxyPath !== "" ? resolve(configuredProxyPath) : null,
+  };
   const server = createServer((request, response) => {
+    const requestStartedAt = Date.now();
+    const requestPath = new URL(request.url ?? "/", "http://localhost").pathname;
+    response.once("finish", () => {
+      runtimeLogger.write(
+        `${request.method ?? "UNKNOWN"} ${requestPath} · ${response.statusCode} · ${Date.now() - requestStartedAt}ms`,
+      );
+    });
     void handleRequest(
       request,
       response,
@@ -2018,6 +2123,7 @@ export const startLocalRuntime = async (
       options.capabilityRuntime,
       deployment,
       runtimeNetwork,
+      runtimePaths,
     ).catch(() => {
       if (!response.headersSent) {
         sendJson(response, 500, { error: "INTERNAL_ERROR" });
@@ -2030,6 +2136,7 @@ export const startLocalRuntime = async (
   try {
     await listen(server, host, port);
   } catch (error) {
+    await runtimeLogger.close();
     storage.close();
     runtimeDataLock?.release();
     await provider?.close?.();
@@ -2039,6 +2146,7 @@ export const startLocalRuntime = async (
   const address = server.address();
   if (address === null || typeof address === "string") {
     await close(server);
+    await runtimeLogger.close();
     storage.close();
     await provider?.close?.();
     await environmentEnterpriseRuntime?.close();
@@ -2046,6 +2154,12 @@ export const startLocalRuntime = async (
   }
 
   runtimeNetwork.port = address.port;
+  if (
+    runtimeProcessKind() === "installed" ||
+    process.env.TIDU_DEV_SUPPRESS_INITIAL_STATUS === "1"
+  ) {
+    runtimeLogger.write(`已就绪 · http://${host}:${address.port} · PID ${process.pid}`);
+  }
   let isClosed = false;
 
   return {
@@ -2058,11 +2172,13 @@ export const startLocalRuntime = async (
 
       isClosed = true;
       try {
+        runtimeLogger.write(`停止中 · PID ${process.pid}`);
         if (deployment === "personal" && port !== 0) {
           await switchCodexClientConfiguration({ mode: "official" }).catch(() => undefined);
         }
         await close(server);
       } finally {
+        await runtimeLogger.close();
         storage.close();
         runtimeDataLock?.release();
         await provider?.close?.();

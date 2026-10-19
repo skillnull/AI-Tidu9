@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { closeSync, mkdirSync, openSync, readFileSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 import {
@@ -772,15 +772,26 @@ const startInstalledServiceGroup = async (endpoint: string): Promise<string> => 
   if (process.env.TIDU_EDITION === "enterprise") {
     startArguments.push("--edition", "enterprise");
   }
+  const configuredLogPath = process.env.TIDU_LOG_PATH?.trim();
+  const logPath = resolve(
+    configuredLogPath && configuredLogPath !== ""
+      ? configuredLogPath
+      : join(dirname(resolveDefaultDatabasePath()), "logs", "runtime.log"),
+  );
+  mkdirSync(dirname(logPath), { recursive: true, mode: 0o700 });
+  const logDescriptor = openSync(logPath, "a", 0o600);
   const childProcess = spawn(process.execPath, startArguments, {
     detached: true,
     env: {
       ...process.env,
       TIDU_HOST: endpointUrl.hostname,
+      TIDU_LOG_PATH: logPath,
       TIDU_PORT: endpointUrl.port || "9639",
+      TIDU_RUNTIME_SILENT: "1",
     },
-    stdio: "ignore",
+    stdio: ["ignore", logDescriptor, logDescriptor],
   });
+  closeSync(logDescriptor);
   childProcess.unref();
   for (let attempt = 0; attempt < 40; attempt += 1) {
     await new Promise((resolveWait) => setTimeout(resolveWait, 100));
@@ -1133,8 +1144,9 @@ if (isDirectExecution) {
           host: process.env.TIDU_HOST,
           port,
         });
-        const silentDevelopmentRuntime = process.env.TIDU_DEV_SILENT === "1";
-        if (!silentDevelopmentRuntime) {
+        const silentRuntimeOutput =
+          process.env.TIDU_DEV_SILENT === "1" || process.env.TIDU_RUNTIME_SILENT === "1";
+        if (!silentRuntimeOutput) {
           process.stdout.write(
             `${PRODUCT.explanation}\nRunning at ${runtime.origin}\nConfiguration center: ${runtime.origin}\n`,
           );
@@ -1142,7 +1154,7 @@ if (isDirectExecution) {
 
         if (argumentsList.includes("--cli")) {
           process.stdout.write(`${await runInteractiveConfiguration(runtime.origin)}\n`);
-        } else if (!silentDevelopmentRuntime) {
+        } else if (!silentRuntimeOutput) {
           process.stdout.write(
             "Guided setup: open the configuration center. Terminal setup: tidu start --cli\n",
           );

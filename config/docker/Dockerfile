@@ -19,6 +19,8 @@ ENV NODE_ENV=production
 ENV TIDU_HOST=0.0.0.0
 ENV TIDU_PORT=9639
 ENV TIDU_DATABASE_PATH=/var/lib/ai-tidu9/tidu.db
+ENV TIDU_LOG_PATH=/var/lib/ai-tidu9/logs/runtime.log
+ENV TIDU_RUNTIME_CONFIG_PATH=/var/lib/ai-tidu9/tidu.db
 
 RUN groupadd --system tidu \
   && useradd --system --create-home --gid tidu --home-dir /home/tidu tidu \

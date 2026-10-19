@@ -16,6 +16,7 @@ const requestedService =
   requestedServiceIndex === -1 ? "controller" : (process.argv[requestedServiceIndex + 1] ?? "");
 const startAllServices = process.argv.includes("--start-all");
 const startFrontend = startAllServices || process.argv.includes("--start-frontend");
+const suppressInitialStatus = process.env.TIDU_DEV_SUPPRESS_INITIAL_STATUS === "1";
 const validServices = new Set(["api", "controller", "frontend"]);
 if (!validServices.has(requestedService)) {
   process.stderr.write("--service must be frontend, controller, or api.\n");
@@ -166,12 +167,18 @@ const serviceDetails = {
 
 const printServiceStarted = (service, processId, restarted) => {
   const details = serviceDetails[service];
+  if (restarted) {
+    process.stdout.write(
+      `[AI-TIDU9] ${details.label}已重启 · PID ${processId} · ${details.endpoint}\n`,
+    );
+    return;
+  }
   process.stdout.write(
     [
-      `\n[AI-TIDU9] ${details.label}${restarted ? "已重启" : "已启动"}`,
+      `\n[AI-TIDU9] ${details.label}已启动`,
       `  状态  运行中`,
       `  地址  ${details.endpoint}`,
-      `  进程  PID ${processId} · 监督器 PID ${process.pid}`,
+      `  进程  PID ${processId}`,
       `  命令  ${commands[service]}`,
       `  操作  页面或 tidu service 可启动、停止、重启；Ctrl+C 结束当前服务`,
       "",
@@ -187,7 +194,12 @@ const startServiceSupervisor = (service, spawnChild) => {
   let restarting = false;
   let stopping = false;
 
+  const cleanupProcessFiles = () => {
+    removeServiceProcessId(service, childProcess?.pid);
+    removeSupervisorProcessId(service);
+  };
   const removeSignalHandlers = () => {
+    process.off("SIGHUP", stop);
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
     process.off("SIGUSR2", restart);
@@ -195,9 +207,9 @@ const startServiceSupervisor = (service, spawnChild) => {
   const finish = (exitCode) => {
     if (finalized) return;
     finalized = true;
-    removeServiceProcessId(service, childProcess?.pid);
-    removeSupervisorProcessId(service);
+    cleanupProcessFiles();
     removeSignalHandlers();
+    process.off("exit", cleanupProcessFiles);
     process.exitCode = exitCode;
   };
   const launch = (restarted = false) => {
@@ -207,7 +219,9 @@ const startServiceSupervisor = (service, spawnChild) => {
       return;
     }
     writeServiceProcessId(service, childProcess.pid);
-    printServiceStarted(service, childProcess.pid, restarted);
+    if (restarted || !suppressInitialStatus) {
+      printServiceStarted(service, childProcess.pid, restarted);
+    }
     childProcess.once("error", (error) => {
       process.stderr.write(
         `[AI-TIDU9] ${serviceDetails[service].label}启动失败：${error.message}\n`,
@@ -252,9 +266,11 @@ const startServiceSupervisor = (service, spawnChild) => {
       finish(0);
     }
   }
+  process.on("SIGHUP", stop);
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
   process.on("SIGUSR2", restart);
+  process.once("exit", cleanupProcessFiles);
   launch();
 };
 
@@ -334,11 +350,15 @@ const startApiService = async () => {
   );
 };
 
-const spawnService = (service) =>
+const spawnService = (service, suppressStatus = false) =>
   spawn(process.execPath, [fileURLToPath(import.meta.url), "--service", service], {
     cwd: paths.repository,
-    detached: true,
-    env: { ...process.env, TIDU_DEV_EDITION: edition },
+    detached: false,
+    env: {
+      ...process.env,
+      TIDU_DEV_EDITION: edition,
+      TIDU_DEV_SUPPRESS_INITIAL_STATUS: suppressStatus ? "1" : "0",
+    },
     stdio: "inherit",
   });
 
@@ -389,24 +409,30 @@ const createInventory = async () => {
       {
         actions: ["refresh", "start", "restart", "stop"],
         command: commands.frontend,
+        configurationPath: join(paths.workspace, "vite.config.ts"),
         endpoint: `http://127.0.0.1:${ports.frontend}`,
         id: serviceIds.frontend,
         kind: "frontend",
         lifecycle: "managed",
+        logLocation: "当前启动终端",
         name: "前端服务",
         processId: processIds.frontend,
+        proxyConfigurationPath: join(paths.workspace, "vite.config.ts"),
         status: processIds.frontend === null ? "stopped" : "running",
         version: productVersion,
       },
       {
         actions: ["refresh", "start", "restart", "stop"],
         command: commands.api,
+        configurationPath: databasePath,
         endpoint: `http://127.0.0.1:${ports.api}`,
         id: serviceIds.api,
         kind: "api",
         lifecycle: "managed",
+        logLocation: "当前启动终端",
         name: "接口服务",
         processId: processIds.api,
+        proxyConfigurationPath: null,
         status: processIds.api === null ? "stopped" : "running",
         version: productVersion,
       },
@@ -417,18 +443,19 @@ const createInventory = async () => {
 const startController = async () => {
   assertServiceIsNotRunning("controller");
   writeServiceProcessId("controller");
+  const cleanupControllerFile = () => removeServiceProcessId("controller");
+  process.once("exit", cleanupControllerFile);
   const managedChildren = new Set();
   const registerChild = (childProcess) => {
     managedChildren.add(childProcess);
     childProcess.once("exit", () => managedChildren.delete(childProcess));
-    childProcess.unref();
   };
   const startupServices = [
     startFrontend ? "frontend" : undefined,
     startAllServices ? "api" : undefined,
   ];
   for (const service of startupServices) {
-    if (service !== undefined) registerChild(spawnService(service));
+    if (service !== undefined) registerChild(spawnService(service, true));
   }
 
   const server = createHttpServer(async (request, response) => {
@@ -501,12 +528,11 @@ const startController = async () => {
   });
   process.stdout.write(
     [
-      "\n[AI-TIDU9] 本地开发控制已启动",
-      `  前端  ${startFrontend ? `启动中 · http://127.0.0.1:${ports.frontend}` : "未启动"}`,
-      `  接口  ${startAllServices ? `启动中 · http://127.0.0.1:${ports.api}` : `未启动 · ${commands.api}`}`,
-      `  控制  运行中 · http://127.0.0.1:${ports.control}`,
-      `  进程  PID ${process.pid}`,
-      "  操作  页面与命令行状态联动；Ctrl+C 停止本次启动的服务",
+      "\n[AI-TIDU9] 本地开发环境",
+      `  前端服务  ${startFrontend ? `启动中 · http://127.0.0.1:${ports.frontend}` : "未启动"}`,
+      `  接口服务  ${startAllServices ? `启动中 · http://127.0.0.1:${ports.api}` : `未启动 · ${commands.api}`}`,
+      "  服务操作  页面或 tidu service 命令",
+      "  停止方式  Ctrl+C",
       "",
     ].join("\n"),
   );
@@ -514,18 +540,21 @@ const startController = async () => {
   const stop = () => {
     if (stopping) return;
     stopping = true;
+    cleanupControllerFile();
+    process.off("exit", cleanupControllerFile);
     for (const childProcess of managedChildren) {
       if (childProcess.exitCode === null && childProcess.signalCode === null) {
         childProcess.kill("SIGTERM");
       }
     }
     server.close(() => {
-      removeServiceProcessId("controller");
       process.exitCode = 0;
     });
+    server.closeAllConnections();
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
+  process.once("SIGHUP", stop);
 };
 
 assertInstalledRuntimeIsStopped();

@@ -20,6 +20,8 @@ curl -fsS http://127.0.0.1:9639/health
 docker compose -f config/docker/compose.yml ps
 ```
 
+Server runtime logs are written to `/var/lib/ai-tidu9/logs/runtime.log` in the persistent volume. The Services page shows the log, runtime-configuration, and reverse-proxy configuration locations; deployments without Nginx show “Not configured.” For an external Nginx deployment, provide its runtime-visible configuration path through `TIDU_NGINX_CONFIG_PATH`.
+
 ## Cross-device boundary
 
 - Bind container management ports to the server loopback interface only.
