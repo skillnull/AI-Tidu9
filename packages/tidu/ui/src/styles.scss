@@ -973,10 +973,13 @@ h2 {
     background: #0b1118;
 
     article {
-      align-items: flex-start;
+      align-items: center;
       display: grid;
+      grid-template-areas:
+        "identity status actions"
+        "details details details";
       grid-template-columns: minmax(220px, 1fr) auto auto;
-      padding: 15px;
+      padding: 18px 20px;
 
       & + article {
         border-top: 1px solid var(--line);
@@ -997,17 +1000,23 @@ h2 {
         font-size: 10px;
       }
 
-      dl {
-        display: flex;
-        flex-wrap: wrap;
-        margin: 11px -5px -6px;
+      .service-control-identity {
+        grid-area: identity;
+        min-width: 0;
+      }
+
+      .service-control-details {
+        display: grid;
+        grid-area: details;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        width: 100%;
+        margin: 16px 0 0;
+        padding-top: 14px;
+        border-top: 1px solid #202b35;
 
         div {
-          flex: 1 1 128px;
           min-width: 0;
-          margin: 0 5px 6px;
-          padding-left: 8px;
-          border-left: 1px solid #273541;
+          margin: 0 18px 12px 0;
         }
 
         dt,
@@ -1017,7 +1026,7 @@ h2 {
 
         dt {
           color: #586878;
-          font-size: 8px;
+          font-size: 9px;
         }
 
         dd {
@@ -1025,7 +1034,7 @@ h2 {
           overflow: hidden;
           color: #9ba8b5;
           font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-          font-size: 9px;
+          font-size: 10px;
           text-overflow: ellipsis;
           white-space: nowrap;
         }
@@ -1035,7 +1044,8 @@ h2 {
 
   .service-control-status {
     align-self: center;
-    margin: 0 18px;
+    grid-area: status;
+    margin-left: 24px;
     padding: 4px 0;
     font-size: 10px;
     font-weight: 600;
@@ -1073,6 +1083,8 @@ h2 {
     align-self: center;
     display: flex;
     flex-wrap: wrap;
+    grid-area: actions;
+    margin-left: 18px;
 
     button + button {
       margin-left: 8px;
@@ -2004,12 +2016,28 @@ h2 {
     padding: 16px;
 
     .service-control-list article {
-      grid-template-columns: minmax(0, 1fr);
+      grid-template-areas:
+        "identity status"
+        "actions actions"
+        "details details";
+      grid-template-columns: minmax(0, 1fr) auto;
+
+      .service-control-details {
+        grid-template-columns: minmax(0, 1fr);
+
+        div {
+          margin-right: 0;
+        }
+      }
 
       .service-control-status {
         justify-self: start;
-        margin: 10px 0;
+        margin: 0 0 0 12px;
       }
+    }
+
+    .service-control-actions {
+      margin: 12px 0 0;
     }
 
     .service-control-actions button + button {

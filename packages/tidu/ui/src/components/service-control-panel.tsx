@@ -256,59 +256,6 @@ export const ServiceControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) =
                           ? "Installed or remote API service"
                           : "安装或远程接口服务"}
                 </p>
-                <dl>
-                  <div>
-                    <dt>{english ? "Mode" : "运行方式"}</dt>
-                    <dd>
-                      {service.lifecycle === "managed"
-                        ? english
-                          ? "Managed process"
-                          : "常驻进程"
-                        : english
-                          ? "On-demand command"
-                          : "按需命令"}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>PID</dt>
-                    <dd>
-                      {service.processId ??
-                        (service.lifecycle === "on-demand"
-                          ? english
-                            ? "On demand"
-                            : "按需执行"
-                          : english
-                            ? "Not running"
-                            : "未运行")}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>{english ? "Command" : "命令入口"}</dt>
-                    <dd title={service.command}>{service.command}</dd>
-                  </div>
-                  <div>
-                    <dt>{english ? "Endpoint" : "服务地址"}</dt>
-                    <dd title={service.endpoint}>{service.endpoint}</dd>
-                  </div>
-                  <div>
-                    <dt>{english ? "Version" : "版本"}</dt>
-                    <dd>{service.version}</dd>
-                  </div>
-                  <div>
-                    <dt>{english ? "Logs" : "日志位置"}</dt>
-                    <dd title={service.logLocation}>{service.logLocation}</dd>
-                  </div>
-                  <div>
-                    <dt>{english ? "Configuration" : "配置位置"}</dt>
-                    <dd title={service.configurationPath}>{service.configurationPath}</dd>
-                  </div>
-                  <div>
-                    <dt>{english ? "Proxy configuration" : "代理配置"}</dt>
-                    <dd title={service.proxyConfigurationPath ?? undefined}>
-                      {service.proxyConfigurationPath ?? (english ? "Not configured" : "未配置")}
-                    </dd>
-                  </div>
-                </dl>
               </div>
               <span
                 className={`service-control-status service-control-status-${activeAction ? "pending" : service.status}`}
@@ -350,6 +297,59 @@ export const ServiceControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) =
                     ))}
                 </div>
               ) : null}
+              <dl className="service-control-details">
+                <div>
+                  <dt>{english ? "Mode" : "运行方式"}</dt>
+                  <dd>
+                    {service.lifecycle === "managed"
+                      ? english
+                        ? "Managed process"
+                        : "常驻进程"
+                      : english
+                        ? "On-demand command"
+                        : "按需命令"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>PID</dt>
+                  <dd>
+                    {service.processId ??
+                      (service.lifecycle === "on-demand"
+                        ? english
+                          ? "On demand"
+                          : "按需执行"
+                        : english
+                          ? "Not running"
+                          : "未运行")}
+                  </dd>
+                </div>
+                <div>
+                  <dt>{english ? "Command" : "命令入口"}</dt>
+                  <dd title={service.command}>{service.command}</dd>
+                </div>
+                <div>
+                  <dt>{english ? "Endpoint" : "服务地址"}</dt>
+                  <dd title={service.endpoint}>{service.endpoint}</dd>
+                </div>
+                <div>
+                  <dt>{english ? "Version" : "版本"}</dt>
+                  <dd>{service.version}</dd>
+                </div>
+                <div>
+                  <dt>{english ? "Logs" : "日志位置"}</dt>
+                  <dd title={service.logLocation}>{service.logLocation}</dd>
+                </div>
+                <div>
+                  <dt>{english ? "Configuration" : "配置位置"}</dt>
+                  <dd title={service.configurationPath}>{service.configurationPath}</dd>
+                </div>
+                <div>
+                  <dt>{english ? "Proxy configuration" : "代理配置"}</dt>
+                  <dd title={service.proxyConfigurationPath ?? undefined}>
+                    {service.proxyConfigurationPath ?? (english ? "Not configured" : "未配置")}
+                  </dd>
+                </div>
+              </dl>
             </article>
           );
         })}
