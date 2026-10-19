@@ -255,6 +255,10 @@ export const previewConfigurationImpact = (
     active.modelSelection.model === candidate.modelSelection.model
       ? []
       : ["modelSelection"]),
+    ...(JSON.stringify(active.capabilityCompletion) ===
+    JSON.stringify(candidate.capabilityCompletion)
+      ? []
+      : ["capabilityCompletion"]),
     ...(activeExpertServices?.host === candidateExpertServices?.host
       ? []
       : ["expertServices.host"]),

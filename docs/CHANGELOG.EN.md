@@ -9,7 +9,8 @@ This file records user-visible changes in every public AI-Tidu9 release. Compati
 
 ## Unreleased
 
-- Correct client integration semantics: install the Codex MCP connector by default while preserving the official model list, stop presenting an isolated profile as an additive model, and actively discover the local Ollama catalog without requiring Ollama to be the active runtime first.
+- Replace the Codex MCP registration with mutually exclusive native Provider modes: Official restores the exact original configuration, AI-Tidu9 shows only “九门赛博提督,” and Codex, Cursor, CLI, and OpenAI-compatible entry points now share one Agent kernel with planning, capability completion, and independent verification; Ollama discovery reads the local catalog directly.
+- Add a shared capability-completion configuration and status view with an explicit switch, declared primary capabilities, host/company/custom specialists, company-published capability status, and recent completion records across local, personal, and enterprise runtimes.
 - Standardize installation guidance on switching to Node.js 22.14+ before globally installing and using the `tidu` command; no longer describe the temporary `npx` download as installation-free.
 - Check the runtime version before loading SQLite and other Node.js 22 capabilities, so older Node versions receive clear bilingual upgrade guidance instead of a missing `node:sqlite` error.
 - Add `npm run tidu:dev-p`, `npm run tidu:dev-e`, and matching CLI commands for complete personal and enterprise development runtimes, UI hot updates, automatic backend rebuilds and restarts, and isolated development data.

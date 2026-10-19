@@ -1958,6 +1958,118 @@ h2 {
   font-size: 10px;
 }
 
+.capability-completion-editor,
+.capability-completion-panel {
+  border: 1px solid var(--control-border);
+  border-radius: 16px;
+  background: #0b1118;
+  padding: 24px;
+}
+
+.capability-completion-editor {
+  margin-top: 24px;
+}
+
+.capability-completion-editor-heading,
+.capability-records-heading,
+.capability-status-grid article > div {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.capability-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.capability-policy-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(160px, 1fr);
+  gap: 14px;
+  margin-top: 18px;
+}
+
+.capability-policy-fields label,
+.capability-specialist-row {
+  display: grid;
+  gap: 8px;
+}
+
+.capability-specialist-row {
+  grid-template-columns: 140px minmax(180px, 1fr) minmax(220px, 1fr) auto;
+  margin-top: 12px;
+}
+
+.capability-specialists > button {
+  margin-top: 14px;
+}
+
+.capability-status-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 22px;
+}
+
+.capability-status-grid article,
+.capability-records article {
+  border: 1px solid #24303c;
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.capability-status-grid span,
+.capability-status-grid small,
+.capability-records span,
+.capability-records p {
+  color: #8794a5;
+}
+
+.capability-status-grid strong,
+.capability-status-grid small {
+  display: block;
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+}
+
+.host-agent-flow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  margin: 18px 0;
+  padding: 16px;
+  border-radius: 12px;
+  background: #101820;
+  color: #73d8cc;
+  text-align: center;
+}
+
+.capability-records article + article {
+  margin-top: 10px;
+}
+
+.capability-records article > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+@media (max-width: 900px) {
+  .capability-status-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .capability-specialist-row,
+  .capability-policy-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 @media (max-width: 640px) {
   .shell {
     padding: 24px 14px 20px;

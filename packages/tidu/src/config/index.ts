@@ -2,13 +2,29 @@ export const CONFIG_SCHEMA_VERSION = "1" as const;
 export const DEFAULT_VIRTUAL_MODEL_ID = "ai-tidu9-config";
 
 export type ConfigurationMode = "managed" | "expert";
-export type ModelSource = "company" | "official";
+export type ModelSource = "company" | "custom" | "official";
 
 export interface ModelSelection {
   /** Provider group used behind the single AI-Tidu9 virtual-model entry. */
   source: ModelSource;
   /** Upstream model ID, or `current` to follow the active official Codex model. */
   model: string;
+}
+
+export interface CapabilitySpecialistConfiguration extends ModelSelection {
+  /** Capabilities this specialist is explicitly allowed to complete. */
+  capabilities: readonly string[];
+}
+
+export interface CapabilityCompletionConfiguration {
+  /** Enables bounded specialist calls when the primary model lacks a required capability. */
+  enabled: boolean;
+  /** Capabilities explicitly declared for the selected primary model. */
+  mainCapabilities: readonly string[];
+  /** Ordered, explicitly configured specialist pool. */
+  specialists: readonly CapabilitySpecialistConfiguration[];
+  /** Hard upper bound for specialist calls in one model request. */
+  maximumSpecialists: number;
 }
 
 export interface ExpertServiceConfiguration {
@@ -35,6 +51,8 @@ export interface TiduConfiguration {
   virtualModelName: string;
   /** Upstream selected behind the virtual model. */
   modelSelection: ModelSelection;
+  /** Shared Agent-level capability completion policy used by every host entry point. */
+  capabilityCompletion: CapabilityCompletionConfiguration;
   /** Advanced service settings, present only for expert-mode configurations. */
   expertServices?: ExpertServiceConfiguration;
 }
@@ -71,6 +89,12 @@ export const createDefaultConfiguration = (
     activeMode: mode,
     virtualModelName: "九门赛博提督",
     modelSelection: { source: "official", model: "current" },
+    capabilityCompletion: {
+      enabled: true,
+      mainCapabilities: ["text", "structured-output"],
+      specialists: [],
+      maximumSpecialists: 2,
+    },
   };
   if (mode === "expert") {
     configuration.expertServices = {
@@ -121,13 +145,39 @@ export const validateConfiguration = (
   }
   if (
     (configuration.modelSelection.source !== "official" &&
-      configuration.modelSelection.source !== "company") ||
+      configuration.modelSelection.source !== "company" &&
+      configuration.modelSelection.source !== "custom") ||
     !/^[a-z0-9][a-z0-9._:-]{0,127}$/iu.test(configuration.modelSelection.model.trim())
   ) {
     issues.push({
       code: "INVALID_MODEL_SELECTION",
       field: "modelSelection",
       message: "Model selection must contain a supported source and non-empty model ID.",
+    });
+  }
+  const completion = configuration.capabilityCompletion;
+  const safeCapability = /^[a-z0-9][a-z0-9._:-]{0,63}$/iu;
+  if (
+    typeof completion?.enabled !== "boolean" ||
+    !Number.isInteger(completion.maximumSpecialists) ||
+    completion.maximumSpecialists < 1 ||
+    completion.maximumSpecialists > 8 ||
+    completion.mainCapabilities.length === 0 ||
+    completion.mainCapabilities.some((capability) => !safeCapability.test(capability)) ||
+    completion.specialists.some(
+      (specialist) =>
+        (specialist.source !== "official" &&
+          specialist.source !== "company" &&
+          specialist.source !== "custom") ||
+        !/^[a-z0-9][a-z0-9._:-]{0,127}$/iu.test(specialist.model) ||
+        specialist.capabilities.length === 0 ||
+        specialist.capabilities.some((capability) => !safeCapability.test(capability)),
+    )
+  ) {
+    issues.push({
+      code: "INVALID_MODEL_SELECTION",
+      field: "capabilityCompletion",
+      message: "Capability completion requires valid primary capabilities and specialist models.",
     });
   }
   if (expectedMode === "expert" && configuration.expertServices !== undefined) {

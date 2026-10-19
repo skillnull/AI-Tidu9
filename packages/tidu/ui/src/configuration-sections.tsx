@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { TaskControlView } from "../../src/agent/index.js";
 import type {
+  CapabilityCompletionConfiguration,
   ConfigurationMode,
   ExpertServiceConfiguration,
   ModelSelection,
@@ -72,6 +73,8 @@ export interface ConfigurationForm {
   virtualModelName: string;
   /** Upstream selected behind the single virtual-model entry. */
   modelSelection: ModelSelection;
+  /** Agent-level capability completion shared by every host. */
+  capabilityCompletion: CapabilityCompletionConfiguration;
   /** Advanced runtime service controls available only in expert mode. */
   expertServices?: ExpertServiceConfiguration;
 }
@@ -93,6 +96,174 @@ interface TaskListResponse {
   /** Bounded task summaries ordered by latest update. */
   tasks: readonly TaskControlView[];
 }
+
+interface CapabilityCompletionStatusResponse {
+  available: boolean;
+  operational: boolean;
+  configuration: CapabilityCompletionConfiguration;
+  mainModel: ModelSelection;
+  records: readonly {
+    occurredAt: string;
+    role: string;
+    complemented: boolean;
+    outcome: "failed" | "succeeded";
+    mainModelId: string;
+    specialistModelIds: readonly string[];
+    requiredCapabilities: readonly string[];
+    missingCapabilities: readonly string[];
+  }[];
+  company: { connected: boolean; publishedCapabilityCount: number };
+  hosts: readonly string[];
+}
+
+export const CapabilityCompletionPanel = ({
+  locale,
+  onEdit,
+}: {
+  locale: "en-US" | "zh-CN";
+  onEdit: () => void;
+}) => {
+  const english = locale === "en-US";
+  const [status, setStatus] = useState<CapabilityCompletionStatusResponse>();
+  const [message, setMessage] = useState(english ? "Loading…" : "正在读取…");
+  const refresh = useCallback(async () => {
+    try {
+      const response = await fetch("/api/capability-completion", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setStatus((await response.json()) as CapabilityCompletionStatusResponse);
+      setMessage("");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : english ? "Unavailable" : "读取失败");
+    }
+  }, [english]);
+  useEffect(() => void refresh(), [refresh]);
+  return (
+    <section className="capability-completion-panel">
+      <div className="configuration-heading">
+        <div>
+          <p className="card-label">AGENT CAPABILITY COMPLETION</p>
+          <h2>{english ? "Capability completion" : "能力互补"}</h2>
+          <p>
+            {english
+              ? "Codex, Cursor, CLI, and compatible APIs are entry points to one policy. The Agent invokes configured specialists only for capabilities the primary model lacks, then verifies the combined result."
+              : "Codex、Cursor、CLI 与兼容 API 只是同一策略的入口。主模型缺少任务能力时，Agent 才调用已配置的专家模型补位，并对合并结果独立验收。"}
+          </p>
+        </div>
+        <div className="configuration-view-actions">
+          <button type="button" onClick={() => void refresh()}>
+            {english ? "Refresh" : "刷新"}
+          </button>
+          <button type="button" className="primary-button" onClick={onEdit}>
+            {english ? "Edit policy" : "配置互补"}
+          </button>
+        </div>
+      </div>
+      {message ? <p role="status">{message}</p> : null}
+      {status ? (
+        <>
+          <div className="capability-status-grid">
+            <article>
+              <span>{english ? "Runtime" : "运行状态"}</span>
+              <strong>
+                {!status.available
+                  ? english
+                    ? "Provider unavailable"
+                    : "模型服务不可用"
+                  : status.operational
+                    ? english
+                      ? "Enabled · Ready"
+                      : "已开启"
+                    : status.configuration.enabled
+                      ? english
+                        ? "Enabled · Needs specialists"
+                        : "已开启 · 待配置专家"
+                      : english
+                        ? "Disabled"
+                        : "已关闭"}
+              </strong>
+            </article>
+            <article>
+              <span>{english ? "Primary model" : "主模型"}</span>
+              <strong>
+                {status.mainModel.source} · {status.mainModel.model}
+              </strong>
+              <small>{status.configuration.mainCapabilities.join(" · ")}</small>
+            </article>
+            <article>
+              <span>{english ? "Specialist pool" : "专家模型池"}</span>
+              <strong>{status.configuration.specialists.length}</strong>
+              <small>
+                {status.configuration.specialists.map((model) => model.model).join(" · ") ||
+                  (english ? "Not configured" : "尚未配置")}
+              </small>
+            </article>
+            <article>
+              <span>{english ? "Company capabilities" : "公司能力"}</span>
+              <strong>
+                {status.company.connected
+                  ? status.company.publishedCapabilityCount
+                  : english
+                    ? "Not connected"
+                    : "未接入"}
+              </strong>
+              <small>{english ? "Published by company service" : "由公司服务发布"}</small>
+            </article>
+          </div>
+          <div className="host-agent-flow">
+            <span>{status.hosts.join(" · ")}</span>
+            <b>→</b>
+            <strong>{english ? "AI-Tidu9 Agent" : "九门 Agent"}</strong>
+            <b>→</b>
+            <span>
+              {english ? "Primary + specialists + verifier" : "主模型 + 专家模型 + 验收器"}
+            </span>
+          </div>
+          <div className="capability-records">
+            <div className="capability-records-heading">
+              <h3>{english ? "Recent use" : "最近使用记录"}</h3>
+              <span>{english ? "Latest 50 in this runtime" : "当前运行时最近 50 条"}</span>
+            </div>
+            {status.records.length === 0 ? (
+              <p>{english ? "No routing records yet." : "暂无互补调用记录。"}</p>
+            ) : (
+              status.records.map((record, index) => (
+                <article key={`${record.occurredAt}:${index}`}>
+                  <div>
+                    <strong>
+                      {record.complemented
+                        ? english
+                          ? "Complemented"
+                          : "已补位"
+                        : english
+                          ? "Primary only"
+                          : "仅主模型"}
+                    </strong>
+                    <span>{new Date(record.occurredAt).toLocaleString()}</span>
+                  </div>
+                  <p>
+                    {english ? "Role" : "阶段"}：{record.role} · {english ? "Required" : "所需能力"}
+                    ：{record.requiredCapabilities.join(", ")}
+                  </p>
+                  <p>
+                    {english ? "Specialists" : "专家模型"}：
+                    {record.specialistModelIds.join(", ") || "—"} ·{" "}
+                    {record.outcome === "succeeded"
+                      ? english
+                        ? "Succeeded"
+                        : "成功"
+                      : english
+                        ? "Failed"
+                        : "失败"}
+                  </p>
+                </article>
+              ))
+            )}
+          </div>
+        </>
+      ) : null}
+    </section>
+  );
+};
 
 export interface ConfigurationImpactPreview {
   /** Whether the configuration passed validation. */
@@ -127,7 +298,10 @@ const impactChangeLabel = (
       : `虚拟模型 → ${form.virtualModelName}`,
     modelSelection: english
       ? `Upstream model → ${form.modelSelection.source} · ${form.modelSelection.model}`
-      : `上游模型 → ${form.modelSelection.source === "official" ? "官方" : "公司"} · ${form.modelSelection.model}`,
+      : `上游模型 → ${form.modelSelection.source === "official" ? "宿主" : form.modelSelection.source === "company" ? "公司" : "自定义"} · ${form.modelSelection.model}`,
+    capabilityCompletion: english
+      ? `Capability completion → ${form.capabilityCompletion.enabled ? "enabled" : "disabled"} · ${form.capabilityCompletion.specialists.length} specialists`
+      : `能力互补 → ${form.capabilityCompletion.enabled ? "开启" : "关闭"} · ${form.capabilityCompletion.specialists.length} 个专家模型`,
     "expertServices.host": english
       ? `Listen host → ${service?.host ?? "-"}`
       : `监听地址 → ${service?.host ?? "-"}`,
@@ -420,6 +594,12 @@ export const toForm = (configuration: TiduConfiguration): ConfigurationForm => (
   activeProfileId: configuration.activeProfileId,
   virtualModelName: configuration.virtualModelName,
   modelSelection: configuration.modelSelection ?? { source: "official", model: "current" },
+  capabilityCompletion: configuration.capabilityCompletion ?? {
+    enabled: true,
+    mainCapabilities: ["text", "structured-output"],
+    specialists: [],
+    maximumSpecialists: 2,
+  },
   ...(configuration.activeMode === "expert"
     ? {
         expertServices: configuration.expertServices ?? DEFAULT_EXPERT_SERVICES,
@@ -1204,7 +1384,11 @@ export const QuickStartWizard = ({
           : "codex-host",
   );
   const [modelChoiceMode, setModelChoiceMode] = useState<"company" | "custom" | "host">(
-    form.modelSelection.source === "company" ? "company" : "host",
+    form.modelSelection.source === "company"
+      ? "company"
+      : form.modelSelection.source === "custom"
+        ? "custom"
+        : "host",
   );
   const modelChoiceTouchedRef = useRef(false);
   const providerChoiceTouchedRef = useRef(false);
@@ -1309,8 +1493,7 @@ export const QuickStartWizard = ({
     onFormChange({
       ...form,
       modelSelection: {
-        source:
-          choice === "company" ? "company" : choice === "custom" ? "official" : hostModelSource,
+        source: choice === "company" ? "company" : choice === "custom" ? "custom" : hostModelSource,
         model: choice === "host" ? "current" : "",
       },
     });
@@ -1319,6 +1502,10 @@ export const QuickStartWizard = ({
     if (upstreamCatalogStatus !== "ready" || modelChoiceTouchedRef.current) return;
     if (form.modelSelection.source === "company") {
       setModelChoiceMode("company");
+      return;
+    }
+    if (form.modelSelection.source === "custom") {
+      setModelChoiceMode("custom");
       return;
     }
     setModelChoiceMode(
@@ -1874,7 +2061,7 @@ export const QuickStartWizard = ({
                       onFormChange({
                         ...form,
                         modelSelection: {
-                          source: "official",
+                          source: "custom",
                           model: customModel,
                         },
                       });
@@ -1889,6 +2076,183 @@ export const QuickStartWizard = ({
                   </small>
                 </label>
               ) : null}
+              <section className="capability-completion-editor">
+                <div className="capability-completion-editor-heading">
+                  <div>
+                    <p className="card-label">CAPABILITY COMPLETION</p>
+                    <h3>{english ? "Model capability completion" : "模型能力互补"}</h3>
+                    <p>
+                      {english
+                        ? "Every host enters this same Agent policy. Specialists run only when the primary model lacks a required capability."
+                        : "所有宿主进入同一套 Agent 策略；仅当主模型缺少任务所需能力时，才调用专家模型补位。"}
+                    </p>
+                  </div>
+                  <label className="capability-toggle">
+                    <input
+                      type="checkbox"
+                      checked={form.capabilityCompletion.enabled}
+                      onChange={(event) =>
+                        onFormChange({
+                          ...form,
+                          capabilityCompletion: {
+                            ...form.capabilityCompletion,
+                            enabled: event.target.checked,
+                          },
+                        })
+                      }
+                      disabled={isPending || readOnly}
+                    />
+                    <span>
+                      {form.capabilityCompletion.enabled
+                        ? english
+                          ? "Enabled"
+                          : "已开启"
+                        : english
+                          ? "Disabled"
+                          : "已关闭"}
+                    </span>
+                  </label>
+                </div>
+                <div className="capability-policy-fields">
+                  <label>
+                    {english ? "Primary model capabilities" : "主模型能力"}
+                    <input
+                      value={form.capabilityCompletion.mainCapabilities.join(", ")}
+                      onChange={(event) =>
+                        onFormChange({
+                          ...form,
+                          capabilityCompletion: {
+                            ...form.capabilityCompletion,
+                            mainCapabilities: event.target.value
+                              .split(",")
+                              .map((value) => value.trim())
+                              .filter(Boolean),
+                          },
+                        })
+                      }
+                      placeholder="text, structured-output, vision"
+                      disabled={isPending || readOnly}
+                    />
+                  </label>
+                  <label>
+                    {english ? "Maximum specialists per request" : "单次最多专家数"}
+                    <input
+                      type="number"
+                      min={1}
+                      max={8}
+                      value={form.capabilityCompletion.maximumSpecialists}
+                      onChange={(event) =>
+                        onFormChange({
+                          ...form,
+                          capabilityCompletion: {
+                            ...form.capabilityCompletion,
+                            maximumSpecialists: Number(event.target.value),
+                          },
+                        })
+                      }
+                      disabled={isPending || readOnly}
+                    />
+                  </label>
+                </div>
+                <div className="capability-specialists">
+                  {form.capabilityCompletion.specialists.map((specialist, index) => (
+                    <div
+                      className="capability-specialist-row"
+                      key={`${specialist.source}:${specialist.model}:${index}`}
+                    >
+                      <select
+                        aria-label={english ? "Specialist source" : "专家来源"}
+                        value={specialist.source}
+                        onChange={(event) => {
+                          const specialists = [...form.capabilityCompletion.specialists];
+                          specialists[index] = {
+                            ...specialist,
+                            source: event.target.value as "company" | "custom" | "official",
+                          };
+                          onFormChange({
+                            ...form,
+                            capabilityCompletion: { ...form.capabilityCompletion, specialists },
+                          });
+                        }}
+                        disabled={isPending || readOnly}
+                      >
+                        <option value="official">{english ? "Host" : "宿主"}</option>
+                        <option value="company">{english ? "Company" : "公司"}</option>
+                        <option value="custom">{english ? "Custom" : "自定义"}</option>
+                      </select>
+                      <input
+                        aria-label={english ? "Specialist model" : "专家模型"}
+                        value={specialist.model}
+                        placeholder={english ? "Model ID" : "模型 ID"}
+                        onChange={(event) => {
+                          const specialists = [...form.capabilityCompletion.specialists];
+                          specialists[index] = { ...specialist, model: event.target.value };
+                          onFormChange({
+                            ...form,
+                            capabilityCompletion: { ...form.capabilityCompletion, specialists },
+                          });
+                        }}
+                        disabled={isPending || readOnly}
+                      />
+                      <input
+                        aria-label={english ? "Specialist capabilities" : "专家能力"}
+                        value={specialist.capabilities.join(", ")}
+                        placeholder="vision, research"
+                        onChange={(event) => {
+                          const specialists = [...form.capabilityCompletion.specialists];
+                          specialists[index] = {
+                            ...specialist,
+                            capabilities: event.target.value
+                              .split(",")
+                              .map((value) => value.trim())
+                              .filter(Boolean),
+                          };
+                          onFormChange({
+                            ...form,
+                            capabilityCompletion: { ...form.capabilityCompletion, specialists },
+                          });
+                        }}
+                        disabled={isPending || readOnly}
+                      />
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onFormChange({
+                            ...form,
+                            capabilityCompletion: {
+                              ...form.capabilityCompletion,
+                              specialists: form.capabilityCompletion.specialists.filter(
+                                (_, specialistIndex) => specialistIndex !== index,
+                              ),
+                            },
+                          })
+                        }
+                        disabled={isPending || readOnly}
+                      >
+                        {english ? "Remove" : "移除"}
+                      </button>
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onFormChange({
+                        ...form,
+                        capabilityCompletion: {
+                          ...form.capabilityCompletion,
+                          specialists: [
+                            ...form.capabilityCompletion.specialists,
+                            { source: "official", model: "", capabilities: ["vision"] },
+                          ],
+                        },
+                      })
+                    }
+                    disabled={isPending || readOnly}
+                  >
+                    {english ? "Add specialist model" : "添加专家模型"}
+                  </button>
+                </div>
+              </section>
               {!providerConfigured || !choiceMatchesRuntime ? (
                 <>
                   <textarea

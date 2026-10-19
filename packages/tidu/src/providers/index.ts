@@ -27,7 +27,7 @@ export interface ProviderRoutingContext {
   /** Secret Gate scope shared across one durable Agent task. */
   securityScopeId?: string;
   /** Upstream provider group selected behind the virtual-model entry. */
-  modelSource?: "company" | "official";
+  modelSource?: "company" | "custom" | "official";
   /** Upstream model selected without changing the public virtual-model identity. */
   targetModel?: string;
 }

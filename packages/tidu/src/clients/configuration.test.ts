@@ -132,7 +132,7 @@ test("writes an isolated Codex profile and switches back to the official configu
     ) as { models: { slug: string }[] };
     assert.deepEqual(
       catalog.models.map(({ slug }) => slug),
-      ["ai-tidu9-config", "user-default"],
+      ["ai-tidu9-config"],
     );
 
     await switchCodexClientConfiguration({
@@ -151,9 +151,11 @@ test("writes an isolated Codex profile and switches back to the official configu
       },
     });
     const tiduDefaultConfiguration = readFileSync(defaultConfiguration, "utf8");
-    assert.match(tiduDefaultConfiguration, /model = "user-default"/u);
+    assert.match(tiduDefaultConfiguration, /model = "ai-tidu9-config"/u);
     assert.match(tiduDefaultConfiguration, /model_provider = "ai_tidu9"/u);
     assert.match(tiduDefaultConfiguration, /\[model_providers\.ai_tidu9\]/u);
+    assert.match(tiduDefaultConfiguration, /name = "九门赛博提督"/u);
+    assert.doesNotMatch(tiduDefaultConfiguration, /requires_openai_auth = true/u);
 
     await switchCodexClientConfiguration({
       mode: "official",
@@ -262,7 +264,7 @@ test("retains only the original baseline and latest managed Codex snapshot", asy
   }
 });
 
-test("does not shrink the unified catalog when an older Codex cache omits official models", async () => {
+test("keeps the native AI-Tidu9 catalog isolated from changing official model caches", async () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-catalog-"));
   const codexHomeDirectory = join(temporaryDirectory, ".codex");
   const runtime = await startLocalRuntime({ databasePath: ":memory:", port: 0 });
@@ -297,7 +299,7 @@ test("does not shrink the unified catalog when an older Codex cache omits offici
     ) as { models: { slug: string }[] };
     assert.deepEqual(
       catalog.models.map(({ slug }) => slug),
-      ["ai-tidu9-config", "official-current", "official-newer", "user-default"],
+      ["ai-tidu9-config"],
     );
   } finally {
     await runtime.close();

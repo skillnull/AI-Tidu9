@@ -38,7 +38,7 @@ tidu <command> --help         # Command-specific help
 | `tidu mcp` | Run the stdio MCP bridge for Agent hosts | No |
 | `tidu doctor` | Check runtime, configuration API, and page; optionally print a privacy-safe report | No |
 | `tidu clients` | Discover supported local clients | No |
-| `tidu clients connect/switch/rollback codex` | Create the unified model catalog, or restore and roll back Codex configuration | Yes; the official account is unchanged and all managed settings are recoverable |
+| `tidu clients connect/switch/rollback codex` | Prepare, switch, or roll back mutually exclusive native Codex modes | Yes; the official account is unchanged and all managed settings are recoverable |
 | `tidu channel list/run` | Inspect or invoke AI-Tidu9, official host, and provider channels | No; execution consumes the selected channel's quota |
 | `tidu account` | Inspect reusable Codex and Cursor login state | No |
 | `tidu account relogin/switch` | Invoke the host's official login or switch flow | Yes, only when explicitly run |
@@ -92,9 +92,9 @@ tidu clients switch codex <official|ai-tidu9> [--yes] [--endpoint <url>]
 tidu clients rollback codex [--yes]
 ```
 
-The default setup action is `install` and does not require a prestarted runtime. It installs connectors, prepares the AI-Tidu9 configuration, and automatically starts every service in the installed edition while leaving direct Official mode active. `clients switch codex ai-tidu9` adds one AI-Tidu9 virtual-model entry to Codex. Its official or company upstream is selected on the AI-Tidu9 configuration page; company models are never separate Codex entries. `clients switch codex official` restores an official-only list. Official Codex remains the authority for account identity, plan, and quota data. AI-Tidu9 keeps only its original installation baseline and latest rollback point.
+The default setup action is `install` and does not require a prestarted runtime. It prepares a mutually exclusive native AI-Tidu9 Agent mode for Codex, installs the required transports for other hosts, and automatically starts every service in the installed edition while leaving direct Official mode active. `clients switch codex ai-tidu9` makes Codex show only “九门赛博提督”; tasks enter the same Agent kernel for planning, capability completion, execution, and independent verification. Official, company, and custom upstreams are mutually exclusive configuration choices and never become separate Codex entries. `clients switch codex official` restores the exact original official configuration and model list. Official Codex remains the authority for account identity, plan, and quota data. AI-Tidu9 keeps only its original installation baseline and latest rollback point.
 
-The installed MCP connector exposes `list_tidu_channels` and `route_tidu_channel` to both the Codex plugin and Cursor. It does not replace the host model list. The `codex` and `cursor` channels delegate to official host processes, `tidu` uses the AI-Tidu9 runtime, and provider channels read only their connector-process environment variables.
+Codex uses a native Provider integration and does not register an AI-Tidu9 MCP server. Restart Codex after a mode switch so it reloads the Provider and model catalog. Cursor may use a stdio connector as its transport, but `route_tidu_task` still enters the same Agent kernel used by Codex, CLI, and OpenAI-compatible endpoints; the transport never bypasses planning, capability completion, or verification.
 
 Enterprise servers do not run setup on employee computers or host a separate employee page. After installing the personal edition, an employee enters the administrator-provided company URL under Company access in the local page. Production company URLs must use HTTPS; HTTP is accepted only for loopback development. Company configuration stays read-only and is stored separately from personal drafts and active configuration.
 
@@ -131,7 +131,7 @@ For CI, prefer a provider API channel and keep its credential in the CI secret s
     DASHSCOPE_MODEL: qwen-plus
 ```
 
-Codex and Cursor host channels are intended for developer machines with an existing official login. Headless CI does not reuse desktop credentials. After `tidu setup` and a Cursor restart, its MCP tools can discover and invoke the same channel IDs.
+Codex and Cursor host channels are intended for developer machines with an existing official login. Headless CI does not reuse desktop credentials. After `tidu setup` and a Cursor restart, its connector transport enters the same AI-Tidu9 Agent kernel.
 
 ## ⚙️ Configuration management
 

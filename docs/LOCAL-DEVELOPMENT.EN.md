@@ -18,10 +18,10 @@ Development data is stored in `.tidu-dev/tidu.sqlite`, isolated from globally in
 
 ## Local Codex configuration acceptance
 
-The configuration page is the single upstream selector for the AI-Tidu9 virtual model. It lists official and company-provider models and accepts a custom model ID:
+The configuration page is the single upstream selector for AI-Tidu9. Host, company-provider, and custom models are mutually exclusive, and the model list follows the selected upstream source:
 
-- **AI-Tidu9**: Codex gains one AI-Tidu9 virtual-model entry; its official or company upstream is selected on the configuration page.
-- **Direct Official**: active AI-Tidu9-managed blocks are removed and Codex shows official models only.
+- **AI-Tidu9**: Codex shows only “九门赛博提督”; the configuration page selects the host, company, or custom upstream used by the Agent kernel.
+- **Direct Official**: the exact pre-installation configuration is restored, Codex shows official models only, and calls bypass the AI-Tidu9 runtime.
 
 AI-Tidu9 keeps only its original installation baseline and latest rollback point in its own backup directory; unrelated Codex configuration backups are never removed.
 

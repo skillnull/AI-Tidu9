@@ -30,7 +30,7 @@ export interface ConnectorSetupItem {
   /** Stable connector identifier. */
   id: "browser" | "codex" | "cursor" | "openai";
   /** Capability boundary exposed by this surface. */
-  capability: "browser-management" | "mcp-tools" | "openai-compatible";
+  capability: "browser-management" | "mcp-tools" | "native-agent" | "openai-compatible";
   /** Result of the requested setup action. */
   status: ConnectorSetupStatus;
   /** Human-readable result without credentials or configuration contents. */
@@ -193,13 +193,13 @@ const updateCursorMcp = (
 const configureCodex = (
   codex: string | undefined,
   action: ConnectorSetupAction,
-  command: string,
-  argumentsList: readonly string[],
+  _command: string,
+  _argumentsList: readonly string[],
 ): ConnectorSetupItem => {
   if (codex === undefined) {
     return {
       id: "codex",
-      capability: "mcp-tools",
+      capability: "native-agent",
       status: "unavailable",
       detail: "Codex is not installed.",
     };
@@ -208,38 +208,32 @@ const configureCodex = (
   if (action === "verify") {
     return {
       id: "codex",
-      capability: "mcp-tools",
-      status: configured ? "verified" : "missing",
+      capability: "native-agent",
+      status: configured ? "failed" : "verified",
       detail: configured
-        ? "Codex MCP connector is registered."
-        : "Codex MCP connector is not registered.",
+        ? "A legacy Codex MCP registration is still present."
+        : "Codex uses the native AI-Tidu9 Agent provider; no MCP registration is present.",
     };
   }
   if (action === "uninstall") {
     const removed = !configured || run(codex, ["mcp", "remove", CONNECTOR_NAME]);
     return {
       id: "codex",
-      capability: "mcp-tools",
+      capability: "native-agent",
       status: !configured ? "missing" : removed ? "removed" : "failed",
       detail: removed
         ? "Codex MCP connector removed."
         : "Codex MCP connector could not be removed.",
     };
   }
-  if (configured && (action === "repair" || action === "update")) {
-    run(codex, ["mcp", "remove", CONNECTOR_NAME]);
-  }
-  const installed =
-    configured && action === "install"
-      ? true
-      : run(codex, ["mcp", "add", CONNECTOR_NAME, "--", command, ...argumentsList]);
+  const removedLegacyRegistration = !configured || run(codex, ["mcp", "remove", CONNECTOR_NAME]);
   return {
     id: "codex",
-    capability: "mcp-tools",
-    status: installed ? "configured" : "missing",
-    detail: installed
-      ? "Codex app, CLI, and IDE share the registered MCP connector."
-      : "Codex connector registration failed.",
+    capability: "native-agent",
+    status: removedLegacyRegistration ? "configured" : "failed",
+    detail: removedLegacyRegistration
+      ? "Codex native Agent mode is prepared; legacy MCP registration is absent."
+      : "The legacy Codex MCP registration could not be removed.",
   };
 };
 

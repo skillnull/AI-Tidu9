@@ -21,6 +21,15 @@ test("keeps managed and expert defaults isolated", () => {
   assert.equal(expertConfiguration.activeMode, "expert");
 });
 
+test("accepts an explicit custom upstream source", () => {
+  const configuration = {
+    ...createDefaultConfiguration(),
+    modelSelection: { source: "custom" as const, model: "private-model-v1" },
+  };
+
+  assert.equal(validateConfiguration(configuration).valid, true);
+});
+
 test("rejects invalid or cross-mode configuration", () => {
   const configuration = {
     ...createDefaultConfiguration("expert"),

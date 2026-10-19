@@ -94,7 +94,7 @@ const toolDefinitions = Object.freeze([
   {
     name: "route_tidu_task",
     description:
-      "Default AI-Tidu9 entry: route one text task through the active 九门 policy and virtual model. Use this unless the user explicitly selects another channel.",
+      "Route one goal through the AI-Tidu9 Agent kernel, including planning, capability completion, bounded execution, and verification.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -248,7 +248,7 @@ export const startTiduMcpServer = (options: TiduMcpServerOptions = {}): TiduMcpS
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: "ai-tidu9", title: PRODUCT.explanation, version: PRODUCT.version },
           instructions:
-            "AI-Tidu9 is the default collaboration gateway. Route tasks through route_tidu_task unless the user explicitly requests an official or provider channel; use route_tidu_channel for that explicit switch.",
+            "AI-Tidu9 is an Agent runtime, not an MCP tool collection. route_tidu_task enters the same planning, capability-completion, execution, and verification kernel used by native clients. route_tidu_channel is only for an explicitly selected provider channel.",
         };
       } else if (requestMessage.method === "ping") {
         result = {};

@@ -44,6 +44,24 @@ const normalizeConfiguration = (configuration: TiduConfiguration): TiduConfigura
     source: configuration.modelSelection?.source ?? "official",
     model: configuration.modelSelection?.model.trim() || "current",
   },
+  capabilityCompletion: {
+    enabled: configuration.capabilityCompletion?.enabled ?? true,
+    mainCapabilities: [
+      ...new Set(
+        (configuration.capabilityCompletion?.mainCapabilities ?? ["text", "structured-output"])
+          .map((capability) => capability.trim())
+          .filter(Boolean),
+      ),
+    ],
+    specialists: (configuration.capabilityCompletion?.specialists ?? []).map((specialist) => ({
+      source: specialist.source,
+      model: specialist.model.trim(),
+      capabilities: [
+        ...new Set(specialist.capabilities.map((capability) => capability.trim())),
+      ].filter(Boolean),
+    })),
+    maximumSpecialists: configuration.capabilityCompletion?.maximumSpecialists ?? 2,
+  },
   ...(configuration.expertServices
     ? {
         expertServices: {
@@ -84,6 +102,9 @@ const readSharedConfiguration = (row: ConfigurationRow): TiduConfiguration => {
     activeProfileId: storedConfiguration.activeProfileId ?? DEFAULT_VIRTUAL_MODEL_ID,
     virtualModelName: storedConfiguration.virtualModelName ?? "九门赛博提督",
     modelSelection: storedConfiguration.modelSelection ?? { source: "official", model: "current" },
+    capabilityCompletion:
+      storedConfiguration.capabilityCompletion ??
+      createDefaultConfiguration("managed").capabilityCompletion,
   };
   return assertValidConfiguration(sharedConfiguration, "managed");
 };
@@ -217,6 +238,7 @@ export const createSqliteConfigurationStore = (database: DatabaseSync): Configur
       activeProfileId: configuration.activeProfileId,
       virtualModelName: configuration.virtualModelName,
       modelSelection: configuration.modelSelection,
+      capabilityCompletion: configuration.capabilityCompletion,
     };
     const expertPayload: ExpertDraftPayload = {
       expertServices: configuration.expertServices ?? readExpertServices(draftRows.expert),

@@ -14,7 +14,7 @@ import test from "node:test";
 
 import { setupConnectors } from "./setup.js";
 
-test("setup uses one absolute MCP launch for detected hosts", () => {
+test("setup uses native Codex mode and one absolute MCP launch for Cursor", () => {
   const root = mkdtempSync(join(tmpdir(), "tidu-setup-"));
   const binaryDirectory = join(root, "bin");
   const codexState = join(root, "codex-state");
@@ -37,6 +37,7 @@ test("setup uses one absolute MCP launch for detected hosts", () => {
       executablePath: binaryDirectory,
     });
     assert.equal(report.healthy, true);
+    assert.equal(existsSync(codexState), false);
     const cursorConfiguration = JSON.parse(
       readFileSync(join(root, ".cursor/mcp.json"), "utf8"),
     ) as {
@@ -84,7 +85,7 @@ test("setup uses one absolute MCP launch for detected hosts", () => {
   }
 });
 
-test("setup can register only the Codex connector without changing Cursor", () => {
+test("setup can prepare only native Codex mode without changing Cursor", () => {
   const root = mkdtempSync(join(tmpdir(), "tidu-codex-only-"));
   const binaryDirectory = join(root, "bin");
   const codex = join(binaryDirectory, "codex");
@@ -109,6 +110,7 @@ test("setup can register only the Codex connector without changing Cursor", () =
       report.connectors.map((connector) => connector.id),
       ["codex"],
     );
+    assert.equal(report.connectors[0]?.capability, "native-agent");
     assert.equal(existsSync(join(root, ".cursor/mcp.json")), false);
   } finally {
     rmSync(root, { recursive: true, force: true });

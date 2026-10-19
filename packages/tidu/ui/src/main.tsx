@@ -10,6 +10,7 @@ import {
 } from "./components/host-usage-panel.js";
 import { ServiceControlPanel } from "./components/service-control-panel.js";
 import {
+  CapabilityCompletionPanel,
   type ClientConnectionState,
   type ConfigurationForm,
   type ConfigurationImpactPreview,
@@ -52,6 +53,7 @@ interface CodexFailureResponse {
 }
 
 type SectionId =
+  | "capabilities"
   | "clients"
   | "configuration"
   | "enterprise"
@@ -63,6 +65,7 @@ type SectionId =
 
 const ACTIVE_SECTION_STORAGE_KEY = "ai-tidu9:active-section";
 const sectionIds = new Set<SectionId>([
+  "capabilities",
   "clients",
   "configuration",
   "enterprise",
@@ -137,6 +140,12 @@ const App = () => {
     activeProfileId: "ai-tidu9-config",
     virtualModelName: "九门赛博提督",
     modelSelection: { source: "official", model: "current" },
+    capabilityCompletion: {
+      enabled: true,
+      mainCapabilities: ["text", "structured-output"],
+      specialists: [],
+      maximumSpecialists: 2,
+    },
     expertServices: DEFAULT_EXPERT_SERVICES,
   });
   const [operation, setOperation] = useState<OperationState>({
@@ -272,11 +281,11 @@ const App = () => {
           message:
             mode === "official"
               ? locale === "zh-CN"
-                ? "已恢复纯官方 Codex 直连，并注销九门 MCP。重启 Codex 后现有会话也会完全卸载九门进程。"
-                : "Pure Official Codex direct mode is restored and the AI-Tidu9 MCP is unregistered. Restart Codex to unload it from existing sessions."
+                ? "已恢复纯官方 Codex 直连。重启 Codex 后，宿主将重新加载官方模型与官方账号配置。"
+                : "Pure Official Codex direct mode is restored. Restart Codex to reload the official models and account configuration."
               : locale === "zh-CN"
-                ? "九门本地服务与推理验证通过。重启 Codex 后会显示一个九门虚拟模型；其上游模型由配置页决定，官方账号身份保持不变。"
-                : "The local AI-Tidu9 service and inference were verified. Restart Codex to show both AI-Tidu9 and official models while retaining the official account identity.",
+                ? "九门 Agent 内核与推理链路已验证。重启 Codex 后，宿主只显示“九门赛博提督”；切回官方模式会完整恢复官方直连。"
+                : "The AI-Tidu9 Agent kernel and inference path were verified. Restart Codex to show only AI-Tidu9; switching back fully restores Official direct mode.",
         });
       } catch (error) {
         await refreshCodexConfiguration().catch(() => undefined);
@@ -401,6 +410,7 @@ const App = () => {
           activeProfileId: form.activeProfileId,
           virtualModelName: form.virtualModelName,
           modelSelection: form.modelSelection,
+          capabilityCompletion: form.capabilityCompletion,
         };
   const validation = validateConfiguration(
     {
@@ -440,6 +450,7 @@ const App = () => {
           activeProfileId: savedForm.activeProfileId,
           virtualModelName: savedForm.virtualModelName,
           modelSelection: savedForm.modelSelection,
+          capabilityCompletion: savedForm.capabilityCompletion,
         };
   const isDirty = JSON.stringify(persistedForm) !== JSON.stringify(savedPersistedForm);
   const isPending = operation.status === "pending";
@@ -449,6 +460,8 @@ const App = () => {
     workspace.active.configuration.virtualModelName === form.virtualModelName &&
     workspace.active.configuration.modelSelection.source === form.modelSelection.source &&
     workspace.active.configuration.modelSelection.model === form.modelSelection.model &&
+    JSON.stringify(workspace.active.configuration.capabilityCompletion) ===
+      JSON.stringify(form.capabilityCompletion) &&
     (selectedMode === "managed" ||
       JSON.stringify(workspace.active.configuration.expertServices) ===
         JSON.stringify(form.expertServices));
@@ -625,6 +638,18 @@ const App = () => {
         >
           {locale === "zh-CN" ? "任务" : "Tasks"}
         </button>
+        <button
+          className={
+            activeSection === "capabilities"
+              ? "section-button section-button-active"
+              : "section-button"
+          }
+          type="button"
+          aria-current={activeSection === "capabilities" ? "page" : undefined}
+          onClick={() => setActiveSection("capabilities")}
+        >
+          {locale === "zh-CN" ? "能力互补" : "Capabilities"}
+        </button>
         {bootstrap.deployment === "personal" ? (
           <button
             className={
@@ -639,33 +664,29 @@ const App = () => {
             {locale === "zh-CN" ? "服务" : "Services"}
           </button>
         ) : null}
+        <button
+          className={
+            activeSection === "configuration"
+              ? "section-button section-button-active"
+              : "section-button"
+          }
+          type="button"
+          aria-current={activeSection === "configuration" ? "page" : undefined}
+          onClick={() => setActiveSection("configuration")}
+        >
+          {locale === "zh-CN" ? "配置" : "Configuration"}
+        </button>
         {bootstrap.deployment === "personal" ? (
-          <>
-            <button
-              className={
-                activeSection === "configuration"
-                  ? "section-button section-button-active"
-                  : "section-button"
-              }
-              type="button"
-              aria-current={activeSection === "configuration" ? "page" : undefined}
-              onClick={() => setActiveSection("configuration")}
-            >
-              {locale === "zh-CN" ? "配置" : "Configuration"}
-            </button>
-            <button
-              className={
-                activeSection === "usage"
-                  ? "section-button section-button-active"
-                  : "section-button"
-              }
-              type="button"
-              aria-current={activeSection === "usage" ? "page" : undefined}
-              onClick={() => setActiveSection("usage")}
-            >
-              {locale === "zh-CN" ? "模型统计" : "Model usage"}
-            </button>
-          </>
+          <button
+            className={
+              activeSection === "usage" ? "section-button section-button-active" : "section-button"
+            }
+            type="button"
+            aria-current={activeSection === "usage" ? "page" : undefined}
+            onClick={() => setActiveSection("usage")}
+          >
+            {locale === "zh-CN" ? "模型统计" : "Model usage"}
+          </button>
         ) : null}
         {bootstrap.deployment === "personal" ? (
           <button
@@ -721,7 +742,15 @@ const App = () => {
         </button>
       </nav>
 
-      {bootstrap.deployment === "personal" && activeSection === "configuration" ? (
+      {activeSection === "capabilities" ? (
+        <CapabilityCompletionPanel
+          locale={locale}
+          onEdit={() => {
+            setActiveSection("configuration");
+            setConfigurationView("edit");
+          }}
+        />
+      ) : activeSection === "configuration" ? (
         <>
           <section className="configuration-view-panel">
             <div className="configuration-view-heading">
@@ -814,15 +843,32 @@ const App = () => {
                     ? locale === "zh-CN"
                       ? "官方模型"
                       : "Official"
-                    : locale === "zh-CN"
-                      ? "公司模型"
-                      : "Company"}
+                    : workspace.active.configuration.modelSelection.source === "company"
+                      ? locale === "zh-CN"
+                        ? "公司模型"
+                        : "Company"
+                      : locale === "zh-CN"
+                        ? "自定义模型"
+                        : "Custom"}
                   {" · "}
                   {workspace.active.configuration.modelSelection.model === "current"
                     ? locale === "zh-CN"
                       ? "跟随当前官方模型"
                       : "Follow current official model"
                     : workspace.active.configuration.modelSelection.model}
+                </p>
+                <p>
+                  {locale === "zh-CN" ? "能力互补" : "Capability completion"}：
+                  {workspace.active.configuration.capabilityCompletion.enabled
+                    ? locale === "zh-CN"
+                      ? "已开启"
+                      : "Enabled"
+                    : locale === "zh-CN"
+                      ? "已关闭"
+                      : "Disabled"}
+                  {" · "}
+                  {locale === "zh-CN" ? "专家模型" : "Specialists"}{" "}
+                  {workspace.active.configuration.capabilityCompletion.specialists.length}
                 </p>
                 <p>
                   {locale === "zh-CN" ? "修订" : "Revision"}：{workspace.active.revision} ·{" "}
@@ -958,11 +1004,11 @@ const App = () => {
                 <p className="client-limitation">
                   {group.id === "openai"
                     ? locale === "zh-CN"
-                      ? "这里只管理 Codex 接入，不配置上游模型。九门模式在 Codex 中只增加一个九门虚拟模型；其官方或公司上游在配置页选择。"
-                      : "This area manages Codex connectivity, not upstream selection. AI-Tidu9 mode adds one virtual model to Codex; select its official or company upstream on the configuration page."
+                      ? "Codex 使用原生双模式：九门模式只显示九门 Agent，官方模式只显示官方模型。两套提供方与模型目录严格隔离，上游能力在配置页选择。"
+                      : "Codex uses two native modes: AI-Tidu9 mode exposes only the AI-Tidu9 Agent, while Official mode exposes only official models. Providers and catalogs remain isolated; configure upstream capabilities in Configuration."
                     : locale === "zh-CN"
-                      ? "九门作为 MCP 连接器接入 Cursor；Cursor 官方模型列表不会新增九门模型项。"
-                      : "AI-Tidu9 connects to Cursor as an MCP connector; Cursor's official model list does not gain an AI-Tidu9 model entry."}
+                      ? "Cursor、CLI 与兼容客户端必须进入同一个九门 Agent 内核；宿主协议只负责传输，不改变目标分解、能力补全和独立验收。"
+                      : "Cursor, CLI, and compatible clients enter the same AI-Tidu9 Agent kernel. Host protocols transport requests without bypassing planning, capability completion, or independent verification."}
                 </p>
                 {group.id === "openai" ? (
                   <div className="client-connect-row">
@@ -994,8 +1040,8 @@ const App = () => {
                         <strong>{locale === "zh-CN" ? "九门模式" : "AI-Tidu9 mode"}</strong>
                         <span>
                           {locale === "zh-CN"
-                            ? "一个九门虚拟模型，上游在配置页选择"
-                            : "One virtual model; choose its upstream in Configuration"}
+                            ? "宿主只显示九门 Agent，执行目标分解、能力补全与验收"
+                            : "Expose only the AI-Tidu9 Agent with planning, capability completion, and verification"}
                         </span>
                       </button>
                       <button

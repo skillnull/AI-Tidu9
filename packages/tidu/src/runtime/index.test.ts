@@ -87,6 +87,122 @@ test("exposes bounded Agent task creation and control through the local API", as
   }
 });
 
+test("routes Responses and Chat Completions hosts through the same Agent kernel", async () => {
+  const agentKernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    planner: {
+      understand: async (task) => ({
+        objective: task.goal.objective,
+        acceptanceCriteria: [...task.goal.acceptanceCriteria],
+        constraints: [],
+        assumptions: [],
+        requiredCapabilities: [],
+      }),
+      plan: async () => ({
+        revision: 1,
+        steps: [{ id: "deliver", title: "Deliver through the Agent kernel", kind: "reason" }],
+      }),
+    },
+    worker: {
+      execute: async ({ task }) => ({
+        summary: `Agent completed: ${task.goal.objective}`,
+        evidence: [
+          {
+            kind: "model",
+            integrity: "reported",
+            summary: "The shared Agent worker completed the goal.",
+            supportsCriteria: [0],
+          },
+        ],
+      }),
+    },
+    verifier: {
+      verify: async ({ evidence }) => ({
+        summary: "Shared Agent result verified.",
+        criteria: [
+          {
+            criterionIndex: 0,
+            accepted: true,
+            reason: "The shared Agent emitted completion evidence.",
+            evidenceIds: evidence.map((item) => item.id),
+          },
+        ],
+      }),
+    },
+  });
+  const runtime = await startLocalRuntime({
+    agentKernel,
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    port: 0,
+  });
+
+  try {
+    const responsesResponse = await fetch(`${runtime.origin}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "ai-tidu9-config", input: "Responses host goal" }),
+    });
+    assert.equal(responsesResponse.status, 200);
+    assert.match(await responsesResponse.text(), /Shared Agent result verified/u);
+
+    const chatResponse = await fetch(`${runtime.origin}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        messages: [{ role: "user", content: "Chat host goal" }],
+      }),
+    });
+    assert.equal(chatResponse.status, 200);
+    assert.match(await chatResponse.text(), /Shared Agent result verified/u);
+
+    const taskList = (await (await fetch(`${runtime.origin}/api/tasks`)).json()) as {
+      tasks: Array<{ objective: string }>;
+    };
+    assert.deepEqual(taskList.tasks.map((task) => task.objective).sort(), [
+      "Chat host goal",
+      "Responses host goal",
+    ]);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("exposes the shared capability-completion policy and bounded usage status", async () => {
+  const provider: ModelProvider = {
+    descriptor: { type: "openai-compatible", model: "main-model" },
+    execute: async () => ({
+      kind: "json",
+      statusCode: 200,
+      body: { choices: [{ message: { content: "{}" } }] },
+    }),
+  };
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    port: 0,
+    provider,
+  });
+  try {
+    const response = await fetch(`${runtime.origin}/api/capability-completion`);
+    assert.equal(response.status, 200);
+    const status = (await response.json()) as {
+      available: boolean;
+      operational: boolean;
+      configuration: { enabled: boolean; specialists: unknown[] };
+      hosts: string[];
+      records: unknown[];
+    };
+    assert.equal(status.available, true);
+    assert.equal(status.operational, false);
+    assert.equal(status.configuration.enabled, true);
+    assert.deepEqual(status.configuration.specialists, []);
+    assert.deepEqual(status.hosts, ["codex", "cursor", "cli", "openai-compatible"]);
+    assert.deepEqual(status.records, []);
+  } finally {
+    await runtime.close();
+  }
+});
+
 test("starts a loopback runtime with a verifiable health endpoint", async () => {
   const runtime = await startLocalRuntime({
     databasePath: IN_MEMORY_DATABASE_PATH,
@@ -261,14 +377,14 @@ test("configures the complete Codex dual-channel entry from the local API", asyn
       "ai-tidu9",
     );
     const tiduConfiguration = readFileSync(join(codexHomeDirectory, "config.toml"), "utf8");
-    assert.match(tiduConfiguration, /model = "official-test"/u);
+    assert.match(tiduConfiguration, /model = "ai-tidu9-config"/u);
     assert.match(tiduConfiguration, /model_provider = "ai_tidu9"/u);
     const catalog = JSON.parse(
       readFileSync(join(codexHomeDirectory, ".ai-tidu9-model-catalog.json"), "utf8"),
     ) as { models: { slug: string }[] };
     assert.deepEqual(
       catalog.models.map(({ slug }) => slug),
-      ["ai-tidu9-config", "official-test"],
+      ["ai-tidu9-config"],
     );
     const officialModeResponse = await fetch(`${runtime.origin}/api/clients/codex/configuration`, {
       method: "POST",
@@ -509,6 +625,7 @@ test("routes validated inference through an injected real provider adapter", asy
       body: JSON.stringify({
         model: "ai-tidu9-config",
         messages: [{ role: "user", content: "hello" }],
+        metadata: { ai_tidu9_probe: true },
       }),
     });
     assert.equal(chatResponse.status, 200);
@@ -518,7 +635,11 @@ test("routes validated inference through an injected real provider adapter", asy
     const responsesResponse = await fetch(`${runtime.origin}/v1/responses`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "ai-tidu9-config", input: "hello" }),
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        input: "hello",
+        metadata: { ai_tidu9_probe: true },
+      }),
     });
     assert.equal(responsesResponse.status, 200);
     assert.equal(((await responsesResponse.json()) as { model: string }).model, "ai-tidu9-config");
@@ -576,6 +697,7 @@ test("streams provider events through the virtual-model endpoint without bufferi
       body: JSON.stringify({
         model: "ai-tidu9-config",
         messages: [{ role: "user", content: "hello" }],
+        metadata: { ai_tidu9_probe: true },
         stream: true,
         tools: [
           {
@@ -637,6 +759,7 @@ test("cancels upstream streaming work when the client disconnects", async () => 
       body: JSON.stringify({
         model: "ai-tidu9-config",
         messages: [{ role: "user", content: "hello" }],
+        metadata: { ai_tidu9_probe: true },
         stream: true,
       }),
       signal: clientController.signal,
@@ -853,6 +976,7 @@ test("validates OpenAI-compatible inference requests before provider routing", a
       body: JSON.stringify({
         model: "ai-tidu9-config",
         messages: [{ role: "user", content: "hello" }],
+        metadata: { ai_tidu9_probe: true },
       }),
     });
     assert.equal(chatResponse.status, 503);
@@ -867,7 +991,11 @@ test("validates OpenAI-compatible inference requests before provider routing", a
     const responsesResponse = await fetch(`${runtime.origin}/v1/responses`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "ai-tidu9-config", input: "hello" }),
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        input: "hello",
+        metadata: { ai_tidu9_probe: true },
+      }),
     });
     assert.equal(responsesResponse.status, 503);
     const responseFailure = (await responsesResponse.json()) as {

@@ -34,6 +34,8 @@ flowchart LR
 
 The core does not replace model reasoning or hard-code domain logic. It selects capabilities, limits cost and risk, retains minimal recovery state, and verifies the outcome against the goal.
 
+Capability completion sits after host entry and before model Providers. Hosts only submit goals to the same Agent kernel; the effective configuration explicitly declares primary-model capabilities, specialist sources and capability labels, and the per-request specialist limit. Routing history retains only non-secret model identifiers, required capabilities, outcomes, and timestamps for local, personal, and enterprise status views.
+
 ## 🧱 Module map: responsibilities and exclusions
 
 | Area | Code modules | Owns | Does not own |
@@ -133,8 +135,8 @@ AI-Tidu9 retains only the data required for its own operation. Full conversation
 
 | Client | Preferred entry | Capability owner | Current boundary |
 | --- | --- | --- | --- |
-| Codex app, CLI, and IDE | MCP + app-server / unified model catalog | Official Codex account, session, and permissions | Official models use the official process; the AI-Tidu9 model uses the local router |
-| Cursor Desktop and Agent CLI | User-level MCP; authorized CLI through ACP | Cursor host and CLI account | Desktop login cannot be copied into CLI credentials |
+| Codex app, CLI, and IDE | Native exclusive modes + Responses | Official Codex account, session, and permissions | AI-Tidu9 mode exposes only the AI-Tidu9 Agent; Official mode fully restores direct official access |
+| Cursor Desktop and Agent CLI | Host connector; authorized CLI through ACP | Cursor host and CLI account | Goals enter the same Agent kernel; desktop login cannot be copied into CLI credentials |
 | Generic OpenAI client | `/v1/models`, Chat Completions, Responses | AI-Tidu9 model pool and Agent kernel | Client-specific extensions require separate verification |
 | Browser | Configuration center or enterprise gateway | AI-Tidu9 runtime | Cross-device access requires HTTPS and identity control |
 | Ollama | Upstream model adapter | Local model | It is a provider, not a host client |

@@ -229,7 +229,7 @@ const removeManagedBlock = (content: string, start: string, end: string): string
 const activateDefaultCodexConfiguration = (
   paths: CodexPaths,
   endpoint: string,
-  selectedModel: string,
+  model: string,
 ): void => {
   assertSafeRegularFile(paths.defaultConfiguration);
   const current = existsSync(paths.defaultConfiguration)
@@ -268,9 +268,8 @@ const activateDefaultCodexConfiguration = (
     insertIndex,
     0,
     MANAGED_DEFAULT_START,
-    "# Unified selector: official account models and the AI-Tidu9 virtual model share one list.",
-    "# Account identity, plan, and quota remain owned and reported by official Codex.",
-    `model = ${JSON.stringify(selectedModel)}`,
+    "# Native AI-Tidu9 Agent mode. Official models are intentionally excluded from this provider.",
+    `model = ${JSON.stringify(model)}`,
     'model_provider = "ai_tidu9"',
     `model_catalog_json = ${JSON.stringify(paths.modelCatalog)}`,
     MANAGED_DEFAULT_END,
@@ -278,13 +277,15 @@ const activateDefaultCodexConfiguration = (
   lines.push(
     "",
     MANAGED_PROVIDER_START,
-    "# Local model router only. It never stores or replaces official Codex credentials.",
+    "# Local Agent runtime only. Official Codex credentials are never sent to this endpoint.",
     "[model_providers.ai_tidu9]",
-    'name = "AI-Tidu9"',
+    'name = "九门赛博提督"',
     `base_url = ${JSON.stringify(`${endpoint}/v1`)}`,
     'wire_api = "responses"',
     "requires_openai_auth = false",
     "supports_websockets = false",
+    "request_max_retries = 1",
+    "stream_max_retries = 1",
     MANAGED_PROVIDER_END,
   );
   writePrivateFileAtomically(
@@ -491,6 +492,7 @@ const verifyInference = async (
       body: JSON.stringify({
         model,
         input: "Reply with OK.",
+        metadata: { ai_tidu9_probe: true },
         tools: [{ type: "tool_search" }],
         tool_choice: "none",
         stream: false,
@@ -624,12 +626,6 @@ const createCodexModelCatalog = (model: string, displayName: string): string =>
     2,
   )}\n`;
 
-const readTopLevelString = (content: string, key: string): string | undefined => {
-  const topLevel = content.split(/^\s*\[/mu, 1)[0] ?? "";
-  const match = topLevel.match(new RegExp(`^\\s*${key}\\s*=\\s*"([^"\\n]+)"`, "mu"));
-  return match?.[1];
-};
-
 const readOfficialCatalogModels = (paths: CodexPaths): Record<string, unknown>[] => {
   if (!existsSync(paths.officialModelCache)) return [];
   assertSafeRegularFile(paths.officialModelCache);
@@ -703,43 +699,6 @@ export const listCodexOfficialModels = (
     }
   }
   return [...modelsById.values()];
-};
-
-const createUnifiedCodexModelCatalog = (
-  paths: CodexPaths,
-  model: string,
-  displayName: string,
-): string => {
-  const tiduCatalog = JSON.parse(createCodexModelCatalog(model, displayName)) as {
-    models: Record<string, unknown>[];
-  };
-  const modelsBySlug = new Map<string, Record<string, unknown>>([
-    [model, tiduCatalog.models[0] as Record<string, unknown>],
-  ]);
-  const officialModels = [
-    ...readManagedCatalogHistory(paths, model),
-    ...readOfficialCatalogModels(paths),
-  ];
-  for (const officialModel of officialModels) {
-    if (officialModel.slug === model || officialModel.slug === "managed-default") {
-      continue;
-    }
-    const modelMessages = isRecord(officialModel.model_messages)
-      ? officialModel.model_messages
-      : undefined;
-    const baseInstructions =
-      typeof officialModel.base_instructions === "string"
-        ? officialModel.base_instructions
-        : typeof modelMessages?.instructions_template === "string"
-          ? modelMessages.instructions_template
-          : "You are an AI coding agent using an official Codex model.";
-    modelsBySlug.set(String(officialModel.slug), {
-      ...tiduCatalog.models[0],
-      ...officialModel,
-      base_instructions: baseInstructions,
-    });
-  }
-  return `${JSON.stringify({ models: [...modelsBySlug.values()] }, null, 2)}\n`;
 };
 
 const readManagedState = (statePath: string): CodexProfileState | undefined => {
@@ -1017,11 +976,7 @@ export const configureCodexClient = async (
     };
     writeManagedState(paths.state, existingState);
   }
-  const expectedCatalog = createUnifiedCodexModelCatalog(
-    paths,
-    verified.model,
-    verified.displayName,
-  );
+  const expectedCatalog = createCodexModelCatalog(verified.model, verified.displayName);
   const expectedProfile = createCodexProfile(verified.endpoint, verified.model, paths.modelCatalog);
   if (
     existingState?.endpoint === verified.endpoint &&
@@ -1125,7 +1080,8 @@ export const switchCodexClientConfiguration = async (
       "Install the AI-Tidu9 Codex profile before switching to it.",
     );
   }
-  const activeMode = hasManagedDefaultConfiguration(paths) ? "ai-tidu9" : "official";
+  const managedDefaultActive = hasManagedDefaultConfiguration(paths);
+  const activeMode = managedDefaultActive ? "ai-tidu9" : "official";
   if (activeMode === options.mode && options.mode === "official") {
     return inspectCodexClientConfiguration(options);
   }
@@ -1134,15 +1090,7 @@ export const switchCodexClientConfiguration = async (
     try {
       await verifyEndpoint(state.endpoint, request);
       await verifyInference(state.endpoint, state.model, request);
-      const configuration = existsSync(paths.defaultConfiguration)
-        ? readFileSync(paths.defaultConfiguration, "utf8")
-        : "";
-      const currentModel = readTopLevelString(configuration, "model");
-      const officialModels = readOfficialCatalogModels(paths);
-      const selectedModel =
-        currentModel ??
-        (typeof officialModels[0]?.slug === "string" ? officialModels[0].slug : state.model);
-      activateDefaultCodexConfiguration(paths, state.endpoint, selectedModel);
+      activateDefaultCodexConfiguration(paths, state.endpoint, state.model);
       await verifyEndpoint(state.endpoint, request);
     } catch (error) {
       restoreDefaultConfigurationValues(paths, state.originalBackupId);
