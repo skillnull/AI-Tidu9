@@ -102,6 +102,24 @@ const formatUptime = (seconds: number, english: boolean): string => {
   return english ? `${hours}h ${minutes}m` : `${hours} 小时 ${minutes} 分钟`;
 };
 
+const ServiceDetailValue = ({ label, value }: { label: string; value: string }) => (
+  <dd className="service-control-detail">
+    <button
+      type="button"
+      className="service-control-detail-value"
+      aria-label={`${label}: ${value}`}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") event.currentTarget.blur();
+      }}
+    >
+      {value}
+    </button>
+    <span className="service-control-detail-popover" aria-hidden="true">
+      {value}
+    </span>
+  </dd>
+);
+
 export const ServiceControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
   const english = locale === "en-US";
   const labels = english ? actionLabels.en : actionLabels.zh;
@@ -325,11 +343,17 @@ export const ServiceControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) =
                 </div>
                 <div>
                   <dt>{english ? "Command" : "命令入口"}</dt>
-                  <dd title={service.command}>{service.command}</dd>
+                  <ServiceDetailValue
+                    label={english ? "Command" : "命令入口"}
+                    value={service.command}
+                  />
                 </div>
                 <div>
                   <dt>{english ? "Endpoint" : "服务地址"}</dt>
-                  <dd title={service.endpoint}>{service.endpoint}</dd>
+                  <ServiceDetailValue
+                    label={english ? "Endpoint" : "服务地址"}
+                    value={service.endpoint}
+                  />
                 </div>
                 <div>
                   <dt>{english ? "Version" : "版本"}</dt>
@@ -337,17 +361,26 @@ export const ServiceControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) =
                 </div>
                 <div>
                   <dt>{english ? "Logs" : "日志位置"}</dt>
-                  <dd title={service.logLocation}>{service.logLocation}</dd>
+                  <ServiceDetailValue
+                    label={english ? "Logs" : "日志位置"}
+                    value={service.logLocation}
+                  />
                 </div>
                 <div>
                   <dt>{english ? "Configuration" : "配置位置"}</dt>
-                  <dd title={service.configurationPath}>{service.configurationPath}</dd>
+                  <ServiceDetailValue
+                    label={english ? "Configuration" : "配置位置"}
+                    value={service.configurationPath}
+                  />
                 </div>
                 <div>
                   <dt>{english ? "Proxy configuration" : "代理配置"}</dt>
-                  <dd title={service.proxyConfigurationPath ?? undefined}>
-                    {service.proxyConfigurationPath ?? (english ? "Not configured" : "未配置")}
-                  </dd>
+                  <ServiceDetailValue
+                    label={english ? "Proxy configuration" : "代理配置"}
+                    value={
+                      service.proxyConfigurationPath ?? (english ? "Not configured" : "未配置")
+                    }
+                  />
                 </div>
               </dl>
             </article>

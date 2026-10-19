@@ -1038,6 +1038,77 @@ h2 {
           text-overflow: ellipsis;
           white-space: nowrap;
         }
+
+        .service-control-detail {
+          position: relative;
+          overflow: visible;
+
+          .service-control-detail-value {
+            display: block;
+            width: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            border: 0;
+            border-radius: 0;
+            outline: none;
+            color: inherit;
+            background: transparent;
+            box-shadow: none;
+            cursor: help;
+            font: inherit;
+            text-align: left;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+
+            &:hover,
+            &:focus-visible {
+              border: 0;
+              color: #c9d3dc;
+              background: transparent;
+              box-shadow: none;
+            }
+
+          }
+
+          .service-control-detail-popover {
+            position: absolute;
+            bottom: calc(100% + 7px);
+            left: 0;
+            z-index: 5;
+            width: 420px;
+            max-width: calc(100vw - 48px);
+            padding: 9px 11px;
+            border: 1px solid #34434f;
+            border-radius: 7px;
+            opacity: 0;
+            color: #d6dee6;
+            background: #111923;
+            box-shadow: 0 10px 28px rgb(0 0 0 / 32%);
+            font-size: 10px;
+            line-height: 1.55;
+            pointer-events: none;
+            text-align: left;
+            visibility: hidden;
+            white-space: normal;
+            word-break: break-all;
+          }
+
+          &:hover,
+          &:focus-within {
+            .service-control-detail-popover {
+              opacity: 1;
+              visibility: visible;
+            }
+          }
+        }
+
+        div:nth-child(4n) {
+          .service-control-detail-popover {
+            right: 0;
+            left: auto;
+          }
+        }
       }
     }
   }
@@ -2027,6 +2098,13 @@ h2 {
 
         div {
           margin-right: 0;
+        }
+
+        .service-control-detail-popover,
+        div:nth-child(4n) .service-control-detail-popover {
+          right: auto;
+          left: 0;
+          width: 100%;
         }
       }
 
