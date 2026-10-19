@@ -68,6 +68,10 @@ const pidPaths = {
   controller: join(runtimeDirectory, `controller-${editionSuffix}.pid`),
   frontend: join(runtimeDirectory, `frontend-${editionSuffix}.pid`),
 };
+const supervisorPidPaths = {
+  api: join(runtimeDirectory, `api-${editionSuffix}.supervisor.pid`),
+  frontend: join(runtimeDirectory, `frontend-${editionSuffix}.supervisor.pid`),
+};
 
 const installedDataDirectory =
   process.platform === "darwin"
@@ -90,8 +94,7 @@ const processIsRunning = (processId) => {
   }
 };
 
-const readServiceProcessId = (service) => {
-  const pidPath = pidPaths[service];
+const readProcessId = (pidPath) => {
   if (!existsSync(pidPath)) return null;
   const processId = Number(readFileSync(pidPath, "utf8").trim());
   if (processIsRunning(processId)) return processId;
@@ -99,15 +102,33 @@ const readServiceProcessId = (service) => {
   return null;
 };
 
+const readServiceProcessId = (service) => readProcessId(pidPaths[service]);
+
+const readSupervisorProcessId = (service) => readProcessId(supervisorPidPaths[service]);
+
 const writeServiceProcessId = (service, processId = process.pid) => {
   mkdirSync(runtimeDirectory, { recursive: true });
   writeFileSync(pidPaths[service], `${processId}\n`, { mode: 0o600 });
+};
+
+const writeSupervisorProcessId = (service) => {
+  mkdirSync(runtimeDirectory, { recursive: true });
+  writeFileSync(supervisorPidPaths[service], `${process.pid}\n`, {
+    mode: 0o600,
+  });
 };
 
 const removeServiceProcessId = (service, expectedProcessId = process.pid) => {
   const storedProcessId = readServiceProcessId(service);
   if (storedProcessId === expectedProcessId || storedProcessId === null) {
     rmSync(pidPaths[service], { force: true });
+  }
+};
+
+const removeSupervisorProcessId = (service) => {
+  const storedProcessId = readSupervisorProcessId(service);
+  if (storedProcessId === process.pid || storedProcessId === null) {
+    rmSync(supervisorPidPaths[service], { force: true });
   }
 };
 
@@ -127,7 +148,7 @@ const assertInstalledRuntimeIsStopped = () => {
 };
 
 const assertServiceIsNotRunning = (service) => {
-  const processId = readServiceProcessId(service);
+  const processId = readServiceProcessId(service) ?? readSupervisorProcessId(service);
   if (processId !== null) {
     const serviceName = serviceIds[service] ?? "development controller";
     process.stderr.write(`${serviceName} is already running with PID ${processId}.\n`);
@@ -135,26 +156,106 @@ const assertServiceIsNotRunning = (service) => {
   }
 };
 
-const forwardSignals = (childProcess, service) => {
+const serviceDetails = {
+  api: { label: "接口服务", endpoint: `http://127.0.0.1:${ports.api}` },
+  frontend: {
+    label: "前端服务",
+    endpoint: `http://127.0.0.1:${ports.frontend}`,
+  },
+};
+
+const printServiceStarted = (service, processId, restarted) => {
+  const details = serviceDetails[service];
+  process.stdout.write(
+    [
+      `\n[AI-TIDU9] ${details.label}${restarted ? "已重启" : "已启动"}`,
+      `  状态  运行中`,
+      `  地址  ${details.endpoint}`,
+      `  进程  PID ${processId} · 监督器 PID ${process.pid}`,
+      `  命令  ${commands[service]}`,
+      `  操作  页面或 tidu service 可启动、停止、重启；Ctrl+C 结束当前服务`,
+      "",
+    ].join("\n"),
+  );
+};
+
+const startServiceSupervisor = (service, spawnChild) => {
+  assertServiceIsNotRunning(service);
+  writeSupervisorProcessId(service);
+  let childProcess;
+  let finalized = false;
+  let restarting = false;
   let stopping = false;
-  const stop = () => {
-    if (stopping) return;
-    stopping = true;
-    if (childProcess.exitCode === null && childProcess.signalCode === null) {
-      childProcess.kill("SIGTERM");
-    }
+
+  const removeSignalHandlers = () => {
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+    process.off("SIGUSR2", restart);
   };
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
-  childProcess.once("exit", (exitCode) => {
-    removeServiceProcessId(service, childProcess.pid);
-    process.exitCode = exitCode ?? 0;
-  });
-  childProcess.once("error", (error) => {
-    removeServiceProcessId(service, childProcess.pid);
-    process.stderr.write(`${serviceIds[service]} failed: ${error.message}\n`);
-    process.exitCode = 1;
-  });
+  const finish = (exitCode) => {
+    if (finalized) return;
+    finalized = true;
+    removeServiceProcessId(service, childProcess?.pid);
+    removeSupervisorProcessId(service);
+    removeSignalHandlers();
+    process.exitCode = exitCode;
+  };
+  const launch = (restarted = false) => {
+    childProcess = spawnChild();
+    if (!Number.isInteger(childProcess.pid)) {
+      finish(1);
+      return;
+    }
+    writeServiceProcessId(service, childProcess.pid);
+    printServiceStarted(service, childProcess.pid, restarted);
+    childProcess.once("error", (error) => {
+      process.stderr.write(
+        `[AI-TIDU9] ${serviceDetails[service].label}启动失败：${error.message}\n`,
+      );
+      finish(1);
+    });
+    childProcess.once("exit", (exitCode, signal) => {
+      removeServiceProcessId(service, childProcess.pid);
+      if (restarting && !stopping) {
+        restarting = false;
+        setTimeout(() => launch(true), 250);
+        return;
+      }
+      if (!stopping && !finalized) {
+        process.stderr.write(
+          `[AI-TIDU9] ${serviceDetails[service].label}已退出 · ${signal ?? `code ${exitCode ?? 1}`}\n`,
+        );
+      }
+      finish(stopping ? 0 : (exitCode ?? 1));
+    });
+  };
+  function restart() {
+    if (stopping || restarting || finalized) return;
+    restarting = true;
+    process.stdout.write(
+      `[AI-TIDU9] ${serviceDetails[service].label}重启中… · 当前 PID ${childProcess?.pid ?? "unknown"}\n`,
+    );
+    if (childProcess?.exitCode === null && childProcess.signalCode === null) {
+      childProcess.kill("SIGTERM");
+    } else {
+      restarting = false;
+      launch(true);
+    }
+  }
+  function stop() {
+    if (stopping || finalized) return;
+    stopping = true;
+    process.stdout.write(`[AI-TIDU9] ${serviceDetails[service].label}停止中…\n`);
+    if (childProcess?.exitCode === null && childProcess.signalCode === null) {
+      childProcess.kill("SIGTERM");
+    } else {
+      finish(0);
+    }
+  }
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  process.on("SIGUSR2", restart);
+  launch();
 };
 
 const verifyEnterprisePostgresql = async () => {
@@ -184,47 +285,53 @@ const verifyEnterprisePostgresql = async () => {
 };
 
 const startFrontendService = () => {
-  assertServiceIsNotRunning("frontend");
-  const childProcess = spawn(
-    "../../node_modules/.bin/vite",
-    ["--host", "127.0.0.1", "--port", String(ports.frontend)],
-    {
-      cwd: paths.workspace,
-      env: {
-        ...process.env,
-        TIDU_MANAGER_PORT: String(ports.control),
-        TIDU_RUNTIME_PORT: String(ports.api),
+  startServiceSupervisor("frontend", () =>
+    spawn(
+      "../../node_modules/.bin/vite",
+      ["--host", "127.0.0.1", "--port", String(ports.frontend)],
+      {
+        cwd: paths.workspace,
+        env: {
+          ...process.env,
+          TIDU_MANAGER_PORT: String(ports.control),
+          TIDU_RUNTIME_PORT: String(ports.api),
+        },
+        stdio: "inherit",
       },
-      stdio: "inherit",
-    },
+    ),
   );
-  writeServiceProcessId("frontend", childProcess.pid);
-  forwardSignals(childProcess, "frontend");
 };
 
 const startApiService = async () => {
-  assertServiceIsNotRunning("api");
   await verifyEnterprisePostgresql();
-  const childProcess = spawn(
-    process.execPath,
-    ["--import", "tsx", "packages/tidu/src/cli/index.ts", "start", "--edition", edition],
-    {
-      cwd: paths.repository,
-      env: {
-        ...process.env,
-        NODE_ENV: "development",
-        TIDU_CONNECTOR_CLI_ENTRY: join(paths.repository, "packages/tidu/dist/cli/launcher.js"),
-        TIDU_DATABASE_PATH: databasePath,
-        TIDU_DEV_EDITION: edition,
-        TIDU_DEV_SILENT: "1",
-        TIDU_HOST: "127.0.0.1",
-        TIDU_PORT: String(ports.api),
+  startServiceSupervisor("api", () =>
+    spawn(
+      process.execPath,
+      [
+        "--disable-warning=ExperimentalWarning",
+        "--import",
+        "tsx",
+        "packages/tidu/src/cli/index.ts",
+        "start",
+        "--edition",
+        edition,
+      ],
+      {
+        cwd: paths.repository,
+        env: {
+          ...process.env,
+          NODE_ENV: "development",
+          TIDU_CONNECTOR_CLI_ENTRY: join(paths.repository, "packages/tidu/dist/cli/launcher.js"),
+          TIDU_DATABASE_PATH: databasePath,
+          TIDU_DEV_EDITION: edition,
+          TIDU_DEV_SILENT: "1",
+          TIDU_HOST: "127.0.0.1",
+          TIDU_PORT: String(ports.api),
+        },
+        stdio: "inherit",
       },
-      stdio: "inherit",
-    },
+    ),
   );
-  writeServiceProcessId("api", childProcess.pid);
-  forwardSignals(childProcess, "api");
 };
 
 const spawnService = (service) =>
@@ -232,22 +339,21 @@ const spawnService = (service) =>
     cwd: paths.repository,
     detached: true,
     env: { ...process.env, TIDU_DEV_EDITION: edition },
-    stdio: "ignore",
+    stdio: "inherit",
   });
 
 const stopService = (service) => {
-  const processId = readServiceProcessId(service);
+  const processId = readSupervisorProcessId(service) ?? readServiceProcessId(service);
   if (processId === null) return false;
   process.kill(processId, "SIGTERM");
   return true;
 };
 
-const waitForServiceStop = async (service) => {
-  for (let attempt = 0; attempt < 80; attempt += 1) {
-    if (readServiceProcessId(service) === null) return;
-    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-  }
-  throw new Error(`${serviceIds[service]} did not stop within 8 seconds.`);
+const restartService = (service) => {
+  const supervisorProcessId = readSupervisorProcessId(service);
+  if (supervisorProcessId === null) return false;
+  process.kill(supervisorProcessId, "SIGUSR2");
+  return true;
 };
 
 const createInventory = async () => {
@@ -287,7 +393,7 @@ const createInventory = async () => {
         id: serviceIds.frontend,
         kind: "frontend",
         lifecycle: "managed",
-        name: "前端开发服务",
+        name: "前端服务",
         processId: processIds.frontend,
         status: processIds.frontend === null ? "stopped" : "running",
         version: productVersion,
@@ -335,7 +441,11 @@ const startController = async () => {
       response.end(`${JSON.stringify(body)}\n`);
     };
     if (request.method === "GET" && pathname === "/health") {
-      sendJson(200, { product: "九门赛博提督", role: "development-controller", status: "ok" });
+      sendJson(200, {
+        product: "九门赛博提督",
+        role: "development-controller",
+        status: "ok",
+      });
       return;
     }
     if (request.method === "GET" && pathname === "/api/services") {
@@ -374,11 +484,12 @@ const startController = async () => {
       sendJson(409, { error: "SERVICE_NOT_RUNNING" });
       return;
     }
-    stopService(service);
-    sendJson(202, { accepted: true, action, serviceId: requestedId });
-    if (action === "restart") {
-      void waitForServiceStop(service).then(() => registerChild(spawnService(service)));
+    if (action === "restart" && !restartService(service)) {
+      sendJson(409, { error: "SERVICE_SUPERVISOR_NOT_RUNNING" });
+      return;
     }
+    if (action === "stop") stopService(service);
+    sendJson(202, { accepted: true, action, serviceId: requestedId });
   });
 
   await new Promise((resolve, reject) => {
@@ -389,7 +500,15 @@ const startController = async () => {
     });
   });
   process.stdout.write(
-    `Development control ready at http://127.0.0.1:${ports.control}${startAllServices ? " · frontend and API started" : startFrontend ? " · frontend started" : ""}\n`,
+    [
+      "\n[AI-TIDU9] 本地开发控制已启动",
+      `  前端  ${startFrontend ? `启动中 · http://127.0.0.1:${ports.frontend}` : "未启动"}`,
+      `  接口  ${startAllServices ? `启动中 · http://127.0.0.1:${ports.api}` : `未启动 · ${commands.api}`}`,
+      `  控制  运行中 · http://127.0.0.1:${ports.control}`,
+      `  进程  PID ${process.pid}`,
+      "  操作  页面与命令行状态联动；Ctrl+C 停止本次启动的服务",
+      "",
+    ].join("\n"),
   );
   let stopping = false;
   const stop = () => {

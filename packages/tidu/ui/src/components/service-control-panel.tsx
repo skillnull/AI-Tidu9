@@ -237,7 +237,7 @@ export const ServiceControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) =
                   {service.kind === "frontend"
                     ? english
                       ? "Frontend development service"
-                      : "前端开发服务"
+                      : "前端服务"
                     : service.kind === "cli"
                       ? english
                         ? "CLI service"
