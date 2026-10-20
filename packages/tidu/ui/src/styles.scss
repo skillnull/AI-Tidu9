@@ -143,9 +143,8 @@ select {
 .hero-title-lockup {
   position: relative;
   display: inline-block;
-  min-width: 360px;
   margin: 8px 0 11px;
-  padding: 17px 22px 13px;
+  padding: 17px 20px 13px;
   background: linear-gradient(105deg, rgb(22 52 50 / 18%), rgb(9 13 19 / 0%) 56%);
   isolation: isolate;
 
@@ -153,8 +152,8 @@ select {
     position: absolute;
     top: 0;
     left: 0;
-    width: 310px;
-    height: 32px;
+    width: 72%;
+    height: 28px;
     background-image: linear-gradient(90deg, #70cbbf, rgb(74 139 132 / 44%) 62%, transparent),
       linear-gradient(180deg, #70cbbf, rgb(74 139 132 / 36%) 58%, transparent);
     background-repeat: no-repeat;
@@ -167,8 +166,8 @@ select {
     position: absolute;
     right: 0;
     bottom: 0;
-    width: 112px;
-    height: 24px;
+    width: 72%;
+    height: 28px;
     background-image: linear-gradient(270deg, #63bbae, rgb(74 139 132 / 38%) 58%, transparent),
       linear-gradient(0deg, #63bbae, rgb(74 139 132 / 34%) 56%, transparent);
     background-repeat: no-repeat;
