@@ -67,7 +67,49 @@ export interface CursorAcpLaunch {
 }
 
 const DEFAULT_STATUS_TIMEOUT_MILLISECONDS = 15_000;
+const DEFAULT_LOGIN_CACHE_MILLISECONDS = 30 * 1_000;
+const DEFAULT_MODEL_CACHE_MILLISECONDS = 5 * 60 * 1_000;
 const DEFAULT_COMMAND_CANDIDATES = ["agent", "cursor-agent"] as const;
+
+interface CachedCursorInspection<T> {
+  /** Resolved Cursor CLI identity that produced this result. */
+  commandKey: string;
+  /** Time after which the cached official Cursor CLI result must be refreshed. */
+  expiresAt: number;
+  /** Sanitized Cursor CLI result retained only in this process. */
+  value: T;
+}
+
+let cachedDefaultLogin: CachedCursorInspection<CursorHostLoginState> | undefined;
+let cachedDefaultModels: CachedCursorInspection<CursorHostModel[]> | undefined;
+
+const usesDefaultInspection = (options: CursorHostInspectionOptions): boolean =>
+  options.command === undefined &&
+  options.environment === undefined &&
+  options.timeoutMilliseconds === undefined;
+
+const readCachedInspection = <T>(
+  cached: CachedCursorInspection<T> | undefined,
+  commandKey: string,
+): T | undefined =>
+  cached !== undefined && cached.commandKey === commandKey && cached.expiresAt > Date.now()
+    ? cached.value
+    : undefined;
+
+const cacheDefaultInspection = <T>(
+  value: T,
+  commandKey: string,
+  cacheMilliseconds: number,
+): CachedCursorInspection<T> => ({
+  commandKey,
+  expiresAt: Date.now() + cacheMilliseconds,
+  value,
+});
+
+const invalidateDefaultCursorInspection = (): void => {
+  cachedDefaultLogin = undefined;
+  cachedDefaultModels = undefined;
+};
 
 const resolveCursorCommands = (options: CursorHostInspectionOptions): string[] => {
   if (options.command !== undefined) return [options.command];
@@ -149,7 +191,13 @@ const parseCursorModels = (output: string): CursorHostModel[] =>
 export const listCursorHostModels = (
   options: CursorHostInspectionOptions = {},
 ): CursorHostModel[] => {
-  for (const command of resolveCursorCommands(options)) {
+  const commandCandidates = resolveCursorCommands(options);
+  const commandKey = commandCandidates.join("\u0000");
+  if (usesDefaultInspection(options)) {
+    const cachedModels = readCachedInspection(cachedDefaultModels, commandKey);
+    if (cachedModels !== undefined) return cachedModels;
+  }
+  for (const command of commandCandidates) {
     const result = spawnSync(command, ["--list-models"], {
       encoding: "utf8",
       env: resolveEnvironment(options),
@@ -157,7 +205,15 @@ export const listCursorHostModels = (
     });
     if ((result.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") continue;
     if (result.status !== 0) return [];
-    return parseCursorModels(result.stdout ?? "");
+    const models = parseCursorModels(result.stdout ?? "");
+    if (usesDefaultInspection(options)) {
+      cachedDefaultModels = cacheDefaultInspection(
+        models,
+        commandKey,
+        DEFAULT_MODEL_CACHE_MILLISECONDS,
+      );
+    }
+    return models;
   }
   return [];
 };
@@ -176,6 +232,11 @@ export const inspectCursorHostLogin = (
   options: CursorHostInspectionOptions = {},
 ): CursorHostLoginState => {
   const commandCandidates = resolveCursorCommands(options);
+  const commandKey = commandCandidates.join("\u0000");
+  if (usesDefaultInspection(options)) {
+    const cachedLogin = readCachedInspection(cachedDefaultLogin, commandKey);
+    if (cachedLogin !== undefined) return cachedLogin;
+  }
   for (const command of commandCandidates) {
     const result = spawnSync(command, ["status"], {
       encoding: "utf8",
@@ -190,7 +251,7 @@ export const inspectCursorHostLogin = (
       result.status,
       `${result.stdout ?? ""}\n${result.stderr ?? ""}`,
     );
-    return {
+    const state: CursorHostLoginState = {
       schemaVersion: "1",
       client: "cursor",
       status,
@@ -201,8 +262,16 @@ export const inspectCursorHostLogin = (
       accountEmail: parseAccountEmail(result.stdout ?? ""),
       accountPlan: parseAccountPlan(result.stdout ?? ""),
     };
+    if (usesDefaultInspection(options)) {
+      cachedDefaultLogin = cacheDefaultInspection(
+        state,
+        commandKey,
+        DEFAULT_LOGIN_CACHE_MILLISECONDS,
+      );
+    }
+    return state;
   }
-  return {
+  const state: CursorHostLoginState = {
     schemaVersion: "1",
     client: "cursor",
     status: "unavailable",
@@ -213,6 +282,14 @@ export const inspectCursorHostLogin = (
     accountEmail: null,
     accountPlan: null,
   };
+  if (usesDefaultInspection(options)) {
+    cachedDefaultLogin = cacheDefaultInspection(
+      state,
+      commandKey,
+      DEFAULT_LOGIN_CACHE_MILLISECONDS,
+    );
+  }
+  return state;
 };
 
 const runCursorCommand = async (
@@ -258,8 +335,10 @@ const requireCursorCommand = (options: CursorHostInspectionOptions): string => {
   return state.command;
 };
 
-export const reloginCursorHost = (options: CursorHostCommandOptions = {}): Promise<void> =>
-  runCursorCommand(requireCursorCommand(options), ["login"], options);
+export const reloginCursorHost = async (options: CursorHostCommandOptions = {}): Promise<void> => {
+  await runCursorCommand(requireCursorCommand(options), ["login"], options);
+  if (usesDefaultInspection(options)) invalidateDefaultCursorInspection();
+};
 
 export const switchCursorHostAccount = async (
   options: CursorHostCommandOptions = {},
@@ -267,6 +346,7 @@ export const switchCursorHostAccount = async (
   const command = requireCursorCommand(options);
   await runCursorCommand(command, ["logout"], options);
   await runCursorCommand(command, ["login"], options);
+  if (usesDefaultInspection(options)) invalidateDefaultCursorInspection();
 };
 
 export const createCursorAcpLaunch = (

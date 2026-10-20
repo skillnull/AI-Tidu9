@@ -54,6 +54,8 @@ interface CodexFailureResponse {
   reason?: string;
   /** Stable reason identifier returned by the runtime. */
   reasonCode?: string;
+  /** Safe recovery steps returned by the component that detected the failure. */
+  nextSteps?: readonly string[];
 }
 
 type SectionId =
@@ -92,31 +94,44 @@ const readActiveSection = (): SectionId | undefined => {
 const formatCodexFailure = (failure: CodexFailureResponse, locale: "en-US" | "zh-CN"): string => {
   const officialFailure = failure.failureSource === "official-codex";
   const reason = failure.reason ?? failure.message ?? "Unknown failure.";
+  const routingFailure = failure.reasonCode === "capability_routing_unavailable";
   if (locale === "en-US") {
-    const steps = officialFailure
+    const steps = routingFailure
       ? [
-          "Run 'codex login status' and sign in again if needed.",
-          "Switch to an official model and verify official Codex inference.",
-          "Retry AI-Tidu9 after official Codex works.",
+          "Select a primary model for the current host and confirm its actual capabilities.",
+          "Add a specialist from another available host for any missing capabilities.",
+          "Save and activate the configuration, then update the global Codex setup again.",
         ]
-      : [
-          "Local: confirm the development runtime is running. Remote: confirm the HTTPS endpoint and /health are reachable.",
-          "Check the AI-Tidu9 provider and upstream model compatibility.",
-          "Update the AI-Tidu9 configuration and retry, or switch to Official mode.",
-        ];
+      : officialFailure
+        ? [
+            "Run 'codex login status' and sign in again if needed.",
+            "Switch to an official model and verify official Codex inference.",
+            "Retry AI-Tidu9 after official Codex works.",
+          ]
+        : [
+            "Local: confirm the development runtime is running. Remote: confirm the HTTPS endpoint and /health are reachable.",
+            "Check the AI-Tidu9 provider and upstream model compatibility.",
+            "Update the AI-Tidu9 configuration and retry, or switch to Official mode.",
+          ];
     return `Failure source: ${officialFailure ? "Official Codex" : "AI-Tidu9 service"}\nReason: ${reason}\nRecovery:\n${steps.map((step, index) => `${index + 1}. ${step}`).join("\n")}`;
   }
-  const steps = officialFailure
+  const steps = routingFailure
     ? [
-        "运行 codex login status；登录失效时重新登录官方 Codex。",
-        "切换到官方模型，确认官方模型可以直接调用。",
-        "官方调用恢复后，再切回九门重试。",
+        "为当前宿主选择主模型，并确认该模型的真实能力。",
+        "如主模型存在能力缺口，添加来自其他可用宿主的副模型。",
+        "保存并启用配置后，重新更新全局 Codex 配置。",
       ]
-    : [
-        "本地：确认开发服务正在运行；远程：确认 HTTPS 地址及 /health 可以访问。",
-        "检查九门的模型供应商配置和上游模型兼容性。",
-        "点击“修复 / 安装 Codex 连接”后重试；仍不可用时先切回“官方直连”。",
-      ];
+    : officialFailure
+      ? [
+          "运行 codex login status；登录失效时重新登录官方 Codex。",
+          "切换到官方模型，确认官方模型可以直接调用。",
+          "官方调用恢复后，再切回九门重试。",
+        ]
+      : [
+          "本地：确认开发服务正在运行；远程：确认 HTTPS 地址及 /health 可以访问。",
+          "检查九门的模型供应商配置和上游模型兼容性。",
+          "点击“修复 / 安装 Codex 连接”后重试；仍不可用时先切回“官方直连”。",
+        ];
   return `故障归属：${officialFailure ? "官方 Codex" : "九门服务"}\n具体原因：${reason}\n处理流程：\n${steps.map((step, index) => `${index + 1}. ${step}`).join("\n")}`;
 };
 
@@ -379,9 +394,13 @@ const App = () => {
     return (
       <main className="shell">
         <header className="hero">
-          <p className="eyebrow">AI-Tidu9 · CONFIGURATION CENTER</p>
-          <h1>九门赛博提督</h1>
-          <p className="explanation">智能协作中枢 · 配置中心</p>
+          <div className="hero-copy">
+            <div className="hero-title-lockup">
+              <p className="hero-title-meta">AI-Tidu9 · CONFIGURATION CENTER</p>
+              <h1 data-title="九门赛博提督">九门赛博提督</h1>
+            </div>
+            <p className="explanation">智能协作中枢 · 配置中心</p>
+          </div>
         </header>
         {loadingState.status === "loading" ? (
           <section className="state-panel" aria-live="polite">
@@ -604,8 +623,10 @@ const App = () => {
     <main className="shell">
       <header className="hero">
         <div className="hero-copy">
-          <p className="eyebrow">AI-Tidu9 · CONFIGURATION CENTER</p>
-          <h1>九门赛博提督</h1>
+          <div className="hero-title-lockup">
+            <p className="hero-title-meta">AI-Tidu9 · CONFIGURATION CENTER</p>
+            <h1 data-title="九门赛博提督">九门赛博提督</h1>
+          </div>
           <p className="explanation">
             {locale === "zh-CN"
               ? "智能协作中枢 · 配置中心"

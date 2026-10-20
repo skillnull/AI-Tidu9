@@ -200,6 +200,9 @@ export const validateConfiguration = (
         policy.maximumSpecialists > 8 ||
         policy.mainCapabilities.length === 0 ||
         policy.mainCapabilities.some((capability) => !safeCapability.test(capability)) ||
+        new Set(
+          policy.specialists.map((specialist) => `${specialist.host}\u0000${specialist.model}`),
+        ).size !== policy.specialists.length ||
         policy.specialists.some(
           (specialist) =>
             (specialist.source !== "official" &&

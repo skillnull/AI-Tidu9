@@ -8,7 +8,11 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { inspectCodexHostLogin } from "../accounts/codex-host.js";
-import { inspectCursorHostLogin, reloginCursorHost } from "../accounts/cursor-host.js";
+import {
+  inspectCursorHostLogin,
+  listCursorHostModels,
+  reloginCursorHost,
+} from "../accounts/cursor-host.js";
 import {
   type AgentKernel,
   type CreateAgentTaskInput,
@@ -484,6 +488,9 @@ const sendOpenAiValidation = (
 const providerFailureSource = (provider: ModelProvider): "ai-tidu9" | "official-codex" =>
   provider.descriptor.type === "codex-host" ? "official-codex" : "ai-tidu9";
 
+const isCapabilityRoutingFailure = (reason: string): boolean =>
+  reason.includes("No configured model or capability-completion pool can cover this request.");
+
 const resolveRuntimeProviderType = (provider: ModelProvider | undefined): string | undefined => {
   if (provider?.descriptor.type !== "tidu-router") return provider?.descriptor.type;
   const configuredProvider = process.env.TIDU_PROVIDER?.trim();
@@ -510,11 +517,12 @@ const createProviderFailure = (
   reason: string,
   code = "provider_request_failed",
 ): OpenAiErrorBody => {
-  const failureSource = providerFailureSource(provider);
+  const routingFailure = isCapabilityRoutingFailure(reason);
+  const failureSource = routingFailure ? "ai-tidu9" : providerFailureSource(provider);
   const sourceLabel = failureSource === "official-codex" ? "Official Codex" : "AI-Tidu9";
   const nextSteps = providerRecoverySteps(failureSource);
   return createOpenAiError(
-    code,
+    routingFailure ? "capability_routing_unavailable" : code,
     `Failure source: ${sourceLabel}. Reason: ${reason} Next steps: ${nextSteps.join(" ")}`,
     "server_error",
     null,
@@ -2128,23 +2136,32 @@ const handleRequest = async (
     ]);
     const officialModels = listCodexOfficialModels();
     const cursorLogin = inspectCursorHostLogin();
+    const cursorHostModels = cursorLogin.reusable ? listCursorHostModels() : [];
     const cursorModels =
       cursorCatalogModels.length > 0
         ? cursorCatalogModels.map((model) => ({
             ...model,
             isDefault: model.id === cursorProvider?.descriptor.model,
           }))
-        : cursorLogin.reusable
-          ? [
-              {
-                id: cursorProvider?.descriptor.model ?? "",
-                name: cursorProvider?.descriptor.model ?? "",
-                capabilities: ["text", "code", "tool-use"],
-                capabilitySource: "provider-catalog" as const,
-                isDefault: true,
-              },
-            ].filter((model) => model.id !== "")
-          : [];
+        : cursorHostModels.length > 0
+          ? cursorHostModels.map((model) => ({
+              id: model.id,
+              name: model.name,
+              capabilities: ["text", "code", "tool-use"],
+              capabilitySource: "provider-catalog" as const,
+              isDefault: model.default,
+            }))
+          : cursorLogin.reusable
+            ? [
+                {
+                  id: cursorProvider?.descriptor.model ?? "auto",
+                  name: cursorProvider?.descriptor.model ?? "auto",
+                  capabilities: ["text", "code", "tool-use"],
+                  capabilitySource: "provider-catalog" as const,
+                  isDefault: true,
+                },
+              ]
+            : [];
     const companyProvider = ollamaProvider ?? compatibleProvider;
     const companyModels = ollamaProvider === undefined ? compatibleModels : ollamaModels;
     sendJson(response, 200, {

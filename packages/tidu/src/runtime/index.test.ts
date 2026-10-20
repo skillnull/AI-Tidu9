@@ -959,6 +959,65 @@ test("publishes company models only through the upstream-selection API", async (
   }
 });
 
+test("publishes the official Cursor model catalog when ACP session discovery is unavailable", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-runtime-cursor-catalog-"));
+  const commandPath = join(temporaryDirectory, "agent");
+  const previousPath = process.env.PATH;
+  writeFileSync(
+    commandPath,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "status" ]; then printf "Authenticated with Cursor\\n"; exit 0; fi',
+      'if [ "$1" = "acp" ] && [ "$2" = "--help" ]; then printf "Agent Client Protocol\\n"; exit 0; fi',
+      'if [ "$1" = "--list-models" ]; then printf "auto - Auto (default)\\ncomposer - Composer\\n"; exit 0; fi',
+      "exit 1",
+      "",
+    ].join("\n"),
+    { mode: 0o700 },
+  );
+  chmodSync(commandPath, 0o700);
+  process.env.PATH = temporaryDirectory;
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
+    port: 0,
+  });
+
+  try {
+    const response = await fetch(`${runtime.origin}/api/models/upstreams`);
+    const catalog = (await response.json()) as {
+      hosts: {
+        cursor: {
+          available: boolean;
+          models: Array<{ id: string; name: string; isDefault: boolean }>;
+        };
+      };
+    };
+    assert.equal(catalog.hosts.cursor.available, true);
+    assert.deepEqual(catalog.hosts.cursor.models, [
+      {
+        id: "auto",
+        name: "Auto",
+        capabilities: ["text", "code", "tool-use"],
+        capabilitySource: "provider-catalog",
+        isDefault: true,
+      },
+      {
+        id: "composer",
+        name: "Composer",
+        capabilities: ["text", "code", "tool-use"],
+        capabilitySource: "provider-catalog",
+        isDefault: false,
+      },
+    ]);
+  } finally {
+    await runtime.close();
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
 test("validates OpenAI-compatible inference requests before provider routing", async () => {
   const runtime = await startLocalRuntime({
     databasePath: IN_MEMORY_DATABASE_PATH,

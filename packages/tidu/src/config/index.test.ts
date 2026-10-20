@@ -92,3 +92,49 @@ test("requires every specialist to use a different host from its primary", () =>
   assert.equal(invalid.valid, false);
   assert.equal(valid.valid, true);
 });
+
+test("allows different specialist models from one host and rejects an identical pair", () => {
+  const configuration = createDefaultConfiguration();
+  const specialist = {
+    host: "cursor" as const,
+    source: "official" as const,
+    model: "auto",
+    capabilities: ["code"],
+  };
+  const valid = validateConfiguration({
+    ...configuration,
+    capabilityCompletion: {
+      ...configuration.capabilityCompletion,
+      hostPolicies: {
+        codex: {
+          mainModel: { source: "official", model: "gpt-6-sol" },
+          mainCapabilities: ["text"],
+          specialists: [specialist, { ...specialist, model: "cursor-fast" }],
+          maximumSpecialists: 2,
+        },
+      },
+    },
+  });
+
+  const invalid = validateConfiguration({
+    ...configuration,
+    capabilityCompletion: {
+      ...configuration.capabilityCompletion,
+      hostPolicies: {
+        codex: {
+          mainModel: { source: "official", model: "gpt-6-sol" },
+          mainCapabilities: ["text"],
+          specialists: [specialist, { ...specialist }],
+          maximumSpecialists: 2,
+        },
+      },
+    },
+  });
+
+  assert.equal(valid.valid, true);
+  assert.equal(invalid.valid, false);
+  assert.equal(
+    invalid.issues.some((issue) => issue.field === "capabilityCompletion"),
+    true,
+  );
+});

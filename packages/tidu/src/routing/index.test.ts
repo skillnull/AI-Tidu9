@@ -191,6 +191,42 @@ test("uses an opt-in specialist to complete a cheap main model capability", asyn
   assert.ok(Math.abs((router.inspect()?.estimatedCostPerMillionTokens ?? 0) - 0.6) < 0.000001);
 });
 
+test("does not treat the responses wire protocol as a model capability", async () => {
+  const calls: string[] = [];
+  const router = createDynamicModelRouter(
+    [
+      {
+        profile: profile({ id: "cheap-main", capabilities: ["text", "tool-use"] }),
+        provider: jsonProvider("cheap", async () => {
+          calls.push("cheap-main");
+          return { statusCode: 200, body: { output_text: "ok" } };
+        }),
+      },
+      {
+        profile: profile({ id: "vision-specialist", capabilities: ["text", "vision"] }),
+        provider: jsonProvider("vision", async () => ({
+          statusCode: 200,
+          body: { output_text: "visual evidence" },
+        })),
+      },
+    ],
+    policy,
+  );
+
+  await router.execute({
+    protocol: "responses",
+    virtualModelId: "tidu",
+    body: {
+      input: "Reply with OK.",
+      tools: [{ type: "tool_search" }],
+      tool_choice: "none",
+    },
+  });
+
+  assert.deepEqual(calls, ["cheap-main"]);
+  assert.deepEqual(router.inspect()?.requiredCapabilities, ["text", "tool-use"]);
+});
+
 test("falls back after the preferred model reports quota exhaustion", async () => {
   const calls: string[] = [];
   const models: RoutableModel[] = [

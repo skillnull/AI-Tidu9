@@ -149,9 +149,6 @@ const inferCapabilities = (request: ProviderExecutionRequest): readonly string[]
   if (request.body.response_format !== undefined) {
     inferred.add("structured-output");
   }
-  if (request.protocol === "responses") {
-    inferred.add("responses");
-  }
   const serialized = JSON.stringify(request.body);
   if (/"type"\s*:\s*"(?:image|image_url|input_image)"/u.test(serialized)) {
     inferred.add("vision");
