@@ -9,6 +9,8 @@ This file records user-visible changes in every public AI-Tidu9 release. Compati
 
 ## Unreleased
 
+## 1.1.0 - 2026-10-20
+
 - Replace Codex MCP registration with mutually exclusive native Provider modes: Official restores the exact original configuration, while AI-Tidu9 shows only “九门赛博提督.” Codex, Cursor, CLI, and OpenAI-compatible entries share one execution kernel. Ordinary `/v1` inference uses the single-model fast path; explicit planning and business acceptance remain in the full task flow. Ollama discovery reads the local catalog directly.
 - Fix capability-completion persistence and display. A new secondary defaults to every capability published by its Provider, and later edits persist the exact selected set. Save and continue saves before advancing and stays on the step after failure; a saved draft still requires explicit activation.
 - Extend secondary routing beyond capability gaps. It can use price-backed observed usage, verifiable privacy, observed latency, availability, and explicit failures. Unknown prices and quota data that is not integrated do not drive replacement.
