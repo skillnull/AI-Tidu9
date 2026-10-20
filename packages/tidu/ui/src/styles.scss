@@ -146,30 +146,34 @@ select {
   min-width: 360px;
   margin: 8px 0 11px;
   padding: 17px 22px 13px;
-  border: 1px solid rgb(74 139 132 / 58%);
-  border-right-color: rgb(74 139 132 / 24%);
-  background: linear-gradient(105deg, rgb(22 52 50 / 28%), rgb(9 13 19 / 0%) 68%);
+  background: linear-gradient(105deg, rgb(22 52 50 / 18%), rgb(9 13 19 / 0%) 56%);
   isolation: isolate;
 
   &::before {
     position: absolute;
-    right: -1px;
-    bottom: -1px;
-    width: 36px;
-    height: 9px;
-    border-right: 1px solid #63c2b4;
-    border-bottom: 1px solid #63c2b4;
+    top: 0;
+    left: 0;
+    width: 310px;
+    height: 32px;
+    background-image: linear-gradient(90deg, #70cbbf, rgb(74 139 132 / 44%) 62%, transparent),
+      linear-gradient(180deg, #70cbbf, rgb(74 139 132 / 36%) 58%, transparent);
+    background-repeat: no-repeat;
+    background-position: top left;
+    background-size: 100% 1px, 1px 100%;
     content: "";
   }
 
   &::after {
     position: absolute;
-    top: -1px;
-    right: 18px;
-    width: 46px;
-    height: 1px;
-    background: #8ad9ce;
-    box-shadow: 0 0 10px rgb(99 194 180 / 24%);
+    right: 0;
+    bottom: 0;
+    width: 112px;
+    height: 24px;
+    background-image: linear-gradient(270deg, #63bbae, rgb(74 139 132 / 38%) 58%, transparent),
+      linear-gradient(0deg, #63bbae, rgb(74 139 132 / 34%) 56%, transparent);
+    background-repeat: no-repeat;
+    background-position: bottom right;
+    background-size: 100% 1px, 1px 100%;
     content: "";
   }
 
@@ -181,6 +185,7 @@ select {
     padding: 0 9px;
     color: #6fc8bb;
     background: #090d13;
+    z-index: 1;
     font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
     font-size: 9px;
     font-weight: 500;
