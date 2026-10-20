@@ -1,7 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 
 import {
-  type AgentHostId,
   type CapabilitySpecialistConfiguration,
   type ConfigurationMode,
   createDefaultConfiguration,
@@ -19,28 +18,21 @@ import type {
   SaveConfigurationDraftInput,
 } from "./types.js";
 
-const isAgentHostId = (value: unknown): value is AgentHostId =>
-  value === "codex" || value === "cursor" || value === "ollama" || value === "openai-compatible";
+const normalizeCapabilities = (capabilities: readonly string[]): string[] => [
+  ...new Set(capabilities.map((capability) => capability.trim()).filter(Boolean)),
+];
 
 const normalizeSpecialists = (
   specialists: readonly CapabilitySpecialistConfiguration[],
-  mainHost?: AgentHostId,
 ): CapabilitySpecialistConfiguration[] =>
-  specialists.flatMap((specialist) => {
-    if (!isAgentHostId(specialist.host) || specialist.host === mainHost) return [];
-    return [
-      {
-        host: specialist.host,
-        source: specialist.source,
-        model: specialist.model.trim(),
-        capabilities: [
-          ...new Set(specialist.capabilities.map((capability) => capability.trim())),
-        ].filter(Boolean),
-        inputCostPerMillionTokens: specialist.inputCostPerMillionTokens ?? null,
-        outputCostPerMillionTokens: specialist.outputCostPerMillionTokens ?? null,
-      },
-    ];
-  });
+  specialists.map((specialist) => ({
+    host: specialist.host,
+    source: specialist.source,
+    model: specialist.model.trim(),
+    capabilities: normalizeCapabilities(specialist.capabilities),
+    inputCostPerMillionTokens: specialist.inputCostPerMillionTokens ?? null,
+    outputCostPerMillionTokens: specialist.outputCostPerMillionTokens ?? null,
+  }));
 
 interface ConfigurationRow {
   /** Stored configuration mode. */
@@ -71,13 +63,9 @@ const normalizeConfiguration = (configuration: TiduConfiguration): TiduConfigura
   },
   capabilityCompletion: {
     enabled: configuration.capabilityCompletion?.enabled ?? false,
-    mainCapabilities: [
-      ...new Set(
-        (configuration.capabilityCompletion?.mainCapabilities ?? ["text", "structured-output"])
-          .map((capability) => capability.trim())
-          .filter(Boolean),
-      ),
-    ],
+    mainCapabilities: normalizeCapabilities(
+      configuration.capabilityCompletion?.mainCapabilities ?? ["text", "structured-output"],
+    ),
     specialists: normalizeSpecialists(configuration.capabilityCompletion?.specialists ?? []),
     maximumSpecialists: configuration.capabilityCompletion?.maximumSpecialists ?? 2,
     hostPolicies: Object.fromEntries(
@@ -89,10 +77,8 @@ const normalizeConfiguration = (configuration: TiduConfiguration): TiduConfigura
               source: policy.mainModel.source,
               model: policy.mainModel.model.trim(),
             },
-            mainCapabilities: [
-              ...new Set(policy.mainCapabilities.map((item) => item.trim())),
-            ].filter(Boolean),
-            specialists: normalizeSpecialists(policy.specialists, host as AgentHostId),
+            mainCapabilities: normalizeCapabilities(policy.mainCapabilities),
+            specialists: normalizeSpecialists(policy.specialists),
             maximumSpecialists: policy.maximumSpecialists,
           },
         ],

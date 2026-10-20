@@ -17,7 +17,7 @@ import {
   CapabilityCompletionPanel,
   type ClientConnectionState,
   type ConfigurationForm,
-  type ConfigurationImpactPreview,
+  ConfigurationRequestError,
   clientIntegrationLabel,
   clientReadinessLabel,
   DEFAULT_EXPERT_SERVICES,
@@ -118,7 +118,7 @@ const formatCodexFailure = (failure: CodexFailureResponse, locale: "en-US" | "zh
   const steps = routingFailure
     ? [
         "为当前宿主选择主模型，并确认该模型的真实能力。",
-        "如主模型存在能力缺口，添加来自其他可用宿主的副模型。",
+        "添加其他可用宿主的副模型，动态路由会综合能力、耗用、隐私、延迟与可用性。",
         "保存并启用配置后，重新更新全局 Codex 配置。",
       ]
     : officialFailure
@@ -133,6 +133,40 @@ const formatCodexFailure = (failure: CodexFailureResponse, locale: "en-US" | "zh
           "点击“修复 / 安装 Codex 连接”后重试；仍不可用时先切回“官方直连”。",
         ];
   return `故障归属：${officialFailure ? "官方 Codex" : "九门服务"}\n具体原因：${reason}\n处理流程：\n${steps.map((step, index) => `${index + 1}. ${step}`).join("\n")}`;
+};
+
+const formatConfigurationMutationError = (error: unknown, locale: "en-US" | "zh-CN"): string => {
+  if (error instanceof ConfigurationRequestError) {
+    const issueCodes = new Set(error.issues.map((issue) => issue.code));
+    if (issueCodes.has("INVALID_MODEL_SELECTION")) {
+      return locale === "zh-CN"
+        ? "模型配置无效：请确认主模型和每个副模型均已选择有效模型，并至少勾选一项能力。"
+        : "The model configuration is invalid. Select a valid primary model and secondary models, with at least one capability for each.";
+    }
+    if (issueCodes.has("INVALID_PROFILE_ID")) {
+      return locale === "zh-CN"
+        ? "配置标识无效：仅支持小写字母、数字和连字符，最多 64 位。"
+        : "The profile ID is invalid. Use up to 64 lowercase letters, numbers, or hyphens.";
+    }
+    if (issueCodes.has("INVALID_VIRTUAL_MODEL_NAME")) {
+      return locale === "zh-CN"
+        ? "虚拟模型名称无效：去除首尾空格后需为 1–64 个字符。"
+        : "The virtual-model name is invalid. Enter 1–64 characters after trimming spaces.";
+    }
+    if (issueCodes.has("INVALID_EXPERT_HOST") || issueCodes.has("INVALID_EXPERT_PORT")) {
+      return locale === "zh-CN"
+        ? "服务地址无效：请检查主机名和 1–65535 范围内的端口。"
+        : "The service address is invalid. Check the hostname and a port from 1 to 65535.";
+    }
+    return locale === "zh-CN"
+      ? "配置校验未通过，请检查当前步骤中标出的字段。"
+      : "Configuration validation failed. Check the fields highlighted in this step.";
+  }
+  return error instanceof Error
+    ? error.message
+    : locale === "zh-CN"
+      ? "配置保存失败。"
+      : "Failed to save the configuration.";
 };
 
 const App = () => {
@@ -172,7 +206,10 @@ const App = () => {
   const [operation, setOperation] = useState<OperationState>({
     status: "idle",
   });
-  const [impactPreview, setImpactPreview] = useState<ConfigurationImpactPreview | undefined>();
+  const [toast, setToast] = useState<{
+    message: string;
+    tone: "error" | "success";
+  }>();
   const [hostUsageState, setHostUsageState] = useState<HostUsageLoadState>({
     status: "idle",
   });
@@ -188,21 +225,27 @@ const App = () => {
     model: null,
   });
   const [codexSelectedMode, setCodexSelectedMode] = useState<"official" | "ai-tidu9">("official");
+  const [codexConfigurationLoading, setCodexConfigurationLoading] = useState(false);
   const [codexConfigurationPending, setCodexConfigurationPending] = useState(false);
   const refreshCodexConfiguration = useCallback(async () => {
-    const response = await fetch("/api/clients/codex/configuration", {
-      cache: "no-store",
-    });
-    if (!response.ok) {
-      throw new Error(
-        response.status === 404
-          ? "当前运行的是旧版九门后台，请重启九门服务后刷新页面。"
-          : "Codex 配置状态读取失败。",
-      );
+    setCodexConfigurationLoading(true);
+    try {
+      const response = await fetch("/api/clients/codex/configuration", {
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        throw new Error(
+          response.status === 404
+            ? "当前运行的是旧版九门后台，请重启九门服务后刷新页面。"
+            : "Codex 配置状态读取失败。",
+        );
+      }
+      const configuration = (await response.json()) as CodexConfigurationStatus;
+      setCodexConfiguration(configuration);
+      setCodexSelectedMode(configuration.activeMode);
+    } finally {
+      setCodexConfigurationLoading(false);
     }
-    const configuration = (await response.json()) as CodexConfigurationStatus;
-    setCodexConfiguration(configuration);
-    setCodexSelectedMode(configuration.activeMode);
   }, []);
   const refreshHostUsage = useCallback(async () => {
     setHostUsageState({ status: "loading" });
@@ -305,8 +348,8 @@ const App = () => {
                 ? "已恢复纯官方 Codex 直连。重启 Codex 后，宿主将重新加载官方模型与官方账号配置。"
                 : "Pure Official Codex direct mode is restored. Restart Codex to reload the official models and account configuration."
               : locale === "zh-CN"
-                ? "九门 Agent 内核与推理链路已验证。重启 Codex 后，宿主只显示“九门赛博提督”；切回官方模式会完整恢复官方直连。"
-                : "The AI-Tidu9 Agent kernel and inference path were verified. Restart Codex to show only AI-Tidu9; switching back fully restores Official direct mode.",
+                ? "九门 Agent 内核与路由链路诊断通过。重启 Codex 后，宿主只显示“九门赛博提督”；切回官方模式会完整恢复官方直连。"
+                : "The AI-Tidu9 Agent kernel and routing-path diagnostic passed. Restart Codex to show only AI-Tidu9; switching back fully restores Official direct mode.",
         });
       } catch (error) {
         await refreshCodexConfiguration().catch(() => undefined);
@@ -348,9 +391,9 @@ const App = () => {
         );
         selectedModeRef.current = nextMode;
         setSelectedMode(nextMode);
-        setConfigurationForm(toForm(workspace.drafts.expert.configuration));
+        setConfigurationForm(toForm(workspace.drafts[nextMode].configuration));
       } else {
-        setConfigurationForm(toForm(workspace.drafts.expert.configuration));
+        setConfigurationForm(toForm(workspace.drafts[nextMode].configuration));
       }
 
       setLoadingState({ status: "ready", bootstrap });
@@ -376,6 +419,12 @@ const App = () => {
   }, [refresh]);
 
   useEffect(() => {
+    if (toast === undefined) return;
+    const timeout = window.setTimeout(() => setToast(undefined), 3_000);
+    return () => window.clearTimeout(timeout);
+  }, [toast]);
+
+  useEffect(() => {
     if (
       activeSection === "usage" ||
       (activeSection === "configuration" && configurationView === "active")
@@ -386,24 +435,34 @@ const App = () => {
 
   useEffect(() => {
     if (activeSection === "clients") {
-      void refreshCodexConfiguration();
+      void refreshCodexConfiguration().catch((error: unknown) => {
+        setCodexConnection({
+          status: "error",
+          message:
+            error instanceof Error
+              ? error.message
+              : locale === "zh-CN"
+                ? "Codex 配置状态读取失败。"
+                : "Failed to load Codex configuration status.",
+        });
+      });
     }
-  }, [activeSection, refreshCodexConfiguration]);
+  }, [activeSection, locale, refreshCodexConfiguration]);
 
   if (loadingState.status !== "ready") {
     return (
       <main className="shell">
         <header className="hero">
           <div className="hero-copy">
+            <p className="hero-title-meta">AI-Tidu9 · CONFIGURATION CENTER</p>
             <div className="hero-title-lockup">
-              <p className="hero-title-meta">AI-Tidu9 · CONFIGURATION CENTER</p>
               <h1 data-title="九门赛博提督">九门赛博提督</h1>
             </div>
             <p className="explanation">智能协作中枢 · 配置中心</p>
           </div>
         </header>
         {loadingState.status === "loading" ? (
-          <section className="state-panel" aria-live="polite">
+          <section className="state-panel loading-indicator" aria-live="polite" aria-busy="true">
             正在连接运行时…
           </section>
         ) : (
@@ -425,6 +484,7 @@ const App = () => {
   const setForm = (
     nextForm: ConfigurationForm | ((current: ConfigurationForm) => ConfigurationForm),
   ): void => {
+    setOperation({ status: "idle" });
     setConfigurationForm(nextForm);
   };
   const selectedDraft = workspace.drafts[selectedMode];
@@ -493,8 +553,8 @@ const App = () => {
   const selectMode = (mode: ConfigurationMode): void => {
     selectedModeRef.current = mode;
     setSelectedMode(mode);
+    setConfigurationForm(toForm(workspace.drafts[mode].configuration));
     setOperation({ status: "idle" });
-    setImpactPreview(undefined);
   };
 
   const saveDraft = async (): Promise<boolean> => {
@@ -513,58 +573,20 @@ const App = () => {
         }),
       });
       acceptBootstrap(nextBootstrap, selectedMode);
-      setImpactPreview(undefined);
       setOperation({
         status: "success",
-        message: `${modeLabel(selectedMode)}草稿已保存，尚未启用。`,
+        message:
+          locale === "zh-CN"
+            ? `${modeLabel(selectedMode, locale)}草稿已保存，尚未启用。`
+            : `${modeLabel(selectedMode, locale)} draft saved. Activation is still required.`,
       });
       return true;
     } catch (error) {
       setOperation({
         status: "error",
-        message: error instanceof Error ? error.message : "保存失败",
+        message: formatConfigurationMutationError(error, locale),
       });
       return false;
-    }
-  };
-
-  const simulateDraft = async (): Promise<void> => {
-    setOperation({ status: "pending", action: "simulate" });
-    try {
-      const response = await fetch(`/api/configuration/drafts/${selectedMode}/simulate`, {
-        method: "POST",
-        headers: {
-          accept: "application/json",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          configuration: {
-            schemaVersion: selectedDraft.configuration.schemaVersion,
-            activeMode: selectedMode,
-            ...persistedForm,
-          },
-        }),
-      });
-      const preview = (await response.json()) as ConfigurationImpactPreview & {
-        message?: string;
-      };
-      if (!response.ok) {
-        throw new Error(preview.message ?? `Simulation returned ${response.status}`);
-      }
-      setImpactPreview(preview);
-      setOperation({
-        status: "success",
-        message:
-          locale === "zh-CN"
-            ? `模拟通过：${preview.changes.length} 项变化，${preview.risk === "low" ? "低" : "中"}风险。`
-            : `Simulation passed: ${preview.changes.length} changes, ${preview.risk} risk.`,
-      });
-    } catch (error) {
-      setImpactPreview(undefined);
-      setOperation({
-        status: "error",
-        message: error instanceof Error ? error.message : "Simulation failed",
-      });
     }
   };
 
@@ -577,7 +599,6 @@ const App = () => {
         body: "{}",
       });
       acceptBootstrap(nextBootstrap, selectedMode);
-      setImpactPreview(undefined);
       setOperation({
         status: "success",
         message:
@@ -611,11 +632,17 @@ const App = () => {
         status: "success",
         message: `${modeLabel(selectedMode)}已明确启用。`,
       });
+      setToast({
+        message: locale === "zh-CN" ? "配置启用成功" : "Configuration activated",
+        tone: "success",
+      });
     } catch (error) {
+      const message = error instanceof Error ? error.message : "启用失败";
       setOperation({
         status: "error",
-        message: error instanceof Error ? error.message : "启用失败",
+        message,
       });
+      setToast({ message, tone: "error" });
     }
   };
 
@@ -623,8 +650,8 @@ const App = () => {
     <main className="shell">
       <header className="hero">
         <div className="hero-copy">
+          <p className="hero-title-meta">AI-Tidu9 · CONFIGURATION CENTER</p>
           <div className="hero-title-lockup">
-            <p className="hero-title-meta">AI-Tidu9 · CONFIGURATION CENTER</p>
             <h1 data-title="九门赛博提督">九门赛博提督</h1>
           </div>
           <p className="explanation">
@@ -789,8 +816,7 @@ const App = () => {
                 {configurationView === "edit" ? (
                   <p className="card-label">
                     {locale === "zh-CN" ? "正在编辑" : "EDITING"} ·{" "}
-                    {modeLabel(selectedMode, locale)} · {locale === "zh-CN" ? "草稿修订" : "draft"}{" "}
-                    {selectedDraft.revision}
+                    {modeLabel(selectedMode, locale)}
                   </p>
                 ) : null}
                 <h2>
@@ -808,8 +834,8 @@ const App = () => {
                       ? "这里只显示当前生效的配置；运行状态统一在服务页查看。"
                       : "This view shows active configuration only; runtime status is available under Services."
                     : locale === "zh-CN"
-                      ? "这里只编辑未生效草稿；保存、模拟并启用后才会影响运行流程。"
-                      : "This view edits an inactive draft. Save, preview, and activate it to change runtime behavior."}
+                      ? "点击“保存并下一步”会保存为未生效草稿；明确启用后才会影响运行流程。"
+                      : "Click Save and continue to save an inactive draft; it affects runtime only after explicit activation."}
                 </p>
               </div>
               <div className="configuration-view-actions">
@@ -898,45 +924,33 @@ const App = () => {
                       ? "已关闭"
                       : "Disabled"}
                   {" · "}
-                  {locale === "zh-CN" ? "专家模型" : "Specialists"}{" "}
+                  {locale === "zh-CN" ? "副模型" : "Secondary models"}{" "}
                   {workspace.active.configuration.capabilityCompletion.specialists.length}
-                </p>
-                <p>
-                  {locale === "zh-CN" ? "修订" : "Revision"}：{workspace.active.revision} ·{" "}
-                  {workspace.active.updatedAt}
-                </p>
-                <p>
-                  {locale === "zh-CN" ? "配置契约" : "Configuration contract"}：
-                  {workspace.active.configuration.schemaVersion}
-                </p>
-                <p>
-                  {locale === "zh-CN" ? "草稿修订" : "Draft revisions"}：
-                  {locale === "zh-CN" ? "共享配置" : "Shared"} {workspace.drafts.managed.revision} ·{" "}
-                  {locale === "zh-CN" ? "专家扩展" : "Expert extension"}{" "}
-                  {workspace.drafts.expert.revision}
                 </p>
               </article>
             </section>
           </div>
           <div className="configuration-view-content" hidden={configurationView !== "edit"}>
             <QuickStartWizard
+              key={`${selectedMode}:${configurationTargetHost ?? "all-hosts"}`}
               locale={locale}
               enterpriseEnabled={bootstrap.enterprise.enabled}
-              providerConfigured={bootstrap.runtime.provider.configured}
               providerType={bootstrap.runtime.provider.type}
-              providerModel={bootstrap.runtime.provider.model}
               targetHost={configurationTargetHost}
               selectedMode={selectedMode}
               form={form}
               isDirty={isDirty}
               isPending={isPending}
-              impactPreview={impactPreview}
+              pendingAction={operation.status === "pending" ? operation.action : undefined}
+              operationState={operation}
               isActive={isSelectedDraftActive}
+              draftRevision={selectedDraft.revision}
+              draftUpdatedAt={selectedDraft.updatedAt}
+              activeUpdatedAt={workspace.active.updatedAt}
               entryValidationMessages={entryValidationMessages}
               readOnly={!bootstrap.configuration.editable}
               onFormChange={setForm}
               onSave={saveDraft}
-              onSimulate={simulateDraft}
               onActivate={activateDraft}
               onRollback={rollbackConfiguration}
               onOpenClients={() => setActiveSection("clients")}
@@ -998,11 +1012,18 @@ const App = () => {
                 name: "Cursor",
                 clients: bootstrap.clients.clients.filter((client) => client.id === "cursor"),
               },
+              {
+                id: "ollama",
+                name: "Ollama",
+                clients: bootstrap.clients.clients.filter((client) => client.id === "ollama"),
+              },
             ].map((group) => (
               <article className="client-card" key={group.id}>
                 <div className="client-card-heading">
                   <div>
-                    <p className="client-protocol">{group.id === "openai" ? "OPENAI" : "CURSOR"}</p>
+                    <p className="client-protocol">
+                      {group.id === "openai" ? "OPENAI" : group.id.toUpperCase()}
+                    </p>
                     <h3>{group.name}</h3>
                   </div>
                   <span
@@ -1038,9 +1059,13 @@ const App = () => {
                     ? locale === "zh-CN"
                       ? "Codex 使用原生双模式：九门模式只显示九门 Agent，官方模式只显示官方模型。两套提供方与模型目录严格隔离，上游能力在配置页选择。"
                       : "Codex uses two native modes: AI-Tidu9 mode exposes only the AI-Tidu9 Agent, while Official mode exposes only official models. Providers and catalogs remain isolated; configure upstream capabilities in Configuration."
-                    : locale === "zh-CN"
-                      ? "Cursor、CLI 与兼容客户端必须进入同一个九门 Agent 内核；宿主协议只负责传输，不改变目标分解、能力补全和独立验收。"
-                      : "Cursor, CLI, and compatible clients enter the same AI-Tidu9 Agent kernel. Host protocols transport requests without bypassing planning, capability completion, or independent verification."}
+                    : group.id === "ollama"
+                      ? locale === "zh-CN"
+                        ? "Ollama 客户端负责本地模型安装与运行；九门通过本地 API 发现模型，并把它作为主模型或副模型调度。"
+                        : "The Ollama client installs and runs local models. AI-Tidu9 discovers them through the local API and can route them as primary or secondary models."
+                      : locale === "zh-CN"
+                        ? "Cursor、CLI 与兼容客户端进入同一个九门 Agent 内核；宿主协议只负责传输，目标分解、动态路由、执行进度与最终结果均由内核统一管理。"
+                        : "Cursor, CLI, and compatible clients enter the same AI-Tidu9 Agent kernel. Host protocols only transport requests; the kernel manages planning, dynamic routing, execution progress, and terminal results."}
                 </p>
                 {group.id === "openai" ? (
                   <div className="client-connect-row">
@@ -1049,15 +1074,26 @@ const App = () => {
                         {locale === "zh-CN" ? "Codex 接入模式" : "Codex connection mode"}
                       </strong>
                       <span>
-                        {codexConfiguration.activeMode === "official"
+                        {codexConfigurationLoading
                           ? locale === "zh-CN"
-                            ? "官方直连"
-                            : "Official direct"
-                          : locale === "zh-CN"
-                            ? "九门模式"
-                            : "AI-Tidu9 mode"}
+                            ? "读取中…"
+                            : "Loading…"
+                          : codexConfiguration.activeMode === "official"
+                            ? locale === "zh-CN"
+                              ? "官方直连"
+                              : "Official direct"
+                            : locale === "zh-CN"
+                              ? "九门模式"
+                              : "AI-Tidu9 mode"}
                       </span>
                     </div>
+                    {codexConfigurationLoading ? (
+                      <p className="loading-indicator" role="status" aria-busy="true">
+                        {locale === "zh-CN"
+                          ? "正在读取 Codex 接入状态…"
+                          : "Loading Codex connection status…"}
+                      </p>
+                    ) : null}
                     <div className="codex-configuration-modes">
                       <button
                         type="button"
@@ -1066,14 +1102,18 @@ const App = () => {
                             ? "codex-configuration-mode selected"
                             : "codex-configuration-mode"
                         }
-                        disabled={codexConfigurationPending || !codexConfiguration.installed}
+                        disabled={
+                          codexConfigurationLoading ||
+                          codexConfigurationPending ||
+                          !codexConfiguration.installed
+                        }
                         onClick={() => setCodexSelectedMode("ai-tidu9")}
                       >
                         <strong>{locale === "zh-CN" ? "九门模式" : "AI-Tidu9 mode"}</strong>
                         <span>
                           {locale === "zh-CN"
-                            ? "宿主只显示九门 Agent，执行目标分解、能力补全与验收"
-                            : "Expose only the AI-Tidu9 Agent with planning, capability completion, and verification"}
+                            ? "宿主只显示九门 Agent，并展示目标分解、动态路由、执行进度与最终结果"
+                            : "Expose only the AI-Tidu9 Agent with planning, dynamic routing, execution progress, and terminal results"}
                         </span>
                       </button>
                       <button
@@ -1083,7 +1123,7 @@ const App = () => {
                             ? "codex-configuration-mode selected"
                             : "codex-configuration-mode"
                         }
-                        disabled={codexConfigurationPending}
+                        disabled={codexConfigurationLoading || codexConfigurationPending}
                         onClick={() => setCodexSelectedMode("official")}
                       >
                         <strong>{locale === "zh-CN" ? "官方直连" : "Official direct"}</strong>
@@ -1106,6 +1146,7 @@ const App = () => {
                           className="primary-button"
                           disabled={codexConfigurationPending}
                           onClick={() => void updateCodexConfiguration(codexSelectedMode)}
+                          aria-busy={codexConfigurationPending}
                         >
                           {codexConfigurationPending
                             ? locale === "zh-CN"
@@ -1140,6 +1181,7 @@ const App = () => {
                         className="primary-button"
                         disabled={codexConnection.status === "pending"}
                         onClick={() => void connectCodex()}
+                        aria-busy={codexConnection.status === "pending"}
                       >
                         {codexConnection.status === "pending"
                           ? locale === "zh-CN"
@@ -1172,6 +1214,23 @@ const App = () => {
       ) : (
         <GuideCenter locale={locale} />
       )}
+      {toast ? (
+        <div
+          className={`toast toast-${toast.tone}`}
+          role={toast.tone === "error" ? "alert" : "status"}
+          aria-live={toast.tone === "error" ? "assertive" : "polite"}
+        >
+          <span aria-hidden="true">{toast.tone === "success" ? "✓" : "!"}</span>
+          {toast.message}
+          <button
+            type="button"
+            aria-label={locale === "zh-CN" ? "关闭提示" : "Dismiss"}
+            onClick={() => setToast(undefined)}
+          >
+            ×
+          </button>
+        </div>
+      ) : null}
     </main>
   );
 };

@@ -4,12 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createCapabilityRegistry } from "../capabilities/index.js";
-import type { ModelProvider } from "../providers/index.js";
+import { createTask } from "../protocol/index.js";
+import type { ModelProvider, ProviderExecutionRequest } from "../providers/index.js";
 import { createDynamicModelRouter, type RoutableModel } from "../routing/index.js";
 import { createSecretGate } from "../security/index.js";
 import { openNodeSqliteStorage } from "../storage/index.js";
 import {
   type AgentPlan,
+  type AgentStepOutput,
   type AgentTool,
   type AgentWorker,
   createAgentKernel,
@@ -38,6 +40,242 @@ const createPlanner = (plan: AgentPlan): TaskPlanner => ({
 const successfulWorker: AgentWorker = {
   execute: async ({ step }) => ({ summary: `Completed ${step.title}` }),
 };
+
+const agentStreamEncoder = new TextEncoder();
+
+const encodeAgentSseData = (body: unknown): Uint8Array =>
+  agentStreamEncoder.encode(`data: ${typeof body === "string" ? body : JSON.stringify(body)}\n\n`);
+
+const executeFastStream = async (
+  stream: ReadableStream<Uint8Array>,
+  protocol: ProviderExecutionRequest["protocol"] = "responses",
+): Promise<{ output: AgentStepOutput; deltas: readonly string[] }> => {
+  const provider: ModelProvider = {
+    descriptor: { type: "openai-compatible", model: "stream-test" },
+    execute: async () => ({ kind: "stream", statusCode: 200, stream }),
+  };
+  const plan: AgentPlan = {
+    revision: 1,
+    steps: [{ id: "deliver", title: "Deliver", kind: "reason" }],
+  };
+  const step = plan.steps[0];
+  if (step === undefined) throw new Error("Stream test plan requires one step.");
+  const deltas: string[] = [];
+  const output = await createModelProviderAgentAdapters(provider, "ai-tidu9-config").worker.execute(
+    {
+      task: createTask({ taskId: "stream-test", goal: "Return a streamed result" }),
+      understanding,
+      plan,
+      step,
+      previousResults: [],
+      signal: new AbortController().signal,
+      modelRequest: {
+        protocol,
+        virtualModelId: "ai-tidu9-config",
+        body: protocol === "responses" ? { input: "stream" } : { messages: [] },
+        onOutputDelta: (delta) => deltas.push(delta),
+      },
+    },
+  );
+  return { output, deltas };
+};
+
+test("uses deterministic understanding and planning for response-only tasks", async () => {
+  const kernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    planner: {
+      understand: async () => {
+        throw new Error("response-only understanding must not call the model");
+      },
+      plan: async () => {
+        throw new Error("response-only planning must not call the model");
+      },
+    },
+    worker: {
+      execute: async () => ({
+        summary: "Delivered",
+        evidence: [
+          {
+            kind: "unsupported" as "model",
+            integrity: "reported",
+            summary: "The response was delivered.",
+            supportsCriteria: [0],
+          },
+        ],
+      }),
+    },
+    verifier: {
+      verify: async () => {
+        throw new Error("response-only verification must not call the model");
+      },
+    },
+  });
+
+  const created = await kernel.createTask({
+    goal: { objective: "Reply once", acceptanceCriteria: ["A response is returned."] },
+    planningMode: "response",
+    verificationMode: "response",
+  });
+  const completed = await kernel.runTask(created.task.taskId);
+
+  assert.equal(created.understanding?.objective, "Reply once");
+  assert.equal(created.plan?.steps.length, 1);
+  assert.equal(created.plan?.steps[0]?.id, "deliver");
+  assert.equal(created.plan?.steps[0]?.kind, "reason");
+  assert.equal(completed.task.status, "completed");
+  assert.equal(completed.result?.summary, "Delivered");
+});
+
+test("forwards response capabilities and reasoning strength in one model call", async () => {
+  const requests: ProviderExecutionRequest[] = [];
+  const deliveredText = "x".repeat(4_096);
+  const provider: ModelProvider = {
+    descriptor: { type: "openai-compatible", model: "response-model" },
+    execute: async (request) => {
+      requests.push(request);
+      return {
+        kind: "json",
+        statusCode: 200,
+        body: {
+          id: "resp-agent",
+          object: "response",
+          status: "completed",
+          output: [
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: deliveredText }],
+            },
+          ],
+        },
+      };
+    },
+  };
+  const kernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    ...createModelProviderAgentAdapters(provider, "ai-tidu9-config"),
+  });
+  const created = await kernel.createTask({
+    goal: { objective: "Inspect the image", acceptanceCriteria: ["Return a result."] },
+    planningMode: "response",
+    verificationMode: "response",
+    requiredCapabilities: ["text", "vision", "reasoning"],
+    modelPreferences: { reasoningEffort: "high" },
+    modelRequest: {
+      protocol: "responses",
+      virtualModelId: "ai-tidu9-config",
+      body: {
+        model: "ai-tidu9-config",
+        input: [{ role: "user", content: [{ type: "input_image", image_url: "data:image/png" }] }],
+        stream: true,
+      },
+    },
+  });
+  const completed = await kernel.runTask(created.task.taskId);
+
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0]?.routing?.requiredCapabilities, ["text", "vision", "reasoning"]);
+  assert.deepEqual(requests[0]?.body.reasoning, { effort: "high" });
+  assert.equal(requests[0]?.body.reasoning_effort, undefined);
+  assert.equal(requests[0]?.body.stream, false);
+  assert.equal(completed.result?.summary, deliveredText);
+});
+
+test("accepts fast response streams only after a successful terminal event", async () => {
+  const stream = new ReadableStream<Uint8Array>({
+    start: (controller) => {
+      controller.enqueue(
+        encodeAgentSseData({ type: "response.output_text.delta", delta: "complete" }),
+      );
+      controller.enqueue(
+        encodeAgentSseData({
+          type: "response.completed",
+          response: { status: "completed", output_text: "complete" },
+        }),
+      );
+      controller.enqueue(encodeAgentSseData("[DONE]"));
+      controller.close();
+    },
+  });
+
+  const result = await executeFastStream(stream);
+
+  assert.equal(result.output.summary, "complete");
+  assert.deepEqual(result.deltas, ["complete"]);
+});
+
+test("rejects every unsuccessful fast-stream terminal and partial EOF", async () => {
+  const failureCases = [
+    {
+      name: "response failed",
+      events: [
+        {
+          type: "response.failed",
+          response: { status: "failed", error: { message: "response failed" } },
+        },
+      ],
+      message: /response failed/u,
+    },
+    {
+      name: "response incomplete",
+      events: [
+        {
+          type: "response.incomplete",
+          response: { status: "incomplete", incomplete_details: { reason: "token limit" } },
+        },
+      ],
+      message: /token limit/u,
+    },
+    {
+      name: "typed error",
+      events: [{ type: "error", message: "typed failure" }],
+      message: /typed failure/u,
+    },
+    {
+      name: "error envelope",
+      events: [{ error: { code: "provider_error", message: "provider failure" } }],
+      message: /provider failure/u,
+    },
+    {
+      name: "completed as failed",
+      events: [{ type: "response.completed", response: { status: "failed" } }],
+      message: /did not complete successfully/u,
+    },
+    {
+      name: "completed as incomplete",
+      events: [{ type: "response.completed", response: { status: "incomplete" } }],
+      message: /did not complete successfully/u,
+    },
+    {
+      name: "partial output then EOF",
+      events: [{ type: "response.output_text.delta", delta: "partial" }],
+      message: /without a successful terminal/u,
+    },
+  ] as const;
+
+  for (const failureCase of failureCases) {
+    const stream = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        for (const event of failureCase.events) controller.enqueue(encodeAgentSseData(event));
+        controller.close();
+      },
+    });
+
+    await assert.rejects(() => executeFastStream(stream), failureCase.message, failureCase.name);
+  }
+});
+
+test("preserves fast-stream cancellation errors", async () => {
+  const cancellation = new DOMException("client cancelled", "AbortError");
+  const stream = new ReadableStream<Uint8Array>({
+    pull: (controller) => controller.error(cancellation),
+  });
+
+  await assert.rejects(
+    () => executeFastStream(stream),
+    (error: unknown) => error === cancellation,
+  );
+});
 
 test("uses a configured model provider for understanding, planning, execution, and verification", async () => {
   const responses = [
@@ -120,6 +358,87 @@ test("uses a configured model provider for understanding, planning, execution, a
   assert.equal(result.task.status, "completed");
   assert.equal(result.result?.trustLevel, "low");
   assert.equal(responseIndex, 4);
+});
+
+test("does not route free-form task descriptions as model capability identifiers", async () => {
+  const routedCapabilities: (readonly string[])[] = [];
+  const responses = [
+    {
+      objective: "Explain the current system",
+      acceptanceCriteria: ["The system is explained"],
+      constraints: [],
+      assumptions: [],
+      requiredCapabilities: ["system positioning", "structured Chinese explanation", "vision"],
+    },
+    {
+      revision: 1,
+      steps: [
+        { id: "scope", title: "Scope the explanation", kind: "reason" },
+        { id: "explain", title: "Explain the system", kind: "reason" },
+        { id: "check", title: "Check the explanation", kind: "verify" },
+      ],
+    },
+    {
+      summary: "The system is explained.",
+      evidence: [
+        {
+          kind: "model",
+          integrity: "reported",
+          summary: "The model explained the system.",
+          supportsCriteria: [0],
+        },
+      ],
+    },
+    {
+      summary: "The explanation is complete.",
+      criteria: [
+        {
+          criterionIndex: 0,
+          accepted: true,
+          reason: "The explanation addresses the goal.",
+          evidenceIds: [] as string[],
+        },
+      ],
+    },
+  ];
+  let responseIndex = 0;
+  const provider: ModelProvider = {
+    descriptor: { type: "openai-compatible", model: "agent-test" },
+    execute: async (request) => {
+      routedCapabilities.push(request.routing?.requiredCapabilities ?? []);
+      const response = structuredClone(responses[responseIndex]);
+      responseIndex += 1;
+      return {
+        kind: "json",
+        statusCode: 200,
+        body: { choices: [{ message: { content: JSON.stringify(response) } }] },
+      };
+    },
+  };
+  const kernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    ...createModelProviderAgentAdapters(provider, "ai-tidu9-config"),
+  });
+
+  const created = await kernel.createTask({
+    goal: {
+      objective: "Explain the current system",
+      acceptanceCriteria: ["The system is explained"],
+    },
+  });
+  const completed = await kernel.runTask(created.task.taskId);
+
+  assert.equal(completed.task.status, "completed");
+  assert.deepEqual(completed.plan?.steps, [
+    {
+      id: "deliver",
+      title: "Deliver the requested outcome",
+      kind: "reason",
+      input: undefined,
+      dependsOn: [],
+    },
+  ]);
+  assert.deepEqual(routedCapabilities, [[], ["vision"], ["vision"], []]);
 });
 
 test("completes an Agent task only after a specialist fills the main model capability gap", async () => {

@@ -19,6 +19,47 @@ import { createSecretGate, type SecretGate } from "../security/index.js";
 
 export const TASK_CAPSULE_VERSION = "tidu-task-capsule/1" as const;
 
+const AGENT_EXECUTION_ERROR_CODE_PATTERN = /^[a-z][a-z0-9_.-]{0,63}$/u;
+
+export class AgentExecutionError extends Error {
+  /** Safe machine-readable failure code exposed at the OpenAI-compatible boundary. */
+  public readonly code: string;
+
+  public constructor(code: string, message: string) {
+    super(message.slice(0, 240));
+    this.name = "AgentExecutionError";
+    this.code = AGENT_EXECUTION_ERROR_CODE_PATTERN.test(code) ? code : "agent_task_failed";
+  }
+}
+
+export type AgentReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max"
+  | "ultra";
+
+export interface AgentModelPreferences {
+  /** Caller-selected reasoning strength forwarded to the model that performs the task. */
+  reasoningEffort?: AgentReasoningEffort;
+}
+
+export interface AgentModelRequest {
+  /** OpenAI-compatible protocol used by the caller. */
+  protocol: "chat-completions" | "responses";
+  /** Validated request body retained only for the active in-memory execution. */
+  body: Readonly<Record<string, unknown>>;
+  /** Public virtual model identifier returned to the caller. */
+  virtualModelId: string;
+  /** Live assistant text forwarded only to the active streaming caller. */
+  onOutputDelta?: (delta: string) => void;
+  /** Truthful execution-stage updates forwarded only to the active streaming caller. */
+  onProgress?: (message: string) => void;
+}
+
 export interface TaskBudgetLimits {
   /** Maximum plan steps that may finish across the task. */
   maxSteps: number;
@@ -172,6 +213,10 @@ export interface TaskCapsule {
   capabilityAssembly?: CapabilityAssembly;
   /** Current validated execution plan. */
   plan?: AgentPlan;
+  /** Verification strategy selected for this bounded task. */
+  verificationMode?: "model" | "response";
+  /** Safe caller model preferences retained across durable task execution and resume. */
+  modelPreferences?: AgentModelPreferences;
   /** Latest bounded recovery checkpoint. */
   checkpoint: TaskCheckpoint;
   /** Per-task hard resource limits. */
@@ -281,6 +326,10 @@ export interface AgentWorkerInput {
   previousResults: readonly TaskStepResult[];
   /** Cancellation signal owned by the Agent kernel. */
   signal: AbortSignal;
+  /** Safe caller model preferences that must reach the executing model. */
+  modelPreferences?: AgentModelPreferences;
+  /** Original protocol request available only during the active response execution. */
+  modelRequest?: AgentModelRequest;
 }
 
 export interface AgentWorker {
@@ -330,6 +379,16 @@ export interface TaskApprovalHandler {
 export interface CreateAgentTaskInput extends Omit<CreateTaskInput, "taskId"> {
   /** Optional caller-supplied identifier; a random identifier is used when omitted. */
   taskId?: string;
+  /** Uses a deterministic one-step plan for a response-only protocol request. */
+  planningMode?: "model" | "response";
+  /** Uses bounded protocol verification instead of a second model call. */
+  verificationMode?: "model" | "response";
+  /** Request capabilities already inferred at the protocol boundary. */
+  requiredCapabilities?: readonly string[];
+  /** Safe model preferences selected by the caller. */
+  modelPreferences?: AgentModelPreferences;
+  /** Original model request kept in memory for one response-only execution. */
+  modelRequest?: AgentModelRequest;
   /** Optional task-specific limits constrained by hard platform maxima. */
   budget?: Partial<TaskBudgetLimits>;
 }
@@ -421,6 +480,7 @@ const CAPSULE_LIMITS = Object.freeze({
   maxPlanSteps: 64,
   maxPlanInputBytes: 16 * 1024,
   maxSummaryCharacters: 2048,
+  maxResponseCharacters: 256 * 1024,
 });
 const TERMINAL_STATUSES = new Set<TaskStatus>(["cancelled", "completed"]);
 const EVIDENCE_KINDS = new Set<EvidenceKind>(["human", "model", "system", "tool"]);
@@ -429,13 +489,27 @@ const EVIDENCE_INTEGRITIES = new Set<EvidenceIntegrity>(["observed", "reported"]
 const now = (): string => new Date().toISOString();
 const clone = <TValue>(value: TValue): TValue => structuredClone(value);
 
-const boundedSummary = (value: string): string => {
+const boundedText = (value: string, maximumCharacters: number): string => {
   const summary = value.trim();
   if (summary === "") {
     throw new Error("Agent summaries cannot be empty.");
   }
-  return summary.slice(0, CAPSULE_LIMITS.maxSummaryCharacters);
+  return summary.slice(0, maximumCharacters);
 };
+
+const boundedSummary = (value: string): string =>
+  boundedText(value, CAPSULE_LIMITS.maxSummaryCharacters);
+
+const boundedResponse = (value: string): string =>
+  boundedText(value, CAPSULE_LIMITS.maxResponseCharacters);
+
+const taskFailurePayload = (
+  error: unknown,
+  fallback: string,
+): { reason: string; errorCode?: string } => ({
+  reason: error instanceof Error ? error.message : fallback,
+  ...(error instanceof AgentExecutionError ? { errorCode: error.code } : {}),
+});
 
 const boundedPlanInput = (value: unknown): unknown => {
   if (value === undefined) {
@@ -665,6 +739,7 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
     string,
     { controller: AbortController; requested: "cancel" | "pause" | undefined }
   >();
+  const activeModelRequests = new Map<string, AgentModelRequest>();
   const verifier = options.verifier ?? defaultVerifier;
 
   const persist = async (capsule: TaskCapsule): Promise<TaskCapsule> => {
@@ -694,6 +769,9 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
       goal: protectedGoal,
       taskId,
     });
+    if (input.modelRequest !== undefined) {
+      activeModelRequests.set(taskId, input.modelRequest);
+    }
     const budget = normalizeBudget(options.defaultBudget, input.budget);
     const createdAt = task.createdAt;
     let capsule: TaskCapsule = {
@@ -711,6 +789,10 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
       events: [],
       stepResults: [],
       evidence: [],
+      verificationMode: input.verificationMode ?? "model",
+      ...(input.modelPreferences === undefined
+        ? {}
+        : { modelPreferences: structuredClone(input.modelPreferences) }),
       deadlineAt: new Date(Date.parse(createdAt) + budget.maxDurationMs).toISOString(),
       updatedAt: createdAt,
     };
@@ -727,7 +809,15 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
     try {
       const understanding = validateUnderstanding(
         task,
-        await options.planner.understand(task, controller.signal),
+        input.planningMode === "response"
+          ? {
+              objective: task.goal.objective,
+              acceptanceCriteria: [...task.goal.acceptanceCriteria],
+              constraints: [],
+              assumptions: [],
+              requiredCapabilities: [...(input.requiredCapabilities ?? [])],
+            }
+          : await options.planner.understand(task, controller.signal),
       );
       const capabilityAssembly = options.capabilityRegistry?.assemble({
         requiredCapabilities: understanding.requiredCapabilities,
@@ -740,10 +830,20 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
         );
       }
       const plan = validatePlan(
-        await options.planner.plan(
-          { task, understanding, tools: toolDescriptors, assets: capabilityAssembly?.assets ?? [] },
-          controller.signal,
-        ),
+        input.planningMode === "response"
+          ? {
+              revision: 1,
+              steps: [{ id: "deliver", title: "Deliver the requested outcome", kind: "reason" }],
+            }
+          : await options.planner.plan(
+              {
+                task,
+                understanding,
+                tools: toolDescriptors,
+                assets: capabilityAssembly?.assets ?? [],
+              },
+              controller.signal,
+            ),
         tools,
       );
       capsule = appendEvent(
@@ -754,9 +854,13 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
       );
       return persist(capsule);
     } catch (error) {
-      capsule = transition(capsule, "failed", "task.failed", {
-        reason: error instanceof Error ? error.message : "Planning failed.",
-      });
+      activeModelRequests.delete(taskId);
+      capsule = transition(
+        capsule,
+        "failed",
+        "task.failed",
+        taskFailurePayload(error, "Planning failed."),
+      );
       await persist(capsule);
       throw error;
     }
@@ -920,6 +1024,12 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
                   step,
                   previousResults: capsule.stepResults,
                   signal: controller.signal,
+                  ...(capsule.modelPreferences === undefined
+                    ? {}
+                    : { modelPreferences: capsule.modelPreferences }),
+                  ...(activeModelRequests.get(taskId) === undefined
+                    ? {}
+                    : { modelRequest: activeModelRequests.get(taskId) }),
                 })
               : await tool.execute({
                   input:
@@ -941,18 +1051,18 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
             return persist(capsule);
           }
           const completedAt = now();
-          const rawEvidence = output.evidence ?? [];
-          if (
-            rawEvidence.some(
-              (item) =>
-                !EVIDENCE_KINDS.has(item.kind) ||
-                !EVIDENCE_INTEGRITIES.has(item.integrity) ||
-                !Array.isArray(item.supportsCriteria) ||
-                (item.reference !== undefined && typeof item.reference !== "string"),
-            )
-          ) {
+          const suppliedEvidence = output.evidence ?? [];
+          const evidenceMetadataInvalid = suppliedEvidence.some(
+            (item) =>
+              !EVIDENCE_KINDS.has(item.kind) ||
+              !EVIDENCE_INTEGRITIES.has(item.integrity) ||
+              !Array.isArray(item.supportsCriteria) ||
+              (item.reference !== undefined && typeof item.reference !== "string"),
+          );
+          if (evidenceMetadataInvalid && capsule.verificationMode !== "response") {
             throw new Error("Step returned invalid evidence metadata.");
           }
+          const rawEvidence = evidenceMetadataInvalid ? [] : suppliedEvidence;
           const evidence = rawEvidence.map((item) => ({
             ...item,
             ...(item.reference === undefined
@@ -989,7 +1099,10 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
                 ...capsule.stepResults,
                 {
                   stepId: step.id,
-                  summary: boundedSummary(output.summary),
+                  summary:
+                    capsule.verificationMode === "response"
+                      ? boundedResponse(output.summary)
+                      : boundedSummary(output.summary),
                   completedAt,
                 },
               ],
@@ -1017,6 +1130,7 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
           }
           if (
             options.planner.replan !== undefined &&
+            capsule.verificationMode !== "response" &&
             capsule.usage.replans < capsule.budget.maxReplans
           ) {
             const replanned = validatePlan(
@@ -1047,7 +1161,11 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
                 },
               },
               "plan.updated",
-              { revision: replanned.revision, failedStepId: step.id },
+              {
+                revision: replanned.revision,
+                failedStepId: step.id,
+                reason: boundedSummary(error instanceof Error ? error.message : "Step failed."),
+              },
               { kind: "planner" },
             );
             capsule = await persist(capsule);
@@ -1055,21 +1173,38 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
           }
           capsule = transition(capsule, "failed", "task.failed", {
             stepId: step.id,
-            reason: error instanceof Error ? error.message : "Step failed.",
+            ...taskFailurePayload(error, "Step failed."),
           });
           return persist(capsule);
         }
       }
 
-      const verification = await verifier.verify(
-        {
-          task: capsule.task,
-          plan: capsule.plan as AgentPlan,
-          stepResults: capsule.stepResults,
-          evidence: capsule.evidence,
-        },
-        controller.signal,
-      );
+      const latestStepResult = capsule.stepResults.at(-1);
+      const verification =
+        capsule.verificationMode === "response"
+          ? {
+              summary: latestStepResult?.summary ?? "",
+              criteria: capsule.task.goal.acceptanceCriteria.map((_, criterionIndex) => ({
+                criterionIndex,
+                accepted: (latestStepResult?.summary.trim().length ?? 0) > 0,
+                reason:
+                  (latestStepResult?.summary.trim().length ?? 0) > 0
+                    ? "The response-only task produced a bounded non-empty result."
+                    : "The response-only task produced no result.",
+                evidenceIds: capsule.evidence
+                  .filter((item) => item.supportsCriteria.includes(criterionIndex))
+                  .map((item) => item.id),
+              })),
+            }
+          : await verifier.verify(
+              {
+                task: capsule.task,
+                plan: capsule.plan as AgentPlan,
+                stepResults: capsule.stepResults,
+                evidence: capsule.evidence,
+              },
+              controller.signal,
+            );
       const criteria = verification.criteria.map((criterion) => ({
         ...criterion,
         reason: boundedSummary(criterion.reason),
@@ -1096,7 +1231,10 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
       const evidenceIds = [...new Set(criteria.flatMap((criterion) => criterion.evidenceIds))];
       const result: TaskResult = {
         accepted,
-        summary: boundedSummary(verification.summary),
+        summary:
+          capsule.verificationMode === "response"
+            ? boundedResponse(verification.summary)
+            : boundedSummary(verification.summary),
         criteria,
         trustLevel: calculateTrust(
           accepted,
@@ -1122,14 +1260,18 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
         capsule.task.status !== "paused" &&
         capsule.task.status !== "waiting_for_approval"
       ) {
-        capsule = transition(capsule, "failed", "task.failed", {
-          reason: error instanceof Error ? error.message : "Task execution failed.",
-        });
+        capsule = transition(
+          capsule,
+          "failed",
+          "task.failed",
+          taskFailurePayload(error, "Task execution failed."),
+        );
         return persist(capsule);
       }
       throw error;
     } finally {
       activeExecutions.delete(taskId);
+      activeModelRequests.delete(taskId);
     }
   };
 

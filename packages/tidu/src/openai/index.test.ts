@@ -61,6 +61,31 @@ test("validates chat-completions and responses requests without reading content"
   );
 });
 
+test("rejects unsupported reasoning strength instead of silently changing it", () => {
+  assert.equal(
+    validateResponsesRequest(
+      {
+        model: "ai-tidu9-config",
+        input: "hello",
+        reasoning: { effort: "extreme" },
+      },
+      "ai-tidu9-config",
+    ).error?.error.code,
+    "invalid_reasoning_effort",
+  );
+  assert.equal(
+    validateChatCompletionRequest(
+      {
+        model: "ai-tidu9-config",
+        messages: [{ role: "user", content: "hello" }],
+        reasoning_effort: 3,
+      },
+      "ai-tidu9-config",
+    ).error?.error.code,
+    "invalid_reasoning_effort",
+  );
+});
+
 test("validates baseline function tools and tool-result messages", () => {
   const chatTool = {
     type: "function",

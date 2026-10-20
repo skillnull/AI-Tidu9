@@ -7,14 +7,16 @@ import { basename, dirname, extname, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
-import { inspectCodexHostLogin } from "../accounts/codex-host.js";
+import { inspectCodexHostLogin, inspectCodexHostLoginAsync } from "../accounts/codex-host.js";
 import {
   inspectCursorHostLogin,
-  listCursorHostModels,
+  inspectCursorHostLoginAsync,
   reloginCursorHost,
 } from "../accounts/cursor-host.js";
 import {
+  AgentExecutionError,
   type AgentKernel,
+  type AgentReasoningEffort,
   type CreateAgentTaskInput,
   createAgentKernel,
   createTaskControlView,
@@ -24,6 +26,7 @@ import {
   configureCodexClient,
   inspectCodexClientConfiguration,
   listCodexOfficialModels,
+  refreshCodexClientModelCatalog,
   removeCodexClientConfiguration,
   switchCodexClientConfiguration,
 } from "../clients/configuration.js";
@@ -32,7 +35,6 @@ import {
   type CapabilitySpecialistConfiguration,
   CONFIG_SCHEMA_VERSION,
   type ConfigurationMode,
-  createDefaultConfiguration,
   type TiduConfiguration,
 } from "../config/index.js";
 import { createConfigCenterBootstrap } from "../config-center/index.js";
@@ -63,10 +65,13 @@ import {
   createProviderFromEnvironment,
   discoverOllamaModels,
   type ModelProvider,
+  type ProviderExecutionResult,
 } from "../providers/index.js";
 import {
   type CapabilityCompletionProvider,
+  type CapabilityCompletionUsageRecord,
   createCapabilityCompletionProvider,
+  inferModelRequestCapabilities,
 } from "../routing/index.js";
 import type { ScalingControlPlane, ScalingTaskRequest } from "../scaling/index.js";
 import { createSecretGate, guardModelProvider, type SecretGate } from "../security/index.js";
@@ -93,6 +98,43 @@ const SECURITY_HEADERS = Object.freeze({
   "x-content-type-options": "nosniff",
   "x-frame-options": "DENY",
 });
+
+interface RuntimeReadCacheEntry {
+  /** Cached response value after a successful load. */
+  value?: unknown;
+  /** Time after which the cached response must be refreshed. */
+  expiresAt: number;
+  /** Shared in-flight read used to coalesce concurrent requests. */
+  pending?: Promise<unknown>;
+}
+
+const runtimeReadCaches = new WeakMap<object, Map<string, RuntimeReadCacheEntry>>();
+
+const readCachedRuntimeValue = async <T>(
+  runtime: object,
+  key: string,
+  ttlMilliseconds: number,
+  load: () => Promise<T>,
+): Promise<T> => {
+  const cache = runtimeReadCaches.get(runtime) ?? new Map<string, RuntimeReadCacheEntry>();
+  runtimeReadCaches.set(runtime, cache);
+  const current = cache.get(key);
+  if (current?.value !== undefined && current.expiresAt > Date.now()) {
+    return current.value as T;
+  }
+  if (current?.pending !== undefined) return current.pending as Promise<T>;
+  const pending = load()
+    .then((value) => {
+      cache.set(key, { value, expiresAt: Date.now() + ttlMilliseconds });
+      return value;
+    })
+    .catch((error: unknown) => {
+      cache.delete(key);
+      throw error;
+    });
+  cache.set(key, { expiresAt: 0, pending });
+  return pending;
+};
 const MAXIMUM_JSON_BODY_BYTES = 64 * 1024;
 const MAXIMUM_INFERENCE_JSON_BODY_BYTES = 4 * 1024 * 1024;
 const ENTERPRISE_DISCOVERY_TIMEOUT_MS = 5_000;
@@ -346,6 +388,8 @@ export interface LocalRuntimeOptions {
   capabilityProviders?: readonly CapabilityProviderImplementation[];
   /** Permission and isolation runtime required to invoke capability providers. */
   capabilityRuntime?: CapabilityRuntime;
+  /** Optional active-Codex catalog refresher for embedded runtimes and isolated tests. */
+  codexClientModelCatalogRefresh?: () => Promise<void>;
 }
 
 export interface LocalRuntime {
@@ -565,12 +609,23 @@ const createAgentResponsesBody = (
   model: string,
   text: string,
   responseId = `resp_${randomUUID()}`,
+  reasoningSummary?: string,
 ): Record<string, unknown> => ({
   id: responseId,
   object: "response",
   status: "completed",
   model,
   output: [
+    ...(reasoningSummary === undefined
+      ? []
+      : [
+          {
+            id: `${responseId}_reasoning`,
+            type: "reasoning",
+            status: "completed",
+            summary: [{ type: "summary_text", text: reasoningSummary }],
+          },
+        ]),
     {
       id: `${responseId}_message`,
       type: "message",
@@ -599,52 +654,336 @@ const createAgentChatBody = (
   ],
 });
 
+const resolveAgentFailure = (error: unknown): { code: string; message: string } => ({
+  code: error instanceof AgentExecutionError ? error.code : "agent_task_failed",
+  message: (error instanceof Error ? error.message : "The Agent task failed.").slice(0, 240),
+});
+
 const createAgentResponsesStream = (
   model: string,
-  run: () => Promise<string>,
+  run: (
+    signal: AbortSignal,
+    reportProgress: (message: string) => void,
+    onOutputDelta: (delta: string) => void,
+  ) => Promise<string>,
 ): ReadableStream<Uint8Array> => {
   const responseId = `resp_${randomUUID()}`;
+  const reasoningId = `${responseId}_reasoning`;
+  const messageId = `${responseId}_message`;
   const encoder = new TextEncoder();
+  let closed = false;
+  let keepAlive: NodeJS.Timeout | undefined;
+  const abortController = new AbortController();
   return new ReadableStream<Uint8Array>({
     start(controller) {
-      const write = (event: string): void => controller.enqueue(encoder.encode(event));
-      void run()
+      let sequenceNumber = 0;
+      keepAlive = setInterval(() => {
+        if (!closed) controller.enqueue(encoder.encode(": ai-tidu9 keep-alive\n\n"));
+      }, 10_000);
+      keepAlive.unref();
+      const close = (): void => {
+        if (closed) return;
+        closed = true;
+        if (keepAlive !== undefined) clearInterval(keepAlive);
+        controller.close();
+      };
+      const write = (type: string, payload: Record<string, unknown>): void => {
+        if (closed) return;
+        controller.enqueue(
+          encoder.encode(
+            `event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: sequenceNumber, ...payload })}\n\n`,
+          ),
+        );
+        sequenceNumber += 1;
+      };
+      write("response.created", {
+        response: {
+          id: responseId,
+          object: "response",
+          status: "in_progress",
+          model,
+          output: [],
+        },
+      });
+      write("response.in_progress", {
+        response: {
+          id: responseId,
+          object: "response",
+          status: "in_progress",
+          model,
+          output: [],
+        },
+      });
+      write("response.output_item.added", {
+        output_index: 0,
+        item: {
+          id: reasoningId,
+          type: "reasoning",
+          status: "in_progress",
+          summary: [],
+        },
+      });
+      write("response.reasoning_summary_part.added", {
+        item_id: reasoningId,
+        output_index: 0,
+        summary_index: 0,
+        part: { type: "summary_text", text: "" },
+      });
+      const progressMessages: string[] = [];
+      let reasoningFinished = false;
+      let messageStarted = false;
+      let outputText = "";
+      const finishReasoning = (): void => {
+        if (reasoningFinished) return;
+        reasoningFinished = true;
+        const reasoningSummary = progressMessages.join("\n");
+        write("response.reasoning_summary_text.done", {
+          item_id: reasoningId,
+          output_index: 0,
+          summary_index: 0,
+          text: reasoningSummary,
+        });
+        write("response.reasoning_summary_part.done", {
+          item_id: reasoningId,
+          output_index: 0,
+          summary_index: 0,
+          part: { type: "summary_text", text: reasoningSummary },
+        });
+        write("response.output_item.done", {
+          output_index: 0,
+          item: {
+            id: reasoningId,
+            type: "reasoning",
+            status: "completed",
+            summary: [{ type: "summary_text", text: reasoningSummary }],
+          },
+        });
+      };
+      const startMessage = (): void => {
+        if (messageStarted) return;
+        finishReasoning();
+        messageStarted = true;
+        write("response.output_item.added", {
+          output_index: 1,
+          item: {
+            id: messageId,
+            type: "message",
+            status: "in_progress",
+            role: "assistant",
+            content: [],
+          },
+        });
+        write("response.content_part.added", {
+          item_id: messageId,
+          output_index: 1,
+          content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] },
+        });
+      };
+      const reportProgress = (message: string): void => {
+        const normalized = message.trim();
+        if (
+          closed ||
+          reasoningFinished ||
+          normalized === "" ||
+          progressMessages.at(-1) === normalized
+        ) {
+          return;
+        }
+        const delta = `${progressMessages.length === 0 ? "" : "\n"}${normalized}`;
+        progressMessages.push(normalized);
+        write("response.reasoning_summary_text.delta", {
+          item_id: reasoningId,
+          output_index: 0,
+          summary_index: 0,
+          delta,
+        });
+      };
+      const emitOutputDelta = (delta: string): void => {
+        if (closed || delta === "") return;
+        startMessage();
+        outputText += delta;
+        write("response.output_text.delta", {
+          item_id: messageId,
+          output_index: 1,
+          content_index: 0,
+          delta,
+        });
+      };
+      reportProgress("正在接收任务并选择执行路径…");
+      void run(abortController.signal, reportProgress, emitOutputDelta)
         .then((text) => {
-          write(
-            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n`,
-          );
-          write(
-            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: createAgentResponsesBody(model, text, responseId) })}\n\n`,
-          );
-          write("data: [DONE]\n\n");
-          controller.close();
+          if (outputText === "") {
+            emitOutputDelta(text);
+          } else if (text.startsWith(outputText) && text.length > outputText.length) {
+            emitOutputDelta(text.slice(outputText.length));
+          }
+          startMessage();
+          const reasoningSummary = progressMessages.join("\n");
+          write("response.output_text.done", {
+            item_id: messageId,
+            output_index: 1,
+            content_index: 0,
+            text: outputText,
+          });
+          write("response.content_part.done", {
+            item_id: messageId,
+            output_index: 1,
+            content_index: 0,
+            part: { type: "output_text", text: outputText, annotations: [] },
+          });
+          write("response.output_item.done", {
+            output_index: 1,
+            item: {
+              id: messageId,
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [{ type: "output_text", text: outputText, annotations: [] }],
+            },
+          });
+          write("response.completed", {
+            response: createAgentResponsesBody(model, outputText, responseId, reasoningSummary),
+          });
+          if (!closed) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          close();
         })
-        .catch((error: unknown) => controller.error(error));
+        .catch((error: unknown) => {
+          const failure = resolveAgentFailure(error);
+          finishReasoning();
+          if (messageStarted) {
+            write("response.output_text.done", {
+              item_id: messageId,
+              output_index: 1,
+              content_index: 0,
+              text: outputText,
+            });
+            write("response.content_part.done", {
+              item_id: messageId,
+              output_index: 1,
+              content_index: 0,
+              part: { type: "output_text", text: outputText, annotations: [] },
+            });
+            write("response.output_item.done", {
+              output_index: 1,
+              item: {
+                id: messageId,
+                type: "message",
+                status: "incomplete",
+                role: "assistant",
+                content: [{ type: "output_text", text: outputText, annotations: [] }],
+              },
+            });
+          }
+          const reasoningSummary = progressMessages.join("\n");
+          write("response.failed", {
+            response: {
+              id: responseId,
+              object: "response",
+              status: "failed",
+              model,
+              output: [
+                {
+                  id: reasoningId,
+                  type: "reasoning",
+                  status: "completed",
+                  summary: [{ type: "summary_text", text: reasoningSummary }],
+                },
+                ...(messageStarted
+                  ? [
+                      {
+                        id: messageId,
+                        type: "message",
+                        status: "incomplete",
+                        role: "assistant",
+                        content: [
+                          {
+                            type: "output_text",
+                            text: outputText,
+                            annotations: [],
+                          },
+                        ],
+                      },
+                    ]
+                  : []),
+              ],
+              error: failure,
+            },
+          });
+          if (!closed) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          close();
+        });
+    },
+    cancel() {
+      closed = true;
+      if (keepAlive !== undefined) clearInterval(keepAlive);
+      abortController.abort();
     },
   });
 };
 
 const createAgentChatStream = (
   model: string,
-  run: () => Promise<string>,
+  run: (
+    signal?: AbortSignal,
+    reportProgress?: (message: string) => void,
+    onOutputDelta?: (delta: string) => void,
+  ) => Promise<string>,
 ): ReadableStream<Uint8Array> => {
   const responseId = `chatcmpl_${randomUUID()}`;
   const encoder = new TextEncoder();
+  let closed = false;
+  let keepAlive: NodeJS.Timeout | undefined;
+  const abortController = new AbortController();
   return new ReadableStream<Uint8Array>({
     start(controller) {
-      const write = (event: string): void => controller.enqueue(encoder.encode(event));
-      void run()
+      let firstDelta = true;
+      let outputText = "";
+      keepAlive = setInterval(() => {
+        if (!closed) controller.enqueue(encoder.encode(": ai-tidu9 keep-alive\n\n"));
+      }, 10_000);
+      keepAlive.unref();
+      const write = (event: string): void => {
+        if (!closed) controller.enqueue(encoder.encode(event));
+      };
+      const close = (): void => {
+        if (closed) return;
+        closed = true;
+        if (keepAlive !== undefined) clearInterval(keepAlive);
+        controller.close();
+      };
+      const emitOutputDelta = (delta: string): void => {
+        if (closed || delta === "") return;
+        outputText += delta;
+        write(
+          `data: ${JSON.stringify({ id: responseId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1_000), model, choices: [{ index: 0, delta: { ...(firstDelta ? { role: "assistant" } : {}), content: delta }, finish_reason: null }] })}\n\n`,
+        );
+        firstDelta = false;
+      };
+      void run(abortController.signal, undefined, emitOutputDelta)
         .then((text) => {
-          write(
-            `data: ${JSON.stringify({ id: responseId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1_000), model, choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] })}\n\n`,
-          );
+          if (outputText === "") {
+            emitOutputDelta(text);
+          } else if (text.startsWith(outputText) && text.length > outputText.length) {
+            emitOutputDelta(text.slice(outputText.length));
+          }
           write(
             `data: ${JSON.stringify({ id: responseId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1_000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
           );
           write("data: [DONE]\n\n");
-          controller.close();
+          close();
         })
-        .catch((error: unknown) => controller.error(error));
+        .catch((error: unknown) => {
+          const failure = resolveAgentFailure(error);
+          write(`data: ${JSON.stringify({ error: { ...failure, type: "server_error" } })}\n\n`);
+          write("data: [DONE]\n\n");
+          close();
+        });
+    },
+    cancel() {
+      closed = true;
+      if (keepAlive !== undefined) clearInterval(keepAlive);
+      abortController.abort();
     },
   });
 };
@@ -652,21 +991,92 @@ const createAgentChatStream = (
 const runAgentResponsesTask = async (
   agentKernel: AgentKernel,
   body: Record<string, unknown>,
+  protocol: "chat-completions" | "responses",
   originHost: AgentHostId,
+  signal?: AbortSignal,
+  reportProgress?: (message: string) => void,
+  onOutputDelta?: (delta: string) => void,
 ): Promise<string> => {
   const objective = createAgentObjective(body);
   if (objective === "") throw new Error("The Agent request does not contain a usable goal.");
+  const reasoning = isRecord(body.reasoning) ? body.reasoning.effort : undefined;
+  const requestedReasoningEffort = reasoning ?? body.reasoning_effort;
+  const allowedReasoningEfforts = new Set<AgentReasoningEffort>([
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+  ]);
+  const reasoningEffort =
+    typeof requestedReasoningEffort === "string" &&
+    allowedReasoningEfforts.has(requestedReasoningEffort as AgentReasoningEffort)
+      ? (requestedReasoningEffort as AgentReasoningEffort)
+      : undefined;
+  const model = typeof body.model === "string" ? body.model : "ai-tidu9-config";
+  const requiredCapabilities = inferModelRequestCapabilities({
+    protocol,
+    body,
+    virtualModelId: model,
+    routing: { host: originHost },
+  });
+  reportProgress?.("正在解析请求并确认所需能力…");
   const created = await agentKernel.createTask({
     goal: {
       objective,
       acceptanceCriteria: ["The response addresses the requested goal."],
     },
     originHost,
+    planningMode: "response",
+    verificationMode: "response",
+    requiredCapabilities,
+    ...(reasoningEffort === undefined ? {} : { modelPreferences: { reasoningEffort } }),
+    modelRequest: {
+      protocol,
+      body,
+      virtualModelId: model,
+      ...(onOutputDelta === undefined ? {} : { onOutputDelta }),
+      ...(reportProgress === undefined ? {} : { onProgress: reportProgress }),
+    },
   });
-  const completed = await agentKernel.runTask(created.task.taskId);
+  reportProgress?.(
+    reasoningEffort === undefined
+      ? "执行任务已创建，正在按动态路由调用模型…"
+      : `执行任务已创建，正在按 ${reasoningEffort} 强度调用模型…`,
+  );
+  const cancel = (): void => {
+    void agentKernel.cancelTask(created.task.taskId).catch(() => undefined);
+  };
+  if (signal?.aborted) cancel();
+  signal?.addEventListener("abort", cancel, { once: true });
+  const completed = await agentKernel.runTask(created.task.taskId).finally(() => {
+    signal?.removeEventListener("abort", cancel);
+  });
   if (completed.task.status !== "completed" || completed.result?.accepted !== true) {
-    throw new Error(`The Agent task ended with status ${completed.task.status}.`);
+    const failureEvent = [...completed.events]
+      .reverse()
+      .find((event) => event.type === "task.failed");
+    const failureReason =
+      failureEvent !== undefined &&
+      isRecord(failureEvent.payload) &&
+      typeof failureEvent.payload.reason === "string"
+        ? failureEvent.payload.reason
+        : undefined;
+    const failureCode =
+      failureEvent !== undefined &&
+      isRecord(failureEvent.payload) &&
+      typeof failureEvent.payload.errorCode === "string"
+        ? failureEvent.payload.errorCode
+        : undefined;
+    const message = failureReason ?? `The Agent task ended with status ${completed.task.status}.`;
+    throw failureCode === undefined
+      ? new Error(message)
+      : new AgentExecutionError(failureCode, message);
   }
+  reportProgress?.("模型输出已完成，正在确认响应完整性…");
   return completed.result.summary;
 };
 
@@ -704,6 +1114,29 @@ const handleOpenAiInference = async (
   }
   const requestBody = body as Record<string, unknown>;
   const probe = isRecord(requestBody.metadata) && requestBody.metadata.ai_tidu9_probe === true;
+  const modelSelection = workspace.active.configuration.modelSelection ?? {
+    source: "official" as const,
+    model: "current",
+  };
+  const executeProvider = (
+    signal: AbortSignal,
+    providerBody: Record<string, unknown> = requestBody,
+  ): Promise<ProviderExecutionResult> => {
+    if (provider === undefined) {
+      throw new Error("No upstream model provider is configured.");
+    }
+    return provider.execute({
+      protocol,
+      body: providerBody,
+      virtualModelId: activeModelId,
+      signal,
+      routing: {
+        host: originHost,
+        modelSource: modelSelection.source,
+        ...(modelSelection.model === "current" ? {} : { targetModel: modelSelection.model }),
+      },
+    });
+  };
   if (!probe) {
     if (agentKernel === undefined) {
       sendOpenAiJson(
@@ -719,7 +1152,20 @@ const handleOpenAiInference = async (
       return;
     }
     const model = typeof requestBody.model === "string" ? requestBody.model : "ai-tidu9-config";
-    const run = () => runAgentResponsesTask(agentKernel, requestBody, originHost);
+    const run = async (
+      signal?: AbortSignal,
+      reportProgress?: (message: string) => void,
+      onOutputDelta?: (delta: string) => void,
+    ): Promise<string> =>
+      runAgentResponsesTask(
+        agentKernel,
+        requestBody,
+        protocol,
+        originHost,
+        signal,
+        reportProgress,
+        onOutputDelta,
+      );
     try {
       if (requestBody.stream === true) {
         const stream =
@@ -739,21 +1185,17 @@ const handleOpenAiInference = async (
         );
       }
     } catch (error) {
-      const reason = error instanceof Error ? error.message : "The Agent task failed.";
+      const failure = resolveAgentFailure(error);
       sendOpenAiJson(
         response,
         502,
-        createOpenAiError("agent_task_failed", reason, "server_error"),
+        createOpenAiError(failure.code, failure.message, "server_error"),
         requestId,
       );
     }
     return;
   }
   if (provider !== undefined) {
-    const modelSelection = workspace.active.configuration.modelSelection ?? {
-      source: "official" as const,
-      model: "current",
-    };
     if (
       (modelSelection.source === "company" || modelSelection.source === "custom") &&
       provider.descriptor.type !== "tidu-router" &&
@@ -777,17 +1219,7 @@ const handleOpenAiInference = async (
     request.once("aborted", abortProvider);
     response.once("close", abortProvider);
     try {
-      const result = await provider.execute({
-        protocol,
-        body: body as Record<string, unknown>,
-        virtualModelId: activeModelId,
-        signal: controller.signal,
-        routing: {
-          host: originHost,
-          modelSource: modelSelection.source,
-          ...(modelSelection.model === "current" ? {} : { targetModel: modelSelection.model }),
-        },
-      });
+      const result = await executeProvider(controller.signal);
       if (result.kind === "stream") {
         await sendOpenAiStream(response, result.statusCode, result.stream, requestId);
       } else if (result.statusCode >= 400) {
@@ -980,8 +1412,10 @@ const readDraftConfiguration = (
     throw new TiduError("CONFIGURATION_INVALID", "Configuration payload is invalid.");
   }
 
-  const parseSpecialists = (value: unknown): CapabilitySpecialistConfiguration[] | undefined => {
-    if (!Array.isArray(value)) return undefined;
+  const parseSpecialists = (value: unknown): CapabilitySpecialistConfiguration[] => {
+    if (!Array.isArray(value)) {
+      throw new TiduError("CONFIGURATION_INVALID", "Specialist configuration is invalid.");
+    }
     const specialists: CapabilitySpecialistConfiguration[] = [];
     for (const specialist of value) {
       if (
@@ -997,7 +1431,7 @@ const readDraftConfiguration = (
         !Array.isArray(specialist.capabilities) ||
         !specialist.capabilities.every((capability) => typeof capability === "string")
       ) {
-        return undefined;
+        throw new TiduError("CONFIGURATION_INVALID", "Specialist configuration is invalid.");
       }
       specialists.push({
         host: specialist.host,
@@ -1016,10 +1450,30 @@ const readDraftConfiguration = (
     }
     return specialists;
   };
-  const completionCandidate = isRecord(candidate.capabilityCompletion)
-    ? candidate.capabilityCompletion
-    : undefined;
-  const specialists = parseSpecialists(completionCandidate?.specialists);
+  if (!isRecord(candidate.modelSelection)) {
+    throw new TiduError("CONFIGURATION_INVALID", "Model selection is invalid.");
+  }
+  if (
+    (candidate.modelSelection.source !== "official" &&
+      candidate.modelSelection.source !== "company" &&
+      candidate.modelSelection.source !== "custom") ||
+    typeof candidate.modelSelection.model !== "string"
+  ) {
+    throw new TiduError("CONFIGURATION_INVALID", "Model selection is invalid.");
+  }
+  if (!isRecord(candidate.capabilityCompletion)) {
+    throw new TiduError("CONFIGURATION_INVALID", "Capability completion is invalid.");
+  }
+  const completionCandidate = candidate.capabilityCompletion;
+  if (
+    typeof completionCandidate.enabled !== "boolean" ||
+    !Array.isArray(completionCandidate.mainCapabilities) ||
+    !completionCandidate.mainCapabilities.every((capability) => typeof capability === "string") ||
+    typeof completionCandidate.maximumSpecialists !== "number"
+  ) {
+    throw new TiduError("CONFIGURATION_INVALID", "Capability completion is invalid.");
+  }
+  const specialists = parseSpecialists(completionCandidate.specialists);
   const hostPolicies: Partial<
     Record<
       AgentHostId,
@@ -1031,23 +1485,34 @@ const readDraftConfiguration = (
       }
     >
   > = {};
-  if (isRecord(completionCandidate?.hostPolicies)) {
+  if (
+    completionCandidate.hostPolicies !== undefined &&
+    !isRecord(completionCandidate.hostPolicies)
+  ) {
+    throw new TiduError("CONFIGURATION_INVALID", "Host capability policy is invalid.");
+  }
+  if (isRecord(completionCandidate.hostPolicies)) {
+    const supportedHosts = new Set(["codex", "cursor", "ollama", "openai-compatible"]);
+    if (Object.keys(completionCandidate.hostPolicies).some((host) => !supportedHosts.has(host))) {
+      throw new TiduError("CONFIGURATION_INVALID", "Host capability policy is invalid.");
+    }
     for (const host of ["codex", "cursor", "ollama", "openai-compatible"] as const) {
       const policy = completionCandidate.hostPolicies[host];
-      if (!isRecord(policy) || !isRecord(policy.mainModel)) continue;
-      const policySpecialists = parseSpecialists(policy.specialists);
+      if (policy === undefined) continue;
       if (
+        !isRecord(policy) ||
+        !isRecord(policy.mainModel) ||
         (policy.mainModel.source !== "official" &&
           policy.mainModel.source !== "company" &&
           policy.mainModel.source !== "custom") ||
         typeof policy.mainModel.model !== "string" ||
         !Array.isArray(policy.mainCapabilities) ||
         !policy.mainCapabilities.every((capability) => typeof capability === "string") ||
-        policySpecialists === undefined ||
         typeof policy.maximumSpecialists !== "number"
       ) {
-        continue;
+        throw new TiduError("CONFIGURATION_INVALID", "Host capability policy is invalid.");
       }
+      const policySpecialists = parseSpecialists(policy.specialists);
       hostPolicies[host] = {
         mainModel: {
           source: policy.mainModel.source,
@@ -1064,32 +1529,17 @@ const readDraftConfiguration = (
     activeMode: mode,
     activeProfileId: candidate.activeProfileId,
     virtualModelName: candidate.virtualModelName,
-    modelSelection:
-      isRecord(candidate.modelSelection) &&
-      (candidate.modelSelection.source === "official" ||
-        candidate.modelSelection.source === "company" ||
-        candidate.modelSelection.source === "custom") &&
-      typeof candidate.modelSelection.model === "string"
-        ? {
-            source: candidate.modelSelection.source,
-            model: candidate.modelSelection.model,
-          }
-        : { source: "official", model: "current" },
-    capabilityCompletion:
-      completionCandidate !== undefined &&
-      typeof completionCandidate.enabled === "boolean" &&
-      Array.isArray(completionCandidate.mainCapabilities) &&
-      completionCandidate.mainCapabilities.every((capability) => typeof capability === "string") &&
-      specialists !== undefined &&
-      typeof completionCandidate.maximumSpecialists === "number"
-        ? {
-            enabled: completionCandidate.enabled,
-            mainCapabilities: completionCandidate.mainCapabilities as string[],
-            specialists,
-            maximumSpecialists: completionCandidate.maximumSpecialists,
-            hostPolicies,
-          }
-        : createDefaultConfiguration(mode).capabilityCompletion,
+    modelSelection: {
+      source: candidate.modelSelection.source,
+      model: candidate.modelSelection.model,
+    },
+    capabilityCompletion: {
+      enabled: completionCandidate.enabled,
+      mainCapabilities: completionCandidate.mainCapabilities as string[],
+      specialists,
+      maximumSpecialists: completionCandidate.maximumSpecialists,
+      hostPolicies,
+    },
   };
   if (mode === "expert") {
     const expertServices = candidate.expertServices;
@@ -1180,6 +1630,66 @@ const handleConfigurationMutationError = (
   throw error;
 };
 
+export const evaluateCapabilityCompletionDiagnostic = (
+  record:
+    | Pick<CapabilityCompletionUsageRecord, "mainResult" | "outcome" | "secondaryResults">
+    | undefined,
+  upstreamStatusCode: number | null,
+) => {
+  const mainInvoked =
+    record?.mainResult.outcome === "succeeded" || record?.mainResult.outcome === "failed";
+  const selectedSecondaryResults =
+    record?.secondaryResults.filter(
+      (result) => result.outcome !== "not-run" || result.skipReason === "blocked-by-failure",
+    ) ?? [];
+  const secondaryInvoked = selectedSecondaryResults.some(
+    (result) => result.outcome === "succeeded" || result.outcome === "failed",
+  );
+  const allSelectedInvocationsSucceeded =
+    record?.mainResult.outcome === "succeeded" &&
+    selectedSecondaryResults.length > 0 &&
+    selectedSecondaryResults.every((result) => result.outcome === "succeeded");
+  const upstreamSucceeded =
+    upstreamStatusCode !== null && upstreamStatusCode >= 200 && upstreamStatusCode < 300;
+  const passed =
+    upstreamSucceeded &&
+    record?.outcome === "succeeded" &&
+    mainInvoked &&
+    secondaryInvoked &&
+    allSelectedInvocationsSucceeded;
+  let message =
+    "The configured primary and secondary routing path completed successfully. This diagnostic does not verify the model's claimed semantic capability.";
+  if (!passed) {
+    if (record === undefined) {
+      message = "The routing-path diagnostic did not produce a fresh execution record.";
+    } else if (!mainInvoked) {
+      message = "The routing-path diagnostic failed because the primary model was not invoked.";
+    } else if (record.mainResult.outcome !== "succeeded") {
+      message = "The routing-path diagnostic failed because the primary invocation failed.";
+    } else if (!secondaryInvoked) {
+      message = "The routing-path diagnostic failed because no secondary model was invoked.";
+    } else if (selectedSecondaryResults.some((result) => result.outcome === "failed")) {
+      message =
+        "The routing-path diagnostic failed because at least one selected secondary invocation failed.";
+    } else if (selectedSecondaryResults.some((result) => result.outcome === "not-run")) {
+      message =
+        "The routing-path diagnostic failed because at least one selected secondary invocation did not run.";
+    } else if (!upstreamSucceeded) {
+      message = `The routing-path diagnostic returned HTTP ${String(upstreamStatusCode)}.`;
+    } else {
+      message = "The routing-path diagnostic did not finish with a successful routing outcome.";
+    }
+  }
+  return {
+    allSelectedInvocationsSucceeded,
+    httpStatus: passed ? 200 : 502,
+    mainInvoked,
+    message,
+    passed,
+    secondaryInvoked,
+  };
+};
+
 const handleRequest = async (
   request: import("node:http").IncomingMessage,
   response: import("node:http").ServerResponse,
@@ -1194,6 +1704,7 @@ const handleRequest = async (
   capabilityRuntime: CapabilityRuntime | undefined,
   deployment: "personal" | "enterprise",
   runtimeNetwork: { host: string; port: number },
+  refreshCodexModelCatalog: () => Promise<void>,
   runtimePaths: {
     /** Runtime configuration or persistent configuration-storage path. */
     configurationPath: string;
@@ -1227,6 +1738,14 @@ const handleRequest = async (
     const status = await capabilityCompletionProvider?.inspectCapabilityCompletion();
     const enterpriseState = await enterprise?.snapshot();
     const remoteCompany = await storage.enterpriseConnectionStore?.load();
+    const completionConfiguration = workspace.active.configuration.capabilityCompletion;
+    const codexMainCapabilities =
+      completionConfiguration.hostPolicies?.codex?.mainCapabilities ??
+      (provider?.descriptor.type === "codex-host" ? completionConfiguration.mainCapabilities : []);
+    const codexHostProvider = await getCatalogProviderForHost("codex");
+    const codexReasoningEffortSupported =
+      codexHostProvider?.descriptor.type === "codex-host" &&
+      codexMainCapabilities.includes("reasoning");
     const activeHost: AgentHostId | null =
       provider?.descriptor.type === "codex-host"
         ? "codex"
@@ -1236,12 +1755,11 @@ const handleRequest = async (
             ? "ollama"
             : provider?.descriptor.type === "openai-compatible"
               ? "openai-compatible"
-              : workspace.active.configuration.modelSelection.source === "official"
-                ? "codex"
-                : null;
+              : null;
     sendJson(response, 200, {
       activeHost,
       available: capabilityCompletionProvider !== undefined,
+      codexReasoningEffortSupported,
       operational:
         capabilityCompletionProvider !== undefined &&
         workspace.active.configuration.capabilityCompletion.enabled &&
@@ -1259,6 +1777,109 @@ const handleRequest = async (
       },
       hosts: ["codex", "cursor", "cli", "ollama", "openai-compatible"],
     });
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/capability-completion/test") {
+    try {
+      validateMutationRequest(request);
+      const body = await readJsonBody(request);
+      const host = isRecord(body) ? body.host : undefined;
+      if (
+        host !== "codex" &&
+        host !== "cursor" &&
+        host !== "ollama" &&
+        host !== "openai-compatible"
+      ) {
+        throw new TiduError("CONFIGURATION_INVALID", "A valid primary host is required.");
+      }
+      if (capabilityCompletionProvider === undefined) {
+        sendJson(response, 503, { error: "CAPABILITY_COMPLETION_UNAVAILABLE" });
+        return;
+      }
+      const workspace = await storage.configurationStore.loadWorkspace();
+      const configuration = workspace.active.configuration.capabilityCompletion;
+      const hostPolicy = configuration.hostPolicies?.[host];
+      const mainCapabilities = hostPolicy?.mainCapabilities ?? configuration.mainCapabilities;
+      const specialists = hostPolicy?.specialists ?? configuration.specialists;
+      const requiredCapability =
+        specialists
+          .flatMap((specialist) => specialist.capabilities)
+          .find((capability) => !mainCapabilities.includes(capability)) ??
+        specialists.flatMap((specialist) => specialist.capabilities)[0];
+      if (!configuration.enabled || specialists.length === 0 || requiredCapability === undefined) {
+        sendJson(response, 409, {
+          error: "CAPABILITY_COMPLETION_TEST_NOT_READY",
+          message:
+            "Enable dynamic model routing and configure at least one secondary model capability.",
+        });
+        return;
+      }
+      const startedAt = performance.now();
+      const diagnosticStartedAt = Date.now();
+      const readDiagnosticRecord = async (): Promise<CapabilityCompletionUsageRecord | undefined> =>
+        (await capabilityCompletionProvider.inspectCapabilityCompletion()).records.find(
+          (record) =>
+            record.role === "verification" && Date.parse(record.occurredAt) >= diagnosticStartedAt,
+        );
+      try {
+        const result = await capabilityCompletionProvider.execute({
+          protocol: "responses",
+          body: {
+            model: workspace.active.configuration.activeProfileId,
+            input:
+              "Run a minimal primary-secondary routing-path diagnostic. Return one short sentence.",
+            stream: false,
+          },
+          virtualModelId: workspace.active.configuration.activeProfileId,
+          signal: AbortSignal.timeout(120_000),
+          routing: {
+            host,
+            requiredCapabilities: [requiredCapability],
+            requireSpecialist: true,
+            role: "verification",
+          },
+        });
+        const latest = await readDiagnosticRecord();
+        const diagnostic = evaluateCapabilityCompletionDiagnostic(latest, result.statusCode);
+        sendJson(response, diagnostic.httpStatus, {
+          ...(diagnostic.passed ? {} : { error: "CAPABILITY_COMPLETION_TEST_FAILED" }),
+          verificationScope: "routing-path-only",
+          capabilitySemanticsVerified: false,
+          message: diagnostic.message,
+          durationMilliseconds: Math.round(performance.now() - startedAt),
+          mainInvoked: diagnostic.mainInvoked,
+          secondaryInvoked: diagnostic.secondaryInvoked,
+          requiredCapability,
+          record: latest ?? null,
+          statusCode: result.statusCode,
+        });
+      } catch (error) {
+        const latest = await readDiagnosticRecord();
+        const diagnostic = evaluateCapabilityCompletionDiagnostic(latest, null);
+        sendJson(response, 502, {
+          error: "CAPABILITY_COMPLETION_TEST_FAILED",
+          message: error instanceof Error ? error.message : diagnostic.message,
+          verificationScope: "routing-path-only",
+          capabilitySemanticsVerified: false,
+          durationMilliseconds: Math.round(performance.now() - startedAt),
+          mainInvoked: diagnostic.mainInvoked,
+          secondaryInvoked: diagnostic.secondaryInvoked,
+          requiredCapability,
+          record: latest ?? null,
+          statusCode: null,
+        });
+      }
+    } catch (error) {
+      if (error instanceof TiduError) {
+        handleConfigurationMutationError(response, error);
+      } else {
+        sendJson(response, 502, {
+          error: "CAPABILITY_COMPLETION_TEST_FAILED",
+          message: error instanceof Error ? error.message : "Capability completion test failed.",
+        });
+      }
+    }
     return;
   }
 
@@ -1438,24 +2059,27 @@ const handleRequest = async (
       sendJson(response, 403, { error: "PERSONAL_EDITION_ONLY" });
       return;
     }
-    const cursor = inspectCursorHostLogin();
-    const [codex, cursorProvider] = await Promise.all([
-      inspectCodexHostAccountReport().catch(() => null),
-      cursor.reusable
-        ? createCursorHostModelProvider().catch(() => undefined)
-        : Promise.resolve(undefined),
-    ]);
-    sendJson(response, 200, {
-      activeProvider: provider?.descriptor ?? null,
-      codex,
-      cursor: {
-        agentStatus: cursor.status,
-        agentProtocolAvailable: cursor.acpAvailable,
-        accountEmail: cursor.accountEmail ?? null,
-        accountPlan: cursor.accountPlan ?? null,
-        model: cursorProvider?.descriptor.model ?? null,
-      },
+    const snapshot = await readCachedRuntimeValue(storage, "host-usage", 60_000, async () => {
+      const [codex, cursor] = await Promise.all([
+        inspectCodexHostAccountReport(5_000).catch(() => null),
+        inspectCursorHostLoginAsync().catch(() => null),
+      ]);
+      const cursorProvider = cursor?.reusable
+        ? await getCatalogProviderForHost("cursor")
+        : undefined;
+      return {
+        activeProvider: provider?.descriptor ?? null,
+        codex,
+        cursor: {
+          agentStatus: cursor?.status ?? "unavailable",
+          agentProtocolAvailable: cursor?.acpAvailable ?? false,
+          accountEmail: cursor?.accountEmail ?? null,
+          accountPlan: cursor?.accountPlan ?? null,
+          model: cursorProvider?.descriptor.model ?? null,
+        },
+      };
     });
+    sendJson(response, 200, snapshot);
     return;
   }
 
@@ -2123,76 +2747,60 @@ const handleRequest = async (
   }
 
   if (request.method === "GET" && pathname === "/api/models/upstreams") {
-    const workspace = await storage.configurationStore.loadWorkspace();
-    const [cursorProvider, ollamaProvider, compatibleProvider] = await Promise.all([
-      getCatalogProviderForHost("cursor"),
-      getCatalogProviderForHost("ollama"),
-      getCatalogProviderForHost("openai-compatible"),
-    ]);
-    const [cursorCatalogModels, ollamaModels, compatibleModels] = await Promise.all([
-      cursorProvider?.listModels?.().catch(() => []) ?? [],
-      ollamaProvider?.listModels?.().catch(() => []) ?? [],
-      compatibleProvider?.listModels?.().catch(() => []) ?? [],
-    ]);
-    const officialModels = listCodexOfficialModels();
-    const cursorLogin = inspectCursorHostLogin();
-    const cursorHostModels = cursorLogin.reusable ? listCursorHostModels() : [];
-    const cursorModels =
-      cursorCatalogModels.length > 0
-        ? cursorCatalogModels.map((model) => ({
-            ...model,
-            isDefault: model.id === cursorProvider?.descriptor.model,
-          }))
-        : cursorHostModels.length > 0
-          ? cursorHostModels.map((model) => ({
-              id: model.id,
-              name: model.name,
-              capabilities: ["text", "code", "tool-use"],
-              capabilitySource: "provider-catalog" as const,
-              isDefault: model.default,
-            }))
-          : cursorLogin.reusable
-            ? [
-                {
-                  id: cursorProvider?.descriptor.model ?? "auto",
-                  name: cursorProvider?.descriptor.model ?? "auto",
-                  capabilities: ["text", "code", "tool-use"],
-                  capabilitySource: "provider-catalog" as const,
-                  isDefault: true,
-                },
-              ]
-            : [];
-    const companyProvider = ollamaProvider ?? compatibleProvider;
-    const companyModels = ollamaProvider === undefined ? compatibleModels : ollamaModels;
-    sendJson(response, 200, {
-      selection: workspace.active.configuration.modelSelection ?? {
-        source: "official",
-        model: "current",
-      },
-      official: officialModels,
-      company: companyModels ?? [],
-      hosts: {
-        codex: {
-          available: inspectCodexHostLogin().reusable,
-          models: officialModels,
+    const catalog = await readCachedRuntimeValue(storage, "upstream-models", 60_000, async () => {
+      const workspace = await storage.configurationStore.loadWorkspace();
+      const [cursorProvider, ollamaProvider, compatibleProvider, codexLogin] = await Promise.all([
+        getCatalogProviderForHost("cursor"),
+        getCatalogProviderForHost("ollama"),
+        getCatalogProviderForHost("openai-compatible"),
+        inspectCodexHostLoginAsync(),
+      ]);
+      const [cursorCatalogModels, ollamaModels, compatibleModels] = await Promise.all([
+        cursorProvider?.listModels?.().catch(() => []) ?? [],
+        ollamaProvider?.listModels?.().catch(() => []) ?? [],
+        compatibleProvider?.listModels?.().catch(() => []) ?? [],
+      ]);
+      const officialModels = listCodexOfficialModels();
+      const cursorModels = cursorCatalogModels.map((model) => ({
+        ...model,
+        isDefault: model.id === cursorProvider?.descriptor.model,
+      }));
+      const companyProvider = ollamaProvider ?? compatibleProvider;
+      const companyModels = ollamaProvider === undefined ? compatibleModels : ollamaModels;
+      return {
+        selection: workspace.active.configuration.modelSelection ?? {
+          source: "official",
+          model: "current",
         },
-        cursor: { available: cursorLogin.reusable, models: cursorModels },
-        ollama: {
-          available: ollamaProvider !== undefined,
-          models: ollamaModels,
+        official: officialModels,
+        company: companyModels ?? [],
+        hosts: {
+          codex: {
+            available: codexLogin.reusable,
+            models: officialModels,
+          },
+          cursor: {
+            available: cursorProvider !== undefined,
+            models: cursorModels,
+          },
+          ollama: {
+            available: ollamaProvider !== undefined,
+            models: ollamaModels,
+          },
+          "openai-compatible": {
+            available: compatibleProvider !== undefined,
+            models: compatibleModels,
+          },
         },
-        "openai-compatible": {
-          available: compatibleProvider !== undefined,
-          models: compatibleModels,
-        },
-      },
-      companyConfigured: companyProvider !== undefined,
-      companyProviderType:
-        companyProvider?.descriptor.type === "ollama" ||
-        companyProvider?.descriptor.type === "openai-compatible"
-          ? companyProvider.descriptor.type
-          : null,
+        companyConfigured: companyProvider !== undefined,
+        companyProviderType:
+          companyProvider?.descriptor.type === "ollama" ||
+          companyProvider?.descriptor.type === "openai-compatible"
+            ? companyProvider.descriptor.type
+            : null,
+      };
     });
+    sendJson(response, 200, catalog);
     return;
   }
 
@@ -2316,8 +2924,17 @@ const handleRequest = async (
         storage.configurationStore,
         mode,
         readExpectedRevision(body, "expectedDraftRevision"),
-        async (configuration) =>
-          configuration.activeMode === mode && configuration.activeProfileId.trim() !== "",
+        async (configuration) => {
+          if (configuration.activeMode !== mode || configuration.activeProfileId.trim() === "") {
+            return false;
+          }
+          try {
+            await refreshCodexModelCatalog();
+            return true;
+          } catch {
+            return false;
+          }
+        },
       );
       if (activation.rolledBack) {
         sendJson(response, 422, {
@@ -2513,7 +3130,9 @@ export const startLocalRuntime = async (
   const getConnectedProviderForHost = (host: AgentHostId): Promise<ModelProvider | undefined> =>
     hostProviderPromises.get(host) ?? Promise.resolve(undefined);
   const getCatalogProviderForHost = (host: AgentHostId): Promise<ModelProvider | undefined> =>
-    host === "ollama" ? resolveProviderForHost(host) : getConnectedProviderForHost(host);
+    host === "cursor" || host === "ollama"
+      ? resolveProviderForHost(host)
+      : getConnectedProviderForHost(host);
   const scalingControlPlane =
     options.scalingControlPlane ?? environmentEnterpriseRuntime?.scalingControlPlane;
   const defaultDatabasePath = resolveDefaultDatabasePath();
@@ -2593,6 +3212,13 @@ export const startLocalRuntime = async (
     proxyConfigurationPath:
       configuredProxyPath && configuredProxyPath !== "" ? resolve(configuredProxyPath) : null,
   };
+  const refreshCodexModelCatalog =
+    options.codexClientModelCatalogRefresh ??
+    (process.env.NODE_TEST_CONTEXT !== undefined
+      ? async () => undefined
+      : async () => {
+          await refreshCodexClientModelCatalog();
+        });
   const server = createServer((request, response) => {
     const requestStartedAt = Date.now();
     const requestPath = new URL(request.url ?? "/", "http://localhost").pathname;
@@ -2615,6 +3241,7 @@ export const startLocalRuntime = async (
       options.capabilityRuntime,
       deployment,
       runtimeNetwork,
+      refreshCodexModelCatalog,
       runtimePaths,
     ).catch(() => {
       if (!response.headersSent) {

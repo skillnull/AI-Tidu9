@@ -9,6 +9,7 @@ import type {
   ModelSelection,
   TiduConfiguration,
 } from "../../src/config/index.js";
+import { isValidModelIdentifier } from "../../src/config/index.js";
 import type { ConfigCenterBootstrap } from "../../src/config-center/contracts.js";
 
 export interface EnterpriseMemberUsageReport {
@@ -58,7 +59,7 @@ export type LoadingState =
 
 export type OperationState =
   | { status: "idle" }
-  | { status: "pending"; action: "activate" | "rollback" | "save" | "simulate" }
+  | { status: "pending"; action: "activate" | "rollback" | "save" }
   | { status: "success"; message: string }
   | { status: "error"; message: string };
 
@@ -99,42 +100,102 @@ interface TaskListResponse {
   tasks: readonly TaskControlView[];
 }
 
+interface CapabilityCompletionModelResultView {
+  /** Stable internal routing identifier. */
+  modelId: string;
+  /** Host that owns the model. */
+  host: AgentHostId;
+  /** Configured upstream model identifier. */
+  model: string;
+  /** Whether this is the primary or a secondary model. */
+  role: "main" | "secondary";
+  /** Required capabilities assigned to this model. */
+  capabilities: readonly string[];
+  /** Result of this individual model call. */
+  outcome: "failed" | "not-run" | "succeeded";
+  /** Why a configured model was not called. */
+  skipReason?: "blocked-by-failure" | "not-selected";
+  /** Upstream HTTP status, or null when unavailable. */
+  statusCode: number | null;
+  /** Individual model duration, or null when not called. */
+  durationMilliseconds: number | null;
+  /** Bounded diagnostic summary. */
+  message: string;
+}
+
+interface CapabilityCompletionUsageRecordView {
+  /** Host that originated the request. */
+  host: AgentHostId;
+  /** ISO timestamp for this routing decision. */
+  occurredAt: string;
+  /** Agent role handled by the request. */
+  role: string;
+  /** Whether a secondary model was selected. */
+  complemented: boolean;
+  /** Final combined routing outcome. */
+  outcome: "failed" | "succeeded";
+  /** Primary model used for the request. */
+  mainModelId: string;
+  /** Secondary models selected for the request. */
+  specialistModelIds: readonly string[];
+  /** Capabilities required by the request. */
+  requiredCapabilities: readonly string[];
+  /** Capabilities the primary model did not provide. */
+  missingCapabilities: readonly string[];
+  /** Multi-factor routing rule that selected this route. */
+  reason:
+    | "main-capability-match"
+    | "capability-gap"
+    | "lower-token-cost"
+    | "lower-latency"
+    | "higher-availability"
+    | "tighter-privacy"
+    | "failure-fallback"
+    | "explicit-secondary-test";
+  /** Primary-model execution result. */
+  mainResult: CapabilityCompletionModelResultView;
+  /** Secondary-model execution results. */
+  secondaryResults: readonly CapabilityCompletionModelResultView[];
+}
+
 interface CapabilityCompletionStatusResponse {
   /** Host currently backing the active primary model, when identifiable. */
   activeHost: AgentHostId | null;
   /** Whether capability completion can be executed by this runtime. */
   available: boolean;
-  /** Whether the active policy has at least one usable specialist. */
+  /** Whether the active Codex host policy can execute caller-selected reasoning effort. */
+  codexReasoningEffortSupported: boolean;
+  /** Whether the active policy has at least one usable secondary model. */
   operational: boolean;
   /** Active capability-completion configuration. */
   configuration: CapabilityCompletionConfiguration;
   /** Active primary-model selection. */
   mainModel: ModelSelection;
   /** Recent bounded routing records. */
-  records: readonly {
-    /** Host that originated the request. */
-    host: AgentHostId;
-    /** ISO timestamp for this routing decision. */
-    occurredAt: string;
-    /** Agent role handled by the request. */
-    role: string;
-    /** Whether a specialist was invoked. */
-    complemented: boolean;
-    /** Final routing outcome. */
-    outcome: "failed" | "succeeded";
-    /** Primary model used for the request. */
-    mainModelId: string;
-    /** Specialist models used for the request. */
-    specialistModelIds: readonly string[];
-    /** Capabilities required by the request. */
-    requiredCapabilities: readonly string[];
-    /** Capabilities the primary model did not provide. */
-    missingCapabilities: readonly string[];
-  }[];
+  records: readonly CapabilityCompletionUsageRecordView[];
   /** Connected company capability summary. */
   company: { connected: boolean; publishedCapabilityCount: number };
   /** Host entry points exposed by the runtime. */
   hosts: readonly string[];
+}
+
+interface CapabilityCompletionTestResponse {
+  /** The diagnostic verifies routing execution only, not semantic capability quality. */
+  verificationScope: "routing-path-only";
+  /** Always false until a capability-specific semantic verifier is implemented. */
+  capabilitySemanticsVerified: false;
+  /** End-to-end duration measured by the local runtime. */
+  durationMilliseconds: number;
+  /** Whether the primary model was invoked. */
+  mainInvoked: boolean;
+  /** Whether at least one secondary model was invoked. */
+  secondaryInvoked: boolean;
+  /** Capability deliberately routed through a configured secondary model. */
+  requiredCapability: string;
+  /** HTTP status returned by the combined model route. */
+  statusCode: number | null;
+  /** Detailed record generated by this verification call. */
+  record: CapabilityCompletionUsageRecordView | null;
 }
 
 const MODEL_CAPABILITIES = [
@@ -181,25 +242,31 @@ const MODEL_CAPABILITIES = [
     en: "Long context",
     detail: "处理大型代码库或长文档",
   },
-  {
-    id: "document-analysis",
-    zh: "文档分析",
-    en: "Document analysis",
-    detail: "解析复杂文档和表格",
-  },
-  {
-    id: "domain-context",
-    zh: "领域知识",
-    en: "Domain context",
-    detail: "使用公司或行业专有知识",
-  },
-  {
-    id: "local-private",
-    zh: "本地隐私",
-    en: "Local private",
-    detail: "数据不离开本地边界",
-  },
 ] as const;
+
+export const selectableModelCapabilityIds = MODEL_CAPABILITIES.map((capability) => capability.id);
+
+const NON_ROUTABLE_CAPABILITY_IDS = new Set([
+  "document-analysis",
+  "domain-context",
+  "local-private",
+]);
+
+export const capabilityIdsForPicker = (
+  selected: readonly string[],
+  available?: readonly string[],
+): readonly string[] => {
+  const baseIds: readonly string[] = selectableModelCapabilityIds;
+  const extraIds = [...new Set([...(available ?? []), ...selected])].filter(
+    (capability) => !baseIds.includes(capability),
+  );
+  return [...baseIds, ...extraIds].filter(
+    (capability) =>
+      available === undefined ||
+      selected.includes(capability) ||
+      (available.includes(capability) && !NON_ROUTABLE_CAPABILITY_IDS.has(capability)),
+  );
+};
 
 type CatalogModel = {
   id: string;
@@ -210,6 +277,10 @@ type CatalogModel = {
   inputCostPerMillionTokens?: number | null;
   outputCostPerMillionTokens?: number | null;
 };
+
+export const defaultCapabilitiesForModel = (
+  model: Pick<CatalogModel, "capabilities"> | undefined,
+): readonly string[] => [...(model?.capabilities ?? [])];
 
 const capabilityLabel = (capability: string, english: boolean): string => {
   const item = MODEL_CAPABILITIES.find((candidate) => candidate.id === capability);
@@ -229,19 +300,28 @@ const CapabilityPicker = ({
   disabled: boolean;
   onChange: (capabilities: readonly string[]) => void;
 }) => {
-  const capabilityIds = available ?? selected;
-  const options = [
-    ...MODEL_CAPABILITIES,
-    ...capabilityIds
-      .filter((capability) => !MODEL_CAPABILITIES.some((item) => item.id === capability))
-      .map((id) => ({ id, zh: id, en: id, detail: "自定义能力声明" })),
-  ].filter((capability) => available === undefined || available.includes(capability.id));
+  const options = capabilityIdsForPicker(selected, available).map(
+    (capability) =>
+      MODEL_CAPABILITIES.find((item) => item.id === capability) ?? {
+        id: capability,
+        zh: capability,
+        en: capability,
+        detail: "自定义能力声明",
+      },
+  );
   return (
     <div className="capability-picker">
       {options.map((capability) => {
         const checked = selected.includes(capability.id);
+        const savedManualDeclaration =
+          available !== undefined &&
+          checked &&
+          (!available.includes(capability.id) || NON_ROUTABLE_CAPABILITY_IDS.has(capability.id));
         return (
-          <label className={checked ? "selected" : ""} key={capability.id}>
+          <label
+            className={`${checked ? "selected" : ""} ${savedManualDeclaration ? "saved-manual" : ""} ${disabled ? "disabled" : ""}`.trim()}
+            key={capability.id}
+          >
             <input
               type="checkbox"
               checked={checked}
@@ -254,9 +334,18 @@ const CapabilityPicker = ({
                 )
               }
             />
-            <span>
+            <span className="capability-check" aria-hidden="true" />
+            <span className="capability-copy">
               <strong>{english ? capability.en : capability.zh}</strong>
-              <small>{english ? capability.id : capability.detail}</small>
+              <small>
+                {savedManualDeclaration
+                  ? english
+                    ? `Saved manual declaration · ${capability.id} · not published by catalog`
+                    : `已保存的手工声明 · ${capability.id} · 目录当前未发布`
+                  : english
+                    ? capability.id
+                    : capability.detail}
+              </small>
             </span>
           </label>
         );
@@ -277,6 +366,25 @@ export const CapabilityCompletionPanel = ({
   const [catalog, setCatalog] = useState<UpstreamModelCatalog>();
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [message, setMessage] = useState(english ? "Loading…" : "正在读取…");
+  const [recordsHost, setRecordsHost] = useState<AgentHostId | null>(null);
+  const [testState, setTestState] = useState<
+    | { status: "idle" }
+    | { status: "pending"; host: AgentHostId }
+    | {
+        status: "success";
+        host: AgentHostId;
+        result: CapabilityCompletionTestResponse;
+      }
+    | { status: "error"; host: AgentHostId; message: string }
+  >({ status: "idle" });
+  useEffect(() => {
+    if (recordsHost === null) return undefined;
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") setRecordsHost(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [recordsHost]);
   const refresh = useCallback(async () => {
     setCatalogLoading(true);
     void fetch("/api/models/upstreams", { cache: "no-store" })
@@ -287,7 +395,9 @@ export const CapabilityCompletionPanel = ({
       .catch(() => undefined)
       .finally(() => setCatalogLoading(false));
     try {
-      const response = await fetch("/api/capability-completion", { cache: "no-store" });
+      const response = await fetch("/api/capability-completion", {
+        cache: "no-store",
+      });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       setStatus((await response.json()) as CapabilityCompletionStatusResponse);
       setMessage("");
@@ -302,6 +412,65 @@ export const CapabilityCompletionPanel = ({
       (host === "cursor" ? "auto" : english ? "Default" : "默认模型")
     );
   };
+  const displayResultMessage = (result: CapabilityCompletionModelResultView): string => {
+    if (english) return result.message;
+    if (result.skipReason === "not-selected")
+      return "本次请求按动态路由规则由其他模型执行，当前模型未被选中。";
+    if (result.skipReason === "blocked-by-failure")
+      return "该模型已被选中，但同一路由中的其他模型先失败，因而未执行。";
+    return result.message;
+  };
+  const routingReasonLabel = (reason: CapabilityCompletionUsageRecordView["reason"]): string =>
+    (english
+      ? {
+          "main-capability-match": "primary matched",
+          "capability-gap": "capability completion",
+          "lower-token-cost": "lower token cost",
+          "lower-latency": "lower observed latency",
+          "higher-availability": "higher availability",
+          "tighter-privacy": "tighter privacy boundary",
+          "failure-fallback": "failure fallback",
+          "explicit-secondary-test": "explicit primary + secondary test",
+        }
+      : {
+          "main-capability-match": "主模型匹配",
+          "capability-gap": "能力互补",
+          "lower-token-cost": "更低耗用/成本",
+          "lower-latency": "更低实测延迟",
+          "higher-availability": "更高可用性",
+          "tighter-privacy": "更严格隐私边界",
+          "failure-fallback": "失败切换",
+          "explicit-secondary-test": "主副模型显式联测",
+        })[reason];
+  const runCompletionTest = async (host: AgentHostId): Promise<void> => {
+    setTestState({ status: "pending", host });
+    try {
+      const response = await fetch("/api/capability-completion/test", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ host }),
+      });
+      const result = (await response.json()) as CapabilityCompletionTestResponse & {
+        message?: string;
+      };
+      if (!response.ok) {
+        throw new Error(
+          result.message ??
+            (english
+              ? `Complement test returned ${response.status}`
+              : `互补测试返回 ${response.status}`),
+        );
+      }
+      setTestState({ status: "success", host, result });
+      await refresh();
+    } catch (error) {
+      setTestState({
+        status: "error",
+        host,
+        message: error instanceof Error ? error.message : english ? "Test failed" : "测试失败",
+      });
+    }
+  };
   useEffect(() => void refresh(), [refresh]);
   return (
     <section className="capability-completion-panel">
@@ -311,21 +480,35 @@ export const CapabilityCompletionPanel = ({
           <h2>{english ? "Capability completion" : "能力互补"}</h2>
           <p>
             {english
-              ? "Codex, Cursor, CLI, and compatible APIs are entry points to one policy. The Agent invokes configured specialists only for capabilities the primary model lacks, then verifies the combined result."
-              : "Codex、Cursor、CLI 与兼容 API 只是同一策略的入口。主模型缺少任务能力时，Agent 才调用已配置的专家模型补位，并对合并结果独立验收。"}
+              ? "Codex, Cursor, CLI, and compatible APIs share one dynamic policy. Capability, token cost, privacy, observed latency, availability, and failures participate in routing."
+              : "Codex、Cursor、CLI 与兼容 API 共用一套动态策略；能力、耗用/成本、隐私、实测延迟、可用性和失败切换会参与路由。"}
           </p>
         </div>
         <div className="configuration-view-actions">
-          <button type="button" onClick={() => void refresh()}>
-            {english ? "Refresh" : "刷新"}
+          <button
+            type="button"
+            onClick={() => void refresh()}
+            disabled={catalogLoading}
+            aria-busy={catalogLoading}
+          >
+            {catalogLoading ? (english ? "Loading…" : "读取中…") : english ? "Refresh" : "刷新"}
           </button>
         </div>
       </div>
-      {message ? <p role="status">{message}</p> : null}
+      {message ? (
+        <p
+          className={catalogLoading ? "loading-indicator" : undefined}
+          role="status"
+          aria-busy={catalogLoading}
+        >
+          {message}
+        </p>
+      ) : null}
       {status ? (
         <>
           <div className="capability-host-policies">
             {(["codex", "cursor", "ollama", "openai-compatible"] as const).map((host) => {
+              const hostRecords = status.records.filter((record) => record.host === host);
               const configuredPolicy = status.configuration.hostPolicies?.[host];
               const policy =
                 configuredPolicy ??
@@ -386,9 +569,30 @@ export const CapabilityCompletionPanel = ({
                                 : "互补已关闭"}
                       </span>
                     </div>
-                    <button type="button" onClick={() => onEdit(host)}>
-                      {english ? "Quick configure" : "快速配置"}
-                    </button>
+                    <div className="capability-host-actions">
+                      <button type="button" onClick={() => setRecordsHost(host)}>
+                        {english ? "Usage history" : "使用记录"} ({hostRecords.length})
+                      </button>
+                      {configured ? (
+                        <button
+                          type="button"
+                          onClick={() => void runCompletionTest(host)}
+                          disabled={!operational || testState.status === "pending"}
+                          aria-busy={testState.status === "pending" && testState.host === host}
+                        >
+                          {testState.status === "pending" && testState.host === host
+                            ? english
+                              ? "Testing…"
+                              : "正在测试…"
+                            : english
+                              ? "Test primary + secondary"
+                              : "测试主副模型"}
+                        </button>
+                      ) : null}
+                      <button type="button" onClick={() => onEdit(host)}>
+                        {english ? "Quick configure" : "快速配置"}
+                      </button>
+                    </div>
                   </div>
                   {configured && policy ? (
                     <div className="capability-host-policy-details">
@@ -412,14 +616,14 @@ export const CapabilityCompletionPanel = ({
                         </div>
                       </div>
                       {policy.specialists.length > 0 ? (
-                        policy.specialists.map((specialist, index) => (
+                        policy.specialists.map((specialist) => (
                           <div
                             className="capability-host-model specialist"
-                            key={`${specialist.host}:${specialist.model}:${index}`}
+                            key={`${specialist.host}:${specialist.model}`}
                           >
                             <div className="capability-host-model-heading">
                               <span>
-                                {english ? "Specialist" : "副模型"} · {specialist.host}
+                                {english ? "Secondary" : "副模型"} · {specialist.host}
                               </span>
                               <strong>{displayModel(specialist.host, specialist)}</strong>
                             </div>
@@ -441,7 +645,7 @@ export const CapabilityCompletionPanel = ({
                       ) : (
                         <div className="capability-host-model specialist empty">
                           <div className="capability-host-model-heading">
-                            <span>{english ? "Specialist" : "副模型"}</span>
+                            <span>{english ? "Secondary" : "副模型"}</span>
                             <small>{english ? "Not configured" : "未配置"}</small>
                           </div>
                         </div>
@@ -452,114 +656,151 @@ export const CapabilityCompletionPanel = ({
               );
             })}
           </div>
-          <div className="capability-records">
-            <div className="capability-records-heading">
-              <h3>{english ? "Recent use" : "最近使用记录"}</h3>
-              <span>{english ? "Latest 50 in this runtime" : "当前运行时最近 50 条"}</span>
+          {testState.status === "success" ? (
+            <div className="capability-test-result success" role="status">
+              <strong>
+                {english ? "Routing-path diagnostic passed" : "主副模型路由链路诊断通过"}
+              </strong>
+              <span>
+                {testState.host} · {capabilityLabel(testState.result.requiredCapability, english)} ·{" "}
+                {testState.result.durationMilliseconds} ms
+              </span>
+              <small>
+                {english
+                  ? `Primary ${testState.result.mainInvoked ? "called" : "not called"}; secondary ${testState.result.secondaryInvoked ? "called" : "not called"}.`
+                  : `主模型${testState.result.mainInvoked ? "已调用" : "未调用"}；副模型${testState.result.secondaryInvoked ? "已调用" : "未调用"}。`}
+              </small>
             </div>
-            {status.records.length === 0 ? (
-              <p>{english ? "No routing records yet." : "暂无互补调用记录。"}</p>
-            ) : (
-              status.records.map((record, index) => (
-                <article key={`${record.occurredAt}:${index}`}>
+          ) : testState.status === "error" ? (
+            <div className="capability-test-result error" role="alert">
+              <strong>
+                {english ? "Routing-path diagnostic failed" : "主副模型路由链路诊断失败"}
+              </strong>
+              <span>{testState.message}</span>
+            </div>
+          ) : null}
+          {recordsHost !== null ? (
+            <div className="capability-record-dialog-backdrop">
+              <section
+                className="capability-record-dialog"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="capability-record-dialog-title"
+              >
+                <div className="capability-records-heading">
                   <div>
-                    <strong>
-                      {record.complemented
-                        ? english
-                          ? "Complemented"
-                          : "已补位"
-                        : english
-                          ? "Primary only"
-                          : "仅主模型"}
-                    </strong>
-                    <span>{new Date(record.occurredAt).toLocaleString()}</span>
+                    <h3 id="capability-record-dialog-title">
+                      {recordsHost} · {english ? "Usage history" : "使用记录"}
+                    </h3>
+                    <span>{english ? "Latest 50 in this runtime" : "当前运行时最近 50 条"}</span>
                   </div>
-                  <p>
-                    {english ? "Host" : "宿主"}：{record.host} · {english ? "Role" : "阶段"}：
-                    {record.role} · {english ? "Required" : "所需能力"}：
-                    {record.requiredCapabilities.join(", ")}
-                  </p>
-                  <p>
-                    {english ? "Specialists" : "专家模型"}：
-                    {record.specialistModelIds.join(", ") || "—"} ·{" "}
-                    {record.outcome === "succeeded"
-                      ? english
-                        ? "Succeeded"
-                        : "成功"
-                      : english
-                        ? "Failed"
-                        : "失败"}
-                  </p>
-                </article>
-              ))
-            )}
-          </div>
+                  <button type="button" onClick={() => setRecordsHost(null)}>
+                    {english ? "Close" : "关闭"}
+                  </button>
+                </div>
+                <div className="capability-records">
+                  {status.records.filter((record) => record.host === recordsHost).length === 0 ? (
+                    <p>{english ? "No usage records for this host." : "该宿主暂无调用记录。"}</p>
+                  ) : (
+                    status.records
+                      .filter((record) => record.host === recordsHost)
+                      .map((record) => (
+                        <article
+                          key={`${record.occurredAt}:${record.host}:${record.mainModelId}:${record.reason}`}
+                        >
+                          <div className="capability-record-summary">
+                            <strong>{english ? "Combined result" : "组合结果"}</strong>
+                            <small
+                              className={
+                                record.outcome === "succeeded"
+                                  ? "record-succeeded"
+                                  : "record-failed"
+                              }
+                            >
+                              {record.outcome === "succeeded"
+                                ? english
+                                  ? "Succeeded"
+                                  : "成功"
+                                : english
+                                  ? "Failed"
+                                  : "失败"}
+                            </small>
+                            <span>{new Date(record.occurredAt).toLocaleString()}</span>
+                          </div>
+                          <p className="capability-record-detail">
+                            {english ? "Required" : "所需能力"}：
+                            {record.requiredCapabilities.join(" / ")}
+                            {` · ${english ? "Route" : "路由原因"}：${routingReasonLabel(record.reason)}`}
+                          </p>
+                          <div className="capability-model-results">
+                            {[record.mainResult, ...record.secondaryResults].map((modelResult) => (
+                              <div
+                                className={`capability-model-result ${modelResult.outcome}`}
+                                key={modelResult.modelId}
+                              >
+                                <div>
+                                  <strong>
+                                    {modelResult.role === "main"
+                                      ? english
+                                        ? "Primary model"
+                                        : "主模型"
+                                      : english
+                                        ? "Secondary model"
+                                        : "副模型"}
+                                  </strong>
+                                  <small>
+                                    {modelResult.outcome === "succeeded"
+                                      ? english
+                                        ? "Succeeded"
+                                        : "成功"
+                                      : modelResult.outcome === "failed"
+                                        ? english
+                                          ? "Failed"
+                                          : "失败"
+                                        : english
+                                          ? "Not called"
+                                          : "未调用"}
+                                  </small>
+                                </div>
+                                <p>{modelResult.model}</p>
+                                <div className="capability-model-result-meta">
+                                  <span>
+                                    {modelResult.host} · {english ? "Capabilities" : "能力"}：
+                                    {modelResult.capabilities.length > 0
+                                      ? modelResult.capabilities
+                                          .map((capability) => capabilityLabel(capability, english))
+                                          .join(" / ")
+                                      : "—"}
+                                  </span>
+                                  <span>
+                                    {modelResult.durationMilliseconds === null
+                                      ? "—"
+                                      : `${modelResult.durationMilliseconds} ms`}
+                                    {modelResult.statusCode === null
+                                      ? ""
+                                      : ` · HTTP ${modelResult.statusCode}`}
+                                  </span>
+                                </div>
+                                {modelResult.outcome === "succeeded" ||
+                                modelResult.message === "" ? null : (
+                                  <p className="capability-model-result-error">
+                                    {displayResultMessage(modelResult)}
+                                  </p>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </article>
+                      ))
+                  )}
+                </div>
+              </section>
+            </div>
+          ) : null}
         </>
       ) : null}
     </section>
   );
-};
-
-export interface ConfigurationImpactPreview {
-  /** Whether the configuration passed validation. */
-  valid: boolean;
-  /** Configuration fields changed by activation. */
-  changes: readonly string[];
-  /** Activation risk classification. */
-  risk: "low" | "medium";
-  /** Validation issues blocking activation. */
-  issues: readonly { code: string; field: string; message: string }[];
-  /** Whether the runtime must restart to apply listener changes. */
-  restartRequired: boolean;
-}
-
-const impactChangeLabel = (
-  change: string,
-  form: ConfigurationForm,
-  mode: ConfigurationMode,
-  locale: "en-US" | "zh-CN",
-): string => {
-  const english = locale === "en-US";
-  const service = form.expertServices;
-  const labels: Record<string, string> = {
-    activeMode: english
-      ? `Runtime mode → ${modeLabel(mode, locale)}`
-      : `运行模式 → ${modeLabel(mode, locale)}`,
-    activeProfileId: english
-      ? `Profile ID → ${form.activeProfileId}`
-      : `配置标识 → ${form.activeProfileId}`,
-    virtualModelName: english
-      ? `Virtual model → ${form.virtualModelName}`
-      : `虚拟模型 → ${form.virtualModelName}`,
-    modelSelection: english
-      ? `Upstream model → ${form.modelSelection.source} · ${form.modelSelection.model}`
-      : `上游模型 → ${form.modelSelection.source === "official" ? "宿主" : form.modelSelection.source === "company" ? "公司" : "自定义"} · ${form.modelSelection.model}`,
-    capabilityCompletion: english
-      ? `Capability completion → ${form.capabilityCompletion.enabled ? "enabled" : "disabled"} · ${form.capabilityCompletion.specialists.length} specialists`
-      : `能力互补 → ${form.capabilityCompletion.enabled ? "开启" : "关闭"} · ${form.capabilityCompletion.specialists.length} 个专家模型`,
-    "expertServices.host": english
-      ? `Listen host → ${service?.host ?? "-"}`
-      : `监听地址 → ${service?.host ?? "-"}`,
-    "expertServices.port": english
-      ? `Listen port → ${service?.port ?? "-"}`
-      : `监听端口 → ${service?.port ?? "-"}`,
-    "expertServices.responsesApiEnabled": `Responses API → ${
-      service?.responsesApiEnabled ? (english ? "enabled" : "启用") : english ? "disabled" : "关闭"
-    }`,
-    "expertServices.chatCompletionsApiEnabled": `Chat Completions API → ${
-      service?.chatCompletionsApiEnabled
-        ? english
-          ? "enabled"
-          : "启用"
-        : english
-          ? "disabled"
-          : "关闭"
-    }`,
-    "expertServices.taskApiEnabled": `Agent Task API → ${
-      service?.taskApiEnabled ? (english ? "enabled" : "启用") : english ? "disabled" : "关闭"
-    }`,
-  };
-  return labels[change] ?? change;
 };
 
 const taskStatusLabel = (status: TaskControlView["status"], locale: "en-US" | "zh-CN"): string =>
@@ -590,6 +831,7 @@ export const TaskControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
   const [pendingTaskId, setPendingTaskId] = useState<string | undefined>();
 
   const refreshTasks = useCallback(async () => {
+    setMessage(english ? "Loading task capsules…" : "正在读取任务胶囊…");
     try {
       const response = await fetch("/api/tasks", {
         headers: { accept: "application/json" },
@@ -610,7 +852,7 @@ export const TaskControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
             : "无法读取任务状态",
       );
     }
-  }, []);
+  }, [english]);
 
   useEffect(() => {
     void refreshTasks();
@@ -671,8 +913,15 @@ export const TaskControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
           type="button"
           onClick={() => void refreshTasks()}
           disabled={pendingTaskId !== undefined}
+          aria-busy={snapshot === undefined}
         >
-          {english ? "Refresh tasks" : "刷新任务"}
+          {snapshot === undefined
+            ? english
+              ? "Loading…"
+              : "读取中…"
+            : english
+              ? "Refresh tasks"
+              : "刷新任务"}
         </button>
       </div>
       {snapshot?.available === false ? (
@@ -793,12 +1042,48 @@ export const TaskControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
           })}
         </div>
       )}
-      <p className="operation-message" aria-live="polite">
+      <p
+        className={`operation-message${pendingTaskId !== undefined || snapshot === undefined ? " loading-indicator" : ""}`}
+        aria-live="polite"
+        aria-busy={pendingTaskId !== undefined || snapshot === undefined}
+      >
         {message}
       </p>
     </section>
   );
 };
+
+export interface ConfigurationRequestIssue {
+  /** Stable validation issue identifier. */
+  code: string;
+  /** Configuration field rejected by the runtime. */
+  field: string;
+  /** Runtime-provided diagnostic text. */
+  message: string;
+}
+
+interface ConfigurationRequestFailure {
+  /** Stable runtime error identifier. */
+  error?: string;
+  /** Runtime-provided summary. */
+  message?: string;
+  /** Field-level validation failures. */
+  issues?: readonly ConfigurationRequestIssue[];
+}
+
+export class ConfigurationRequestError extends Error {
+  /** HTTP status returned by the configuration center. */
+  readonly status: number;
+  /** Field-level validation failures returned by the runtime. */
+  readonly issues: readonly ConfigurationRequestIssue[];
+
+  constructor(message: string, status: number, issues: readonly ConfigurationRequestIssue[]) {
+    super(message);
+    this.name = "ConfigurationRequestError";
+    this.status = status;
+    this.issues = issues;
+  }
+}
 
 export const requestBootstrap = async (
   path = "/api/config-center",
@@ -808,10 +1093,13 @@ export const requestBootstrap = async (
     ...init,
     headers: { accept: "application/json", ...init?.headers },
   });
-  const body = (await response.json()) as ConfigCenterBootstrap | { message?: string };
+  const body = (await response.json()) as ConfigCenterBootstrap | ConfigurationRequestFailure;
   if (!response.ok) {
-    throw new Error(
-      "message" in body && body.message ? body.message : `配置中心返回 ${response.status}`,
+    const failure = body as ConfigurationRequestFailure;
+    throw new ConfigurationRequestError(
+      failure.message ?? `配置中心返回 ${response.status}`,
+      response.status,
+      failure.issues ?? [],
     );
   }
   return body as ConfigCenterBootstrap;
@@ -911,7 +1199,7 @@ export const GuideCenter = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
               <ol>
                 <li>Use an OpenAI-compatible provider or local Ollama.</li>
                 <li>Edit Normal or Expert without changing the active profile.</li>
-                <li>Preview impact, save, then explicitly activate.</li>
+                <li>Click Save and continue, then activate the saved draft explicitly.</li>
                 <li>Rollback restores the previous known-good version.</li>
               </ol>
             </article>
@@ -990,7 +1278,7 @@ export const GuideCenter = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
                 <li>OpenAI兼容服务设置 TIDU_PROVIDER=openai-compatible。</li>
                 <li>本地Ollama设置 TIDU_PROVIDER=ollama。</li>
                 <li>通过 TIDU_PROVIDER_MODEL 指定真实模型。</li>
-                <li>再保存并明确启用普通或专家入口草稿。</li>
+                <li>点击“保存并下一步”保存草稿，再明确启用普通或专家入口。</li>
               </ol>
             </article>
             <article className="guide-card">
@@ -1264,7 +1552,7 @@ export const EnterpriseReadOnlyPanel = ({
             onChange={(event) => setEndpoint(event.target.value)}
           />
         </label>
-        <button type="submit" disabled={pending || endpoint.trim() === ""}>
+        <button type="submit" disabled={pending || endpoint.trim() === ""} aria-busy={pending}>
           {pending
             ? english
               ? "Checking…"
@@ -1419,7 +1707,7 @@ export const EnterpriseEditionPanel = ({
             autoComplete="off"
             required
           />
-          <button type="submit" disabled={loading}>
+          <button type="submit" disabled={loading} aria-busy={loading}>
             {loading
               ? english
                 ? "Verifying…"
@@ -1445,6 +1733,7 @@ export const EnterpriseEditionPanel = ({
               .finally(() => setLoading(false));
           }}
           disabled={loading}
+          aria-busy={loading}
         >
           {english ? "Refresh member usage" : "刷新成员用量"}
         </button>
@@ -1507,12 +1796,8 @@ interface QuickStartWizardProps {
   locale: "en-US" | "zh-CN";
   /** Whether enterprise services are attached. */
   enterpriseEnabled: boolean;
-  /** Whether a real model provider is ready. */
-  providerConfigured: boolean;
   /** Sanitized active provider name. */
   providerType: string | null;
-  /** Sanitized active upstream model name. */
-  providerModel: string | null;
   /** Host selected by a capability-card quick configuration action. */
   targetHost?: AgentHostId;
   /** Currently selected isolated draft. */
@@ -1523,10 +1808,18 @@ interface QuickStartWizardProps {
   isDirty: boolean;
   /** Whether an operation is running. */
   isPending: boolean;
-  /** Latest activation impact preview. */
-  impactPreview?: ConfigurationImpactPreview;
+  /** Configuration operation currently running. */
+  pendingAction?: "activate" | "rollback" | "save";
+  /** Latest configuration operation result. */
+  operationState: OperationState;
   /** Whether this form is the active runtime configuration. */
   isActive: boolean;
+  /** Revision of the persisted draft currently being edited. */
+  draftRevision: number;
+  /** ISO timestamp of the latest successful draft save. */
+  draftUpdatedAt: string;
+  /** ISO timestamp of the currently active runtime configuration. */
+  activeUpdatedAt: string;
   /** Validation messages for required entry fields. */
   entryValidationMessages: EntryValidationMessages;
   /** Whether this installation may modify configuration. */
@@ -1535,9 +1828,7 @@ interface QuickStartWizardProps {
   onFormChange: (form: ConfigurationForm) => void;
   /** Save the current draft. */
   onSave: () => Promise<boolean>;
-  /** Simulate activation impact. */
-  onSimulate: () => Promise<void>;
-  /** Activate the verified draft. */
+  /** Activate the saved draft. */
   onActivate: () => Promise<void>;
   /** Restore the previous known-good runtime configuration. */
   onRollback: () => Promise<void>;
@@ -1565,33 +1856,29 @@ const createEmptyHostCatalog = (): UpstreamModelCatalog["hosts"] => ({
   "openai-compatible": { available: false, models: [] },
 });
 
-export const QuickStartWizard = ({
-  locale,
-  enterpriseEnabled,
-  providerConfigured,
-  providerType,
-  providerModel,
-  targetHost,
-  selectedMode,
-  form,
-  isDirty,
-  isPending,
-  impactPreview,
-  isActive,
-  entryValidationMessages,
-  readOnly,
-  onFormChange,
-  onSave,
-  onSimulate,
-  onActivate,
-  onRollback,
-  onOpenClients,
-}: QuickStartWizardProps) => {
-  const english = locale === "en-US";
-  const [step, setStep] = useState(targetHost === undefined ? 0 : 2);
-  const [providerChoice, setProviderChoice] = useState<
-    "codex-host" | "cursor-host" | "ollama" | "compatible"
-  >(() =>
+interface WizardAdvanceOptions {
+  /** Current zero-based wizard step. */
+  step: number;
+  /** Number of steps in the wizard. */
+  stepCount: number;
+  /** Whether the current step passes synchronous validation. */
+  canAdvance: boolean;
+  /** Whether the form differs from the persisted draft. */
+  isDirty: boolean;
+  /** Saves the current draft and reports whether persistence succeeded. */
+  onSave: () => Promise<boolean>;
+}
+
+type ProviderChoice = "codex-host" | "cursor-host" | "ollama" | "compatible";
+type ModelChoiceMode = "company" | "custom" | "host";
+
+export const resolveWizardEntryState = (
+  targetHost: AgentHostId | undefined,
+  providerType: string | null,
+  selectedMode: ConfigurationMode,
+  form: ConfigurationForm,
+) => {
+  const providerChoice: ProviderChoice =
     targetHost === "codex"
       ? "codex-host"
       : targetHost === "cursor"
@@ -1606,14 +1893,70 @@ export const QuickStartWizard = ({
                 ? "ollama"
                 : providerType === "openai-compatible"
                   ? "compatible"
-                  : "codex-host",
+                  : "codex-host";
+  const targetSelection =
+    targetHost === undefined
+      ? form.modelSelection
+      : form.capabilityCompletion.hostPolicies?.[targetHost]?.mainModel;
+  const modelChoiceMode: ModelChoiceMode =
+    targetSelection === undefined
+      ? "host"
+      : targetSelection.source === "company"
+        ? "company"
+        : targetSelection.source === "custom"
+          ? "custom"
+          : "host";
+  return {
+    step: targetHost === undefined ? (selectedMode === "expert" ? 1 : 0) : 2,
+    providerChoice,
+    modelChoiceMode,
+  };
+};
+
+export const resolveWizardAdvance = async ({
+  step,
+  stepCount,
+  canAdvance,
+  isDirty,
+  onSave,
+}: WizardAdvanceOptions): Promise<number> => {
+  if (!canAdvance) return step;
+  if ((step === 1 || step === 2) && isDirty && !(await onSave())) return step;
+  return Math.min(stepCount - 1, step + 1);
+};
+
+export const QuickStartWizard = ({
+  locale,
+  enterpriseEnabled,
+  providerType,
+  targetHost,
+  selectedMode,
+  form,
+  isDirty,
+  isPending,
+  pendingAction,
+  operationState,
+  isActive,
+  draftRevision,
+  draftUpdatedAt,
+  activeUpdatedAt,
+  entryValidationMessages,
+  readOnly,
+  onFormChange,
+  onSave,
+  onActivate,
+  onRollback,
+  onOpenClients,
+}: QuickStartWizardProps) => {
+  const english = locale === "en-US";
+  const [step, setStep] = useState(
+    () => resolveWizardEntryState(targetHost, providerType, selectedMode, form).step,
   );
-  const [modelChoiceMode, setModelChoiceMode] = useState<"company" | "custom" | "host">(
-    form.modelSelection.source === "company"
-      ? "company"
-      : form.modelSelection.source === "custom"
-        ? "custom"
-        : "host",
+  const [providerChoice, setProviderChoice] = useState<ProviderChoice>(
+    () => resolveWizardEntryState(targetHost, providerType, selectedMode, form).providerChoice,
+  );
+  const [modelChoiceMode, setModelChoiceMode] = useState<ModelChoiceMode>(
+    () => resolveWizardEntryState(targetHost, providerType, selectedMode, form).modelChoiceMode,
   );
   const modelChoiceTouchedRef = useRef(false);
   const providerChoiceTouchedRef = useRef(false);
@@ -1638,30 +1981,26 @@ export const QuickStartWizard = ({
   const [upstreamCatalogStatus, setUpstreamCatalogStatus] = useState<"error" | "loading" | "ready">(
     "loading",
   );
-  useEffect(() => {
-    setStep(targetHost === undefined ? (selectedMode === "expert" ? 1 : 0) : 2);
-    setProviderCheck({ status: "idle" });
-  }, [selectedMode, targetHost]);
   const stepLabels = english
     ? ["Deployment", "Entry", "Model", "Activate", "Clients (optional)"]
     : ["部署", "入口", "模型", "启用", "客户端（可选）"];
   const entryIsValid = Object.keys(entryValidationMessages).length === 0;
   const clientSetupIsAvailable = isActive && !isDirty;
-  const effectiveProviderType =
-    providerType === "tidu-router" ? upstreamCatalog.companyProviderType : providerType;
-  const activeProviderChoice =
-    effectiveProviderType === "codex-host" ||
-    effectiveProviderType === "cursor-host" ||
-    effectiveProviderType === "ollama"
-      ? effectiveProviderType
-      : effectiveProviderType === "openai-compatible"
-        ? "compatible"
-        : null;
-  const choiceMatchesRuntime =
-    (providerChoice === "codex-host" && effectiveProviderType === "codex-host") ||
-    (providerChoice === "cursor-host" && effectiveProviderType === "cursor-host") ||
-    (providerChoice === "ollama" && effectiveProviderType === "ollama") ||
-    (providerChoice === "compatible" && effectiveProviderType === "openai-compatible");
+  const savedStateLabel = isDirty
+    ? english
+      ? "Unsaved changes"
+      : "有未保存修改"
+    : isActive
+      ? english
+        ? "Saved and active"
+        : "已保存并生效"
+      : english
+        ? "Draft saved · activation required"
+        : "草稿已保存 · 待启用";
+  const savedStateTimestamp = new Date(isActive ? activeUpdatedAt : draftUpdatedAt).toLocaleString(
+    locale,
+  );
+  const activeProviderChoice = providerChoice;
   const providerLabel =
     providerChoice === "codex-host"
       ? "Codex"
@@ -1672,7 +2011,6 @@ export const QuickStartWizard = ({
           : english
             ? "Compatible provider"
             : "兼容服务";
-  const customModel = modelChoiceMode === "custom" ? form.modelSelection.model : "";
   const hostModelOptions =
     providerChoice === "codex-host"
       ? upstreamCatalog.official
@@ -1714,6 +2052,7 @@ export const QuickStartWizard = ({
     specialists: form.capabilityCompletion.specialists,
     maximumSpecialists: form.capabilityCompletion.maximumSpecialists,
   };
+  const customModel = modelChoiceMode === "custom" ? activeHostPolicy.mainModel.model : "";
   const updateActiveHostPolicy = (
     policy: typeof activeHostPolicy,
     nextModelSelection = policy.mainModel,
@@ -1739,11 +2078,10 @@ export const QuickStartWizard = ({
       selection.model === "current"
         ? providerCheck.provider === providerChoice
           ? providerCheck.model
-          : providerModel
+          : (hostCatalogModels.find((model) => model.isDefault)?.id ?? hostCatalogModels[0]?.id)
         : selection.model;
-    return (
-      hostCatalogModels.find((model) => model.id === resolvedModel)?.capabilities ??
-      MODEL_CAPABILITIES.map((capability) => capability.id)
+    return defaultCapabilitiesForModel(
+      hostCatalogModels.find((model) => model.id === resolvedModel),
     );
   };
   const selectMainModel = (selection: ModelSelection): void =>
@@ -1780,13 +2118,11 @@ export const QuickStartWizard = ({
       .map((model) => ({ host, model })),
   );
   const detectedPrimaryModel =
-    form.modelSelection.model === "current"
+    activeHostPolicy.mainModel.model === "current"
       ? providerCheck.provider === providerChoice
         ? providerCheck.model
-        : choiceMatchesRuntime
-          ? providerModel
-          : undefined
-      : form.modelSelection.model;
+        : (hostModelOptions.find((model) => model.isDefault)?.id ?? hostModelOptions[0]?.id)
+      : activeHostPolicy.mainModel.model;
   const modelSelectOptions =
     modelChoiceMode === "host" &&
     detectedPrimaryModel &&
@@ -1794,9 +2130,9 @@ export const QuickStartWizard = ({
       ? [{ id: detectedPrimaryModel, name: detectedPrimaryModel }, ...providerModelOptions]
       : providerModelOptions;
   const selectedModelId =
-    form.modelSelection.model === "current"
+    activeHostPolicy.mainModel.model === "current"
       ? (detectedPrimaryModel ?? "")
-      : form.modelSelection.model;
+      : activeHostPolicy.mainModel.model;
   const primaryCatalogModel = hostCatalogModels.find((model) => model.id === detectedPrimaryModel);
   const updateSpecialists = (specialists: readonly CapabilitySpecialistConfiguration[]): void =>
     updateActiveHostPolicy({
@@ -1804,23 +2140,7 @@ export const QuickStartWizard = ({
       specialists,
       maximumSpecialists: Math.max(1, specialists.length),
     });
-  useEffect(() => {
-    if (upstreamCatalogStatus !== "ready") return;
-    let changed = false;
-    const specialists = activeHostPolicy.specialists.map((specialist) => {
-      if (specialist.host !== "cursor" || specialist.model !== "current") return specialist;
-      const defaultModel = upstreamCatalog.hosts.cursor.models.find((model) => model.isDefault);
-      if (defaultModel === undefined) return specialist;
-      changed = true;
-      return {
-        ...specialist,
-        model: defaultModel.id,
-        capabilities: defaultModel.capabilities ?? [],
-      };
-    });
-    if (changed) updateSpecialists(specialists);
-  }, [activeHostPolicy.specialists, upstreamCatalog.hosts.cursor.models, upstreamCatalogStatus]);
-  const selectProvider = (choice: "codex-host" | "cursor-host" | "ollama" | "compatible"): void => {
+  const selectProvider = (choice: ProviderChoice): void => {
     modelChoiceTouchedRef.current = true;
     providerChoiceTouchedRef.current = true;
     setProviderChoice(choice);
@@ -1831,9 +2151,14 @@ export const QuickStartWizard = ({
       source: choice === "codex-host" || choice === "cursor-host" ? "official" : "company",
       model: "current",
     };
+    const nextHostModels = upstreamCatalog.hosts[nextHostId]?.models ?? [];
+    const nextCatalogModel =
+      nextModelSelection.model === "current"
+        ? (nextHostModels.find((model) => model.isDefault) ?? nextHostModels[0])
+        : nextHostModels.find((model) => model.id === nextModelSelection.model);
     const nextPolicy = savedPolicy ?? {
       mainModel: nextModelSelection,
-      mainCapabilities: ["text", "structured-output"],
+      mainCapabilities: defaultCapabilitiesForModel(nextCatalogModel),
       specialists: [],
       maximumSpecialists: 2,
     };
@@ -1852,19 +2177,7 @@ export const QuickStartWizard = ({
       },
     });
   };
-  useEffect(() => {
-    if (targetHost === undefined) return;
-    selectProvider(
-      targetHost === "codex"
-        ? "codex-host"
-        : targetHost === "cursor"
-          ? "cursor-host"
-          : targetHost === "ollama"
-            ? "ollama"
-            : "compatible",
-    );
-  }, [targetHost]);
-  const selectModelChoiceMode = (choice: "company" | "custom" | "host"): void => {
+  const selectModelChoiceMode = (choice: ModelChoiceMode): void => {
     modelChoiceTouchedRef.current = true;
     setModelChoiceMode(choice);
     selectMainModel({
@@ -1873,44 +2186,32 @@ export const QuickStartWizard = ({
     });
   };
   useEffect(() => {
-    if (
-      step !== 2 ||
-      upstreamCatalogStatus !== "ready" ||
-      modelChoiceMode !== "host" ||
-      form.modelSelection.model !== "current" ||
-      !detectedPrimaryModel
-    ) {
-      return;
-    }
-    selectMainModel({ source: hostModelSource, model: detectedPrimaryModel });
-  }, [
-    detectedPrimaryModel,
-    form.modelSelection.model,
-    modelChoiceMode,
-    step,
-    upstreamCatalogStatus,
-  ]);
-  useEffect(() => {
     if (upstreamCatalogStatus !== "ready" || modelChoiceTouchedRef.current) return;
-    if (form.modelSelection.source === "company") {
+    if (activeHostPolicy.mainModel.source === "company") {
       setModelChoiceMode("company");
       return;
     }
-    if (form.modelSelection.source === "custom") {
+    if (activeHostPolicy.mainModel.source === "custom") {
       setModelChoiceMode("custom");
       return;
     }
     setModelChoiceMode(
-      form.modelSelection.model === "current" ||
-        upstreamCatalog.official.some((model) => model.id === form.modelSelection.model)
+      activeHostPolicy.mainModel.model === "current" ||
+        upstreamCatalog.official.some((model) => model.id === activeHostPolicy.mainModel.model)
         ? "host"
         : "custom",
     );
-  }, [form.modelSelection, upstreamCatalog.hosts, upstreamCatalogStatus]);
+  }, [
+    activeHostPolicy.mainModel.model,
+    activeHostPolicy.mainModel.source,
+    upstreamCatalog.official,
+    upstreamCatalogStatus,
+  ]);
   useEffect(() => {
     if (
       upstreamCatalogStatus !== "ready" ||
       providerType !== "tidu-router" ||
+      targetHost !== undefined ||
       providerChoiceTouchedRef.current
     ) {
       return;
@@ -1920,7 +2221,7 @@ export const QuickStartWizard = ({
     } else if (upstreamCatalog.companyProviderType === "openai-compatible") {
       setProviderChoice("compatible");
     }
-  }, [providerType, upstreamCatalog.companyProviderType, upstreamCatalogStatus]);
+  }, [providerType, targetHost, upstreamCatalog.companyProviderType, upstreamCatalogStatus]);
   useEffect(() => {
     if (step !== 2) return;
     setUpstreamCatalogStatus("loading");
@@ -2014,22 +2315,46 @@ export const QuickStartWizard = ({
       current = false;
     };
   }, [step, activeProviderChoice]);
+  const modelConfigurationIsValid =
+    isValidModelIdentifier(activeHostPolicy.mainModel.model) &&
+    activeHostPolicy.mainCapabilities.length > 0 &&
+    activeHostPolicy.specialists.every(
+      (specialist) =>
+        specialist.host !== activeHostId &&
+        isValidModelIdentifier(specialist.model) &&
+        specialist.capabilities.length > 0,
+    );
   const canAdvance =
     step === 1
       ? entryIsValid
       : step === 2
-        ? entryIsValid && providerConfigured && choiceMatchesRuntime
+        ? entryIsValid && modelConfigurationIsValid
         : step === 3
           ? clientSetupIsAvailable
           : true;
+  const advanceIssue =
+    step === 1 && !entryIsValid
+      ? english
+        ? "Complete the required entry fields first."
+        : "请先完成入口必填项。"
+      : step === 2 && !modelConfigurationIsValid
+        ? english
+          ? "Select a valid primary model and at least one capability for every configured model. Model IDs cannot contain spaces."
+          : "请选择有效的主模型，并为每个已配置模型至少保留一项能力；模型 ID 不能包含空格。"
+        : step === 3 && !clientSetupIsAvailable
+          ? english
+            ? "Activate this configuration before continuing."
+            : "请先启用当前配置。"
+          : "";
   const advanceStep = async (): Promise<void> => {
-    if (!canAdvance) {
-      return;
-    }
-    if ((step === 1 || step === 2) && isDirty && !(await onSave())) {
-      return;
-    }
-    setStep(Math.min(stepLabels.length - 1, step + 1));
+    const nextStep = await resolveWizardAdvance({
+      step,
+      stepCount: stepLabels.length,
+      canAdvance,
+      isDirty,
+      onSave,
+    });
+    if (nextStep !== step) setStep(nextStep);
   };
 
   return (
@@ -2040,13 +2365,21 @@ export const QuickStartWizard = ({
           <h2>{english ? "Finish setup step by step" : "按步骤完成首次配置"}</h2>
           <p>
             {english
-              ? "Next saves valid entry fields automatically. Continue only when the detected model configuration matches the active runtime; activate the configuration before connecting clients."
-              : "入口必填项通过校验后，点击下一步自动保存。模型步骤只读取所选服务的配置；与当前运行配置一致后才能继续，不会调用模型。"}
+              ? "Choose the models step by step. Save changes when continuing, then explicitly activate the saved draft."
+              : "按步骤选择模型；点击“保存并下一步”写入草稿，再明确启用后生效。"}
           </p>
         </div>
-        <span className="onboarding-counter">
-          {step + 1} / {stepLabels.length}
-        </span>
+        <div className="onboarding-status-summary">
+          <span className={`onboarding-save-state ${isDirty ? "unsaved" : "saved"}`}>
+            {savedStateLabel}
+          </span>
+          <small>
+            {english ? "Draft" : "草稿"} #{draftRevision} · {savedStateTimestamp}
+          </small>
+          <span className="onboarding-counter">
+            {step + 1} / {stepLabels.length}
+          </span>
+        </div>
       </div>
 
       <nav className="onboarding-steps" aria-label={english ? "Setup progress" : "配置进度"}>
@@ -2399,7 +2732,9 @@ export const QuickStartWizard = ({
               </div>
               <div className="upstream-model-control" aria-live="polite">
                 {modelChoiceMode !== "custom" && upstreamCatalogStatus === "loading" ? (
-                  <p>{english ? "Loading available models…" : "正在读取可用模型…"}</p>
+                  <p className="loading-indicator" role="status" aria-busy="true">
+                    {english ? "Loading available models…" : "正在读取可用模型…"}
+                  </p>
                 ) : modelChoiceMode !== "custom" && upstreamCatalogStatus === "error" ? (
                   <p className="upstream-model-empty">
                     {modelChoiceMode === "company"
@@ -2471,8 +2806,8 @@ export const QuickStartWizard = ({
                     <h3>{english ? "Model capability completion" : "模型能力互补"}</h3>
                     <p>
                       {english
-                        ? "The selected host is the primary. Specialists must come from other hosts and run only for missing capabilities."
-                        : "当前选择的宿主就是主模型入口；副模型必须来自其他宿主，仅在主模型缺少任务能力时补位。"}
+                        ? "The selected host is the preferred primary. Other hosts may be selected for capability gaps, lower token use or cost, privacy, observed latency, availability, and failure fallback."
+                        : "当前宿主是优先主模型；副模型还会按能力缺口、耗用/成本、隐私、实测延迟、可用性和失败切换规则参与调度。"}
                     </p>
                   </div>
                   <label className="capability-toggle">
@@ -2553,7 +2888,7 @@ export const QuickStartWizard = ({
                           available={
                             modelChoiceMode === "custom"
                               ? undefined
-                              : (primaryCatalogModel?.capabilities ?? [])
+                              : primaryCatalogModel?.capabilities
                           }
                           english={english}
                           disabled={isPending || readOnly}
@@ -2569,10 +2904,10 @@ export const QuickStartWizard = ({
                     <div className="capability-specialists">
                       <div className="capability-section-heading">
                         <div>
-                          <h4>{english ? "2. Select specialist models" : "2. 选择副模型"}</h4>
+                          <h4>{english ? "2. Select secondary models" : "2. 选择副模型"}</h4>
                           <p>
                             {english
-                              ? "Specialists come from other hosts. Selecting at most two usually minimizes cost."
+                              ? "Secondary models come from other hosts. Selecting at most two usually minimizes cost."
                               : "副模型来自其他宿主；建议最多选择 2 个，通常更省成本。"}
                           </p>
                         </div>
@@ -2580,12 +2915,12 @@ export const QuickStartWizard = ({
                       {upstreamCatalogStatus === "loading" ? (
                         <div className="capability-loading" role="status">
                           <span aria-hidden="true" />
-                          {english ? "Loading specialist models…" : "正在读取副模型…"}
+                          {english ? "Loading secondary models…" : "正在读取副模型…"}
                         </div>
                       ) : upstreamCatalogStatus === "error" ? (
                         <p className="capability-loading-error" role="alert">
                           {english
-                            ? "Specialist models could not be loaded. Refresh and try again."
+                            ? "Secondary models could not be loaded. Refresh and try again."
                             : "副模型读取失败，请刷新后重试。"}
                         </p>
                       ) : (
@@ -2609,21 +2944,18 @@ export const QuickStartWizard = ({
                                 model.id === specialist.model ||
                                 !keysUsedByOtherRows.has(specialistKey(specialist.host, model.id)),
                             );
+                            const resolvedSpecialistModelId =
+                              specialist.model === "current"
+                                ? modelOptions.find((model) => model.isDefault)?.id
+                                : specialist.model;
                             const selectedCatalogModel = modelOptions.find(
-                              (model) => model.id === specialist.model,
+                              (model) => model.id === resolvedSpecialistModelId,
                             );
-                            const addedCapabilities = specialist.capabilities.filter(
-                              (capability) =>
-                                !activeHostPolicy.mainCapabilities.includes(capability),
-                            );
-                            const knownCost =
-                              specialist.inputCostPerMillionTokens != null ||
-                              specialist.outputCostPerMillionTokens != null;
                             if (!hostAvailable) {
                               return (
                                 <article
                                   className="capability-specialist-card"
-                                  key={`${specialist.host}:${specialist.model}:${index}`}
+                                  key={`${specialist.host}:${specialist.model}`}
                                 >
                                   <div className="capability-specialist-heading">
                                     <div>
@@ -2660,7 +2992,7 @@ export const QuickStartWizard = ({
                             return (
                               <article
                                 className="capability-specialist-card"
-                                key={`${specialist.host}:${specialist.model}:${index}`}
+                                key={`${specialist.host}:${specialist.model}`}
                               >
                                 <div className="capability-specialist-heading">
                                   <div>
@@ -2673,15 +3005,6 @@ export const QuickStartWizard = ({
                                         (english ? "Model not selected" : "尚未选择模型")}
                                     </strong>
                                   </div>
-                                  <span
-                                    className={addedCapabilities.length > 0 ? "gain" : "warning"}
-                                  >
-                                    {addedCapabilities.length > 0
-                                      ? `${english ? "Adds" : "新增"} ${addedCapabilities.length}`
-                                      : english
-                                        ? "No added capability"
-                                        : "无新增能力"}
-                                  </span>
                                   <button
                                     type="button"
                                     onClick={() =>
@@ -2712,7 +3035,7 @@ export const QuickStartWizard = ({
                                         host,
                                         source: modelSourceForHost(host),
                                         model: selectedModel.id,
-                                        capabilities: selectedModel.capabilities ?? [],
+                                        capabilities: defaultCapabilitiesForModel(selectedModel),
                                         inputCostPerMillionTokens:
                                           selectedModel.inputCostPerMillionTokens ?? null,
                                         outputCostPerMillionTokens:
@@ -2734,8 +3057,8 @@ export const QuickStartWizard = ({
                                     ))}
                                   </select>
                                   <select
-                                    aria-label={english ? "Specialist model" : "副模型"}
-                                    value={specialist.model}
+                                    aria-label={english ? "Secondary model" : "副模型"}
+                                    value={resolvedSpecialistModelId ?? specialist.model}
                                     onChange={(event) => {
                                       const selectedModel = modelOptions.find(
                                         (model) => model.id === event.target.value,
@@ -2744,7 +3067,7 @@ export const QuickStartWizard = ({
                                       specialists[index] = {
                                         ...specialist,
                                         model: event.target.value,
-                                        capabilities: selectedModel?.capabilities ?? [],
+                                        capabilities: defaultCapabilitiesForModel(selectedModel),
                                         inputCostPerMillionTokens:
                                           selectedModel?.inputCostPerMillionTokens ?? null,
                                         outputCostPerMillionTokens:
@@ -2769,33 +3092,7 @@ export const QuickStartWizard = ({
                                       </option>
                                     ))}
                                   </select>
-                                  <div className="capability-cost-status">
-                                    <span>{english ? "Cost" : "费用"}</span>
-                                    <strong>
-                                      {knownCost
-                                        ? `${specialist.inputCostPerMillionTokens ?? "?"} / ${specialist.outputCostPerMillionTokens ?? "?"} / 1M tokens`
-                                        : specialist.host === "codex" ||
-                                            specialist.host === "cursor"
-                                          ? english
-                                            ? "Account quota · unit price unavailable"
-                                            : "宿主账号额度 · 未提供单价"
-                                          : english
-                                            ? "Unknown · excluded from cheapest ranking"
-                                            : "价格未知 · 不参与最省钱排序"}
-                                    </strong>
-                                  </div>
                                 </div>
-                                {selectedCatalogModel?.capabilities?.length ? (
-                                  <p className="capability-evidence">
-                                    {english
-                                      ? "Capabilities published by catalog"
-                                      : "模型目录已发布能力"}
-                                    ：
-                                    {selectedCatalogModel.capabilities
-                                      .map((item) => capabilityLabel(item, english))
-                                      .join("、")}
-                                  </p>
-                                ) : null}
                                 {selectedCatalogModel === undefined ? null : selectedCatalogModel
                                     .capabilities?.length ? (
                                   <CapabilityPicker
@@ -2882,7 +3179,7 @@ export const QuickStartWizard = ({
                                   host: choice.host,
                                   source: modelSourceForHost(choice.host),
                                   model: choice.model.id,
-                                  capabilities: choice.model.capabilities ?? [],
+                                  capabilities: defaultCapabilitiesForModel(choice.model),
                                   inputCostPerMillionTokens:
                                     choice.model.inputCostPerMillionTokens ?? null,
                                   outputCostPerMillionTokens:
@@ -2908,114 +3205,67 @@ export const QuickStartWizard = ({
                   </>
                 ) : null}
               </section>
-              {!providerConfigured || !choiceMatchesRuntime ? (
-                <>
-                  <textarea
-                    className="onboarding-command"
-                    aria-label={english ? "Provider startup command" : "模型服务启动命令"}
-                    readOnly
-                    wrap="soft"
-                    rows={providerChoice === "compatible" ? 3 : 2}
-                    value={
-                      providerChoice === "codex-host"
-                        ? "TIDU_PROVIDER=codex-host\ntidu start  # follows the current Codex model"
-                        : providerChoice === "cursor-host"
-                          ? "TIDU_PROVIDER=cursor-host\ntidu start  # follows the current Cursor model"
-                          : providerChoice === "ollama"
-                            ? "TIDU_PROVIDER=ollama\nTIDU_PROVIDER_MODEL=<installed-model> tidu start"
-                            : "TIDU_PROVIDER=openai-compatible\nTIDU_PROVIDER_BASE_URL=<service-url>\nTIDU_PROVIDER_MODEL=<model> TIDU_PROVIDER_API_KEY=<runtime-key> tidu start"
-                    }
-                  />
-                  <p>
-                    {providerChoice === "compatible"
-                      ? english
-                        ? "Set the compatible service URL and model, then restart. Secrets stay in the process environment."
-                        : "填写兼容服务地址和模型名后重启；密钥只从进程环境读取。"
-                      : english
-                        ? `Restart AI-Tidu9 with ${providerLabel} to load this host and its model catalog.`
-                        : `使用 ${providerLabel} 重启九门后，才会加载该宿主及其模型目录。`}
-                  </p>
-                </>
-              ) : null}
             </section>
           </div>
         ) : step === 3 ? (
           <>
             <p className="onboarding-kicker">{english ? "Safe activation" : "安全启用"}</p>
-            <h3>{english ? "Save → preview → activate" : "保存 → 模拟 → 启用"}</h3>
+            <h3>{english ? "Activate the saved draft" : "启用已保存草稿"}</h3>
+            <div className={`activation-state ${isActive ? "active" : "pending"}`} role="status">
+              <strong>
+                {isActive
+                  ? english
+                    ? "This configuration is saved and active."
+                    : "当前配置已保存并正在生效。"
+                  : english
+                    ? "The draft is saved but is not active yet."
+                    : "草稿已经保存，但尚未影响实际运行。"}
+              </strong>
+              <span>
+                {isActive
+                  ? english
+                    ? `Activated at ${new Date(activeUpdatedAt).toLocaleString(locale)}.`
+                    : `生效时间：${new Date(activeUpdatedAt).toLocaleString(locale)}。`
+                  : english
+                    ? "Select “Activate and apply” below to replace the current runtime configuration."
+                    : "点击下方“明确启用并生效”，才会替换当前运行配置。"}
+              </span>
+            </div>
             <div className="onboarding-choice-row">
-              <button
-                type="button"
-                onClick={() => void onSave()}
-                disabled={readOnly || !isDirty || isPending}
-              >
-                {english ? "1. Save" : "1. 保存草稿"}
-              </button>
-              <button
-                type="button"
-                onClick={() => void onSimulate()}
-                disabled={readOnly || isDirty || isPending}
-              >
-                {english ? "2. Preview" : "2. 模拟影响"}
-              </button>
               <button
                 className="primary-button"
                 type="button"
                 onClick={() => void onActivate()}
-                disabled={readOnly || isDirty || isPending || impactPreview?.valid !== true}
+                disabled={readOnly || isDirty || isPending || isActive}
+                aria-busy={pendingAction === "activate"}
               >
-                {english ? "3. Activate" : "3. 启用配置"}
+                {pendingAction === "activate"
+                  ? english
+                    ? "Activating…"
+                    : "启用中…"
+                  : isActive
+                    ? english
+                      ? "Active"
+                      : "已启用并生效"
+                    : english
+                      ? "Activate and apply"
+                      : "明确启用并生效"}
               </button>
-              <button type="button" onClick={() => void onRollback()} disabled={isPending}>
-                {english ? "Rollback" : "回滚"}
+              <button
+                type="button"
+                onClick={() => void onRollback()}
+                disabled={isPending}
+                aria-busy={pendingAction === "rollback"}
+              >
+                {pendingAction === "rollback"
+                  ? english
+                    ? "Rolling back…"
+                    : "回滚中…"
+                  : english
+                    ? "Rollback"
+                    : "回滚"}
               </button>
             </div>
-            {impactPreview ? (
-              <section
-                className={`impact-preview ${impactPreview.valid ? "impact-preview-valid" : "impact-preview-invalid"}`}
-                aria-live="polite"
-              >
-                <div className="impact-preview-heading">
-                  <strong>
-                    {impactPreview.valid
-                      ? english
-                        ? "Preview passed"
-                        : "模拟通过"
-                      : english
-                        ? "Activation blocked"
-                        : "无法启用"}
-                  </strong>
-                  <span>
-                    {english
-                      ? `${impactPreview.risk} risk`
-                      : `${impactPreview.risk === "low" ? "低" : "中"}风险`}
-                  </span>
-                </div>
-                {impactPreview.changes.length === 0 ? (
-                  <p>{english ? "No runtime changes." : "与当前生效配置一致，无运行影响。"}</p>
-                ) : (
-                  <ul>
-                    {impactPreview.changes.map((change) => (
-                      <li key={change}>{impactChangeLabel(change, form, selectedMode, locale)}</li>
-                    ))}
-                  </ul>
-                )}
-                {impactPreview.restartRequired ? (
-                  <p className="impact-restart">
-                    {english
-                      ? "The listener address changed. Restart the runtime after activation."
-                      : "监听地址发生变化；启用后需要重启运行时。"}
-                  </p>
-                ) : null}
-                {impactPreview.issues.length > 0 ? (
-                  <ul className="impact-issues">
-                    {impactPreview.issues.map((issue) => (
-                      <li key={`${issue.code}-${issue.field}`}>{issue.message}</li>
-                    ))}
-                  </ul>
-                ) : null}
-              </section>
-            ) : null}
           </>
         ) : (
           <>
@@ -3033,6 +3283,19 @@ export const QuickStartWizard = ({
         )}
       </div>
 
+      {operationState.status === "error" ? (
+        <p className="operation-message operation-error" role="alert">
+          {operationState.message}
+        </p>
+      ) : operationState.status === "success" ? (
+        <p className="operation-message" role="status">
+          {operationState.message}
+        </p>
+      ) : advanceIssue !== "" ? (
+        <p className="operation-message" role="status">
+          {advanceIssue}
+        </p>
+      ) : null}
       <div className="onboarding-navigation">
         <button
           type="button"
@@ -3045,8 +3308,19 @@ export const QuickStartWizard = ({
           type="button"
           onClick={() => void advanceStep()}
           disabled={step === stepLabels.length - 1 || !canAdvance || isPending}
+          aria-busy={pendingAction === "save"}
         >
-          {english ? "Next" : "下一步"}
+          {pendingAction === "save"
+            ? english
+              ? "Saving draft…"
+              : "正在保存草稿…"
+            : isDirty && (step === 1 || step === 2)
+              ? english
+                ? "Save and continue"
+                : "保存并下一步"
+              : english
+                ? "Next"
+                : "下一步"}
         </button>
       </div>
     </section>

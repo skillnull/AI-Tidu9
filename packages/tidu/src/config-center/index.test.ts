@@ -55,7 +55,7 @@ test("creates a configuration-center bootstrap with isolated drafts", async () =
   assert.equal(bootstrap.clients.privacy, "metadata-only");
   assert.deepEqual(
     bootstrap.clients.clients.map((client) => client.id),
-    ["codex", "cursor", "openai-cli"],
+    ["codex", "cursor", "openai-cli", "ollama"],
   );
 });
 

@@ -21,8 +21,8 @@ AI-Tidu9 uses a modular architecture with one core, multiple entry points, and r
 flowchart LR
   User[User goal] --> Surface[Codex / Cursor / CLI / Browser]
   Surface --> Entry[Connectors and virtual-model entry]
-  Entry --> Gate[Policy, quota, approval, and Secret Gate]
-  Gate --> Kernel[Agent kernel<br/>Understand · Plan · Execute · Verify]
+  Entry --> Gate[Policy, approval, and Secret Gate]
+  Gate --> Kernel[Agent kernel<br/>Lifecycle · Route · Execute · Check]
   Kernel --> Router[Dynamic routing and capability completion]
   Router --> Models[Current host model / external models / Ollama]
   Router --> Assets[Agent / Skill / MCP / Tool / Knowledge]
@@ -32,9 +32,9 @@ flowchart LR
   Kernel --> Result[Verifiable result]
 ```
 
-The core does not replace model reasoning or hard-code domain logic. It selects capabilities, limits cost and risk, retains minimal recovery state, and verifies the outcome against the goal.
+The core does not replace model reasoning or hard-code domain logic. It selects capabilities, limits cost and risk, retains minimal recovery state, and ensures that every request ends in an explicit completed or failed state. The full task flow can also verify business acceptance criteria; ordinary inference performs a response-completeness check only.
 
-Capability completion sits after host entry and before model Providers. Hosts submit both goals and host identity to the same Agent kernel. Each host independently declares its primary model, capabilities, cross-host specialists, capability labels, cost evidence, and per-request limit. The entry host fixes the primary; every specialist must come from another host and execute through that host's Provider. An unavailable specialist host fails closed instead of falling back to the primary host. Routing invokes only specialists that fill a gap and prefers lower known cost. History retains only non-secret host and model identifiers, required capabilities, outcomes, and timestamps for local, personal, and enterprise status views.
+Dynamic model routing sits after host entry and before model Providers. Hosts submit both goals and host identity to the same Agent kernel. Each host independently declares a preferred primary, capabilities, cross-host secondary models, capability labels, cost evidence, and per-request limit. Every secondary must come from another host and execute through that host's Provider; an unavailable target host fails closed without borrowing another host's credentials. Routing first filters by capability, verifiable privacy, and current availability, then compares observed usage with comparable known prices, observed latency, and availability. Capability gaps use bounded composition, a fully capable secondary may execute directly when evidence shows an advantage, and `429` or explicit failure triggers fallback among fully capable candidates. Unknown prices and quota data that is not integrated do not drive replacement. History retains only non-secret host and model identifiers, required capabilities, selection reason, outcomes, and timestamps for local, personal, and enterprise status views.
 
 ## 🧱 Module map: responsibilities and exclusions
 
@@ -49,7 +49,9 @@ Capability completion sits after host entry and before model Providers. Hosts su
 
 Every module belongs to the single public package `@skillnull/tidu`. Directories preserve internal boundaries; they are not separate npm packages to install.
 
-## 🔄 Task flow: from goal to acceptance
+## 🔄 Task flow: fast inference and full tasks
+
+Ordinary `/v1/chat/completions` and `/v1/responses` requests call the selected model once by default. They perform policy and capability checks, record the execution lifecycle, and check response completeness. Streaming sends real execution stages and model-output deltas as they occur; progress events are not hidden chain of thought. Goal decomposition, checkpoints, tool approval, and independent business acceptance belong to the full task flow:
 
 ```mermaid
 sequenceDiagram
@@ -60,7 +62,7 @@ sequenceDiagram
   participant Capability as Model/capability
 
   Client->>Gate: Submit goal and context
-  Gate->>Gate: Check policy, secrets, and quota
+  Gate->>Gate: Check policy, secrets, and approvals
   Gate->>Agent: Forward compliant input only
   Agent->>Route: Request the capability required by a step
   Route->>Capability: Select the main model or a specialist
@@ -76,7 +78,7 @@ Tasks use append-only events and monotonically increasing revisions. Write or ex
 | Event | Default action | Reason |
 | --- | --- | --- |
 | Required capability is unavailable | Reject before execution | Never let a model pretend it has a capability |
-| Main model returns `429` | Mark process-local quota exhaustion and reroute | Preserve continuity without hiding the switch |
+| Main model returns `429` | Mark it unavailable in the current process and reroute | Preserve continuity without hiding the switch |
 | Specialist fails | Try the next eligible candidate within budget, otherwise fail closed | Capability completion cannot exceed spend or call bounds |
 | Non-idempotent result is uncertain | Pause for human review | Prevent duplicate charges, sends, or writes |
 | New configuration fails its health check | Restore the previous known-good snapshot | Keep configuration changes reversible |
@@ -140,6 +142,8 @@ AI-Tidu9 retains only the data required for its own operation. Full conversation
 | Generic OpenAI client | `/v1/models`, Chat Completions, Responses | AI-Tidu9 model pool and Agent kernel | Client-specific extensions require separate verification |
 | Browser | Configuration center or enterprise gateway | AI-Tidu9 runtime | Cross-device access requires HTTPS and identity control |
 | Ollama | Upstream model adapter | Local model | It is a provider, not a host client |
+
+The Codex and Cursor host bridges publish only capabilities verified through the current protocol. Host-native image input, web research, or tool use does not appear in the selectable catalog until the bridge implements it. Such requests fail closed instead of degrading into apparently successful text-only requests.
 
 ## 🛡️ Architecture invariants
 

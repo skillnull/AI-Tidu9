@@ -18,6 +18,7 @@ import {
   configureCodexClient,
   inspectCodexClientConfiguration,
   listCodexOfficialModels,
+  refreshCodexClientModelCatalog,
   removeCodexClientConfiguration,
   rollbackCodexClientConfiguration,
   switchCodexClientConfiguration,
@@ -35,6 +36,7 @@ const writeOfficialModelCache = (codexHomeDirectory: string): void => {
           input_modalities: ["text", "image"],
           supported_reasoning_levels: [{ effort: "medium" }],
           supports_search_tool: true,
+          tool_mode: "code_mode_only",
           context_window: 128000,
           visibility: "list",
           supported_in_api: true,
@@ -90,7 +92,7 @@ test("lists current and retained official Codex models without managed entries",
       {
         id: "user-default",
         name: "Official Default",
-        capabilities: ["text", "vision", "reasoning", "web-research", "long-context"],
+        capabilities: ["text", "structured-output", "reasoning", "code", "long-context"],
         capabilitySource: "host-catalog",
       },
       {
@@ -143,11 +145,31 @@ test("writes an isolated Codex profile and switches back to the official configu
     assert.equal(configuredStatus.activeMode, "official");
     const catalog = JSON.parse(
       readFileSync(join(codexHomeDirectory, ".ai-tidu9-model-catalog.json"), "utf8"),
-    ) as { models: { slug: string }[] };
+    ) as {
+      models: {
+        slug: string;
+        apply_patch_tool_type?: string | null;
+        default_reasoning_summary?: string;
+        input_modalities?: readonly string[];
+        supports_image_detail_original?: boolean;
+        supports_parallel_tool_calls?: boolean;
+        supports_search_tool?: boolean;
+        support_verbosity?: boolean;
+        web_search_tool_type?: string;
+      }[];
+    };
     assert.deepEqual(
       catalog.models.map(({ slug }) => slug),
       ["ai-tidu9-config"],
     );
+    assert.equal(catalog.models[0]?.default_reasoning_summary, "auto");
+    assert.deepEqual(catalog.models[0]?.input_modalities, ["text"]);
+    assert.equal(catalog.models[0]?.supports_image_detail_original, false);
+    assert.equal(catalog.models[0]?.supports_parallel_tool_calls, false);
+    assert.equal(catalog.models[0]?.supports_search_tool, false);
+    assert.equal(catalog.models[0]?.support_verbosity, false);
+    assert.equal(catalog.models[0]?.apply_patch_tool_type, null);
+    assert.equal(catalog.models[0]?.web_search_tool_type, undefined);
 
     await switchCodexClientConfiguration({
       mode: "ai-tidu9",
@@ -196,21 +218,262 @@ test("keeps company service models behind the single virtual-model catalog entry
     port: 0,
     provider: {
       descriptor: { type: "openai-compatible", model: "corp-model-v2" },
-      execute: async () => ({ kind: "json", statusCode: 200, body: { output: [] } }),
+      execute: async () => ({
+        kind: "json",
+        statusCode: 200,
+        body: { output: [] },
+      }),
     },
   });
   try {
-    await configureCodexClient({ endpoint: runtime.origin, codexHomeDirectory });
+    await configureCodexClient({
+      endpoint: runtime.origin,
+      codexHomeDirectory,
+    });
     const catalog = JSON.parse(
       readFileSync(join(codexHomeDirectory, ".ai-tidu9-model-catalog.json"), "utf8"),
-    ) as { models: { slug: string; display_name: string }[] };
+    ) as {
+      models: {
+        slug: string;
+        display_name: string;
+        default_reasoning_level?: string;
+        supported_reasoning_levels?: readonly { effort: string }[];
+      }[];
+    };
     assert.deepEqual(
       catalog.models.map(({ slug }) => slug),
       ["ai-tidu9-config"],
     );
     assert.equal(catalog.models[0]?.display_name, "九门赛博提督");
+    assert.equal(catalog.models[0]?.default_reasoning_level, undefined);
+    assert.deepEqual(catalog.models[0]?.supported_reasoning_levels, []);
   } finally {
     await runtime.close();
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
+test("publishes reasoning strength only for an executable Codex primary provider", async () => {
+  const readCatalogForProvider = async (providerType: string) => {
+    const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-reasoning-catalog-"));
+    const codexHomeDirectory = join(temporaryDirectory, ".codex");
+    const request: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.endsWith("/health")) {
+        return Response.json({ product: "九门赛博提督", status: "ok" });
+      }
+      if (url.endsWith("/v1/models")) {
+        return Response.json({
+          object: "list",
+          data: [
+            {
+              id: "ai-tidu9-config",
+              display_name: "九门赛博提督",
+              owned_by: "AI-Tidu9",
+            },
+          ],
+        });
+      }
+      if (url.endsWith("/api/capability-completion")) {
+        return Response.json({
+          activeHost: "codex",
+          available: true,
+          codexReasoningEffortSupported: providerType === "codex-host",
+        });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    };
+
+    try {
+      await configureCodexClient({
+        endpoint: "http://127.0.0.1:9639",
+        codexHomeDirectory,
+        request,
+      });
+      return JSON.parse(
+        readFileSync(join(codexHomeDirectory, ".ai-tidu9-model-catalog.json"), "utf8"),
+      ) as {
+        models: {
+          default_reasoning_level?: string;
+          supported_reasoning_levels?: readonly { effort: string }[];
+        }[];
+      };
+    } finally {
+      rmSync(temporaryDirectory, { force: true, recursive: true });
+    }
+  };
+
+  const codexCatalog = await readCatalogForProvider("codex-host");
+  assert.equal(codexCatalog.models[0]?.default_reasoning_level, "medium");
+  assert.deepEqual(
+    codexCatalog.models[0]?.supported_reasoning_levels?.map(({ effort }) => effort),
+    ["low", "medium", "high"],
+  );
+
+  for (const providerType of ["cursor-host", "ollama", "openai-compatible"]) {
+    const catalog = await readCatalogForProvider(providerType);
+    assert.equal(catalog.models[0]?.default_reasoning_level, undefined);
+    assert.deepEqual(catalog.models[0]?.supported_reasoning_levels, []);
+  }
+});
+
+test("refreshes reasoning strength metadata when entering AI-Tidu9 mode", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-reasoning-refresh-"));
+  const codexHomeDirectory = join(temporaryDirectory, ".codex");
+  let activeProviderType = "codex-host";
+  const request: typeof fetch = async (input) => {
+    const url = String(input);
+    if (url.endsWith("/health")) {
+      return Response.json({ product: "九门赛博提督", status: "ok" });
+    }
+    if (url.endsWith("/v1/models")) {
+      return Response.json({
+        object: "list",
+        data: [
+          {
+            id: "ai-tidu9-config",
+            display_name: "九门赛博提督",
+            owned_by: "AI-Tidu9",
+          },
+        ],
+      });
+    }
+    if (url.endsWith("/api/capability-completion")) {
+      return Response.json({
+        activeHost: "codex",
+        available: true,
+        codexReasoningEffortSupported: activeProviderType === "codex-host",
+      });
+    }
+    if (url.endsWith("/v1/hosts/codex/responses")) {
+      return Response.json({ id: "verified", object: "response", output: [] });
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+
+  try {
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory,
+      request,
+    });
+    activeProviderType = "cursor-host";
+    await switchCodexClientConfiguration({
+      mode: "ai-tidu9",
+      codexHomeDirectory,
+      request,
+    });
+    const catalog = JSON.parse(
+      readFileSync(join(codexHomeDirectory, ".ai-tidu9-model-catalog.json"), "utf8"),
+    ) as {
+      models: {
+        default_reasoning_level?: string;
+        supported_reasoning_levels?: readonly { effort: string }[];
+      }[];
+    };
+    assert.equal(catalog.models[0]?.default_reasoning_level, undefined);
+    assert.deepEqual(catalog.models[0]?.supported_reasoning_levels, []);
+  } finally {
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
+test("refreshes reasoning strength metadata after the active provider changes", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-reasoning-provider-change-"));
+  const codexHomeDirectory = join(temporaryDirectory, ".codex");
+  let activeHost = "codex";
+  const request: typeof fetch = async (input) => {
+    const url = String(input);
+    if (url.endsWith("/health")) {
+      return Response.json({ product: "九门赛博提督", status: "ok" });
+    }
+    if (url.endsWith("/v1/models")) {
+      return Response.json({
+        object: "list",
+        data: [
+          {
+            id: "ai-tidu9-config",
+            display_name: "九门赛博提督",
+            owned_by: "AI-Tidu9",
+          },
+        ],
+      });
+    }
+    if (url.endsWith("/api/capability-completion")) {
+      return Response.json({
+        activeHost: "codex",
+        available: true,
+        codexReasoningEffortSupported: activeHost === "codex",
+      });
+    }
+    if (url.endsWith("/v1/hosts/codex/responses")) {
+      return Response.json({ id: "verified", object: "response", output: [] });
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+
+  try {
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory,
+      request,
+    });
+    await switchCodexClientConfiguration({
+      mode: "ai-tidu9",
+      codexHomeDirectory,
+      request,
+    });
+    const defaultConfigurationPath = join(codexHomeDirectory, "config.toml");
+    const activeConfiguration = readFileSync(defaultConfigurationPath, "utf8");
+
+    activeHost = "cursor";
+    const status = await refreshCodexClientModelCatalog({
+      codexHomeDirectory,
+      request,
+    });
+    const catalog = JSON.parse(
+      readFileSync(join(codexHomeDirectory, ".ai-tidu9-model-catalog.json"), "utf8"),
+    ) as {
+      models: {
+        default_reasoning_level?: string;
+        supported_reasoning_levels?: readonly { effort: string }[];
+      }[];
+    };
+
+    assert.equal(status.activeMode, "ai-tidu9");
+    assert.equal(readFileSync(defaultConfigurationPath, "utf8"), activeConfiguration);
+    assert.equal(catalog.models[0]?.default_reasoning_level, undefined);
+    assert.deepEqual(catalog.models[0]?.supported_reasoning_levels, []);
+  } finally {
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
+test("does not refresh an inactive optional Codex profile", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-inactive-catalog-refresh-"));
+  const codexHomeDirectory = join(temporaryDirectory, ".codex");
+  let requestCount = 0;
+
+  try {
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory,
+      verifyRuntime: false,
+    });
+    const catalogPath = join(codexHomeDirectory, ".ai-tidu9-model-catalog.json");
+    const originalCatalog = readFileSync(catalogPath, "utf8");
+    const status = await refreshCodexClientModelCatalog({
+      codexHomeDirectory,
+      request: async () => {
+        requestCount += 1;
+        throw new Error("Inactive profiles must not contact the runtime.");
+      },
+    });
+
+    assert.equal(status.activeMode, "official");
+    assert.equal(requestCount, 0);
+    assert.equal(readFileSync(catalogPath, "utf8"), originalCatalog);
+  } finally {
     rmSync(temporaryDirectory, { force: true, recursive: true });
   }
 });
@@ -281,7 +544,10 @@ test("retains only the original baseline and latest managed Codex snapshot", asy
 test("keeps the native AI-Tidu9 catalog isolated from changing official model caches", async () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-catalog-"));
   const codexHomeDirectory = join(temporaryDirectory, ".codex");
-  const runtime = await startLocalRuntime({ databasePath: ":memory:", port: 0 });
+  const runtime = await startLocalRuntime({
+    databasePath: ":memory:",
+    port: 0,
+  });
   try {
     mkdirSync(codexHomeDirectory, { mode: 0o700, recursive: true });
     writeFileSync(
@@ -304,9 +570,15 @@ test("keeps the native AI-Tidu9 catalog isolated from changing official model ca
       }),
       { mode: 0o600 },
     );
-    await configureCodexClient({ endpoint: runtime.origin, codexHomeDirectory });
+    await configureCodexClient({
+      endpoint: runtime.origin,
+      codexHomeDirectory,
+    });
     writeOfficialModelCache(codexHomeDirectory);
-    await configureCodexClient({ endpoint: runtime.origin, codexHomeDirectory });
+    await configureCodexClient({
+      endpoint: runtime.origin,
+      codexHomeDirectory,
+    });
 
     const catalog = JSON.parse(
       readFileSync(join(codexHomeDirectory, ".ai-tidu9-model-catalog.json"), "utf8"),
@@ -459,7 +731,9 @@ test("attributes an official Codex inference failure and keeps official mode act
   const defaultConfiguration = join(codexHomeDirectory, "config.toml");
   try {
     mkdirSync(codexHomeDirectory, { mode: 0o700, recursive: true });
-    writeFileSync(defaultConfiguration, 'model = "official-model"\n', { mode: 0o600 });
+    writeFileSync(defaultConfiguration, 'model = "official-model"\n', {
+      mode: 0o600,
+    });
     await configureCodexClient({
       endpoint: "http://127.0.0.1:9639",
       codexHomeDirectory,

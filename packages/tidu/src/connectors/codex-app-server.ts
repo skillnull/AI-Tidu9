@@ -11,6 +11,15 @@ import {
 } from "./json-rpc.js";
 
 export type CodexApprovalDecision = "accept" | "acceptForSession" | "cancel" | "decline";
+export type CodexReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max"
+  | "ultra";
 
 export interface CodexAgentEvent {
   /** App-server notification method. */
@@ -28,6 +37,8 @@ export interface CodexAgentOptions extends CodexHostInspectionOptions {
   sandbox?: "read-only" | "workspace-write";
   /** Optional model selected through Codex's authoritative model catalog. */
   model?: string;
+  /** Reasoning effort used by delegated inference turns. */
+  reasoningEffort?: CodexReasoningEffort;
   /** Optional notification observer for streaming UI integration. */
   onEvent?: (event: CodexAgentEvent) => void;
   /** Explicit reviewer for command and file-change approval requests. */
@@ -85,6 +96,8 @@ export interface CodexTurnResult {
   status: "completed" | "failed" | "interrupted";
   /** Concatenated assistant message deltas. */
   text: string;
+  /** Per-turn token usage reported by the official app-server. */
+  usage: { inputTokens: number; outputTokens: number; totalTokens: number } | null;
 }
 
 export interface CodexAgentClient {
@@ -102,6 +115,7 @@ export interface CodexAgentClient {
     text: string,
     signal?: AbortSignal,
     onTextDelta?: (delta: string) => void,
+    reasoningEffort?: CodexReasoningEffort,
   ) => Promise<CodexTurnResult>;
   /** Interrupts one active turn. */
   cancel: (threadId: string, turnId: string) => Promise<void>;
@@ -120,6 +134,17 @@ interface TurnState {
   cleanup: () => void;
   /** Receives text as soon as the official app-server emits it. */
   onTextDelta?: (delta: string) => void;
+  /** Latest per-turn token usage reported by the official app-server. */
+  usage: CodexTurnResult["usage"];
+}
+
+interface BufferedTurnNotifications {
+  /** Text deltas received before the turn was registered locally. */
+  deltas: string[];
+  /** Terminal result received before the turn was registered locally. */
+  completion?: Omit<CodexTurnResult, "text" | "usage">;
+  /** Token usage received before the turn was registered locally. */
+  usage?: NonNullable<CodexTurnResult["usage"]>;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -168,17 +193,66 @@ const defaultServerRequest = async (
 
 export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentClient => {
   const activeTurns = new Map<string, TurnState>();
+  const bufferedTurnNotifications = new Map<string, BufferedTurnNotifications>();
   let initialized = false;
+
+  const bufferTurnNotification = (
+    turnId: string,
+    update: (buffer: BufferedTurnNotifications) => void,
+  ): void => {
+    const buffer = bufferedTurnNotifications.get(turnId) ?? { deltas: [] };
+    update(buffer);
+    bufferedTurnNotifications.set(turnId, buffer);
+    if (bufferedTurnNotifications.size > 32) {
+      const oldestTurnId = bufferedTurnNotifications.keys().next().value;
+      if (oldestTurnId !== undefined) bufferedTurnNotifications.delete(oldestTurnId);
+    }
+  };
+
+  const completeTurn = (
+    completion: Omit<CodexTurnResult, "text" | "usage">,
+    state: TurnState,
+  ): void => {
+    activeTurns.delete(completion.turnId);
+    state.cleanup();
+    state.resolve({ ...completion, text: state.text, usage: state.usage });
+  };
 
   const onNotification = (notification: JsonRpcNotification): void => {
     options.onEvent?.(notification);
     const turnId = readString(notification.params, "turnId");
+    if (
+      notification.method === "thread/tokenUsage/updated" &&
+      turnId !== undefined &&
+      isRecord(notification.params) &&
+      isRecord(notification.params.tokenUsage)
+    ) {
+      const tokenUsage = notification.params.tokenUsage;
+      const last = isRecord(tokenUsage.last) ? tokenUsage.last : tokenUsage.total;
+      const inputTokens = readNumber(last, "inputTokens");
+      const outputTokens = readNumber(last, "outputTokens");
+      const totalTokens = readNumber(last, "totalTokens");
+      if (inputTokens !== null && outputTokens !== null && totalTokens !== null) {
+        const usage = { inputTokens, outputTokens, totalTokens };
+        const state = activeTurns.get(turnId);
+        if (state === undefined) {
+          bufferTurnNotification(turnId, (buffer) => {
+            buffer.usage = usage;
+          });
+        } else {
+          state.usage = usage;
+        }
+      }
+      return;
+    }
     if (notification.method === "item/agentMessage/delta" && turnId !== undefined) {
       const state = activeTurns.get(turnId);
       const delta = readString(notification.params, "delta");
       if (state !== undefined && delta !== undefined) {
         state.text += delta;
         state.onTextDelta?.(delta);
+      } else if (delta !== undefined) {
+        bufferTurnNotification(turnId, (buffer) => buffer.deltas.push(delta));
       }
       return;
     }
@@ -200,11 +274,12 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     }
     const state = activeTurns.get(completedTurnId);
     if (state === undefined) {
+      bufferTurnNotification(completedTurnId, (buffer) => {
+        buffer.completion = { threadId, turnId: completedTurnId, status };
+      });
       return;
     }
-    activeTurns.delete(completedTurnId);
-    state.cleanup();
-    state.resolve({ threadId, turnId: completedTurnId, status, text: state.text });
+    completeTurn({ threadId, turnId: completedTurnId, status }, state);
   };
 
   const launch = createCodexAppServerLaunch(options);
@@ -318,6 +393,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       text: string,
       signal?: AbortSignal,
       onTextDelta?: (delta: string) => void,
+      reasoningEffort?: CodexReasoningEffort,
     ): Promise<CodexTurnResult> => {
       requireInitialized();
       if (text.trim() === "") {
@@ -329,6 +405,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           threadId,
           input: [{ type: "text", text, text_elements: [] }],
           approvalPolicy: "on-request",
+          effort: reasoningEffort ?? options.reasoningEffort ?? null,
         },
         signal,
       );
@@ -344,13 +421,24 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           reject(new TiduError("INTERNAL_ERROR", "Codex turn cancelled."));
         };
         signal?.addEventListener("abort", abort, { once: true });
-        activeTurns.set(turnId, {
+        const state: TurnState = {
           text: "",
           resolve,
           reject,
           cleanup: () => signal?.removeEventListener("abort", abort),
           onTextDelta,
-        });
+          usage: null,
+        };
+        activeTurns.set(turnId, state);
+        const buffered = bufferedTurnNotifications.get(turnId);
+        if (buffered === undefined) return;
+        bufferedTurnNotifications.delete(turnId);
+        for (const delta of buffered.deltas) {
+          state.text += delta;
+          state.onTextDelta?.(delta);
+        }
+        if (buffered.usage !== undefined) state.usage = buffered.usage;
+        if (buffered.completion !== undefined) completeTurn(buffered.completion, state);
       });
     },
     cancel: async (threadId: string, turnId: string): Promise<void> => {
@@ -363,6 +451,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
         state.reject(new TiduError("INTERNAL_ERROR", "Codex connection closed."));
       }
       activeTurns.clear();
+      bufferedTurnNotifications.clear();
       await client.close();
     },
   };

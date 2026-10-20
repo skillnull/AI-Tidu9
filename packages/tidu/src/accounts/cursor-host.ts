@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 
 import { TiduError } from "../core/index.js";
+import { inspectProcess } from "./process-inspection.js";
 
 export type CursorHostLoginStatus =
   | "authenticated"
@@ -218,6 +219,37 @@ export const listCursorHostModels = (
   return [];
 };
 
+export const listCursorHostModelsAsync = async (
+  options: CursorHostInspectionOptions = {},
+): Promise<CursorHostModel[]> => {
+  const commandCandidates = resolveCursorCommands(options);
+  const commandKey = commandCandidates.join("\u0000");
+  if (usesDefaultInspection(options)) {
+    const cachedModels = readCachedInspection(cachedDefaultModels, commandKey);
+    if (cachedModels !== undefined) return cachedModels;
+  }
+  for (const command of commandCandidates) {
+    const result = await inspectProcess(
+      command,
+      ["--list-models"],
+      resolveEnvironment(options),
+      options.timeoutMilliseconds ?? DEFAULT_STATUS_TIMEOUT_MILLISECONDS,
+    );
+    if (result.errorCode === "ENOENT") continue;
+    if (result.status !== 0) return [];
+    const models = parseCursorModels(result.stdout);
+    if (usesDefaultInspection(options)) {
+      cachedDefaultModels = cacheDefaultInspection(
+        models,
+        commandKey,
+        DEFAULT_MODEL_CACHE_MILLISECONDS,
+      );
+    }
+    return models;
+  }
+  return [];
+};
+
 const supportsCursorAcp = (command: string, options: CursorHostInspectionOptions): boolean => {
   const result = spawnSync(command, ["acp", "--help"], {
     encoding: "utf8",
@@ -262,6 +294,74 @@ export const inspectCursorHostLogin = (
       accountEmail: parseAccountEmail(result.stdout ?? ""),
       accountPlan: parseAccountPlan(result.stdout ?? ""),
     };
+    if (usesDefaultInspection(options)) {
+      cachedDefaultLogin = cacheDefaultInspection(
+        state,
+        commandKey,
+        DEFAULT_LOGIN_CACHE_MILLISECONDS,
+      );
+    }
+    return state;
+  }
+  const state: CursorHostLoginState = {
+    schemaVersion: "1",
+    client: "cursor",
+    status: "unavailable",
+    command: null,
+    acpAvailable: false,
+    reusable: false,
+    authority: "cursor-host",
+    accountEmail: null,
+    accountPlan: null,
+  };
+  if (usesDefaultInspection(options)) {
+    cachedDefaultLogin = cacheDefaultInspection(
+      state,
+      commandKey,
+      DEFAULT_LOGIN_CACHE_MILLISECONDS,
+    );
+  }
+  return state;
+};
+
+export const inspectCursorHostLoginAsync = async (
+  options: CursorHostInspectionOptions = {},
+): Promise<CursorHostLoginState> => {
+  const commandCandidates = resolveCursorCommands(options);
+  const commandKey = commandCandidates.join("\u0000");
+  if (usesDefaultInspection(options)) {
+    const cachedLogin = readCachedInspection(cachedDefaultLogin, commandKey);
+    if (cachedLogin !== undefined) return cachedLogin;
+  }
+  for (const command of commandCandidates) {
+    const statusResult = await inspectProcess(
+      command,
+      ["status"],
+      resolveEnvironment(options),
+      options.timeoutMilliseconds ?? DEFAULT_STATUS_TIMEOUT_MILLISECONDS,
+    );
+    if (statusResult.errorCode === "ENOENT") continue;
+    const acpResult = await inspectProcess(
+      command,
+      ["acp", "--help"],
+      resolveEnvironment(options),
+      options.timeoutMilliseconds ?? DEFAULT_STATUS_TIMEOUT_MILLISECONDS,
+    );
+    const output = `${statusResult.stdout}\n${statusResult.stderr}`;
+    const state: CursorHostLoginState = {
+      schemaVersion: "1",
+      client: "cursor",
+      status: parseLoginStatus(statusResult.status, output),
+      command,
+      acpAvailable:
+        acpResult.status === 0 &&
+        /Agent Client Protocol|\bACP\b/iu.test(`${acpResult.stdout}\n${acpResult.stderr}`),
+      reusable: false,
+      authority: "cursor-host",
+      accountEmail: parseAccountEmail(statusResult.stdout),
+      accountPlan: parseAccountPlan(statusResult.stdout),
+    };
+    state.reusable = state.acpAvailable && state.status === "authenticated";
     if (usesDefaultInspection(options)) {
       cachedDefaultLogin = cacheDefaultInspection(
         state,

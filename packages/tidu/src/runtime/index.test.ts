@@ -19,7 +19,7 @@ import {
 import type { ModelProvider } from "../providers/index.js";
 import { createScalingControlPlane } from "../scaling/index.js";
 import { IN_MEMORY_DATABASE_PATH, STORAGE_SCHEMA_VERSION } from "../storage/index.js";
-import { startLocalRuntime } from "./index.js";
+import { evaluateCapabilityCompletionDiagnostic, startLocalRuntime } from "./index.js";
 
 test("exposes bounded Agent task creation and control through the local API", async () => {
   const agentKernel = createAgentKernel({
@@ -100,7 +100,13 @@ test("routes Responses and Chat Completions hosts through the same Agent kernel"
       }),
       plan: async () => ({
         revision: 1,
-        steps: [{ id: "deliver", title: "Deliver through the Agent kernel", kind: "reason" }],
+        steps: [
+          {
+            id: "deliver",
+            title: "Deliver through the Agent kernel",
+            kind: "reason",
+          },
+        ],
       }),
     },
     worker: {
@@ -140,10 +146,13 @@ test("routes Responses and Chat Completions hosts through the same Agent kernel"
     const responsesResponse = await fetch(`${runtime.origin}/v1/responses`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "ai-tidu9-config", input: "Responses host goal" }),
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        input: "Responses host goal",
+      }),
     });
     assert.equal(responsesResponse.status, 200);
-    assert.match(await responsesResponse.text(), /Shared Agent result verified/u);
+    assert.match(await responsesResponse.text(), /Agent completed: Responses host goal/u);
 
     const chatResponse = await fetch(`${runtime.origin}/v1/chat/completions`, {
       method: "POST",
@@ -154,15 +163,18 @@ test("routes Responses and Chat Completions hosts through the same Agent kernel"
       }),
     });
     assert.equal(chatResponse.status, 200);
-    assert.match(await chatResponse.text(), /Shared Agent result verified/u);
+    assert.match(await chatResponse.text(), /Agent completed: Chat host goal/u);
 
     const cursorResponse = await fetch(`${runtime.origin}/v1/hosts/cursor/responses`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "ai-tidu9-config", input: "Cursor host goal" }),
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        input: "Cursor host goal",
+      }),
     });
     assert.equal(cursorResponse.status, 200);
-    assert.match(await cursorResponse.text(), /Shared Agent result verified/u);
+    assert.match(await cursorResponse.text(), /Agent completed: Cursor host goal/u);
 
     const taskList = (await (await fetch(`${runtime.origin}/api/tasks`)).json()) as {
       tasks: Array<{ objective: string; originHost?: string }>;
@@ -201,6 +213,7 @@ test("exposes the shared capability-completion policy and bounded usage status",
     const status = (await response.json()) as {
       activeHost: string | null;
       available: boolean;
+      codexReasoningEffortSupported: boolean;
       operational: boolean;
       configuration: { enabled: boolean; specialists: unknown[] };
       hosts: string[];
@@ -208,6 +221,7 @@ test("exposes the shared capability-completion policy and bounded usage status",
     };
     assert.equal(status.activeHost, "openai-compatible");
     assert.equal(status.available, true);
+    assert.equal(status.codexReasoningEffortSupported, false);
     assert.equal(status.operational, false);
     assert.equal(status.configuration.enabled, false);
     assert.deepEqual(status.configuration.specialists, []);
@@ -216,6 +230,63 @@ test("exposes the shared capability-completion policy and bounded usage status",
   } finally {
     await runtime.close();
   }
+});
+
+const createCapabilityDiagnosticRecord = (secondaryOutcome: "failed" | "succeeded") => ({
+  outcome: secondaryOutcome,
+  mainResult: {
+    modelId: "main:codex:official",
+    host: "codex" as const,
+    model: "primary-model",
+    role: "main" as const,
+    capabilities: ["text"],
+    outcome: "succeeded" as const,
+    statusCode: 200,
+    durationMilliseconds: 12,
+    message: "",
+  },
+  secondaryResults: [
+    {
+      modelId: "specialist-0:cursor:official",
+      host: "cursor" as const,
+      model: "secondary-model",
+      role: "secondary" as const,
+      capabilities: ["code"],
+      outcome: secondaryOutcome,
+      statusCode: secondaryOutcome === "succeeded" ? 200 : 503,
+      durationMilliseconds: 18,
+      message: secondaryOutcome === "succeeded" ? "" : "Secondary model unavailable.",
+    },
+  ],
+});
+
+test("fails the capability-completion diagnostic when a selected secondary invocation fails", () => {
+  const result = evaluateCapabilityCompletionDiagnostic(
+    createCapabilityDiagnosticRecord("failed"),
+    200,
+  );
+
+  assert.equal(result.httpStatus, 502);
+  assert.equal(result.passed, false);
+  assert.equal(result.mainInvoked, true);
+  assert.equal(result.secondaryInvoked, true);
+  assert.equal(result.allSelectedInvocationsSucceeded, false);
+  assert.match(result.message, /secondary invocation failed/iu);
+  assert.doesNotMatch(result.message, /completed successfully/iu);
+});
+
+test("passes the capability-completion diagnostic only after primary and secondary success", () => {
+  const result = evaluateCapabilityCompletionDiagnostic(
+    createCapabilityDiagnosticRecord("succeeded"),
+    200,
+  );
+
+  assert.equal(result.httpStatus, 200);
+  assert.equal(result.passed, true);
+  assert.equal(result.mainInvoked, true);
+  assert.equal(result.secondaryInvoked, true);
+  assert.equal(result.allSelectedInvocationsSucceeded, true);
+  assert.match(result.message, /completed successfully/iu);
 });
 
 test("starts a loopback runtime with a verifiable health endpoint", async () => {
@@ -584,11 +655,14 @@ test("serves the local configuration center and its bootstrap API", async () => 
   }
 });
 
-test("routes validated inference through an injected real provider adapter", async () => {
+test("routes ordinary inference through one Agent model call and preserves reasoning strength", async () => {
   const requests: Array<{
     protocol: string;
     model: unknown;
     virtualModelId: string;
+    reasoning: unknown;
+    reasoningEffort: unknown;
+    role: unknown;
   }> = [];
   const provider: ModelProvider = {
     descriptor: { type: "openai-compatible", model: "upstream-test-model" },
@@ -597,6 +671,9 @@ test("routes validated inference through an injected real provider adapter", asy
         protocol: request.protocol,
         model: request.body.model,
         virtualModelId: request.virtualModelId,
+        reasoning: request.body.reasoning,
+        reasoningEffort: request.body.reasoning_effort,
+        role: request.routing?.role,
       });
       return {
         kind: "json",
@@ -607,14 +684,20 @@ test("routes validated inference through an injected real provider adapter", asy
                 id: "chatcmpl-test",
                 object: "chat.completion",
                 model: request.virtualModelId,
-                choices: [],
+                choices: [{ message: { content: "hello from chat" } }],
               }
             : {
                 id: "resp-test",
                 object: "response",
                 model: request.virtualModelId,
                 status: "completed",
-                output: [],
+                output: [
+                  {
+                    type: "message",
+                    role: "assistant",
+                    content: [{ type: "output_text", text: "hello from responses" }],
+                  },
+                ],
               },
       };
     },
@@ -640,7 +723,6 @@ test("routes validated inference through an injected real provider adapter", asy
       body: JSON.stringify({
         model: "ai-tidu9-config",
         messages: [{ role: "user", content: "hello" }],
-        metadata: { ai_tidu9_probe: true },
       }),
     });
     assert.equal(chatResponse.status, 200);
@@ -653,7 +735,7 @@ test("routes validated inference through an injected real provider adapter", asy
       body: JSON.stringify({
         model: "ai-tidu9-config",
         input: "hello",
-        metadata: { ai_tidu9_probe: true },
+        reasoning: { effort: "high" },
       }),
     });
     assert.equal(responsesResponse.status, 200);
@@ -663,13 +745,184 @@ test("routes validated inference through an injected real provider adapter", asy
         protocol: "chat-completions",
         model: "ai-tidu9-config",
         virtualModelId: "ai-tidu9-config",
+        reasoning: undefined,
+        reasoningEffort: undefined,
+        role: "worker",
       },
       {
         protocol: "responses",
         model: "ai-tidu9-config",
         virtualModelId: "ai-tidu9-config",
+        reasoning: { effort: "high" },
+        reasoningEffort: undefined,
+        role: "worker",
       },
     ]);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("streams real upstream output deltas through the Agent Responses lifecycle", async () => {
+  const encoder = new TextEncoder();
+  let upstreamStreamRequested = false;
+  let upstreamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const provider: ModelProvider = {
+    descriptor: { type: "openai-compatible", model: "upstream-test-model" },
+    execute: async (request) => {
+      upstreamStreamRequested = request.body.stream === true;
+      return {
+        kind: "stream",
+        statusCode: 200,
+        stream: new ReadableStream<Uint8Array>({
+          start(controller) {
+            upstreamController = controller;
+            controller.enqueue(
+              encoder.encode(
+                'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello "}\n\n',
+              ),
+            );
+          },
+        }),
+      };
+    },
+  };
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    port: 0,
+    provider,
+  });
+
+  try {
+    const response = await fetch(`${runtime.origin}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        input: "hello",
+        stream: true,
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(upstreamStreamRequested, true);
+    const reader = response.body?.getReader();
+    assert.notEqual(reader, undefined);
+    const decoder = new TextDecoder();
+    let events = "";
+    while (!events.includes('"delta":"hello "')) {
+      const chunk = await reader?.read();
+      assert.equal(chunk?.done, false);
+      events += decoder.decode(chunk?.value, { stream: true });
+    }
+    assert.doesNotMatch(events, /event: response\.completed/u);
+    assert.match(events, /正在接收任务并选择执行路径/u);
+    assert.match(events, /执行路径已确认，正在接收模型输出/u);
+    upstreamController?.enqueue(
+      encoder.encode(
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"world"}\n\n',
+      ),
+    );
+    upstreamController?.enqueue(
+      encoder.encode(
+        'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello world"}]}]}}\n\n',
+      ),
+    );
+    upstreamController?.enqueue(encoder.encode("data: [DONE]\n\n"));
+    upstreamController?.close();
+    while (true) {
+      const chunk = await reader?.read();
+      if (chunk?.done !== false) break;
+      events += decoder.decode(chunk.value, { stream: true });
+    }
+    events += decoder.decode();
+    assert.equal(events.match(/event: response\.output_text\.delta/gu)?.length, 2);
+    assert.match(events, /"delta":"hello "/u);
+    assert.match(events, /"delta":"world"/u);
+    assert.match(events, /"text":"hello world"/u);
+    assert.match(events, /event: response\.completed/u);
+    assert.match(events, /data: \[DONE\]/u);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("fails the public stream when Agent execution fails without hiding it behind a direct call", async () => {
+  let providerCalls = 0;
+  const provider: ModelProvider = {
+    descriptor: { type: "openai-compatible", model: "upstream-test-model" },
+    execute: async (request) => {
+      providerCalls += 1;
+      assert.equal(request.body.stream, false);
+      return {
+        kind: "json",
+        statusCode: 200,
+        body: {
+          id: "resp-fallback",
+          object: "response",
+          model: request.virtualModelId,
+          status: "completed",
+          output: [
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "fallback OK" }],
+            },
+          ],
+        },
+      };
+    },
+  };
+  const agentKernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    planner: {
+      understand: async (task) => ({
+        objective: task.goal.objective,
+        acceptanceCriteria: [...task.goal.acceptanceCriteria],
+        constraints: [],
+        assumptions: [],
+        requiredCapabilities: [],
+      }),
+      plan: async () => ({
+        revision: 1,
+        steps: [{ id: "deliver", title: "Deliver", kind: "reason" }],
+      }),
+    },
+    worker: {
+      execute: async () => {
+        throw new Error("Agent orchestration failed before delivery.");
+      },
+    },
+  });
+  const runtime = await startLocalRuntime({
+    agentKernel,
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
+    port: 0,
+    provider,
+  });
+
+  try {
+    const response = await fetch(`${runtime.origin}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        input: "Reply with OK",
+        stream: true,
+      }),
+    });
+    const events = await response.text();
+
+    assert.equal(response.status, 200);
+    assert.equal(providerCalls, 0);
+    assert.doesNotMatch(events, /fallback OK/u);
+    assert.doesNotMatch(events, /event: response\.completed/u);
+    assert.match(events, /event: response\.reasoning_summary_text\.done/u);
+    assert.match(events, /event: response\.reasoning_summary_part\.done/u);
+    assert.match(events, /event: response\.output_item\.done/u);
+    assert.match(events, /event: response\.failed/u);
+    assert.match(events, /Agent orchestration failed before delivery/u);
+    assert.match(events, /data: \[DONE\]/u);
   } finally {
     await runtime.close();
   }
@@ -728,6 +981,263 @@ test("streams provider events through the virtual-model endpoint without bufferi
     assert.equal(response.headers.get("x-accel-buffering"), "no");
     assert.equal(receivedTools, true);
     assert.match(await response.text(), /data: \[DONE\]/u);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("completes the Agent Responses stream with explicit lifecycle events", async () => {
+  const agentKernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    planner: {
+      understand: async (task) => ({
+        objective: task.goal.objective,
+        acceptanceCriteria: [...task.goal.acceptanceCriteria],
+        constraints: [],
+        assumptions: [],
+        requiredCapabilities: [],
+      }),
+      plan: async () => ({
+        revision: 1,
+        steps: [{ id: "deliver", title: "Deliver", kind: "reason" }],
+      }),
+    },
+    worker: {
+      execute: async () => ({
+        summary: "OK",
+        evidence: [
+          {
+            kind: "model",
+            integrity: "reported",
+            summary: "The Agent returned OK.",
+            supportsCriteria: [0],
+          },
+        ],
+      }),
+    },
+    verifier: {
+      verify: async ({ evidence }) => ({
+        summary: "OK",
+        criteria: [
+          {
+            criterionIndex: 0,
+            accepted: true,
+            reason: "The Agent response was produced.",
+            evidenceIds: evidence.map((item) => item.id),
+          },
+        ],
+      }),
+    },
+  });
+  const runtime = await startLocalRuntime({
+    agentKernel,
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
+    port: 0,
+  });
+
+  try {
+    const response = await fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        input: "Reply with OK",
+        stream: true,
+      }),
+    });
+    const events = await response.text();
+
+    assert.equal(response.status, 200);
+    assert.match(events, /event: response\.created/u);
+    assert.match(events, /event: response\.reasoning_summary_text\.delta/u);
+    assert.match(events, /正在接收任务并选择执行路径/u);
+    assert.match(events, /event: response\.output_text\.delta/u);
+    assert.match(events, /event: response\.completed/u);
+    assert.match(events, /data: \[DONE\]/u);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("reports Agent stream failures as terminal events instead of disconnecting", async () => {
+  const agentKernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    planner: {
+      understand: async () => {
+        throw new Error("routing unavailable");
+      },
+      plan: async () => ({ revision: 1, steps: [] }),
+    },
+    worker: {
+      execute: async () => {
+        throw new Error("routing unavailable");
+      },
+    },
+  });
+  const runtime = await startLocalRuntime({
+    agentKernel,
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
+    port: 0,
+  });
+
+  try {
+    const response = await fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        input: "Reply with OK",
+        metadata: { ai_tidu9_agent: true },
+        stream: true,
+      }),
+    });
+    const events = await response.text();
+
+    assert.equal(response.status, 200);
+    assert.match(events, /event: response\.failed/u);
+    assert.match(events, /routing unavailable/u);
+    assert.match(events, /data: \[DONE\]/u);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("reports Agent Chat stream failures as terminal data instead of disconnecting", async () => {
+  const agentKernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    planner: {
+      understand: async (task) => ({
+        objective: task.goal.objective,
+        acceptanceCriteria: [...task.goal.acceptanceCriteria],
+        constraints: [],
+        assumptions: [],
+        requiredCapabilities: [],
+      }),
+      plan: async () => ({
+        revision: 1,
+        steps: [{ id: "deliver", title: "Deliver", kind: "reason" }],
+      }),
+    },
+    worker: {
+      execute: async () => {
+        throw new Error("chat routing unavailable");
+      },
+    },
+  });
+  const runtime = await startLocalRuntime({
+    agentKernel,
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
+    port: 0,
+  });
+
+  try {
+    const response = await fetch(`${runtime.origin}/v1/hosts/codex/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        messages: [{ role: "user", content: "Reply with OK" }],
+        metadata: { ai_tidu9_agent: true },
+        stream: true,
+      }),
+    });
+    const events = await response.text();
+
+    assert.equal(response.status, 200);
+    assert.match(events, /"code":"agent_task_failed"/u);
+    assert.match(events, /chat routing unavailable/u);
+    assert.match(events, /data: \[DONE\]/u);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("preserves bounded provider error details across Agent response formats", async () => {
+  const upstreamSecret = "provider-secret-value";
+  const upstreamMessage = `The Codex text bridge does not support image input. Authorization: Bearer ${upstreamSecret} ${"diagnostic".repeat(40)}`;
+  let providerCalls = 0;
+  const provider: ModelProvider = {
+    descriptor: { type: "codex-host", model: "codex-test-model" },
+    execute: async () => {
+      providerCalls += 1;
+      return {
+        kind: "json",
+        statusCode: 400,
+        body: {
+          error: {
+            code: "host_bridge_image_unsupported",
+            message: upstreamMessage,
+            type: "invalid_request_error",
+          },
+          privateDiagnostic: upstreamSecret,
+        },
+      };
+    },
+  };
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
+    port: 0,
+    provider,
+  });
+  const requests = [
+    {
+      path: "/v1/hosts/codex/responses",
+      body: {
+        model: "ai-tidu9-config",
+        input: "Inspect the image",
+        stream: true,
+      },
+      stream: true,
+    },
+    {
+      path: "/v1/hosts/codex/chat/completions",
+      body: {
+        model: "ai-tidu9-config",
+        messages: [{ role: "user", content: "Inspect the image" }],
+        stream: true,
+      },
+      stream: true,
+    },
+    {
+      path: "/v1/hosts/codex/responses",
+      body: { model: "ai-tidu9-config", input: "Inspect the image" },
+      stream: false,
+    },
+    {
+      path: "/v1/hosts/codex/chat/completions",
+      body: {
+        model: "ai-tidu9-config",
+        messages: [{ role: "user", content: "Inspect the image" }],
+      },
+      stream: false,
+    },
+  ] as const;
+
+  try {
+    for (const request of requests) {
+      const response = await fetch(`${runtime.origin}${request.path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(request.body),
+      });
+      const responseText = await response.text();
+
+      assert.equal(response.status, request.stream ? 200 : 502);
+      assert.match(responseText, /host_bridge_image_unsupported/u);
+      assert.match(responseText, /does not support image input/u);
+      assert.doesNotMatch(responseText, new RegExp(upstreamSecret, "u"));
+      assert.doesNotMatch(responseText, /privateDiagnostic/u);
+      if (request.stream) assert.match(responseText, /data: \[DONE\]/u);
+      const errorMessage = request.stream
+        ? /"message":"([^"]*)"/u.exec(responseText)?.[1]
+        : ((JSON.parse(responseText) as { error: { message: string } }).error.message ?? "");
+      assert.ok((errorMessage?.length ?? 0) <= 240);
+    }
+    assert.equal(providerCalls, requests.length);
   } finally {
     await runtime.close();
   }
@@ -812,7 +1322,40 @@ test("keeps mode drafts isolated until a valid draft is explicitly activated", a
   try {
     const initialResponse = await fetch(`${runtime.origin}/api/config-center`);
     const initial = (await initialResponse.json()) as ConfigCenterBootstrap;
-    const expertRevision = initial.configuration.workspace.drafts.expert.revision;
+    const initialExpertDraft = initial.configuration.workspace.drafts.expert;
+    const expertRevision = initialExpertDraft.revision;
+    const selectedCapabilityCompletion = {
+      enabled: true,
+      mainCapabilities: ["vision"],
+      specialists: [
+        {
+          host: "cursor" as const,
+          source: "official" as const,
+          model: "claude-opus-5[thinking=true,context=300k,effort=high,fast=false]",
+          capabilities: ["code"],
+          inputCostPerMillionTokens: null,
+          outputCostPerMillionTokens: null,
+        },
+      ],
+      maximumSpecialists: 1,
+      hostPolicies: {
+        codex: {
+          mainModel: { source: "official" as const, model: "gpt-5.6-sol" },
+          mainCapabilities: ["reasoning"],
+          specialists: [
+            {
+              host: "cursor" as const,
+              source: "official" as const,
+              model: "claude-opus-5[thinking=true,context=300k,effort=high,fast=false]",
+              capabilities: ["code"],
+              inputCostPerMillionTokens: null,
+              outputCostPerMillionTokens: null,
+            },
+          ],
+          maximumSpecialists: 1,
+        },
+      },
+    };
 
     const invalidResponse = await fetch(`${runtime.origin}/api/configuration/drafts/expert`, {
       method: "PUT",
@@ -829,18 +1372,54 @@ test("keeps mode drafts isolated until a valid draft is explicitly activated", a
     });
     assert.equal(invalidResponse.status, 422);
 
+    const invalidModelSelectionResponse = await fetch(
+      `${runtime.origin}/api/configuration/drafts/expert`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          expectedRevision: expertRevision,
+          configuration: {
+            ...initialExpertDraft.configuration,
+            modelSelection: { source: "official" },
+          },
+        }),
+      },
+    );
+    assert.equal(invalidModelSelectionResponse.status, 422);
+
+    const invalidCapabilityCompletionResponse = await fetch(
+      `${runtime.origin}/api/configuration/drafts/expert`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          expectedRevision: expertRevision,
+          configuration: {
+            ...initialExpertDraft.configuration,
+            capabilityCompletion: {
+              enabled: true,
+              mainCapabilities: ["text"],
+              specialists: "not-an-array",
+              maximumSpecialists: 1,
+            },
+          },
+        }),
+      },
+    );
+    assert.equal(invalidCapabilityCompletionResponse.status, 422);
+
     const saveResponse = await fetch(`${runtime.origin}/api/configuration/drafts/expert`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         expectedRevision: expertRevision,
         configuration: {
-          schemaVersion: CONFIG_SCHEMA_VERSION,
-          activeMode: "expert",
+          ...initialExpertDraft.configuration,
           activeProfileId: "expert-local",
           virtualModelName: "本地专家入口",
-          expertServices:
-            initial.configuration.workspace.drafts.expert.configuration.expertServices,
+          modelSelection: { source: "official", model: "gpt-5.6-sol" },
+          capabilityCompletion: selectedCapabilityCompletion,
         },
       }),
     });
@@ -850,6 +1429,10 @@ test("keeps mode drafts isolated until a valid draft is explicitly activated", a
     assert.equal(
       saved.configuration.workspace.drafts.expert.configuration.virtualModelName,
       "本地专家入口",
+    );
+    assert.deepEqual(
+      saved.configuration.workspace.drafts.expert.configuration.capabilityCompletion,
+      selectedCapabilityCompletion,
     );
 
     const activateResponse = await fetch(
@@ -868,6 +1451,180 @@ test("keeps mode drafts isolated until a valid draft is explicitly activated", a
     assert.equal(
       activated.configuration.workspace.active.configuration.virtualModelName,
       "本地专家入口",
+    );
+    assert.deepEqual(
+      activated.configuration.workspace.active.configuration.capabilityCompletion,
+      selectedCapabilityCompletion,
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("publishes Codex reasoning strength only for a reusable Codex host and policy", async () => {
+  const cases = [
+    {
+      expected: true,
+      hostCapabilities: undefined,
+      providerType: "codex-host",
+    },
+    {
+      expected: false,
+      hostCapabilities: ["text"],
+      providerType: "codex-host",
+    },
+    {
+      expected: false,
+      hostCapabilities: undefined,
+      providerType: "cursor-host",
+    },
+    {
+      expected: false,
+      hostCapabilities: ["reasoning"],
+      providerType: "cursor-host",
+    },
+  ] as const;
+  for (const { expected, hostCapabilities, providerType } of cases) {
+    const provider: ModelProvider = {
+      descriptor: { type: providerType, model: `${providerType}-model` },
+      execute: async () => ({
+        kind: "json",
+        statusCode: 200,
+        body: { output: [] },
+      }),
+    };
+    const runtime = await startLocalRuntime({
+      codexClientModelCatalogRefresh: async () => undefined,
+      databasePath: IN_MEMORY_DATABASE_PATH,
+      port: 0,
+      provider,
+    });
+
+    try {
+      const initial = (await (
+        await fetch(`${runtime.origin}/api/config-center`)
+      ).json()) as ConfigCenterBootstrap;
+      const managedDraft = initial.configuration.workspace.drafts.managed;
+      const saveResponse = await fetch(`${runtime.origin}/api/configuration/drafts/managed`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          expectedRevision: managedDraft.revision,
+          configuration: {
+            ...managedDraft.configuration,
+            modelSelection: {
+              source: "official",
+              model: `${providerType}-model`,
+            },
+            capabilityCompletion: {
+              ...managedDraft.configuration.capabilityCompletion,
+              mainCapabilities: ["reasoning"],
+              hostPolicies:
+                hostCapabilities === undefined
+                  ? undefined
+                  : {
+                      codex: {
+                        mainModel: {
+                          source: "official",
+                          model: `${providerType}-model`,
+                        },
+                        mainCapabilities: [...hostCapabilities],
+                        specialists: [],
+                        maximumSpecialists: 2,
+                      },
+                    },
+            },
+          },
+        }),
+      });
+      assert.equal(saveResponse.status, 200);
+      const saved = (await saveResponse.json()) as ConfigCenterBootstrap;
+      const activationResponse = await fetch(
+        `${runtime.origin}/api/configuration/drafts/managed/activate`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            expectedDraftRevision: saved.configuration.workspace.drafts.managed.revision,
+          }),
+        },
+      );
+      assert.equal(activationResponse.status, 200);
+
+      const status = (await (
+        await fetch(`${runtime.origin}/api/capability-completion`)
+      ).json()) as {
+        activeHost: string | null;
+        codexReasoningEffortSupported: boolean;
+      };
+      assert.equal(status.activeHost, providerType === "codex-host" ? "codex" : "cursor");
+      assert.equal(status.codexReasoningEffortSupported, expected);
+    } finally {
+      await runtime.close();
+    }
+  }
+});
+
+test("rolls activation back when the active Codex catalog refresh fails", async () => {
+  let refreshCount = 0;
+  const runtime = await startLocalRuntime({
+    codexClientModelCatalogRefresh: async () => {
+      refreshCount += 1;
+      throw new Error("simulated catalog refresh failure");
+    },
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
+    port: 0,
+  });
+
+  try {
+    const initial = (await (
+      await fetch(`${runtime.origin}/api/config-center`)
+    ).json()) as ConfigCenterBootstrap;
+    const managedDraft = initial.configuration.workspace.drafts.managed;
+    const originalActiveName =
+      initial.configuration.workspace.active.configuration.virtualModelName;
+    const saveResponse = await fetch(`${runtime.origin}/api/configuration/drafts/managed`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedRevision: managedDraft.revision,
+        configuration: {
+          ...managedDraft.configuration,
+          virtualModelName: "Catalog refresh candidate",
+        },
+      }),
+    });
+    assert.equal(saveResponse.status, 200);
+    const saved = (await saveResponse.json()) as ConfigCenterBootstrap;
+
+    const activationResponse = await fetch(
+      `${runtime.origin}/api/configuration/drafts/managed/activate`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          expectedDraftRevision: saved.configuration.workspace.drafts.managed.revision,
+        }),
+      },
+    );
+    assert.equal(activationResponse.status, 422);
+    assert.deepEqual(await activationResponse.json(), {
+      error: "CONFIGURATION_HEALTH_CHECK_FAILED",
+      message: "Configuration failed its health probe and the known-good version was restored.",
+    });
+    assert.equal(refreshCount, 1);
+
+    const afterFailure = (await (
+      await fetch(`${runtime.origin}/api/config-center`)
+    ).json()) as ConfigCenterBootstrap;
+    assert.equal(
+      afterFailure.configuration.workspace.active.configuration.virtualModelName,
+      originalActiveName,
+    );
+    assert.equal(
+      afterFailure.configuration.workspace.drafts.managed.configuration.virtualModelName,
+      "Catalog refresh candidate",
     );
   } finally {
     await runtime.close();
@@ -915,7 +1672,11 @@ test("publishes company models only through the upstream-selection API", async (
         { id: "company-model/v2", name: "Company Model V2" },
         { id: "company-model/v3", name: "Company Model V3" },
       ],
-      execute: async () => ({ kind: "json", statusCode: 200, body: { output: [] } }),
+      execute: async () => ({
+        kind: "json",
+        statusCode: 200,
+        body: { output: [] },
+      }),
     },
   });
 
@@ -959,7 +1720,7 @@ test("publishes company models only through the upstream-selection API", async (
   }
 });
 
-test("publishes the official Cursor model catalog when ACP session discovery is unavailable", async () => {
+test("does not publish Cursor models that ACP cannot execute", async () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-runtime-cursor-catalog-"));
   const commandPath = join(temporaryDirectory, "agent");
   const previousPath = process.env.PATH;
@@ -993,23 +1754,8 @@ test("publishes the official Cursor model catalog when ACP session discovery is 
         };
       };
     };
-    assert.equal(catalog.hosts.cursor.available, true);
-    assert.deepEqual(catalog.hosts.cursor.models, [
-      {
-        id: "auto",
-        name: "Auto",
-        capabilities: ["text", "code", "tool-use"],
-        capabilitySource: "provider-catalog",
-        isDefault: true,
-      },
-      {
-        id: "composer",
-        name: "Composer",
-        capabilities: ["text", "code", "tool-use"],
-        capabilitySource: "provider-catalog",
-        isDefault: false,
-      },
-    ]);
+    assert.equal(catalog.hosts.cursor.available, false);
+    assert.deepEqual(catalog.hosts.cursor.models, []);
   } finally {
     await runtime.close();
     if (previousPath === undefined) delete process.env.PATH;

@@ -25,8 +25,12 @@ export interface CursorAcpOptions extends CursorHostInspectionOptions {
   workingDirectory: string;
   /** Initial Cursor Agent mode. */
   mode?: CursorAgentMode;
+  /** Cursor-owned model ID to select for newly created sessions. */
+  requestedModel?: string;
   /** Optional notification observer for streaming UI integration. */
   onEvent?: (event: CursorAcpEvent) => void;
+  /** Per-request ACP deadline; defaults to the normal interactive watchdog. */
+  requestTimeoutMilliseconds?: number;
   /** Explicit reviewer for Cursor tool permission requests. */
   onPermission?: (request: JsonRpcServerRequest) => Promise<CursorPermissionDecision>;
   /** Explicit handler for Cursor blocking extension methods. */
@@ -38,6 +42,8 @@ export interface CursorAcpSession {
   id: string;
   /** Model ID selected for this session, when Cursor reports it. */
   model: string | null;
+  /** Model IDs that this ACP session explicitly allows. */
+  availableModels: readonly string[];
 }
 
 export interface CursorAcpPromptResult {
@@ -49,13 +55,20 @@ export interface CursorAcpPromptResult {
   text: string;
 }
 
+const CURSOR_REQUEST_WATCHDOG_MILLISECONDS = 5 * 60_000;
+
 export interface CursorAcpClient {
   /** Negotiates ACP capabilities and authenticates with Cursor-owned login. */
-  initialize: () => Promise<void>;
+  initialize: (signal?: AbortSignal) => Promise<void>;
   /** Creates a new Cursor Agent session. */
-  createSession: () => Promise<CursorAcpSession>;
+  createSession: (signal?: AbortSignal) => Promise<CursorAcpSession>;
   /** Sends a prompt and waits for the ACP terminal response. */
-  prompt: (sessionId: string, text: string, signal?: AbortSignal) => Promise<CursorAcpPromptResult>;
+  prompt: (
+    sessionId: string,
+    text: string,
+    signal?: AbortSignal,
+    onTextDelta?: (delta: string) => void,
+  ) => Promise<CursorAcpPromptResult>;
   /** Cancels active work for a session. */
   cancel: (sessionId: string) => Promise<void>;
   /** Terminates the delegated Cursor Agent process. */
@@ -96,8 +109,37 @@ const readCurrentModel = (value: unknown): string | undefined => {
   return undefined;
 };
 
+const readModelConfigOption = (
+  value: unknown,
+):
+  | { configId: string; type: string; currentValue: string | undefined; values: readonly string[] }
+  | undefined => {
+  if (!isRecord(value) || !Array.isArray(value.configOptions)) return undefined;
+  for (const option of value.configOptions) {
+    if (!isRecord(option)) continue;
+    const configId = readString(option, "configId") ?? readString(option, "id");
+    const category = readString(option, "category");
+    if (configId === undefined || (category !== "model" && !/model/iu.test(configId))) continue;
+    const values = Array.isArray(option.options)
+      ? option.options.flatMap((candidate) => {
+          if (!isRecord(candidate)) return [];
+          const value = readString(candidate, "value") ?? readString(candidate, "id");
+          return value === undefined ? [] : [value];
+        })
+      : [];
+    return {
+      configId,
+      type: readString(option, "type") ?? "select",
+      currentValue: readString(option, "currentValue"),
+      values,
+    };
+  }
+  return undefined;
+};
+
 export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClient => {
   const messageChunks = new Map<string, string>();
+  const textDeltaListeners = new Map<string, (delta: string) => void>();
   let initialized = false;
   let initializedModel: string | undefined;
   const launch = createCursorAcpLaunch(options);
@@ -139,12 +181,18 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
     const text = readString(update.content, "text");
     if (text !== undefined) {
       messageChunks.set(sessionId, `${messageChunks.get(sessionId) ?? ""}${text}`);
+      textDeltaListeners.get(sessionId)?.(text);
     }
   };
 
   const client: JsonRpcClient = createStdioJsonRpcClient(
     { ...launch, workingDirectory: options.workingDirectory },
-    { onNotification: handleNotification, onRequest: handleRequest },
+    {
+      onNotification: handleNotification,
+      onRequest: handleRequest,
+      requestTimeoutMilliseconds:
+        options.requestTimeoutMilliseconds ?? CURSOR_REQUEST_WATCHDOG_MILLISECONDS,
+    },
   );
 
   const requireInitialized = (): void => {
@@ -154,60 +202,101 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
   };
 
   return {
-    initialize: async (): Promise<void> => {
+    initialize: async (signal?: AbortSignal): Promise<void> => {
       if (initialized) {
         return;
       }
-      const initializeResponse = await client.request<unknown>("initialize", {
-        protocolVersion: 1,
-        clientCapabilities: {
-          fs: { readTextFile: false, writeTextFile: false },
-          terminal: false,
+      const initializeResponse = await client.request<unknown>(
+        "initialize",
+        {
+          protocolVersion: 1,
+          clientCapabilities: {
+            fs: { readTextFile: false, writeTextFile: false },
+            terminal: false,
+          },
+          clientInfo: { name: "ai_tidu9", version: "0.2.0-alpha.1" },
         },
-        clientInfo: { name: "ai-tidu9", version: "0.2.0-alpha.1" },
-      });
+        signal,
+      );
       initializedModel = readCurrentModel(initializeResponse);
-      await client.request("authenticate", { methodId: "cursor_login" });
+      await client.request("authenticate", { methodId: "cursor_login" }, signal);
       initialized = true;
     },
-    createSession: async (): Promise<CursorAcpSession> => {
+    createSession: async (signal?: AbortSignal): Promise<CursorAcpSession> => {
       requireInitialized();
-      const response = await client.request<Record<string, unknown>>("session/new", {
-        cwd: options.workingDirectory,
-        mcpServers: [],
-      });
+      const response = await client.request<Record<string, unknown>>(
+        "session/new",
+        {
+          cwd: options.workingDirectory,
+          mcpServers: [],
+        },
+        signal,
+      );
       const id = readString(response, "sessionId");
       if (id === undefined) {
         throw new TiduError("INTERNAL_ERROR", "Cursor ACP returned an invalid session response.");
       }
       if (options.mode !== undefined && options.mode !== "agent") {
-        await client.request("session/set_mode", { sessionId: id, modeId: options.mode });
+        await client.request("session/set_mode", { sessionId: id, modeId: options.mode }, signal);
       }
-      return { id, model: readCurrentModel(response) ?? initializedModel ?? null };
+      let selectedModel = readCurrentModel(response) ?? initializedModel ?? null;
+      const initialModelOption = readModelConfigOption(response);
+      if (options.requestedModel !== undefined && options.requestedModel !== selectedModel) {
+        const modelOption = initialModelOption;
+        if (modelOption === undefined) {
+          throw new TiduError(
+            "CONFIGURATION_INVALID",
+            "Cursor ACP did not expose a model selection option for this session.",
+          );
+        }
+        if (modelOption.values.length > 0 && !modelOption.values.includes(options.requestedModel)) {
+          const availableModels = modelOption.values.slice(0, 12).join(", ");
+          throw new TiduError(
+            "CONFIGURATION_INVALID",
+            `Cursor ACP does not offer the configured model ${options.requestedModel}. Session options: ${availableModels}.`,
+          );
+        }
+        const updateResponse = await client.request<unknown>(
+          "session/set_config_option",
+          {
+            sessionId: id,
+            configId: modelOption.configId,
+            type: modelOption.type,
+            value: options.requestedModel,
+          },
+          signal,
+        );
+        selectedModel = readCurrentModel(updateResponse) ?? options.requestedModel;
+      }
+      return { id, model: selectedModel, availableModels: initialModelOption?.values ?? [] };
     },
     prompt: async (
       sessionId: string,
       text: string,
       signal?: AbortSignal,
+      onTextDelta?: (delta: string) => void,
     ): Promise<CursorAcpPromptResult> => {
       requireInitialized();
       if (text.trim() === "") {
         throw new TiduError("CONFIGURATION_INVALID", "Cursor prompt cannot be empty.");
       }
       messageChunks.set(sessionId, "");
-      const response = await client.request<Record<string, unknown>>(
-        "session/prompt",
-        { sessionId, prompt: [{ type: "text", text }] },
-        signal,
-      );
-      const stopReason = readString(response, "stopReason") ?? "unknown";
-      const result = {
-        sessionId,
-        stopReason,
-        text: messageChunks.get(sessionId) ?? "",
-      };
-      messageChunks.delete(sessionId);
-      return result;
+      if (onTextDelta !== undefined) textDeltaListeners.set(sessionId, onTextDelta);
+      try {
+        const response = await client.request<Record<string, unknown>>(
+          "session/prompt",
+          { sessionId, prompt: [{ type: "text", text }] },
+          signal,
+        );
+        return {
+          sessionId,
+          stopReason: readString(response, "stopReason") ?? "unknown",
+          text: messageChunks.get(sessionId) ?? "",
+        };
+      } finally {
+        textDeltaListeners.delete(sessionId);
+        messageChunks.delete(sessionId);
+      }
     },
     cancel: async (sessionId: string): Promise<void> => {
       requireInitialized();
@@ -215,6 +304,7 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
     },
     close: async (): Promise<void> => {
       messageChunks.clear();
+      textDeltaListeners.clear();
       await client.close();
     },
   };

@@ -2,7 +2,7 @@ import { accessSync, constants, statSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { delimiter, join } from "node:path";
 
-export type LocalClientId = "codex" | "cursor" | "openai-cli";
+export type LocalClientId = "codex" | "cursor" | "ollama" | "openai-cli";
 export type LocalClientReadiness = "configurable" | "limited" | "not-detected";
 export type LocalClientLimitation = "cursor-standard-chat-only";
 export type LocalClientIntegrationMode = "native-agent" | "virtual-model" | "not-detected";
@@ -102,6 +102,13 @@ const CLIENT_DEFINITIONS: readonly LocalClientDefinition[] = [
     protocol: "responses",
     limitation: null,
   },
+  {
+    id: "ollama",
+    name: "Ollama",
+    commands: ["ollama"],
+    protocol: "chat-completions",
+    limitation: null,
+  },
 ];
 
 const isFile = (candidatePath: string): boolean => {
@@ -176,10 +183,11 @@ const resolveApplicationCandidates = (
     Pick<LocalClientDiscoveryEnvironment, "localApplicationDataDirectory">,
 ): readonly string[] => {
   if (environment.operatingSystem === "darwin") {
-    const applicationName = clientId === "codex" ? "Codex.app" : "Cursor.app";
     if (clientId === "openai-cli") {
       return [];
     }
+    const applicationName =
+      clientId === "codex" ? "Codex.app" : clientId === "cursor" ? "Cursor.app" : "Ollama.app";
     return [
       join("/Applications", applicationName),
       join(environment.homeDirectory, "Applications", applicationName),
@@ -189,13 +197,24 @@ const resolveApplicationCandidates = (
     if (environment.localApplicationDataDirectory === undefined || clientId === "openai-cli") {
       return [];
     }
-    const applicationDirectory = clientId === "codex" ? "Codex" : "Programs/Cursor";
+    const applicationDirectory =
+      clientId === "codex"
+        ? "Codex"
+        : clientId === "cursor"
+          ? "Programs/Cursor"
+          : "Programs/Ollama";
     return [join(environment.localApplicationDataDirectory, applicationDirectory)];
   }
   if (clientId === "cursor") {
     return [
       join(environment.homeDirectory, ".local/share/applications/cursor.desktop"),
       "/usr/share/applications/cursor.desktop",
+    ];
+  }
+  if (clientId === "ollama") {
+    return [
+      join(environment.homeDirectory, ".local/share/applications/ollama.desktop"),
+      "/usr/share/applications/ollama.desktop",
     ];
   }
   return [];
@@ -211,7 +230,7 @@ const resolveConfigurationCandidates = (
   if (clientId === "codex") {
     return [join(environment.homeDirectory, ".codex/config.toml")];
   }
-  if (clientId === "openai-cli") {
+  if (clientId === "openai-cli" || clientId === "ollama") {
     return [];
   }
   if (environment.operatingSystem === "darwin") {

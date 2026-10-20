@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 
 import { TiduError } from "../core/index.js";
+import { inspectProcess } from "./process-inspection.js";
 
 export type CodexHostLoginStatus =
   | "authenticated"
@@ -157,6 +158,32 @@ export const inspectCodexHostLogin = (
     result.error === undefined || (result.error as NodeJS.ErrnoException).code !== "ENOENT";
   const status = commandAvailable
     ? parseLoginStatus(result.status, `${result.stdout ?? ""}\n${result.stderr ?? ""}`)
+    : "unavailable";
+  return {
+    schemaVersion: "1",
+    client: "codex",
+    status,
+    commandAvailable,
+    ...storage,
+    reusable:
+      status === "authenticated" && (!storage.authStoragePresent || storage.authStorageSafe),
+    authority: "codex-host",
+  };
+};
+
+export const inspectCodexHostLoginAsync = async (
+  options: CodexHostInspectionOptions = {},
+): Promise<CodexHostLoginState> => {
+  const storage = inspectAuthStorage(options);
+  const result = await inspectProcess(
+    resolveCodexCommand(options),
+    ["login", "status"],
+    resolveEnvironment(options),
+    options.timeoutMilliseconds ?? DEFAULT_STATUS_TIMEOUT_MILLISECONDS,
+  );
+  const commandAvailable = result.errorCode !== "ENOENT";
+  const status = commandAvailable
+    ? parseLoginStatus(result.status, `${result.stdout}\n${result.stderr}`)
     : "unavailable";
   return {
     schemaVersion: "1",

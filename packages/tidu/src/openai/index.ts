@@ -126,6 +126,48 @@ const validateModel = (
 const isFunctionName = (value: unknown): value is string =>
   typeof value === "string" && /^[a-zA-Z0-9_-]{1,64}$/u.test(value);
 
+const REASONING_EFFORTS = new Set([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+]);
+
+const validateReasoningEffort = (
+  body: Record<string, unknown>,
+  protocol: "chat-completions" | "responses",
+): OpenAiRequestValidation => {
+  if (protocol === "responses" && body.reasoning !== undefined && !isRecord(body.reasoning)) {
+    return {
+      valid: false,
+      error: createOpenAiError(
+        "invalid_reasoning",
+        "reasoning must be an object when provided.",
+        "invalid_request_error",
+        "reasoning",
+      ),
+    };
+  }
+  const nestedEffort = isRecord(body.reasoning) ? body.reasoning.effort : undefined;
+  const effort = nestedEffort ?? body.reasoning_effort;
+  if (effort !== undefined && (typeof effort !== "string" || !REASONING_EFFORTS.has(effort))) {
+    return {
+      valid: false,
+      error: createOpenAiError(
+        "invalid_reasoning_effort",
+        "reasoning effort is not supported.",
+        "invalid_request_error",
+        nestedEffort === undefined ? "reasoning_effort" : "reasoning.effort",
+      ),
+    };
+  }
+  return { valid: true };
+};
+
 const isChatFunctionTool = (value: unknown): boolean =>
   isRecord(value) &&
   value.type === "function" &&
@@ -342,6 +384,8 @@ export const validateChatCompletionRequest = (
       ),
     };
   }
+  const reasoningValidation = validateReasoningEffort(body, "chat-completions");
+  if (!reasoningValidation.valid) return reasoningValidation;
   return validateTools(body, "chat-completions");
 };
 
@@ -390,5 +434,7 @@ export const validateResponsesRequest = (
       ),
     };
   }
+  const reasoningValidation = validateReasoningEffort(body, "responses");
+  if (!reasoningValidation.valid) return reasoningValidation;
   return validateTools(body, "responses");
 };

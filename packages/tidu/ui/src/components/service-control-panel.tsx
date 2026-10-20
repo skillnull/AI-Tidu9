@@ -233,7 +233,12 @@ export const ServiceControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) =
                 : "安装进程与服务状态"}
           </p>
         </div>
-        <button type="button" onClick={() => void refresh()} disabled={pending !== undefined}>
+        <button
+          type="button"
+          onClick={() => void refresh()}
+          disabled={pending !== undefined}
+          aria-busy={pending === "inventory:refresh"}
+        >
           {pending === "inventory:refresh" ? (english ? "Refreshing…" : "刷新中…") : labels.refresh}
         </button>
       </div>
@@ -307,6 +312,7 @@ export const ServiceControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) =
                             service.status !== "running")
                         }
                         onClick={() => void runAction(service, action)}
+                        aria-busy={pending === `${service.id}:${action}`}
                       >
                         {pending === `${service.id}:${action}`
                           ? progressLabels[action]

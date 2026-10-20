@@ -6,19 +6,23 @@ AI-Tidu9 is not valuable because it "calls another model." Its job is to answer 
 
 ## 🔎 Filter before scoring
 
-`createDynamicModelRouter(models, policy)` receives model adapters and non-sensitive metadata. It derives required capabilities from protocol, tools, structured output, image input, and caller constraints. Disabled, quota-exhausted, protocol-incompatible, and privacy-incompatible models are removed before capability, cost, privacy, latency, and availability are scored. A `429` marks process-local quota exhaustion and triggers rerouting.
+`createDynamicModelRouter(models, policy)` receives model adapters and non-sensitive metadata. It derives required capabilities from protocol, declared tools, structured output, long textual input, image input, and caller constraints. Disabled, capability-incompatible, protocol-incompatible, privacy-incompatible, and currently unavailable models are removed before comparison. Observed token use is compared only after applying known prices; an unknown price cannot justify a lower-cost replacement. A `429` or explicit provider failure updates process-local availability observations and triggers rerouting. Unintegrated remaining-quota data does not drive a pre-emptive replacement.
 
 Privacy and required capabilities are admission criteria. A low price or low latency can never compensate for violating either boundary.
 
-## 🧩 Complete only the missing capability
+## 🧩 Secondary models do more than fill capability gaps
 
 Capability completion is opt-in. The configuration declares whether it is enabled, which model IDs may enter the specialist pool, the maximum specialist count, and task-level spend, time, privacy, and output bounds.
 
-A specialist never takes over the full conversation. It receives the minimum input required for the missing capability and returns bounded evidence to the main model. Zero-cost and local models participate through the same metadata contract.
+When the preferred primary lacks a required capability, a secondary receives only the minimum input for that gap and returns bounded evidence to the primary. When a secondary covers every required capability and comparable evidence shows lower price-backed token cost, tighter verifiable privacy, lower observed latency, or higher availability, it may execute the request directly and avoid an unnecessary serial call. A `429` and explicit failures also trigger fallback among fully capable candidates. Only a model with an explicit zero price participates as zero-cost; local providers such as Ollama can contribute verifiable `local` privacy metadata.
+
+Ordinary `/v1` inference follows a single-model fast path by default. The kernel records request parsing, capability confirmation, dynamic routing, model execution, output receipt, and completeness checking while forwarding real output deltas directly to the client. It does not add fixed goal-decomposition or independent semantic-acceptance calls to every request, and progress text is not presented as hidden model reasoning. The full task flow can still perform planning, checkpoints, and independent business acceptance when explicitly required.
 
 ## 🧰 Assemble capability assets on demand
 
 `createCapabilityRegistry` describes Agents, Skills, MCP servers, tools, and knowledge through one contract. After understanding the goal, the kernel selects the smallest set compatible with capability, cost, permission, and privacy constraints. Discovery reads bounded metadata only; it never executes extensions or follows symbolic links. Missing required capabilities fail before execution.
+
+A capability catalog describes what an adapter can actually execute, not every feature in the underlying host product. The current Codex and Cursor host bridges do not advertise image input, web research, or tool use until those bridge paths exist. A request requiring one of those capabilities fails closed before execution.
 
 ## 🔐 Restore secrets only at the real execution boundary
 

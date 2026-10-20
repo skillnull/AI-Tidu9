@@ -1,5 +1,15 @@
 export const CONFIG_SCHEMA_VERSION = "1" as const;
 export const DEFAULT_VIRTUAL_MODEL_ID = "ai-tidu9-config";
+export const REQUIRED_AGENT_CAPABILITIES = ["text", "structured-output"] as const;
+export const MODEL_ROUTING_CAPABILITIES = [
+  ...REQUIRED_AGENT_CAPABILITIES,
+  "reasoning",
+  "code",
+  "vision",
+  "tool-use",
+  "long-context",
+  "web-research",
+] as const;
 
 export type ConfigurationMode = "managed" | "expert";
 export type ModelSource = "company" | "custom" | "official";
@@ -100,6 +110,20 @@ export interface ConfigurationValidationResult {
   issues: readonly ConfigurationValidationIssue[];
 }
 
+export const isValidModelIdentifier = (modelId: string): boolean => {
+  const normalizedModelId = modelId.trim();
+  const characters = [...normalizedModelId];
+  return (
+    characters.length >= 1 &&
+    characters.length <= 128 &&
+    !/\s/u.test(normalizedModelId) &&
+    characters.every((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint >= 0x20 && codePoint !== 0x7f;
+    })
+  );
+};
+
 export const createDefaultConfiguration = (
   mode: ConfigurationMode = "managed",
 ): TiduConfiguration => {
@@ -111,7 +135,7 @@ export const createDefaultConfiguration = (
     modelSelection: { source: "official", model: "current" },
     capabilityCompletion: {
       enabled: false,
-      mainCapabilities: ["text", "structured-output"],
+      mainCapabilities: [...REQUIRED_AGENT_CAPABILITIES],
       specialists: [],
       maximumSpecialists: 2,
       hostPolicies: {},
@@ -168,7 +192,7 @@ export const validateConfiguration = (
     (configuration.modelSelection.source !== "official" &&
       configuration.modelSelection.source !== "company" &&
       configuration.modelSelection.source !== "custom") ||
-    !/^[a-z0-9][a-z0-9._:-]{0,127}$/iu.test(configuration.modelSelection.model.trim())
+    !isValidModelIdentifier(configuration.modelSelection.model)
   ) {
     issues.push({
       code: "INVALID_MODEL_SELECTION",
@@ -213,7 +237,7 @@ export const validateConfiguration = (
               specialist.host !== "ollama" &&
               specialist.host !== "openai-compatible") ||
             specialist.host === policy.host ||
-            !/^[a-z0-9][a-z0-9._:-]{0,127}$/iu.test(specialist.model) ||
+            !isValidModelIdentifier(specialist.model) ||
             specialist.capabilities.length === 0 ||
             specialist.capabilities.some((capability) => !safeCapability.test(capability)) ||
             (specialist.inputCostPerMillionTokens != null &&

@@ -1,8 +1,20 @@
 import assert from "node:assert/strict";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { TiduError } from "../core/index.js";
+import {
+  createCodexHostModelProvider,
+  createCursorModelCatalog,
+  createLiveJsonStream,
+  findUnsupportedHostBridgeRequest,
+  requestPrompt,
+  requireCompletedCursorPrompt,
+  requireValidHostModelText,
+} from "./codex-host.js";
 import {
   createCatalogModelRouter,
   createOllamaProvider,
@@ -11,6 +23,40 @@ import {
   discoverOllamaModels,
   type ModelProvider,
 } from "./index.js";
+
+const readStreamText = async (stream: ReadableStream<Uint8Array>): Promise<string> =>
+  new Response(stream).text();
+
+const createFakeCodexProviderCommand = (directory: string): string => {
+  const executable = join(directory, "fake-codex-provider");
+  const source = `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === "login" && args[1] === "status") { console.log("Logged in"); process.exit(0); }
+const fs = require("node:fs");
+fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "start\\n");
+let turnCount = 0;
+const readline = require("node:readline").createInterface({ input: process.stdin });
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+readline.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.id === undefined) return;
+  if (request.method === "initialize") send({ jsonrpc: "2.0", id: request.id, result: {} });
+  else if (request.method === "thread/start") send({ jsonrpc: "2.0", id: request.id, result: { thread: { id: "thread-1" }, model: "gpt-test" } });
+  else if (request.method === "turn/start") {
+    turnCount += 1;
+    const turnId = "turn-" + turnCount;
+    fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "effort:" + request.params.effort + "\\n");
+    send({ jsonrpc: "2.0", id: request.id, result: { turn: { id: turnId } } });
+    send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId, itemId: "item-1", delta: request.params.effort + "-result" } });
+    send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: "thread-1", turn: { id: turnId, status: "completed" } } });
+  }
+  else send({ jsonrpc: "2.0", id: request.id, result: {} });
+});
+`;
+  writeFileSync(executable, source, { mode: 0o700 });
+  chmodSync(executable, 0o700);
+  return executable;
+};
 
 interface TestServer {
   /** Loopback origin allocated for the test server. */
@@ -53,6 +99,227 @@ const startTestServer = async (
       }),
   };
 };
+
+test("publishes only text-contract capabilities for Cursor ACP models", () => {
+  assert.deepEqual(createCursorModelCatalog("cursor-default", ["cursor-default", "cursor-fast"]), [
+    {
+      id: "cursor-default",
+      name: "cursor-default",
+      capabilities: ["text", "structured-output", "code"],
+      capabilitySource: "provider-catalog",
+    },
+    {
+      id: "cursor-fast",
+      name: "cursor-fast",
+      capabilities: ["text", "structured-output", "code"],
+      capabilitySource: "provider-catalog",
+    },
+  ]);
+  assert.deepEqual(createCursorModelCatalog("cursor-current", ["cursor-fast"])[0], {
+    id: "cursor-current",
+    name: "cursor-current",
+    capabilities: ["text", "structured-output", "code"],
+    capabilitySource: "provider-catalog",
+  });
+});
+
+test("preserves Responses instructions and JSON format constraints in host prompts", () => {
+  const request = {
+    protocol: "responses" as const,
+    body: {
+      model: "ai-tidu9-config",
+      instructions: "Use the caller's requested field names.",
+      input: "Summarize the result.",
+      text: {
+        format: {
+          type: "json_schema",
+          name: "summary",
+          schema: { type: "object", required: ["summary"] },
+        },
+      },
+    },
+    virtualModelId: "ai-tidu9-config",
+  };
+  const prompt = requestPrompt(request);
+
+  assert.match(prompt, /Caller instructions:\nUse the caller's requested field names\./u);
+  assert.match(prompt, /"type":"json_schema"/u);
+  assert.match(prompt, /"required":\["summary"\]/u);
+  assert.equal(requireValidHostModelText(request, '{"summary":"done"}'), '{"summary":"done"}');
+  assert.throws(() => requireValidHostModelText(request, "not json"), /did not return valid JSON/u);
+});
+
+test("fails closed for image and tool requests unsupported by host text bridges", () => {
+  const baseRequest = {
+    protocol: "responses" as const,
+    virtualModelId: "ai-tidu9-config",
+  };
+  const imageResult = findUnsupportedHostBridgeRequest({
+    ...baseRequest,
+    body: {
+      input: [
+        {
+          role: "user",
+          content: [{ type: "input_image", image_url: "data:image/png;base64,test" }],
+        },
+      ],
+    },
+  });
+  const toolResult = findUnsupportedHostBridgeRequest({
+    ...baseRequest,
+    body: {
+      input: "Use a tool.",
+      tools: [{ type: "function", name: "lookup" }],
+      tool_choice: "auto",
+    },
+  });
+  const disabledToolResult = findUnsupportedHostBridgeRequest({
+    ...baseRequest,
+    body: {
+      input: "Do not use a tool.",
+      tools: [{ type: "function", name: "lookup" }],
+      tool_choice: "none",
+    },
+  });
+
+  assert.equal(imageResult?.statusCode, 400);
+  assert.match(JSON.stringify(imageResult), /host_bridge_image_unsupported/u);
+  assert.equal(toolResult?.statusCode, 400);
+  assert.match(JSON.stringify(toolResult), /host_bridge_tools_unsupported/u);
+  assert.equal(disabledToolResult, undefined);
+});
+
+test("reuses one Codex model session while forwarding effort and live deltas per turn", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-"));
+  const codexHomeDirectory = join(temporaryDirectory, "codex-home");
+  const processLog = join(temporaryDirectory, "provider.log");
+  mkdirSync(codexHomeDirectory, { recursive: true });
+  const command = createFakeCodexProviderCommand(temporaryDirectory);
+  const provider = await createCodexHostModelProvider(undefined, {
+    codexHomeDirectory,
+    command,
+    environment: { TIDU_CODEX_PROVIDER_TEST_LOG: processLog },
+  });
+  try {
+    assert.notEqual(provider, undefined);
+    if (provider === undefined) throw new Error("Expected a Codex host provider.");
+    const lowResult = await provider.execute({
+      protocol: "responses",
+      body: {
+        model: "ai-tidu9-config",
+        input: "low request",
+        reasoning: { effort: "low" },
+      },
+      virtualModelId: "ai-tidu9-config",
+    });
+    assert.equal(lowResult.kind, "json");
+    assert.match(JSON.stringify(lowResult), /low-result/u);
+
+    const highResult = await provider.execute({
+      protocol: "responses",
+      body: {
+        model: "ai-tidu9-config",
+        input: "high request",
+        reasoning: { effort: "high" },
+        stream: true,
+      },
+      virtualModelId: "ai-tidu9-config",
+    });
+    assert.equal(highResult.kind, "stream");
+    if (highResult.kind !== "stream") throw new Error("Expected a streaming provider result.");
+    const streamBody = await readStreamText(highResult.stream);
+    assert.match(streamBody, /response\.output_text\.delta/u);
+    assert.match(streamBody, /high-result/u);
+    assert.match(streamBody, /response\.completed/u);
+    assert.match(streamBody, /data: \[DONE\]/u);
+
+    await provider.close?.();
+    assert.deepEqual(readFileSync(processLog, "utf8").trim().split("\n"), [
+      "start",
+      "effort:low",
+      "effort:high",
+    ]);
+  } finally {
+    await provider?.close?.();
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("rejects Cursor prompts unless ACP reports a non-empty end_turn", () => {
+  assert.equal(
+    requireCompletedCursorPrompt("cursor-model", {
+      stopReason: "end_turn",
+      text: "complete response",
+    }),
+    "complete response",
+  );
+  assert.throws(
+    () =>
+      requireCompletedCursorPrompt("cursor-model", {
+        stopReason: "cancelled",
+        text: "partial response",
+      }),
+    /stopped with cancelled/u,
+  );
+  assert.throws(
+    () =>
+      requireCompletedCursorPrompt("cursor-model", {
+        stopReason: "end_turn",
+        text: "  ",
+      }),
+    /returned an empty response/u,
+  );
+});
+
+test("terminates failed host streams with response.failed and DONE", async () => {
+  const stream = createLiveJsonStream(
+    {
+      protocol: "responses",
+      body: { model: "ai-tidu9-config", input: "hello", stream: true },
+      virtualModelId: "ai-tidu9-config",
+    },
+    async (onTextDelta) => {
+      onTextDelta("partial");
+      throw new Error("Cursor model cursor-test stopped with cancelled.");
+    },
+  );
+  const body = await readStreamText(stream);
+
+  assert.match(body, /event: response\.output_text\.delta/u);
+  assert.match(body, /event: response\.failed/u);
+  assert.match(body, /host_model_failed/u);
+  assert.match(body, /data: \[DONE\]/u);
+  assert.doesNotMatch(body, /event: response\.completed/u);
+});
+
+test("ignores late host deltas and failures after the consumer cancels the stream", async () => {
+  let emitDelta: (delta: string) => void = () => undefined;
+  let rejectRun: (reason: Error) => void = () => undefined;
+  const runResult = new Promise<string>((_resolve, reject) => {
+    rejectRun = reject;
+  });
+  const stream = createLiveJsonStream(
+    {
+      protocol: "responses",
+      body: { model: "ai-tidu9-config", input: "hello", stream: true },
+      virtualModelId: "ai-tidu9-config",
+    },
+    (onTextDelta) => {
+      emitDelta = onTextDelta;
+      onTextDelta("first");
+      return runResult;
+    },
+  );
+  const reader = stream.getReader();
+  const firstChunk = await reader.read();
+
+  assert.equal(firstChunk.done, false);
+  assert.match(new TextDecoder().decode(firstChunk.value), /first/u);
+  await reader.cancel("test cancellation");
+  assert.doesNotThrow(() => emitDelta("late"));
+  rejectRun(new Error("late host failure"));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+});
 
 test("routes official catalog models separately from company and virtual models", async () => {
   const calls: string[] = [];
@@ -545,7 +812,7 @@ test("discovers installed models from a running Ollama service", async () => {
   }
 });
 
-test("reads model capabilities published by Ollama", async () => {
+test("publishes only Ollama capabilities that the adapter forwards", async () => {
   const server = await startTestServer((request, response) => {
     if (request.url === "/api/tags") {
       response.writeHead(200, { "content-type": "application/json" });
@@ -573,7 +840,7 @@ test("reads model capabilities published by Ollama", async () => {
       {
         id: "qwen-vision",
         name: "qwen-vision",
-        capabilities: ["text", "vision", "tool-use", "reasoning"],
+        capabilities: ["text", "vision", "tool-use"],
         capabilitySource: "provider-catalog",
       },
     ]);

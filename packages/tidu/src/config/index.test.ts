@@ -1,7 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createDefaultConfiguration, validateConfiguration } from "./index.js";
+import {
+  createDefaultConfiguration,
+  isValidModelIdentifier,
+  MODEL_ROUTING_CAPABILITIES,
+  validateConfiguration,
+} from "./index.js";
+
+test("publishes only capabilities implemented by request routing", () => {
+  assert.deepEqual(MODEL_ROUTING_CAPABILITIES, [
+    "text",
+    "structured-output",
+    "reasoning",
+    "code",
+    "vision",
+    "tool-use",
+    "long-context",
+    "web-research",
+  ]);
+});
 
 test("creates a safe managed configuration", () => {
   const configuration = createDefaultConfiguration();
@@ -29,6 +47,44 @@ test("accepts an explicit custom upstream source", () => {
   };
 
   assert.equal(validateConfiguration(configuration).valid, true);
+});
+
+test("accepts published provider model identifiers with routing metadata", () => {
+  const cursorModelId = "auto-smart[optimize_for=balanced]";
+  assert.equal(isValidModelIdentifier(cursorModelId), true);
+  assert.equal(
+    isValidModelIdentifier("grok-4.7[context=256k,reasoning_effort=high,fast=true]"),
+    true,
+  );
+  assert.equal(isValidModelIdentifier("provider/model:latest"), true);
+  assert.equal(isValidModelIdentifier("model with spaces"), false);
+  assert.equal(isValidModelIdentifier(""), false);
+
+  const configuration = createDefaultConfiguration();
+  assert.equal(
+    validateConfiguration({
+      ...configuration,
+      capabilityCompletion: {
+        ...configuration.capabilityCompletion,
+        hostPolicies: {
+          codex: {
+            mainModel: { source: "official", model: "gpt-5.6-sol" },
+            mainCapabilities: ["text"],
+            specialists: [
+              {
+                host: "cursor",
+                source: "official",
+                model: cursorModelId,
+                capabilities: ["code"],
+              },
+            ],
+            maximumSpecialists: 1,
+          },
+        },
+      },
+    }).valid,
+    true,
+  );
 });
 
 test("rejects invalid or cross-mode configuration", () => {

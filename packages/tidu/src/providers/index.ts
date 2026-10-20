@@ -23,6 +23,8 @@ export interface ProviderRoutingContext {
   host?: AgentHostId;
   /** Capabilities required by the caller in addition to those inferred from the request. */
   requiredCapabilities?: readonly string[];
+  /** Diagnostic-only request that forces one configured secondary route without validating its semantic capability. */
+  requireSpecialist?: boolean;
   /** Most permissive data boundary allowed for this request. */
   privacy?: ProviderPrivacy;
   /** Semantic role used when coordinating main and specialist models. */
@@ -178,7 +180,7 @@ export interface OllamaDiscoveryOptions {
   timeoutMilliseconds?: number;
 }
 
-const DEFAULT_PROVIDER_TIMEOUT_MILLISECONDS = 120_000;
+const DEFAULT_PROVIDER_TIMEOUT_MILLISECONDS = 5 * 60_000;
 const MAXIMUM_PROVIDER_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -561,7 +563,6 @@ export const createOllamaProvider = (options: ProviderAdapterOptions): ModelProv
             ...(published.includes("completion") ? ["text"] : []),
             ...(published.includes("vision") ? ["vision"] : []),
             ...(published.includes("tools") ? ["tool-use"] : []),
-            ...(published.includes("thinking") ? ["reasoning"] : []),
           ];
           return {
             id: modelId,

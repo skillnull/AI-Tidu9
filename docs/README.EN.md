@@ -56,7 +56,7 @@ tidu setup
 tidu start
 ```
 
-Open the configuration-center URL printed in the terminal. The guided flow detects the deployment, names the entry, connects a model, previews impact, activates the configuration, and connects supported clients.
+Open the configuration-center URL printed in the terminal. The guided flow detects the deployment, names the entry, connects a model, saves the draft when you click Save and continue, requests explicit activation, and connects supported clients.
 
 > [!NOTE]
 > The npm installation command does not install or switch Node.js. Switch the current terminal to a compatible Node version before installing AI-Tidu9.
@@ -94,8 +94,8 @@ This path preserves three separate responsibilities:
 | Mechanic | Purpose | Critical boundary |
 | --- | --- | --- |
 | **Many entries, one core** | Codex, Cursor, CLI, and OpenAI-compatible clients share policy and capabilities | Never read or copy private host tokens |
-| **Dynamic routing** | Select models by capability, cost, privacy, latency, availability, and quota | Estimated cost never impersonates provider billing |
-| **Capability completion** | Let a low-cost main model invoke a specialist only for a missing capability | Specialist pool, count, spend, and privacy bounds are explicit |
+| **Dynamic routing** | Select models by capability, known cost, verifiable privacy, observed latency, availability, and explicit failure signals | Unknown prices and quota data that is not integrated never drive replacement |
+| **Cross-model collaboration** | Let configured secondary models participate for capability gaps, lower price-backed token cost, lower latency, higher availability, or failure fallback | Model pool, count, spend, and privacy bounds are explicit |
 | **Runtime Secret Gate** | Detect, block, or replace sensitive information before egress | Recover real values only inside the current task's private memory scope |
 | **Recoverable execution** | Use task capsules, checkpoints, and known-good configuration for recovery | Never replay uncertain non-idempotent work automatically |
 
@@ -113,6 +113,8 @@ See [Core Routing and Secret Gate](./CORE-DIFFERENTIATORS.EN.md) for implementat
 ### Connect a model source
 
 AI-Tidu9 automatically uses the current model from a signed-in Codex or Cursor host. You do not need to enter a model name or key. Calls go through the official host process; AI-Tidu9 never reads or copies host credentials. The commands below explicitly override that default.
+
+A capability available in the host is not automatically available through the current bridge protocol. The Codex and Cursor catalogs publish only bridge capabilities that have been verified. Image input, web research, and tool use are not advertised until their bridge paths are implemented. Requests containing an unsupported capability fail explicitly instead of being silently rewritten as text-only requests.
 
 OpenAI-compatible service:
 
@@ -148,12 +150,17 @@ tidu uninstall             # Remove every AI-Tidu9-owned artifact
 
 Complete removal preserves host accounts, conversations, unrelated plugins and configuration, and custom database paths.
 
-Generic clients use `/v1/models`, `/v1/chat/completions`, and `/v1/responses` on the same base URL. These endpoints and host connectors enter the same AI-Tidu9 Agent kernel for planning, capability completion, bounded execution, and independent verification.
+Generic clients use `/v1/models`, `/v1/chat/completions`, and `/v1/responses` on the same base URL. Ordinary inference uses a single-model fast path: policy and capability checks, dynamic routing, one model execution, and a response-completeness check. It does not add serial model calls merely to simulate collaboration. Use the full task flow or explicitly configured capability completion when goal decomposition, checkpoints, or independent business acceptance is required.
 
-The Configuration Center's Capability Completion section shows the effective switch, each host's primary model, cross-host specialist pool, company-published capabilities, cost evidence, and recent routing records for local, personal, and enterprise runtimes. Codex, Cursor, Ollama, and compatible services share one Agent kernel but keep separate completion policies: the entry host fixes the primary, while every specialist must come from another host and execute through that host's Provider. Capabilities are selected from a visible catalog; unknown prices are labeled and excluded from cheapest-model ranking. Policy changes still use the draft, preview, and explicit activation flow.
+A streaming request returns execution stages first, then incremental model output, and ends with an explicit completion or failure event. This visible process reports verifiable states such as request parsing, routing, model execution, output receipt, and completeness checking. It does not expose a model's hidden chain of thought.
+
+The Configuration Center's Capability Completion section shows the effective switch, each host's preferred primary, cross-host secondary pool, company-published capabilities, cost evidence, observed performance, and recent routing records for local, personal, and enterprise runtimes. Codex, Cursor, Ollama, and compatible services share one Agent kernel but keep separate dynamic-routing policies. Every secondary must come from another host and execute through that host's Provider; it may fill a capability gap or execute a request when price-backed token use, verifiable privacy, observed latency, availability, or an explicit failure favors it. Unknown prices and quota data that is not integrated do not drive replacement.
+
+A newly selected secondary defaults to every capability actually published by its Provider; later edits persist the exact selected set. When a wizard step has unsaved changes, Save and continue saves first, and a failed save does not advance. Saving a draft still does not activate it. Global effort is shown only when the active host is Codex and the value is actually forwarded to that host. Other hosts do not expose an ineffective switch.
+
 `tidu setup` prepares a rollback-safe AI-Tidu9 Codex configuration without leaving Official mode. Codex uses mutually exclusive native modes: AI-Tidu9 mode exposes only the AI-Tidu9 Agent, while Official mode exposes only official models. Their providers and model catalogs are never merged. Configuration selects exactly one host, company, or custom upstream. Company models are not separate Codex entries. The Services page shows either repository-development services or locally installed services for the current runtime shape, with status refresh and supported actions. AI-Tidu9 retains only its original installation baseline and latest rollback point.
 
-Use `tidu channel run <channel>` for explicit dual-channel execution. `tidu` enters the AI-Tidu9 Agent kernel, while `codex` and `cursor` are dispatchable official host capabilities. CI can select `openai`, `deepseek`, `qwen`, `glm`, `kimi`, `doubao`, `hunyuan`, or `custom`. Hosts limited to connector protocols, including Cursor, must still submit goals to the same Agent kernel rather than bypass planning, capability completion, or verification.
+Use `tidu channel run <channel>` for explicit dual-channel execution. `tidu` enters the AI-Tidu9 Agent kernel, while `codex` and `cursor` are dispatchable official host capabilities. CI can select `openai`, `deepseek`, `qwen`, `glm`, `kimi`, `doubao`, `hunyuan`, or `custom`. Hosts limited to connector protocols, including Cursor, still pass through the same policy, routing, execution lifecycle, and terminal checks instead of bypassing the kernel boundary.
 
 ## 🛡️ Trust boundaries and security promises
 

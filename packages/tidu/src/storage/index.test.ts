@@ -91,6 +91,59 @@ test("shares entry fields across drafts without changing the active configuratio
   }
 });
 
+test("preserves the exact user-selected capabilities when normalizing editable policies", async () => {
+  const storage = await openNodeSqliteStorage({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+  });
+
+  try {
+    const initialWorkspace = await storage.configurationStore.loadWorkspace();
+    const saved = await storage.configurationStore.saveDraft({
+      mode: "managed",
+      expectedRevision: initialWorkspace.drafts.managed.revision,
+      configuration: {
+        ...createDefaultConfiguration("managed"),
+        capabilityCompletion: {
+          enabled: true,
+          mainCapabilities: ["vision"],
+          specialists: [],
+          maximumSpecialists: 1,
+          hostPolicies: {
+            codex: {
+              mainModel: { source: "official", model: "current" },
+              mainCapabilities: ["reasoning"],
+              specialists: [
+                {
+                  host: "cursor",
+                  source: "official",
+                  model: "auto",
+                  capabilities: ["code"],
+                },
+              ],
+              maximumSpecialists: 1,
+            },
+          },
+        },
+      },
+    });
+
+    assert.deepEqual(saved.drafts.managed.configuration.capabilityCompletion.mainCapabilities, [
+      "vision",
+    ]);
+    assert.deepEqual(
+      saved.drafts.managed.configuration.capabilityCompletion.hostPolicies?.codex?.mainCapabilities,
+      ["reasoning"],
+    );
+    assert.deepEqual(
+      saved.drafts.managed.configuration.capabilityCompletion.hostPolicies?.codex?.specialists[0]
+        ?.capabilities,
+      ["code"],
+    );
+  } finally {
+    storage.close();
+  }
+});
+
 test("rejects invalid drafts and stale revisions without changing persisted state", async () => {
   const storage = await openNodeSqliteStorage({
     databasePath: IN_MEMORY_DATABASE_PATH,
@@ -116,6 +169,37 @@ test("rejects invalid drafts and stale revisions without changing persisted stat
         configuration: createDefaultConfiguration("managed"),
       }),
       { code: "CONFIGURATION_CONFLICT" },
+    );
+    await assert.rejects(
+      storage.configurationStore.saveDraft({
+        mode: "managed",
+        expectedRevision: initialWorkspace.drafts.managed.revision,
+        configuration: {
+          ...createDefaultConfiguration("managed"),
+          capabilityCompletion: {
+            enabled: true,
+            mainCapabilities: ["text"],
+            specialists: [],
+            maximumSpecialists: 1,
+            hostPolicies: {
+              codex: {
+                mainModel: { source: "official", model: "current" },
+                mainCapabilities: ["text"],
+                specialists: [
+                  {
+                    host: "codex",
+                    source: "official",
+                    model: "gpt-5.6-sol",
+                    capabilities: ["code"],
+                  },
+                ],
+                maximumSpecialists: 1,
+              },
+            },
+          },
+        },
+      }),
+      { code: "CONFIGURATION_INVALID" },
     );
 
     const unchangedWorkspace = await storage.configurationStore.loadWorkspace();

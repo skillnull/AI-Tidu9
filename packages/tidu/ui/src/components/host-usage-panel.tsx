@@ -88,7 +88,12 @@ export const HostUsagePanel = ({
               : "Official host data is shown per source; unavailable fields stay unreported."}
           </p>
         </div>
-        <button type="button" onClick={onRefresh} disabled={state.status === "loading"}>
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={state.status === "loading"}
+          aria-busy={state.status === "loading"}
+        >
           {state.status === "loading"
             ? chinese
               ? "读取中…"
@@ -99,7 +104,7 @@ export const HostUsagePanel = ({
         </button>
       </div>
       {state.status === "idle" || state.status === "loading" ? (
-        <p role="status">
+        <p className="loading-indicator" role="status" aria-busy="true">
           {chinese
             ? "正在读取宿主账号、模型与额度数据…"
             : "Loading host account, model, and usage data…"}
@@ -237,7 +242,12 @@ export const HostUsagePanel = ({
                 : "See Cursor settings or usage dashboard"}
             </p>
             {snapshot?.cursor.agentStatus !== "authenticated" ? (
-              <button type="button" onClick={onConnectCursor} disabled={connectingCursor}>
+              <button
+                type="button"
+                onClick={onConnectCursor}
+                disabled={connectingCursor}
+                aria-busy={connectingCursor}
+              >
                 {connectingCursor
                   ? chinese
                     ? "等待浏览器授权…"

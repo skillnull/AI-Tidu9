@@ -14,11 +14,13 @@ test("discovers supported clients from metadata without reading configuration co
   const cursorApplication = join(homeDirectory, "Applications/Cursor.app");
   const cursorAgentExecutable = join(binaryDirectory, "agent");
   const openAiExecutable = join(binaryDirectory, "openai");
+  const ollamaApplication = join(homeDirectory, "Applications/Ollama.app");
 
   try {
     mkdirSync(binaryDirectory, { recursive: true });
     mkdirSync(join(homeDirectory, ".codex"), { recursive: true });
     mkdirSync(cursorApplication, { recursive: true });
+    mkdirSync(ollamaApplication, { recursive: true });
     writeFileSync(codexConfiguration, "SECRET_VALUE_MUST_NOT_BE_READ", {
       mode: 0o600,
     });
@@ -50,6 +52,9 @@ test("discovers supported clients from metadata without reading configuration co
     assert.equal(discovery.clients[1]?.limitation, null);
     assert.equal(discovery.clients[2]?.signals.command, true);
     assert.equal(discovery.clients[2]?.integrationMode, "virtual-model");
+    assert.equal(discovery.clients[3]?.id, "ollama");
+    assert.equal(discovery.clients[3]?.signals.application, true);
+    assert.equal(discovery.clients[3]?.readiness, "configurable");
     assert.doesNotMatch(JSON.stringify(discovery), /SECRET_VALUE_MUST_NOT_BE_READ/u);
   } finally {
     rmSync(temporaryDirectory, { force: true, recursive: true });

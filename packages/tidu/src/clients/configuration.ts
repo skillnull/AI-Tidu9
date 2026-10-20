@@ -45,7 +45,7 @@ export interface CodexOfficialModel {
   id: string;
   /** Human-readable official model name. */
   name: string;
-  /** Capabilities derived only from fields published by the Codex model catalog. */
+  /** Capabilities executable through the text bridge and grounded in the official host catalog. */
   capabilities: readonly string[];
   /** Evidence source for the displayed capability declaration. */
   capabilitySource: "host-catalog";
@@ -79,6 +79,11 @@ export interface CodexClientModeOptions extends CodexClientRollbackOptions {
   /** Configuration to make active for newly started Codex sessions. */
   mode: CodexClientMode;
   /** Optional fetch implementation for isolated tests. */
+  request?: typeof fetch;
+}
+
+export interface CodexClientModelCatalogRefreshOptions extends CodexClientRollbackOptions {
+  /** Optional fetch implementation for embedded runtimes and isolated tests. */
   request?: typeof fetch;
 }
 
@@ -154,6 +159,8 @@ interface VerifiedEndpoint {
   model: string;
   /** Human-readable virtual-model name returned by model discovery. */
   displayName: string;
+  /** Whether the currently executable primary provider accepts Codex reasoning effort. */
+  reasoningEffortSupported: boolean;
 }
 
 interface CodexFailureDiagnostic {
@@ -438,6 +445,18 @@ const requestJson = async (
   return body;
 };
 
+const activeProviderSupportsCodexReasoningEffort = async (
+  request: typeof fetch,
+  endpoint: string,
+): Promise<boolean> => {
+  try {
+    const capabilityCompletion = await requestJson(request, endpoint, "/api/capability-completion");
+    return capabilityCompletion.codexReasoningEffortSupported === true;
+  } catch {
+    return false;
+  }
+};
+
 const verifyEndpoint = async (
   candidate: string,
   request: typeof fetch,
@@ -477,6 +496,7 @@ const verifyEndpoint = async (
       typeof firstModel.display_name === "string" && firstModel.display_name.trim()
         ? firstModel.display_name.trim()
         : firstModel.id,
+    reasoningEffortSupported: await activeProviderSupportsCodexReasoningEffort(request, endpoint),
   };
 };
 
@@ -497,6 +517,7 @@ const verifyInference = async (
         model,
         input: "Reply with OK.",
         metadata: { ai_tidu9_probe: true },
+        response_format: { type: "json_object" },
         tools: [{ type: "tool_search" }],
         tool_choice: "none",
         stream: false,
@@ -571,7 +592,11 @@ const createCodexProfile = (endpoint: string, model: string, modelCatalogPath: s
     "",
   ].join("\n");
 
-const createCodexModelCatalog = (model: string, displayName: string): string =>
+const createCodexModelCatalog = (
+  model: string,
+  displayName: string,
+  reasoningEffortSupported: boolean,
+): string =>
   `${JSON.stringify(
     {
       models: [
@@ -579,12 +604,14 @@ const createCodexModelCatalog = (model: string, displayName: string): string =>
           slug: model,
           display_name: displayName,
           description: "AI-Tidu9 active virtual model",
-          default_reasoning_level: "medium",
-          supported_reasoning_levels: [
-            { effort: "low", description: "Fast" },
-            { effort: "medium", description: "Balanced" },
-            { effort: "high", description: "Deep reasoning" },
-          ],
+          ...(reasoningEffortSupported ? { default_reasoning_level: "medium" } : {}),
+          supported_reasoning_levels: reasoningEffortSupported
+            ? [
+                { effort: "low", description: "Fast" },
+                { effort: "medium", description: "Balanced" },
+                { effort: "high", description: "Deep reasoning" },
+              ]
+            : [],
           shell_type: "shell_command",
           visibility: "list",
           supported_in_api: true,
@@ -605,16 +632,15 @@ const createCodexModelCatalog = (model: string, displayName: string): string =>
             permissions: null,
           },
           include_skills_usage_instructions: true,
-          default_reasoning_summary: "none",
-          support_verbosity: true,
+          default_reasoning_summary: "auto",
+          support_verbosity: false,
           default_verbosity: "low",
-          apply_patch_tool_type: "freeform",
-          web_search_tool_type: "text_and_image",
+          apply_patch_tool_type: null,
           truncation_policy: { mode: "tokens", limit: 10_000 },
-          input_modalities: ["text", "image"],
-          supports_parallel_tool_calls: true,
-          supports_image_detail_original: true,
-          supports_search_tool: true,
+          input_modalities: ["text"],
+          supports_parallel_tool_calls: false,
+          supports_image_detail_original: false,
+          supports_search_tool: false,
           context_window: 128_000,
           max_context_window: 128_000,
           comp_hash: "ai-tidu9-1",
@@ -709,23 +735,21 @@ export const listCodexOfficialModels = (
             ? model.max_context_window
             : 0;
       const capabilities = new Set<string>();
-      if (inputModalities.includes("text")) capabilities.add("text");
-      if (inputModalities.includes("image")) capabilities.add("vision");
+      if (inputModalities.includes("text")) {
+        capabilities.add("text");
+        capabilities.add("structured-output");
+      }
       if (
         Array.isArray(model.supported_reasoning_levels) &&
         model.supported_reasoning_levels.length > 0
       ) {
         capabilities.add("reasoning");
       }
-      if (model.supports_search_tool === true || typeof model.web_search_tool_type === "string") {
-        capabilities.add("web-research");
-      }
       if (
-        typeof model.tool_mode === "string" ||
-        (Array.isArray(model.experimental_supported_tools) &&
-          model.experimental_supported_tools.length > 0)
+        (typeof model.tool_mode === "string" && model.tool_mode.includes("code")) ||
+        typeof model.apply_patch_tool_type === "string"
       ) {
-        capabilities.add("tool-use");
+        capabilities.add("code");
       }
       if (contextWindow >= 100_000) capabilities.add("long-context");
       modelsById.set(id, {
@@ -1001,6 +1025,7 @@ export const configureCodexClient = async (
           endpoint: normalizeEndpoint(options.endpoint),
           model: DEFAULT_VIRTUAL_MODEL_ID,
           displayName: PRODUCT.name,
+          reasoningEffortSupported: false,
         }
       : await verifyEndpoint(options.endpoint, request);
   const paths = resolveCodexPaths(options.codexHomeDirectory);
@@ -1014,7 +1039,11 @@ export const configureCodexClient = async (
     };
     writeManagedState(paths.state, existingState);
   }
-  const expectedCatalog = createCodexModelCatalog(verified.model, verified.displayName);
+  const expectedCatalog = createCodexModelCatalog(
+    verified.model,
+    verified.displayName,
+    verified.reasoningEffortSupported,
+  );
   const expectedProfile = createCodexProfile(verified.endpoint, verified.model, paths.modelCatalog);
   if (
     existingState?.endpoint === verified.endpoint &&
@@ -1099,6 +1128,28 @@ export const inspectCodexClientConfiguration = (
   };
 };
 
+export const refreshCodexClientModelCatalog = async (
+  options: CodexClientModelCatalogRefreshOptions = {},
+): Promise<CodexClientStatus> => {
+  const paths = resolveCodexPaths(options.codexHomeDirectory);
+  const state = readManagedState(paths.state);
+  if (state === undefined || !existsSync(paths.profile) || !hasManagedDefaultConfiguration(paths)) {
+    return inspectCodexClientConfiguration(options);
+  }
+  const verified = await verifyEndpoint(state.endpoint, options.request ?? fetch);
+  if (verified.model !== state.model) {
+    throw new TiduError(
+      "CONFIGURATION_CONFLICT",
+      "The active virtual model changed after the Codex client was configured.",
+    );
+  }
+  writePrivateFileAtomically(
+    paths.modelCatalog,
+    createCodexModelCatalog(state.model, verified.displayName, verified.reasoningEffortSupported),
+  );
+  return inspectCodexClientConfiguration(options);
+};
+
 export const switchCodexClientConfiguration = async (
   options: CodexClientModeOptions,
 ): Promise<CodexClientStatus> => {
@@ -1129,7 +1180,15 @@ export const switchCodexClientConfiguration = async (
       await verifyEndpoint(state.endpoint, request);
       await verifyInference(state.endpoint, state.model, request);
       activateDefaultCodexConfiguration(paths, state.endpoint, state.model);
-      await verifyEndpoint(state.endpoint, request);
+      const verified = await verifyEndpoint(state.endpoint, request);
+      writePrivateFileAtomically(
+        paths.modelCatalog,
+        createCodexModelCatalog(
+          state.model,
+          verified.displayName,
+          verified.reasoningEffortSupported,
+        ),
+      );
     } catch (error) {
       restoreDefaultConfigurationValues(paths, state.originalBackupId);
       writeManagedState(paths.state, {

@@ -168,6 +168,7 @@ export {
   type CodexAgentEvent,
   type CodexAgentOptions,
   type CodexApprovalDecision,
+  type CodexReasoningEffort,
   type CodexThread,
   type CodexTurnResult,
   createCodexAgentClient,
