@@ -9,6 +9,8 @@ This file records user-visible changes in every public AI-Tidu9 release. Compati
 
 ## Unreleased
 
+## 1.1.1 - 2026-10-21
+
 - Correct capability provenance and display. Primary and secondary models now show only capabilities returned by the host model catalog and supported by the routing contract, selecting that verified set by default. Cursor models on the same host are differentiated by ACP reasoning and context parameters. Model changes refresh capabilities and stale out-of-catalog selections are removed. Cursor model selectors show the ACP-published name while retaining the original parameterized ID for execution and persistence; secondary-model cards no longer repeat the selected model or reserve an empty column.
 - Handle the JSON-RPC race where a child closes standard input before a write. The connection now fails explicitly, rejects pending requests, and reaps the child instead of emitting an unhandled `EPIPE`.
 - Harden the release gate. Both the release commit and immutable Tag must pass remote `Quality`; any failure stops the flow before npm publication instead of allowing a locally non-reproduced failure into a published version.

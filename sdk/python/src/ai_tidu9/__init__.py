@@ -3,4 +3,4 @@
 from .client import CapabilityInvocationResult, TiduClient, TiduError
 
 __all__ = ["CapabilityInvocationResult", "TiduClient", "TiduError"]
-__version__ = "1.1.0"
+__version__ = "1.1.1"
