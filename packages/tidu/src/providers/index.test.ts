@@ -199,7 +199,7 @@ test("preserves Responses instructions and JSON format constraints in host promp
   assert.throws(() => requireValidHostModelText(request, "not json"), /did not return valid JSON/u);
 });
 
-test("fails closed for image and tool requests unsupported by host text bridges", () => {
+test("fails closed for images and required tools while allowing optional tool declarations", () => {
   const baseRequest = {
     protocol: "responses" as const,
     virtualModelId: "ai-tidu9-config",
@@ -215,12 +215,20 @@ test("fails closed for image and tool requests unsupported by host text bridges"
       ],
     },
   });
-  const toolResult = findUnsupportedHostBridgeRequest({
+  const optionalToolResult = findUnsupportedHostBridgeRequest({
     ...baseRequest,
     body: {
       input: "Use a tool.",
       tools: [{ type: "function", name: "lookup" }],
       tool_choice: "auto",
+    },
+  });
+  const requiredToolResult = findUnsupportedHostBridgeRequest({
+    ...baseRequest,
+    body: {
+      input: "Use a tool.",
+      tools: [{ type: "function", name: "lookup" }],
+      tool_choice: "required",
     },
   });
   const disabledToolResult = findUnsupportedHostBridgeRequest({
@@ -234,8 +242,9 @@ test("fails closed for image and tool requests unsupported by host text bridges"
 
   assert.equal(imageResult?.statusCode, 400);
   assert.match(JSON.stringify(imageResult), /host_bridge_image_unsupported/u);
-  assert.equal(toolResult?.statusCode, 400);
-  assert.match(JSON.stringify(toolResult), /host_bridge_tools_unsupported/u);
+  assert.equal(optionalToolResult, undefined);
+  assert.equal(requiredToolResult?.statusCode, 400);
+  assert.match(JSON.stringify(requiredToolResult), /host_bridge_tools_unsupported/u);
   assert.equal(disabledToolResult, undefined);
 });
 

@@ -50,6 +50,11 @@ export interface OpenAiRequestValidation {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
+export const requestRequiresToolExecution = (body: Readonly<Record<string, unknown>>): boolean =>
+  Array.isArray(body.tools) &&
+  body.tools.length > 0 &&
+  (body.tool_choice === "required" || isRecord(body.tool_choice));
+
 export const createOpenAiError = (
   code: string,
   message: string,

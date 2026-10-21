@@ -56,7 +56,7 @@ tidu setup
 tidu start
 ```
 
-Open the configuration-center URL printed in the terminal. The guided flow detects the deployment, names the entry, connects a model, saves the draft when you click Save and continue, requests explicit activation, and connects supported clients.
+Open the configuration-center URL printed in the terminal. The guided flow detects the deployment, names the entry, connects a model, saves the draft when you click Save and continue, requests activation, and connects supported clients.
 
 > [!NOTE]
 > The npm installation command does not install or switch Node.js. Switch the current terminal to a compatible Node version before installing AI-Tidu9.

@@ -7,7 +7,7 @@ import {
   inspectCodexHostLogin,
   inspectCodexHostLoginAsync,
 } from "../accounts/codex-host.js";
-import { inspectCursorHostLogin } from "../accounts/cursor-host.js";
+import { inspectCursorHostLoginAsync } from "../accounts/cursor-host.js";
 import {
   type CodexAccountSummary,
   type CodexAgentClient,
@@ -18,6 +18,7 @@ import {
   createCodexAgentClient,
 } from "../connectors/codex-app-server.js";
 import { type CursorAcpModel, createCursorAcpClient } from "../connectors/cursor-acp.js";
+import { requestRequiresToolExecution } from "../openai/index.js";
 import type { ModelProvider, ProviderExecutionRequest, ProviderExecutionResult } from "./index.js";
 
 const CODEX_TURN_TIMEOUT_MILLISECONDS = 5 * 60_000;
@@ -73,18 +74,14 @@ export const findUnsupportedHostBridgeRequest = (
       },
     };
   }
-  if (
-    Array.isArray(request.body.tools) &&
-    request.body.tools.length > 0 &&
-    request.body.tool_choice !== "none"
-  ) {
+  if (requestRequiresToolExecution(request.body)) {
     return {
       kind: "json",
       statusCode: 400,
       body: {
         error: {
           code: "host_bridge_tools_unsupported",
-          message: "The Codex and Cursor text bridge cannot return tool calls.",
+          message: "The Codex and Cursor text bridge cannot satisfy a required tool call.",
           type: "invalid_request_error",
         },
       },
@@ -608,7 +605,7 @@ export const createCodexHostModelProvider = async (
 };
 
 export const createCursorHostModelProvider = async (): Promise<ModelProvider | undefined> => {
-  if (!inspectCursorHostLogin().reusable) {
+  if (!(await inspectCursorHostLoginAsync()).reusable) {
     return undefined;
   }
   const discoveryDirectory = await mkdtemp(join(tmpdir(), "tidu-cursor-model-discovery-"));

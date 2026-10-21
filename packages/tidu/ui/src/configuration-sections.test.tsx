@@ -4,6 +4,7 @@ import { MODEL_ROUTING_CAPABILITIES } from "../../src/config/index.js";
 
 import {
   capabilityIdsForPicker,
+  catalogNeedsConfiguredSpecialistRecovery,
   defaultModelCapabilities,
   resolveWizardAdvance,
   resolveWizardEntryState,
@@ -13,6 +14,68 @@ import {
   updatePrimaryModelSelection,
   updateSpecialistModelSelection,
 } from "./configuration-sections.js";
+import { catalogModelName, modelDisplayName } from "./model-display.js";
+
+test("shows the provider model name instead of its parameterized execution identifier", () => {
+  const models = [
+    {
+      id: "claude-opus-5-5[context=300k,effort=medium,fast=false]",
+      name: "claude-opus-5-5",
+      isDefault: true,
+    },
+  ];
+
+  assert.equal(
+    catalogModelName(models, "claude-opus-5-5[context=300k,effort=medium,fast=false]"),
+    "claude-opus-5-5",
+  );
+  assert.equal(catalogModelName(models, "current"), "claude-opus-5-5");
+  assert.equal(catalogModelName(models, "missing-model"), undefined);
+  assert.equal(
+    modelDisplayName({
+      catalog: {
+        companyConfigured: false,
+        companyProviderType: null,
+        company: [],
+        official: [],
+        hosts: {
+          codex: { available: false, models: [] },
+          cursor: { available: true, models },
+          ollama: { available: false, models: [] },
+          "openai-compatible": { available: false, models: [] },
+        },
+      },
+      currentName: "Default",
+      host: "cursor",
+      selection: {
+        source: "official",
+        model: "claude-opus-5-5[context=300k,effort=medium,fast=false]",
+      },
+    }),
+    "claude-opus-5-5",
+  );
+  assert.equal(
+    modelDisplayName({
+      catalog: undefined,
+      currentName: "Default",
+      host: "cursor",
+      selection: {
+        source: "official",
+        model: "claude-opus-5-5[context=300k,effort=medium,fast=false]",
+      },
+    }),
+    "claude-opus-5-5",
+  );
+  assert.equal(
+    modelDisplayName({
+      catalog: undefined,
+      currentName: "Default",
+      host: "cursor",
+      selection: { source: "custom", model: "custom-model[variant=test]" },
+    }),
+    "custom-model[variant=test]",
+  );
+});
 
 test("offers only capabilities implemented by the model-routing contract", () => {
   const capabilityIds: readonly string[] = selectableModelCapabilityIds;
@@ -50,6 +113,51 @@ test("defaults a model to all and only its interface-published capabilities", ()
       ["text", "code", "vision"],
     ),
     ["text", "vision"],
+  );
+});
+
+test("retries a transiently missing configured secondary-model catalog", () => {
+  const specialist = {
+    host: "cursor" as const,
+    source: "official" as const,
+    model: "claude-opus-5-5[context=300k,effort=medium,fast=false]",
+    capabilities: ["code"],
+  };
+  const catalog = {
+    companyConfigured: false,
+    companyProviderType: null,
+    company: [],
+    official: [],
+    hosts: {
+      codex: { available: true, models: [] },
+      cursor: { available: false, models: [] },
+      ollama: { available: false, models: [] },
+      "openai-compatible": { available: false, models: [] },
+    },
+  };
+
+  assert.equal(catalogNeedsConfiguredSpecialistRecovery(catalog, [specialist]), true);
+  assert.equal(
+    catalogNeedsConfiguredSpecialistRecovery(
+      {
+        ...catalog,
+        hosts: {
+          ...catalog.hosts,
+          cursor: {
+            available: true,
+            models: [
+              {
+                id: specialist.model,
+                name: "claude-opus-5-5",
+                capabilities: ["text", "code"],
+              },
+            ],
+          },
+        },
+      },
+      [specialist],
+    ),
+    false,
   );
 });
 

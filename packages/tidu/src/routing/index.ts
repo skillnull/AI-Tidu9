@@ -4,6 +4,7 @@ import type {
   CapabilitySpecialistConfiguration,
   ModelSelection,
 } from "../config/index.js";
+import { requestRequiresToolExecution } from "../openai/index.js";
 import type {
   ModelProvider,
   ProviderExecutionRequest,
@@ -268,11 +269,19 @@ export const inferModelRequestCapabilities = (
     ...(request.routing?.requiredCapabilities ?? []),
   ]);
   const tools = Array.isArray(request.body.tools) ? request.body.tools : [];
-  const toolsEnabled = tools.length > 0 && request.body.tool_choice !== "none";
-  if (toolsEnabled) {
+  const toolExecutionRequired = requestRequiresToolExecution(request.body);
+  if (toolExecutionRequired) {
     inferred.add("tool-use");
   }
-  const identifiers = toolsEnabled ? tools.flatMap(toolIdentifiers) : [];
+  const selectedToolIdentifiers = isRecord(request.body.tool_choice)
+    ? toolIdentifiers(request.body.tool_choice)
+    : [];
+  const identifiers =
+    selectedToolIdentifiers.length > 0
+      ? selectedToolIdentifiers
+      : toolExecutionRequired && tools.length === 1
+        ? tools.flatMap(toolIdentifiers)
+        : [];
   if (identifiers.some((identifier) => WEB_RESEARCH_TOOL_TYPES.has(identifier))) {
     inferred.add("web-research");
   }
@@ -1062,7 +1071,11 @@ export const createDynamicModelRouter = (
       requiredCapabilities,
     )[0];
     if (main === undefined) {
-      throw new Error("No configured model or capability-completion pool can cover this request.");
+      main = preferredMain ?? rankModels(eligible, requiredCapabilities)[0];
+      reason = "capability-gap";
+    }
+    if (main === undefined) {
+      throw new Error("No enabled model satisfies the verified request routing constraints.");
     }
     if (excludedMainIds.size > 0) reason = "failure-fallback";
     else if (main.profile.id !== policy.mainModelId && reason === "main-capability-match") {
@@ -1193,7 +1206,6 @@ export const createDynamicModelRouter = (
         const cancellation = requestCancellationError(request, error);
         if (cancellation !== undefined) throw cancellation;
         for (const specialist of route.specialists) exhaustedModels.add(specialist.profile.id);
-        lastCapabilityUnsupportedResult = undefined;
         lastFailure =
           error instanceof Error ? error : new Error("Capability secondary model failed.");
         continue;
@@ -1211,7 +1223,6 @@ export const createDynamicModelRouter = (
           },
         });
       } catch (error) {
-        lastCapabilityUnsupportedResult = undefined;
         const cancellation = requestCancellationError(request, error);
         lastFailure =
           cancellation ?? (error instanceof Error ? error : new Error("Model provider failed."));
@@ -1225,7 +1236,12 @@ export const createDynamicModelRouter = (
         });
         if (cancellation !== undefined) throw cancellation;
         attemptedMainIds.add(route.main.profile.id);
-        if (attemptedMainIds.size >= models.length) throw lastFailure;
+        if (attemptedMainIds.size >= models.length) {
+          if (lastCapabilityUnsupportedResult !== undefined) {
+            return lastCapabilityUnsupportedResult;
+          }
+          throw lastFailure;
+        }
         continue;
       }
       const cancellationAfterMain = requestCancellationError(request);
@@ -1319,7 +1335,6 @@ export const createDynamicModelRouter = (
         });
         return result;
       }
-      lastCapabilityUnsupportedResult = undefined;
       lastFailure = new Error(
         `Model ${route.main.profile.id} failed with HTTP ${result.statusCode}.`,
       );

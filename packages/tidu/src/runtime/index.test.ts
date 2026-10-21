@@ -663,6 +663,8 @@ test("routes ordinary inference through one Agent model call and preserves reaso
     reasoning: unknown;
     reasoningEffort: unknown;
     role: unknown;
+    toolChoice: unknown;
+    tools: unknown;
   }> = [];
   const provider: ModelProvider = {
     descriptor: { type: "openai-compatible", model: "upstream-test-model" },
@@ -674,6 +676,8 @@ test("routes ordinary inference through one Agent model call and preserves reaso
         reasoning: request.body.reasoning,
         reasoningEffort: request.body.reasoning_effort,
         role: request.routing?.role,
+        toolChoice: request.body.tool_choice,
+        tools: request.body.tools,
       });
       return {
         kind: "json",
@@ -736,6 +740,14 @@ test("routes ordinary inference through one Agent model call and preserves reaso
         model: "ai-tidu9-config",
         input: "hello",
         reasoning: { effort: "high" },
+        tools: [
+          {
+            type: "function",
+            name: "read_file",
+            parameters: { type: "object" },
+          },
+        ],
+        tool_choice: "auto",
       }),
     });
     assert.equal(responsesResponse.status, 200);
@@ -748,6 +760,8 @@ test("routes ordinary inference through one Agent model call and preserves reaso
         reasoning: undefined,
         reasoningEffort: undefined,
         role: "worker",
+        toolChoice: undefined,
+        tools: undefined,
       },
       {
         protocol: "responses",
@@ -756,6 +770,14 @@ test("routes ordinary inference through one Agent model call and preserves reaso
         reasoning: { effort: "high" },
         reasoningEffort: undefined,
         role: "worker",
+        toolChoice: "auto",
+        tools: [
+          {
+            type: "function",
+            name: "read_file",
+            parameters: { type: "object" },
+          },
+        ],
       },
     ]);
   } finally {

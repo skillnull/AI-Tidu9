@@ -532,9 +532,6 @@ const sendOpenAiValidation = (
 const providerFailureSource = (provider: ModelProvider): "ai-tidu9" | "official-codex" =>
   provider.descriptor.type === "codex-host" ? "official-codex" : "ai-tidu9";
 
-const isCapabilityRoutingFailure = (reason: string): boolean =>
-  reason.includes("No configured model or capability-completion pool can cover this request.");
-
 const resolveRuntimeProviderType = (provider: ModelProvider | undefined): string | undefined => {
   if (provider?.descriptor.type !== "tidu-router") return provider?.descriptor.type;
   const configuredProvider = process.env.TIDU_PROVIDER?.trim();
@@ -561,12 +558,11 @@ const createProviderFailure = (
   reason: string,
   code = "provider_request_failed",
 ): OpenAiErrorBody => {
-  const routingFailure = isCapabilityRoutingFailure(reason);
-  const failureSource = routingFailure ? "ai-tidu9" : providerFailureSource(provider);
+  const failureSource = providerFailureSource(provider);
   const sourceLabel = failureSource === "official-codex" ? "Official Codex" : "AI-Tidu9";
   const nextSteps = providerRecoverySteps(failureSource);
   return createOpenAiError(
-    routingFailure ? "capability_routing_unavailable" : code,
+    code,
     `Failure source: ${sourceLabel}. Reason: ${reason} Next steps: ${nextSteps.join(" ")}`,
     "server_error",
     null,
@@ -3173,6 +3169,25 @@ export const startLocalRuntime = async (
       : guardModelProvider(capabilityCompletionProvider, secretGate);
   const activeConfiguration = (await storage.configurationStore.loadWorkspace()).active
     .configuration;
+  if (activeConfiguration.capabilityCompletion.enabled) {
+    const configuredSpecialistHosts = new Set(
+      [
+        ...activeConfiguration.capabilityCompletion.specialists,
+        ...Object.values(activeConfiguration.capabilityCompletion.hostPolicies ?? {}).flatMap(
+          (policy) => policy.specialists,
+        ),
+      ].map((specialist) => specialist.host),
+    );
+    for (const specialistHost of configuredSpecialistHosts) {
+      if (specialistHost === "cursor" || specialistHost === "ollama") {
+        void (async () => {
+          if ((await resolveProviderForHost(specialistHost)) === undefined) {
+            await resolveProviderForHost(specialistHost);
+          }
+        })();
+      }
+    }
+  }
   const activeExpertServices =
     activeConfiguration.activeMode === "expert" ? activeConfiguration.expertServices : undefined;
   const host = options.host ?? activeExpertServices?.host ?? DEFAULT_RUNTIME_HOST;

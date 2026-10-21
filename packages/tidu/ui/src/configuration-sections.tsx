@@ -12,6 +12,12 @@ import type {
 } from "../../src/config/index.js";
 import { isValidModelIdentifier, MODEL_ROUTING_CAPABILITIES } from "../../src/config/index.js";
 import type { ConfigCenterBootstrap } from "../../src/config-center/contracts.js";
+import {
+  type CatalogModel,
+  modelDisplayName,
+  modelSourceForHost,
+  type UpstreamModelCatalog,
+} from "./model-display.js";
 
 export interface EnterpriseMemberUsageReport {
   /** Published enterprise-state revision. */
@@ -254,16 +260,6 @@ export const capabilityIdsForPicker = (
   return selectableModelCapabilityIds.filter((capability) => published.has(capability));
 };
 
-type CatalogModel = {
-  id: string;
-  name: string;
-  isDefault?: boolean;
-  capabilities?: readonly string[];
-  capabilitySource?: "company-published" | "host-catalog" | "provider-catalog";
-  inputCostPerMillionTokens?: number | null;
-  outputCostPerMillionTokens?: number | null;
-};
-
 export const defaultModelCapabilities = (
   publishedCapabilities: readonly string[],
 ): readonly string[] => capabilityIdsForPicker(publishedCapabilities);
@@ -418,13 +414,13 @@ export const CapabilityCompletionPanel = ({
       setMessage(error instanceof Error ? error.message : english ? "Unavailable" : "读取失败");
     }
   }, [english]);
-  const displayModel = (host: AgentHostId, selection: ModelSelection): string => {
-    if (selection.model !== "current") return selection.model;
-    return (
-      catalog?.hosts[host].models.find((model) => model.isDefault)?.id ??
-      (host === "cursor" ? "auto" : english ? "Default" : "默认模型")
-    );
-  };
+  const displayModel = (host: AgentHostId, selection: ModelSelection): string =>
+    modelDisplayName({
+      catalog,
+      currentName: host === "cursor" ? "auto" : english ? "Default" : "默认模型",
+      host,
+      selection,
+    });
   const displayResultMessage = (result: CapabilityCompletionModelResultView): string => {
     if (english) return result.message;
     if (result.skipReason === "not-selected")
@@ -775,7 +771,14 @@ export const CapabilityCompletionPanel = ({
                                           : "未调用"}
                                   </small>
                                 </div>
-                                <p>{modelResult.model}</p>
+                                <p>
+                                  {displayModel(modelResult.host, {
+                                    source: modelResult.modelId.endsWith(":custom")
+                                      ? "custom"
+                                      : modelSourceForHost(modelResult.host),
+                                    model: modelResult.model,
+                                  })}
+                                </p>
                                 <div className="capability-model-result-meta">
                                   <span>
                                     {modelResult.host} · {english ? "Capabilities" : "能力"}：
@@ -1291,7 +1294,7 @@ export const GuideCenter = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
                 <li>OpenAI兼容服务设置 TIDU_PROVIDER=openai-compatible。</li>
                 <li>本地Ollama设置 TIDU_PROVIDER=ollama。</li>
                 <li>通过 TIDU_PROVIDER_MODEL 指定真实模型。</li>
-                <li>点击“保存并下一步”保存草稿，再明确启用普通或专家入口。</li>
+                <li>点击“保存并下一步”保存草稿，再启用普通或专家入口。</li>
               </ol>
             </article>
             <article className="guide-card">
@@ -1849,19 +1852,6 @@ interface QuickStartWizardProps {
   onOpenClients: () => void;
 }
 
-interface UpstreamModelCatalog {
-  /** Whether a company provider is active in this runtime. */
-  companyConfigured: boolean;
-  /** Concrete company adapter hidden behind the runtime router. */
-  companyProviderType: "ollama" | "openai-compatible" | null;
-  /** Company-provider models available behind the virtual model. */
-  company: readonly CatalogModel[];
-  /** Official Codex models available to the signed-in account. */
-  official: readonly CatalogModel[];
-  /** Models grouped by the host that can actually execute them. */
-  hosts: Record<AgentHostId, { available: boolean; models: readonly CatalogModel[] }>;
-}
-
 const createEmptyHostCatalog = (): UpstreamModelCatalog["hosts"] => ({
   codex: { available: false, models: [] },
   cursor: { available: false, models: [] },
@@ -1886,6 +1876,17 @@ const catalogModelForSelection = (
       : undefined)
   );
 };
+
+export const catalogNeedsConfiguredSpecialistRecovery = (
+  catalog: UpstreamModelCatalog,
+  specialists: readonly CapabilitySpecialistConfiguration[],
+): boolean =>
+  specialists.some((specialist) => {
+    const hostCatalog = catalog.hosts[specialist.host];
+    if (!hostCatalog.available || hostCatalog.models.length === 0) return true;
+    if (specialist.model === "current") return false;
+    return !hostCatalog.models.some((model) => model.id === specialist.model);
+  });
 
 const equalCapabilities = (left: readonly string[], right: readonly string[]): boolean =>
   left.length === right.length && left.every((capability, index) => capability === right[index]);
@@ -2252,32 +2253,42 @@ export const QuickStartWizard = ({
   }, [providerType, targetHost, upstreamCatalog.companyProviderType, upstreamCatalogStatus]);
   useEffect(() => {
     if (step !== 2) return;
+    let current = true;
     setUpstreamCatalogStatus("loading");
-    void fetch("/api/models/upstreams", { cache: "no-store" })
-      .then(async (response) => {
-        if (!response.ok) throw new Error("Model catalog unavailable");
-        const catalog = (await response.json()) as Omit<UpstreamModelCatalog, "hosts"> & {
-          hosts?: UpstreamModelCatalog["hosts"];
+    const readCatalog = async (): Promise<UpstreamModelCatalog> => {
+      const response = await fetch("/api/models/upstreams", { cache: "no-store" });
+      if (!response.ok) throw new Error("Model catalog unavailable");
+      const catalog = (await response.json()) as Omit<UpstreamModelCatalog, "hosts"> & {
+        hosts?: UpstreamModelCatalog["hosts"];
+      };
+      const fallbackHosts = createEmptyHostCatalog();
+      fallbackHosts.codex = {
+        available: catalog.official.length > 0,
+        models: catalog.official,
+      };
+      if (catalog.companyProviderType !== null) {
+        const companyHost = catalog.companyProviderType;
+        fallbackHosts[companyHost] = {
+          available: catalog.companyConfigured,
+          models: catalog.company,
         };
-        const fallbackHosts = createEmptyHostCatalog();
-        fallbackHosts.codex = {
-          available: catalog.official.length > 0,
-          models: catalog.official,
-        };
-        if (catalog.companyProviderType !== null) {
-          const companyHost = catalog.companyProviderType;
-          fallbackHosts[companyHost] = {
-            available: catalog.companyConfigured,
-            models: catalog.company,
-          };
+      }
+      return {
+        ...catalog,
+        hosts: catalog.hosts ?? fallbackHosts,
+      };
+    };
+    void (async () => {
+      try {
+        let catalog = await readCatalog();
+        if (catalogNeedsConfiguredSpecialistRecovery(catalog, activeHostPolicy.specialists)) {
+          catalog = await readCatalog();
         }
-        setUpstreamCatalog({
-          ...catalog,
-          hosts: catalog.hosts ?? fallbackHosts,
-        });
+        if (!current) return;
+        setUpstreamCatalog(catalog);
         setUpstreamCatalogStatus("ready");
-      })
-      .catch(() => {
+      } catch {
+        if (!current) return;
         setUpstreamCatalog({
           companyConfigured: false,
           companyProviderType: null,
@@ -2286,7 +2297,11 @@ export const QuickStartWizard = ({
           hosts: createEmptyHostCatalog(),
         });
         setUpstreamCatalogStatus("error");
-      });
+      }
+    })();
+    return () => {
+      current = false;
+    };
   }, [step]);
   useEffect(() => {
     if (step !== 2 || upstreamCatalogStatus !== "ready") return;
@@ -2443,8 +2458,8 @@ export const QuickStartWizard = ({
           <h2>{english ? "Finish setup step by step" : "按步骤完成首次配置"}</h2>
           <p>
             {english
-              ? "Choose the models step by step. Save changes when continuing, then explicitly activate the saved draft."
-              : "按步骤选择模型；点击“保存并下一步”写入草稿，再明确启用后生效。"}
+              ? "Choose the models step by step. Save changes when continuing, then activate the saved draft."
+              : "按步骤选择模型；点击“保存并下一步”写入草稿，再启用后生效。"}
           </p>
         </div>
         <div className="onboarding-status-summary">
@@ -3026,12 +3041,16 @@ export const QuickStartWizard = ({
                                   <div className="capability-specialist-heading">
                                     <div>
                                       <span>
-                                        {english ? "Unavailable specialist" : "不可用的副模型配置"}
+                                        {english
+                                          ? "Secondary model catalog unavailable"
+                                          : "副模型目录读取失败"}
                                       </span>
-                                      <strong>{hostLabel(specialist.host)}</strong>
+                                      <strong>
+                                        {hostLabel(specialist.host)} · {specialist.model}
+                                      </strong>
                                     </div>
                                     <span className="warning">
-                                      {english ? "Not selectable" : "不参与选择与路由"}
+                                      {english ? "Saved configuration retained" : "已保留配置"}
                                     </span>
                                     <button
                                       type="button"
@@ -3049,8 +3068,8 @@ export const QuickStartWizard = ({
                                   </div>
                                   <p className="capability-evidence">
                                     {english
-                                      ? "This saved host is currently unavailable or exposes no models. It has no capability controls."
-                                      : "该已保存宿主当前不可用或未提供模型，因此不展示能力项，也不会参与互补路由。"}
+                                      ? "The live model catalog is temporarily unavailable. Runtime requests will reconnect to the host."
+                                      : "暂未读到实时模型目录；实际请求会重新连接该宿主。"}
                                   </p>
                                 </article>
                               );
@@ -3299,7 +3318,7 @@ export const QuickStartWizard = ({
                     : `生效时间：${new Date(activeUpdatedAt).toLocaleString(locale)}。`
                   : english
                     ? "Select “Activate and apply” below to replace the current runtime configuration."
-                    : "点击下方“明确启用并生效”，才会替换当前运行配置。"}
+                    : "点击下方“启用并生效”，才会替换当前运行配置。"}
               </span>
             </div>
             <div className="onboarding-choice-row">
@@ -3320,7 +3339,7 @@ export const QuickStartWizard = ({
                       : "已启用并生效"
                     : english
                       ? "Activate and apply"
-                      : "明确启用并生效"}
+                      : "启用并生效"}
               </button>
               <button
                 type="button"

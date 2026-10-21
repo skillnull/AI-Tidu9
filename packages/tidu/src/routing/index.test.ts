@@ -49,7 +49,7 @@ test("infers structured output from the Responses text format", () => {
   );
 });
 
-test("infers web research and code only from declared tool structure", () => {
+test("treats auto tools as optional and infers capabilities only from required execution", () => {
   assert.deepEqual(
     inferModelRequestCapabilities({
       protocol: "responses",
@@ -63,15 +63,31 @@ test("infers web research and code only from declared tool structure", () => {
         ],
       },
     }),
-    ["code", "text", "tool-use", "web-research"],
+    ["text"],
   );
   assert.deepEqual(
     inferModelRequestCapabilities({
       protocol: "responses",
       virtualModelId: "tidu",
-      body: { input: "Please use apply_patch, shell, and web search." },
+      body: {
+        input: "Search the web.",
+        tools: [{ type: "web_search" }],
+        tool_choice: "required",
+      },
     }),
-    ["text"],
+    ["text", "tool-use", "web-research"],
+  );
+  assert.deepEqual(
+    inferModelRequestCapabilities({
+      protocol: "responses",
+      virtualModelId: "tidu",
+      body: {
+        input: "Apply the patch.",
+        tools: [{ type: "function", name: "apply_patch" }],
+        tool_choice: { type: "function", name: "apply_patch" },
+      },
+    }),
+    ["code", "text", "tool-use"],
   );
   assert.deepEqual(
     inferModelRequestCapabilities({
@@ -1271,6 +1287,87 @@ test("does not require tool capabilities when the caller disables declared tools
   assert.deepEqual(router.inspect()?.requiredCapabilities, ["text"]);
 });
 
+test("calls the main model for every capability metadata gap", async () => {
+  const cases: ReadonlyArray<{
+    body: Readonly<Record<string, unknown>>;
+    missingCapabilities: readonly string[];
+  }> = [
+    {
+      body: { input: "Return JSON.", response_format: { type: "json_object" } },
+      missingCapabilities: ["structured-output"],
+    },
+    {
+      body: { input: "Think.", reasoning: { effort: "high" } },
+      missingCapabilities: ["reasoning"],
+    },
+    {
+      body: {
+        input: [
+          {
+            role: "user",
+            content: [{ type: "input_image", image_url: "local" }],
+          },
+        ],
+      },
+      missingCapabilities: ["vision"],
+    },
+    {
+      body: { input: "x".repeat(100_000) },
+      missingCapabilities: ["long-context"],
+    },
+    {
+      body: {
+        input: "Apply the patch.",
+        tools: [{ type: "function", name: "apply_patch" }],
+        tool_choice: { type: "function", name: "apply_patch" },
+      },
+      missingCapabilities: ["code", "tool-use"],
+    },
+    {
+      body: {
+        input: "Search the web.",
+        tools: [{ type: "web_search" }],
+        tool_choice: "required",
+      },
+      missingCapabilities: ["tool-use", "web-research"],
+    },
+  ];
+
+  for (const regressionCase of cases) {
+    const calls: string[] = [];
+    const router = createDynamicModelRouter(
+      [
+        {
+          profile: profile({ id: "cheap-main", capabilities: ["text"] }),
+          provider: jsonProvider("main", async () => {
+            calls.push("cheap-main");
+            return { statusCode: 200, body: { output_text: "upstream accepted the request" } };
+          }),
+        },
+        {
+          profile: profile({ id: "vision-specialist", capabilities: ["text"] }),
+          provider: jsonProvider("specialist", async () => {
+            calls.push("vision-specialist");
+            return { statusCode: 200, body: { output_text: "specialist" } };
+          }),
+        },
+      ],
+      policy,
+    );
+
+    const result = await router.execute({
+      protocol: "responses",
+      virtualModelId: "tidu",
+      body: regressionCase.body,
+    });
+
+    assert.equal(result.statusCode, 200);
+    assert.deepEqual(calls, ["cheap-main"]);
+    assert.equal(router.inspect()?.reason, "capability-gap");
+    assert.deepEqual(router.inspect()?.missingCapabilities, regressionCase.missingCapabilities);
+  }
+});
+
 test("keeps the main model when fewer observed tokens still cost more", async () => {
   const calls: string[] = [];
   const router = createDynamicModelRouter(
@@ -1476,6 +1573,54 @@ test("tries another capable model after an explicit host bridge capability rejec
     router.inspectAttempts().map((attempt) => attempt.outcome),
     ["failed", "succeeded"],
   );
+});
+
+test("preserves the explicit bridge limitation when every fallback is unavailable", async () => {
+  const calls: string[] = [];
+  const router = createDynamicModelRouter(
+    [
+      {
+        profile: profile({ id: "cheap-main", capabilities: ["text"] }),
+        provider: jsonProvider("host-bridge", async () => {
+          calls.push("cheap-main");
+          return {
+            statusCode: 400,
+            body: {
+              error: {
+                code: "host_bridge_tools_unsupported",
+                message: "The bridge cannot satisfy a required tool call.",
+              },
+            },
+          };
+        }),
+      },
+      {
+        profile: profile({ id: "vision-specialist", capabilities: ["text", "code"] }),
+        provider: jsonProvider("unavailable", async () => {
+          calls.push("vision-specialist");
+          return {
+            statusCode: 503,
+            body: { error: { code: "provider_unavailable", message: "Unavailable." } },
+          };
+        }),
+      },
+    ],
+    policy,
+  );
+
+  const result = await router.execute({
+    protocol: "responses",
+    virtualModelId: "tidu",
+    body: {
+      input: "Call lookup.",
+      tools: [{ type: "function", name: "lookup" }],
+      tool_choice: "required",
+    },
+  });
+
+  assert.equal(result.statusCode, 400);
+  assert.deepEqual(calls, ["cheap-main", "vision-specialist"]);
+  assert.match(JSON.stringify(result), /host_bridge_tools_unsupported/u);
 });
 
 test("does not fall back for an ordinary client error", async () => {

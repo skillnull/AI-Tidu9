@@ -34,6 +34,11 @@ import {
   TaskControlPanel,
   toForm,
 } from "./configuration-sections.js";
+import {
+  agentHostForProviderType,
+  modelDisplayName,
+  type UpstreamModelCatalog,
+} from "./model-display.js";
 
 interface CodexConfigurationStatus {
   /** Whether the managed AI-Tidu9 profile is installed. */
@@ -214,6 +219,7 @@ const App = () => {
   const [hostUsageState, setHostUsageState] = useState<HostUsageLoadState>({
     status: "idle",
   });
+  const [upstreamModelCatalog, setUpstreamModelCatalog] = useState<UpstreamModelCatalog>();
   const [connectingCursor, setConnectingCursor] = useState(false);
   const [cursorConnectionError, setCursorConnectionError] = useState<string | null>(null);
   const [codexConnection, setCodexConnection] = useState<ClientConnectionState>({
@@ -267,6 +273,15 @@ const App = () => {
       });
     }
   }, [locale]);
+  const refreshUpstreamModelCatalog = useCallback(async () => {
+    try {
+      const response = await fetch("/api/models/upstreams", { cache: "no-store" });
+      if (!response.ok) return;
+      setUpstreamModelCatalog((await response.json()) as UpstreamModelCatalog);
+    } catch {
+      // Model IDs remain readable without exposing provider parameters when discovery is unavailable.
+    }
+  }, []);
   const connectCursor = useCallback(async () => {
     setConnectingCursor(true);
     setCursorConnectionError(null);
@@ -431,8 +446,9 @@ const App = () => {
       (activeSection === "configuration" && configurationView === "active")
     ) {
       void refreshHostUsage();
+      void refreshUpstreamModelCatalog();
     }
-  }, [activeSection, configurationView, refreshHostUsage]);
+  }, [activeSection, configurationView, refreshHostUsage, refreshUpstreamModelCatalog]);
 
   useEffect(() => {
     if (activeSection === "clients") {
@@ -481,6 +497,13 @@ const App = () => {
 
   const { bootstrap } = loadingState;
   const workspace = bootstrap.configuration.workspace;
+  const activeModelSelection = workspace.active.configuration.modelSelection;
+  const activeModelName = modelDisplayName({
+    catalog: upstreamModelCatalog,
+    currentName: locale === "zh-CN" ? "跟随当前官方模型" : "Follow current official model",
+    host: agentHostForProviderType(bootstrap.runtime.provider.type),
+    selection: activeModelSelection,
+  });
   const form = configurationForm;
   const setForm = (
     nextForm: ConfigurationForm | ((current: ConfigurationForm) => ConfigurationForm),
@@ -631,7 +654,7 @@ const App = () => {
       acceptBootstrap(nextBootstrap, selectedMode);
       setOperation({
         status: "success",
-        message: `${modeLabel(selectedMode)}已明确启用。`,
+        message: `${modeLabel(selectedMode)}已启用。`,
       });
       setToast({
         message: locale === "zh-CN" ? "配置启用成功" : "Configuration activated",
@@ -835,8 +858,8 @@ const App = () => {
                       ? "这里只显示当前生效的配置；运行状态统一在服务页查看。"
                       : "This view shows active configuration only; runtime status is available under Services."
                     : locale === "zh-CN"
-                      ? "点击“保存并下一步”会保存为未生效草稿；明确启用后才会影响运行流程。"
-                      : "Click Save and continue to save an inactive draft; it affects runtime only after explicit activation."}
+                      ? "点击“保存并下一步”会保存为未生效草稿；启用后才会影响运行流程。"
+                      : "Click Save and continue to save an inactive draft; it affects runtime only after activation."}
                 </p>
               </div>
               <div className="configuration-view-actions">
@@ -897,11 +920,11 @@ const App = () => {
                 </p>
                 <p>
                   {locale === "zh-CN" ? "当前上游" : "Selected upstream"}：
-                  {workspace.active.configuration.modelSelection.source === "official"
+                  {activeModelSelection.source === "official"
                     ? locale === "zh-CN"
                       ? "官方模型"
                       : "Official"
-                    : workspace.active.configuration.modelSelection.source === "company"
+                    : activeModelSelection.source === "company"
                       ? locale === "zh-CN"
                         ? "公司模型"
                         : "Company"
@@ -909,11 +932,7 @@ const App = () => {
                         ? "自定义模型"
                         : "Custom"}
                   {" · "}
-                  {workspace.active.configuration.modelSelection.model === "current"
-                    ? locale === "zh-CN"
-                      ? "跟随当前官方模型"
-                      : "Follow current official model"
-                    : workspace.active.configuration.modelSelection.model}
+                  {activeModelName}
                 </p>
                 <p>
                   {locale === "zh-CN" ? "能力互补" : "Capability completion"}：
@@ -969,6 +988,7 @@ const App = () => {
         <HostUsagePanel
           state={hostUsageState}
           locale={locale}
+          modelCatalog={upstreamModelCatalog}
           onRefresh={() => void refreshHostUsage()}
           onConnectCursor={() => void connectCursor()}
           connectingCursor={connectingCursor}

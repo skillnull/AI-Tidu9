@@ -1,3 +1,10 @@
+import type { UpstreamModelCatalog } from "../model-display.js";
+import {
+  agentHostForProviderType,
+  modelDisplayName,
+  modelSourceForHost,
+} from "../model-display.js";
+
 export interface HostUsageSnapshot {
   /** Active model provider in the local runtime. */
   activeProvider: { type: string; model: string } | null;
@@ -60,6 +67,7 @@ const resolveCodexPlanPricing = (
 export const HostUsagePanel = ({
   state,
   locale,
+  modelCatalog,
   onRefresh,
   onConnectCursor,
   connectingCursor,
@@ -67,6 +75,7 @@ export const HostUsagePanel = ({
 }: {
   state: HostUsageLoadState;
   locale: "en-US" | "zh-CN";
+  modelCatalog: UpstreamModelCatalog | undefined;
   onRefresh: () => void;
   onConnectCursor: () => void;
   connectingCursor: boolean;
@@ -76,6 +85,29 @@ export const HostUsagePanel = ({
   const snapshot = state.status === "ready" ? state.snapshot : null;
   const usage = snapshot?.codex?.usage;
   const codexPricing = resolveCodexPlanPricing(snapshot?.codex?.account?.plan);
+  const activeProviderHost = agentHostForProviderType(snapshot?.activeProvider?.type);
+  const activeProviderModel =
+    snapshot?.activeProvider === null || snapshot?.activeProvider === undefined
+      ? "—"
+      : modelDisplayName({
+          catalog: modelCatalog,
+          currentName: chinese ? "当前默认模型" : "Current default model",
+          host: activeProviderHost,
+          selection: {
+            source:
+              activeProviderHost === undefined ? "custom" : modelSourceForHost(activeProviderHost),
+            model: snapshot.activeProvider.model,
+          },
+        });
+  const cursorModel =
+    snapshot?.cursor.model === null || snapshot?.cursor.model === undefined
+      ? "—"
+      : modelDisplayName({
+          catalog: modelCatalog,
+          currentName: "auto",
+          host: "cursor",
+          selection: { source: "official", model: snapshot.cursor.model },
+        });
   return (
     <section className="host-usage-panel">
       <div className="configuration-heading">
@@ -149,9 +181,7 @@ export const HostUsagePanel = ({
             ) : null}
             <p>
               {chinese ? "当前运行模型" : "Active runtime model"}：
-              {snapshot?.activeProvider?.type === "codex-host"
-                ? snapshot.activeProvider.model
-                : "—"}
+              {snapshot?.activeProvider?.type === "codex-host" ? activeProviderModel : "—"}
             </p>
             <p>
               {chinese ? "剩余额度（短周期）" : "Remaining short-window quota"}：
@@ -233,7 +263,7 @@ export const HostUsagePanel = ({
             </p>
             <p>{chinese ? "计费单位" : "Billing unit"}：—</p>
             <p>
-              {chinese ? "可用 Agent 模型" : "Agent model"}：{snapshot?.cursor.model ?? "—"}
+              {chinese ? "可用 Agent 模型" : "Agent model"}：{cursorModel}
             </p>
             <p>
               {chinese ? "剩余额度与重置次数" : "Remaining quota and resets"}：
