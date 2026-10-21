@@ -9,6 +9,9 @@ This file records user-visible changes in every public AI-Tidu9 release. Compati
 
 ## Unreleased
 
+- Correct capability defaults and display. A primary model's first configuration and every new secondary now select all eight standard capabilities. Model catalogs, model changes, and the capability-completion switch no longer overwrite user selections, hide standard capabilities, or mark them as unpublished manual declarations.
+- Handle the JSON-RPC race where a child closes standard input before a write. The connection now fails explicitly, rejects pending requests, and reaps the child instead of emitting an unhandled `EPIPE`.
+
 ## 1.1.0 - 2026-10-20
 
 - Replace Codex MCP registration with mutually exclusive native Provider modes: Official restores the exact original configuration, while AI-Tidu9 shows only “九门赛博提督.” Codex, Cursor, CLI, and OpenAI-compatible entries share one execution kernel. Ordinary `/v1` inference uses the single-model fast path; explicit planning and business acceptance remain in the full task flow. Ollama discovery reads the local catalog directly.

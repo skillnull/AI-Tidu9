@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { MODEL_ROUTING_CAPABILITIES } from "../../src/config/index.js";
 
 import {
   capabilityIdsForPicker,
-  defaultCapabilitiesForModel,
+  defaultModelCapabilities,
   resolveWizardAdvance,
   resolveWizardEntryState,
   selectableModelCapabilityIds,
+  updateCapabilityCompletionEnabled,
+  updatePrimaryModelSelection,
+  updateSpecialistModelSelection,
 } from "./configuration-sections.js";
 
 test("offers only capabilities implemented by the model-routing contract", () => {
@@ -17,35 +21,94 @@ test("offers only capabilities implemented by the model-routing contract", () =>
     "reasoning",
     "code",
     "vision",
-    "web-research",
     "tool-use",
     "long-context",
+    "web-research",
   ]);
+  assert.deepEqual(selectableModelCapabilityIds, MODEL_ROUTING_CAPABILITIES);
   assert.equal(capabilityIds.includes("document-analysis"), false);
   assert.equal(capabilityIds.includes("domain-context"), false);
   assert.equal(capabilityIds.includes("local-private"), false);
 });
 
-test("keeps saved manual capabilities visible without offering unsupported capabilities", () => {
-  assert.deepEqual(capabilityIdsForPicker(["code"], ["text"]), ["text", "code"]);
-  assert.deepEqual(capabilityIdsForPicker([], ["document-analysis"]), []);
-  assert.deepEqual(capabilityIdsForPicker(["document-analysis"], ["text", "document-analysis"]), [
-    "text",
+test("always offers every standard capability and keeps saved custom capabilities removable", () => {
+  assert.deepEqual(capabilityIdsForPicker(["code"]), selectableModelCapabilityIds);
+  assert.deepEqual(capabilityIdsForPicker([]), selectableModelCapabilityIds);
+  assert.deepEqual(capabilityIdsForPicker(["document-analysis"]), [
+    ...selectableModelCapabilityIds,
     "document-analysis",
   ]);
 });
 
-test("defaults a newly selected secondary model to every published capability", () => {
-  const publishedCapabilities = ["text", "structured-output", "code", "tool-use"];
-
-  assert.deepEqual(
-    defaultCapabilitiesForModel({ capabilities: publishedCapabilities }),
-    publishedCapabilities,
-  );
+test("defaults every newly selected primary or secondary model to all standard capabilities", () => {
+  assert.deepEqual(defaultModelCapabilities(), selectableModelCapabilityIds);
 });
 
-test("does not invent capabilities when a model publishes no capability metadata", () => {
-  assert.deepEqual(defaultCapabilitiesForModel(undefined), []);
+test("enabling or disabling capability completion preserves every saved model selection", () => {
+  const policy = {
+    mainModel: { source: "official" as const, model: "gpt-primary" },
+    mainCapabilities: ["text"],
+    specialists: [
+      {
+        host: "cursor" as const,
+        source: "official" as const,
+        model: "cursor-secondary",
+        capabilities: ["code"],
+      },
+    ],
+    maximumSpecialists: 2,
+  };
+  const configuration = {
+    enabled: false,
+    mainCapabilities: policy.mainCapabilities,
+    specialists: policy.specialists,
+    maximumSpecialists: policy.maximumSpecialists,
+    hostPolicies: { codex: policy },
+  };
+
+  const enabled = updateCapabilityCompletionEnabled(configuration, true);
+  const disabled = updateCapabilityCompletionEnabled(enabled, false);
+
+  assert.deepEqual(enabled.mainCapabilities, ["text"]);
+  assert.deepEqual(enabled.specialists[0]?.capabilities, ["code"]);
+  assert.equal(enabled.maximumSpecialists, 2);
+  assert.deepEqual(enabled.hostPolicies?.codex, policy);
+  assert.deepEqual(disabled.mainCapabilities, ["text"]);
+  assert.deepEqual(disabled.specialists[0]?.capabilities, ["code"]);
+  assert.equal(disabled.maximumSpecialists, 2);
+  assert.deepEqual(disabled.hostPolicies?.codex, policy);
+});
+
+test("changing a configured model preserves explicit capability selections", () => {
+  const policy = {
+    mainModel: { source: "official" as const, model: "gpt-primary" },
+    mainCapabilities: ["text"],
+    specialists: [],
+    maximumSpecialists: 2,
+  };
+  const specialist = {
+    host: "cursor" as const,
+    source: "official" as const,
+    model: "cursor-primary",
+    capabilities: ["code"],
+    inputCostPerMillionTokens: null,
+    outputCostPerMillionTokens: null,
+  };
+
+  const nextPolicy = updatePrimaryModelSelection(policy, {
+    source: "custom",
+    model: "custom-primary",
+  });
+  const nextSpecialist = updateSpecialistModelSelection(specialist, {
+    host: "cursor",
+    source: "official",
+    model: "cursor-secondary",
+    inputCostPerMillionTokens: 1,
+    outputCostPerMillionTokens: 2,
+  });
+
+  assert.deepEqual(nextPolicy.mainCapabilities, ["text"]);
+  assert.deepEqual(nextSpecialist.capabilities, ["code"]);
 });
 
 test("opens a target-host editor without synthesizing or changing its policy", () => {

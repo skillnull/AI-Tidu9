@@ -29,6 +29,9 @@ test("creates a safe managed configuration", () => {
   assert.equal(configuration.virtualModelName, "九门赛博提督");
   assert.deepEqual(configuration.modelSelection, { source: "official", model: "current" });
   assert.equal(configuration.capabilityCompletion.enabled, false);
+  assert.deepEqual(configuration.capabilityCompletion.mainCapabilities, [
+    ...MODEL_ROUTING_CAPABILITIES,
+  ]);
 });
 
 test("keeps managed and expert defaults isolated", () => {

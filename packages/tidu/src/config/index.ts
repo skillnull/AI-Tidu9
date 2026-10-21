@@ -135,7 +135,7 @@ export const createDefaultConfiguration = (
     modelSelection: { source: "official", model: "current" },
     capabilityCompletion: {
       enabled: false,
-      mainCapabilities: [...REQUIRED_AGENT_CAPABILITIES],
+      mainCapabilities: [...MODEL_ROUTING_CAPABILITIES],
       specialists: [],
       maximumSpecialists: 2,
       hostPolicies: {},

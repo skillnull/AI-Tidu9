@@ -6,10 +6,11 @@ import type {
   CapabilitySpecialistConfiguration,
   ConfigurationMode,
   ExpertServiceConfiguration,
+  HostCapabilityCompletionPolicy,
   ModelSelection,
   TiduConfiguration,
 } from "../../src/config/index.js";
-import { isValidModelIdentifier } from "../../src/config/index.js";
+import { isValidModelIdentifier, MODEL_ROUTING_CAPABILITIES } from "../../src/config/index.js";
 import type { ConfigCenterBootstrap } from "../../src/config-center/contracts.js";
 
 export interface EnterpriseMemberUsageReport {
@@ -244,7 +245,7 @@ const MODEL_CAPABILITIES = [
   },
 ] as const;
 
-export const selectableModelCapabilityIds = MODEL_CAPABILITIES.map((capability) => capability.id);
+export const selectableModelCapabilityIds: readonly string[] = [...MODEL_ROUTING_CAPABILITIES];
 
 const NON_ROUTABLE_CAPABILITY_IDS = new Set([
   "document-analysis",
@@ -252,19 +253,11 @@ const NON_ROUTABLE_CAPABILITY_IDS = new Set([
   "local-private",
 ]);
 
-export const capabilityIdsForPicker = (
-  selected: readonly string[],
-  available?: readonly string[],
-): readonly string[] => {
+export const capabilityIdsForPicker = (selected: readonly string[]): readonly string[] => {
   const baseIds: readonly string[] = selectableModelCapabilityIds;
-  const extraIds = [...new Set([...(available ?? []), ...selected])].filter(
-    (capability) => !baseIds.includes(capability),
-  );
+  const extraIds = [...new Set(selected)].filter((capability) => !baseIds.includes(capability));
   return [...baseIds, ...extraIds].filter(
-    (capability) =>
-      available === undefined ||
-      selected.includes(capability) ||
-      (available.includes(capability) && !NON_ROUTABLE_CAPABILITY_IDS.has(capability)),
+    (capability) => selected.includes(capability) || !NON_ROUTABLE_CAPABILITY_IDS.has(capability),
   );
 };
 
@@ -278,9 +271,31 @@ type CatalogModel = {
   outputCostPerMillionTokens?: number | null;
 };
 
-export const defaultCapabilitiesForModel = (
-  model: Pick<CatalogModel, "capabilities"> | undefined,
-): readonly string[] => [...(model?.capabilities ?? [])];
+export const defaultModelCapabilities = (): readonly string[] => [...MODEL_ROUTING_CAPABILITIES];
+
+export const updateCapabilityCompletionEnabled = (
+  configuration: CapabilityCompletionConfiguration,
+  enabled: boolean,
+): CapabilityCompletionConfiguration => ({ ...configuration, enabled });
+
+export const updatePrimaryModelSelection = (
+  policy: HostCapabilityCompletionPolicy,
+  mainModel: ModelSelection,
+): HostCapabilityCompletionPolicy => ({ ...policy, mainModel });
+
+type SpecialistModelSelection = Pick<
+  CapabilitySpecialistConfiguration,
+  "host" | "source" | "model" | "inputCostPerMillionTokens" | "outputCostPerMillionTokens"
+>;
+
+export const updateSpecialistModelSelection = (
+  specialist: CapabilitySpecialistConfiguration,
+  selection: SpecialistModelSelection,
+): CapabilitySpecialistConfiguration => ({
+  ...specialist,
+  ...selection,
+  capabilities: specialist.capabilities,
+});
 
 const capabilityLabel = (capability: string, english: boolean): string => {
   const item = MODEL_CAPABILITIES.find((candidate) => candidate.id === capability);
@@ -289,18 +304,16 @@ const capabilityLabel = (capability: string, english: boolean): string => {
 
 const CapabilityPicker = ({
   selected,
-  available,
   english,
   disabled,
   onChange,
 }: {
   selected: readonly string[];
-  available?: readonly string[];
   english: boolean;
   disabled: boolean;
   onChange: (capabilities: readonly string[]) => void;
 }) => {
-  const options = capabilityIdsForPicker(selected, available).map(
+  const options = capabilityIdsForPicker(selected).map(
     (capability) =>
       MODEL_CAPABILITIES.find((item) => item.id === capability) ?? {
         id: capability,
@@ -313,13 +326,9 @@ const CapabilityPicker = ({
     <div className="capability-picker">
       {options.map((capability) => {
         const checked = selected.includes(capability.id);
-        const savedManualDeclaration =
-          available !== undefined &&
-          checked &&
-          (!available.includes(capability.id) || NON_ROUTABLE_CAPABILITY_IDS.has(capability.id));
         return (
           <label
-            className={`${checked ? "selected" : ""} ${savedManualDeclaration ? "saved-manual" : ""} ${disabled ? "disabled" : ""}`.trim()}
+            className={`${checked ? "selected" : ""} ${disabled ? "disabled" : ""}`.trim()}
             key={capability.id}
           >
             <input
@@ -337,15 +346,7 @@ const CapabilityPicker = ({
             <span className="capability-check" aria-hidden="true" />
             <span className="capability-copy">
               <strong>{english ? capability.en : capability.zh}</strong>
-              <small>
-                {savedManualDeclaration
-                  ? english
-                    ? `Saved manual declaration · ${capability.id} · not published by catalog`
-                    : `已保存的手工声明 · ${capability.id} · 目录当前未发布`
-                  : english
-                    ? capability.id
-                    : capability.detail}
-              </small>
+              <small>{english ? capability.id : capability.detail}</small>
             </span>
           </label>
         );
@@ -1122,7 +1123,7 @@ export const toForm = (configuration: TiduConfiguration): ConfigurationForm => (
   },
   capabilityCompletion: configuration.capabilityCompletion ?? {
     enabled: false,
-    mainCapabilities: ["text", "structured-output"],
+    mainCapabilities: [...MODEL_ROUTING_CAPABILITIES],
     specialists: [],
     maximumSpecialists: 2,
   },
@@ -2072,29 +2073,8 @@ export const QuickStartWizard = ({
       },
     });
   };
-  const hostCatalogModels = upstreamCatalog.hosts[activeHostId]?.models ?? [];
-  const capabilitiesForMainModel = (selection: ModelSelection): readonly string[] => {
-    const resolvedModel =
-      selection.model === "current"
-        ? providerCheck.provider === providerChoice
-          ? providerCheck.model
-          : (hostCatalogModels.find((model) => model.isDefault)?.id ?? hostCatalogModels[0]?.id)
-        : selection.model;
-    return defaultCapabilitiesForModel(
-      hostCatalogModels.find((model) => model.id === resolvedModel),
-    );
-  };
   const selectMainModel = (selection: ModelSelection): void =>
-    updateActiveHostPolicy(
-      {
-        ...activeHostPolicy,
-        mainModel: selection,
-        ...(form.capabilityCompletion.enabled
-          ? { mainCapabilities: capabilitiesForMainModel(selection) }
-          : {}),
-      },
-      selection,
-    );
+    updateActiveHostPolicy(updatePrimaryModelSelection(activeHostPolicy, selection), selection);
   const specialistHostCandidates = (
     ["codex", "cursor", "ollama", "openai-compatible"] as const
   ).filter((host) => host !== activeHostId);
@@ -2133,7 +2113,6 @@ export const QuickStartWizard = ({
     activeHostPolicy.mainModel.model === "current"
       ? (detectedPrimaryModel ?? "")
       : activeHostPolicy.mainModel.model;
-  const primaryCatalogModel = hostCatalogModels.find((model) => model.id === detectedPrimaryModel);
   const updateSpecialists = (specialists: readonly CapabilitySpecialistConfiguration[]): void =>
     updateActiveHostPolicy({
       ...activeHostPolicy,
@@ -2151,14 +2130,9 @@ export const QuickStartWizard = ({
       source: choice === "codex-host" || choice === "cursor-host" ? "official" : "company",
       model: "current",
     };
-    const nextHostModels = upstreamCatalog.hosts[nextHostId]?.models ?? [];
-    const nextCatalogModel =
-      nextModelSelection.model === "current"
-        ? (nextHostModels.find((model) => model.isDefault) ?? nextHostModels[0])
-        : nextHostModels.find((model) => model.id === nextModelSelection.model);
     const nextPolicy = savedPolicy ?? {
       mainModel: nextModelSelection,
-      mainCapabilities: defaultCapabilitiesForModel(nextCatalogModel),
+      mainCapabilities: defaultModelCapabilities(),
       specialists: [],
       maximumSpecialists: 2,
     };
@@ -2815,27 +2789,12 @@ export const QuickStartWizard = ({
                       type="checkbox"
                       checked={form.capabilityCompletion.enabled}
                       onChange={(event) => {
-                        const enabled = event.target.checked;
-                        const mainCapabilities = enabled
-                          ? capabilitiesForMainModel(activeHostPolicy.mainModel)
-                          : activeHostPolicy.mainCapabilities;
-                        const maximumSpecialists = Math.max(1, activeHostPolicy.specialists.length);
                         onFormChange({
                           ...form,
-                          capabilityCompletion: {
-                            ...form.capabilityCompletion,
-                            enabled,
-                            mainCapabilities,
-                            maximumSpecialists,
-                            hostPolicies: {
-                              ...form.capabilityCompletion.hostPolicies,
-                              [activeHostId]: {
-                                ...activeHostPolicy,
-                                mainCapabilities,
-                                maximumSpecialists,
-                              },
-                            },
-                          },
+                          capabilityCompletion: updateCapabilityCompletionEnabled(
+                            form.capabilityCompletion,
+                            event.target.checked,
+                          ),
                         });
                       }}
                       disabled={
@@ -2866,8 +2825,8 @@ export const QuickStartWizard = ({
                           </h4>
                           <p>
                             {english
-                              ? "Only select capabilities verified for this model."
-                              : "只勾选已确认可用的能力；路由会把未勾选能力视为缺口。"}
+                              ? "All capabilities are selected by default. Clear only capabilities you do not want this model to provide."
+                              : "默认全选；仅取消你明确不希望该模型提供的能力。"}
                           </p>
                         </div>
                       </div>
@@ -2885,11 +2844,6 @@ export const QuickStartWizard = ({
                       ) : (
                         <CapabilityPicker
                           selected={activeHostPolicy.mainCapabilities}
-                          available={
-                            modelChoiceMode === "custom"
-                              ? undefined
-                              : primaryCatalogModel?.capabilities
-                          }
                           english={english}
                           disabled={isPending || readOnly}
                           onChange={(mainCapabilities) =>
@@ -2907,8 +2861,8 @@ export const QuickStartWizard = ({
                           <h4>{english ? "2. Select secondary models" : "2. 选择副模型"}</h4>
                           <p>
                             {english
-                              ? "Secondary models come from other hosts. Selecting at most two usually minimizes cost."
-                              : "副模型来自其他宿主；建议最多选择 2 个，通常更省成本。"}
+                              ? "New secondary models start with all capabilities selected. Selecting at most two usually minimizes cost."
+                              : "新增副模型默认全选能力；建议最多选择 2 个，通常更省成本。"}
                           </p>
                         </div>
                       </div>
@@ -3031,16 +2985,18 @@ export const QuickStartWizard = ({
                                       );
                                       if (selectedModel === undefined) return;
                                       const specialists = [...activeHostPolicy.specialists];
-                                      specialists[index] = {
-                                        host,
-                                        source: modelSourceForHost(host),
-                                        model: selectedModel.id,
-                                        capabilities: defaultCapabilitiesForModel(selectedModel),
-                                        inputCostPerMillionTokens:
-                                          selectedModel.inputCostPerMillionTokens ?? null,
-                                        outputCostPerMillionTokens:
-                                          selectedModel.outputCostPerMillionTokens ?? null,
-                                      };
+                                      specialists[index] = updateSpecialistModelSelection(
+                                        specialist,
+                                        {
+                                          host,
+                                          source: modelSourceForHost(host),
+                                          model: selectedModel.id,
+                                          inputCostPerMillionTokens:
+                                            selectedModel.inputCostPerMillionTokens ?? null,
+                                          outputCostPerMillionTokens:
+                                            selectedModel.outputCostPerMillionTokens ?? null,
+                                        },
+                                      );
                                       updateSpecialists(specialists);
                                     }}
                                     disabled={isPending || readOnly}
@@ -3064,15 +3020,18 @@ export const QuickStartWizard = ({
                                         (model) => model.id === event.target.value,
                                       );
                                       const specialists = [...activeHostPolicy.specialists];
-                                      specialists[index] = {
-                                        ...specialist,
-                                        model: event.target.value,
-                                        capabilities: defaultCapabilitiesForModel(selectedModel),
-                                        inputCostPerMillionTokens:
-                                          selectedModel?.inputCostPerMillionTokens ?? null,
-                                        outputCostPerMillionTokens:
-                                          selectedModel?.outputCostPerMillionTokens ?? null,
-                                      };
+                                      specialists[index] = updateSpecialistModelSelection(
+                                        specialist,
+                                        {
+                                          host: specialist.host,
+                                          source: specialist.source,
+                                          model: event.target.value,
+                                          inputCostPerMillionTokens:
+                                            selectedModel?.inputCostPerMillionTokens ?? null,
+                                          outputCostPerMillionTokens:
+                                            selectedModel?.outputCostPerMillionTokens ?? null,
+                                        },
+                                      );
                                       updateSpecialists(specialists);
                                     }}
                                     disabled={isPending || readOnly || modelOptions.length === 0}
@@ -3097,7 +3056,6 @@ export const QuickStartWizard = ({
                                     .capabilities?.length ? (
                                   <CapabilityPicker
                                     selected={specialist.capabilities}
-                                    available={selectedCatalogModel.capabilities}
                                     english={english}
                                     disabled={isPending || readOnly}
                                     onChange={(capabilities) => {
@@ -3179,7 +3137,7 @@ export const QuickStartWizard = ({
                                   host: choice.host,
                                   source: modelSourceForHost(choice.host),
                                   model: choice.model.id,
-                                  capabilities: defaultCapabilitiesForModel(choice.model),
+                                  capabilities: defaultModelCapabilities(),
                                   inputCostPerMillionTokens:
                                     choice.model.inputCostPerMillionTokens ?? null,
                                   outputCostPerMillionTokens:

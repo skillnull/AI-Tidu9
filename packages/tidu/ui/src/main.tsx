@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import {
   type AgentHostId,
   type ConfigurationMode,
+  MODEL_ROUTING_CAPABILITIES,
   validateConfiguration,
 } from "../../src/config/index.js";
 import type { ConfigCenterBootstrap } from "../../src/config-center/contracts.js";
@@ -196,7 +197,7 @@ const App = () => {
     modelSelection: { source: "official", model: "current" },
     capabilityCompletion: {
       enabled: false,
-      mainCapabilities: ["text", "structured-output"],
+      mainCapabilities: [...MODEL_ROUTING_CAPABILITIES],
       specialists: [],
       maximumSpecialists: 2,
       hostPolicies: {},

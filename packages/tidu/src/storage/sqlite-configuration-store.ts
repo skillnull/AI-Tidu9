@@ -6,6 +6,7 @@ import {
   createDefaultConfiguration,
   DEFAULT_VIRTUAL_MODEL_ID,
   type ExpertServiceConfiguration,
+  MODEL_ROUTING_CAPABILITIES,
   type TiduConfiguration,
   validateConfiguration,
 } from "../config/index.js";
@@ -64,7 +65,7 @@ const normalizeConfiguration = (configuration: TiduConfiguration): TiduConfigura
   capabilityCompletion: {
     enabled: configuration.capabilityCompletion?.enabled ?? false,
     mainCapabilities: normalizeCapabilities(
-      configuration.capabilityCompletion?.mainCapabilities ?? ["text", "structured-output"],
+      configuration.capabilityCompletion?.mainCapabilities ?? MODEL_ROUTING_CAPABILITIES,
     ),
     specialists: normalizeSpecialists(configuration.capabilityCompletion?.specialists ?? []),
     maximumSpecialists: configuration.capabilityCompletion?.maximumSpecialists ?? 2,
