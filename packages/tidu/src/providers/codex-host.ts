@@ -314,6 +314,42 @@ export const requireCompletedCursorPrompt = (
   return result.text;
 };
 
+export const cursorCapabilitiesForModel = (modelId: string): readonly string[] => {
+  const capabilities = ["text", "structured-output"];
+  const parameterBlock = /\[([^\]]*)\]$/u.exec(modelId)?.[1] ?? "";
+  const parameters = new Map(
+    parameterBlock.split(",").flatMap((entry): [string, string][] => {
+      const separatorIndex = entry.indexOf("=");
+      if (separatorIndex < 1) return [];
+      return [
+        [
+          entry.slice(0, separatorIndex).trim().toLowerCase(),
+          entry
+            .slice(separatorIndex + 1)
+            .trim()
+            .toLowerCase(),
+        ],
+      ];
+    }),
+  );
+  const reasoningEnabled = ["thinking", "reasoning", "reasoning_effort", "effort"].some(
+    (parameter) => {
+      const value = parameters.get(parameter);
+      return value !== undefined && value !== "false" && value !== "none";
+    },
+  );
+  if (reasoningEnabled) capabilities.push("reasoning");
+  capabilities.push("code");
+  const contextMatch = /^(\d+)([km])?$/u.exec(parameters.get("context") ?? "");
+  if (contextMatch !== null) {
+    const contextAmount = Number(contextMatch[1]);
+    const contextMultiplier =
+      contextMatch[2] === "m" ? 1_000_000 : contextMatch[2] === "k" ? 1_000 : 1;
+    if (contextAmount * contextMultiplier >= 100_000) capabilities.push("long-context");
+  }
+  return capabilities;
+};
+
 export const createCursorModelCatalog = (
   currentModel: string,
   availableModels: readonly string[],
@@ -321,7 +357,7 @@ export const createCursorModelCatalog = (
   const publishedModels = availableModels.map((modelId) => ({
     id: modelId,
     name: modelId,
-    capabilities: ["text", "structured-output", "code"],
+    capabilities: cursorCapabilitiesForModel(modelId),
     capabilitySource: "provider-catalog" as const,
   }));
   return publishedModels.some((candidate) => candidate.id === currentModel)
@@ -330,7 +366,7 @@ export const createCursorModelCatalog = (
         {
           id: currentModel,
           name: currentModel,
-          capabilities: ["text", "structured-output", "code"],
+          capabilities: cursorCapabilitiesForModel(currentModel),
           capabilitySource: "provider-catalog" as const,
         },
         ...publishedModels,

@@ -1663,15 +1663,36 @@ test("exposes the active virtual model through OpenAI-compatible discovery", asy
 });
 
 test("publishes company models only through the upstream-selection API", async () => {
+  let catalogRevision = 1;
   const runtime = await startLocalRuntime({
     databasePath: IN_MEMORY_DATABASE_PATH,
     port: 0,
     provider: {
       descriptor: { type: "openai-compatible", model: "company-model/v2" },
-      listModels: async () => [
-        { id: "company-model/v2", name: "Company Model V2" },
-        { id: "company-model/v3", name: "Company Model V3" },
-      ],
+      listModels: async () =>
+        catalogRevision === 1
+          ? [
+              {
+                id: "company-model/v2",
+                name: "Company Model V2",
+                capabilities: ["text", "vision"],
+                capabilitySource: "company-published" as const,
+              },
+              {
+                id: "company-model/v3",
+                name: "Company Model V3",
+                capabilities: ["text", "reasoning", "tool-use"],
+                capabilitySource: "company-published" as const,
+              },
+            ]
+          : [
+              {
+                id: "company-model/v3",
+                name: "Company Model V3",
+                capabilities: ["text", "long-context"],
+                capabilitySource: "company-published" as const,
+              },
+            ],
       execute: async () => ({
         kind: "json",
         statusCode: 200,
@@ -1693,13 +1714,42 @@ test("publishes company models only through the upstream-selection API", async (
     const upstreams = (await (await fetch(`${runtime.origin}/api/models/upstreams`)).json()) as {
       companyConfigured: boolean;
       companyProviderType: string | null;
-      company: Array<{ id: string; name: string }>;
+      company: Array<{
+        id: string;
+        name: string;
+        capabilities: readonly string[];
+        capabilitySource: string;
+      }>;
     };
     assert.equal(upstreams.companyConfigured, true);
     assert.equal(upstreams.companyProviderType, "openai-compatible");
     assert.deepEqual(upstreams.company, [
-      { id: "company-model/v2", name: "Company Model V2" },
-      { id: "company-model/v3", name: "Company Model V3" },
+      {
+        id: "company-model/v2",
+        name: "Company Model V2",
+        capabilities: ["text", "vision"],
+        capabilitySource: "company-published",
+      },
+      {
+        id: "company-model/v3",
+        name: "Company Model V3",
+        capabilities: ["text", "reasoning", "tool-use"],
+        capabilitySource: "company-published",
+      },
+    ]);
+    catalogRevision = 2;
+    const refreshedUpstreams = (await (
+      await fetch(`${runtime.origin}/api/models/upstreams`)
+    ).json()) as {
+      company: Array<{ id: string; capabilities: readonly string[] }>;
+    };
+    assert.deepEqual(refreshedUpstreams.company, [
+      {
+        id: "company-model/v3",
+        name: "Company Model V3",
+        capabilities: ["text", "long-context"],
+        capabilitySource: "company-published",
+      },
     ]);
     const providerDetection = await fetch(`${runtime.origin}/api/provider/detect`, {
       method: "POST",

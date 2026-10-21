@@ -9,7 +9,7 @@ This file records user-visible changes in every public AI-Tidu9 release. Compati
 
 ## Unreleased
 
-- Correct capability provenance and display. Primary and secondary models now show only capabilities returned by the host model catalog and supported by the routing contract, selecting that verified set by default. Model changes refresh capabilities and stale out-of-catalog selections are removed.
+- Correct capability provenance and display. Primary and secondary models now show only capabilities returned by the host model catalog and supported by the routing contract, selecting that verified set by default. Cursor models on the same host are differentiated by ACP reasoning and context parameters. Model changes refresh capabilities and stale out-of-catalog selections are removed.
 - Handle the JSON-RPC race where a child closes standard input before a write. The connection now fails explicitly, rejects pending requests, and reaps the child instead of emitting an unhandled `EPIPE`.
 
 ## 1.1.0 - 2026-10-20

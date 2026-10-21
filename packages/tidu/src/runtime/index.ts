@@ -2747,7 +2747,8 @@ const handleRequest = async (
   }
 
   if (request.method === "GET" && pathname === "/api/models/upstreams") {
-    const catalog = await readCachedRuntimeValue(storage, "upstream-models", 60_000, async () => {
+    // Coalesce concurrent reads only. Capability editing must never reuse a stale per-model catalog.
+    const catalog = await readCachedRuntimeValue(storage, "upstream-models", 0, async () => {
       const workspace = await storage.configurationStore.loadWorkspace();
       const [cursorProvider, ollamaProvider, compatibleProvider, codexLogin] = await Promise.all([
         getCatalogProviderForHost("cursor"),

@@ -10,6 +10,7 @@ import {
   createCodexHostModelProvider,
   createCursorModelCatalog,
   createLiveJsonStream,
+  cursorCapabilitiesForModel,
   findUnsupportedHostBridgeRequest,
   requestPrompt,
   requireCompletedCursorPrompt,
@@ -100,7 +101,7 @@ const startTestServer = async (
   };
 };
 
-test("publishes only text-contract capabilities for Cursor ACP models", () => {
+test("publishes Cursor bridge capabilities and model-specific ACP parameters", () => {
   assert.deepEqual(createCursorModelCatalog("cursor-default", ["cursor-default", "cursor-fast"]), [
     {
       id: "cursor-default",
@@ -121,6 +122,27 @@ test("publishes only text-contract capabilities for Cursor ACP models", () => {
     capabilities: ["text", "structured-output", "code"],
     capabilitySource: "provider-catalog",
   });
+  assert.deepEqual(
+    cursorCapabilitiesForModel("grok-4.7[context=256k,reasoning_effort=high,fast=true]"),
+    ["text", "structured-output", "reasoning", "code", "long-context"],
+  );
+  assert.deepEqual(cursorCapabilitiesForModel("composer-2.5[fast=true]"), [
+    "text",
+    "structured-output",
+    "code",
+  ]);
+  assert.deepEqual(cursorCapabilitiesForModel("claude-sonnet-4[thinking=false,context=200k]"), [
+    "text",
+    "structured-output",
+    "code",
+    "long-context",
+  ]);
+  assert.deepEqual(cursorCapabilitiesForModel("gpt-5.6-sol[reasoning=none,context=272k]"), [
+    "text",
+    "structured-output",
+    "code",
+    "long-context",
+  ]);
 });
 
 test("preserves Responses instructions and JSON format constraints in host prompts", () => {
@@ -451,6 +473,11 @@ test("preserves capabilities and prices published by a compatible model catalog"
             inputCostPerMillionTokens: 0.2,
             outputCostPerMillionTokens: 0.8,
           },
+          {
+            id: "company-reasoning",
+            name: "Company Reasoning",
+            capabilities: ["text", "reasoning", "tool-use"],
+          },
         ],
       }),
     );
@@ -469,6 +496,12 @@ test("preserves capabilities and prices published by a compatible model catalog"
         capabilitySource: "company-published",
         inputCostPerMillionTokens: 0.2,
         outputCostPerMillionTokens: 0.8,
+      },
+      {
+        id: "company-reasoning",
+        name: "Company Reasoning",
+        capabilities: ["text", "reasoning", "tool-use"],
+        capabilitySource: "company-published",
       },
     ]);
   } finally {
@@ -816,16 +849,18 @@ test("publishes only Ollama capabilities that the adapter forwards", async () =>
   const server = await startTestServer((request, response) => {
     if (request.url === "/api/tags") {
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ models: [{ model: "qwen-vision" }] }));
+      response.end(JSON.stringify({ models: [{ model: "qwen-vision" }, { model: "qwen-tools" }] }));
       return;
     }
     assert.equal(request.url, "/api/show");
     void readBody(request).then((body) => {
-      assert.equal(body.model, "qwen-vision");
       response.writeHead(200, { "content-type": "application/json" });
       response.end(
         JSON.stringify({
-          capabilities: ["completion", "vision", "tools", "thinking"],
+          capabilities:
+            body.model === "qwen-vision"
+              ? ["completion", "vision", "thinking"]
+              : ["completion", "tools"],
         }),
       );
     });
@@ -840,7 +875,13 @@ test("publishes only Ollama capabilities that the adapter forwards", async () =>
       {
         id: "qwen-vision",
         name: "qwen-vision",
-        capabilities: ["text", "vision", "tool-use"],
+        capabilities: ["text", "vision"],
+        capabilitySource: "provider-catalog",
+      },
+      {
+        id: "qwen-tools",
+        name: "qwen-tools",
+        capabilities: ["text", "tool-use"],
         capabilitySource: "provider-catalog",
       },
     ]);
