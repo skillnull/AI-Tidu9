@@ -16,6 +16,12 @@ readline.on("line", (line) => {
 });
 `;
 
+const CLOSED_INPUT_CHILD_SOURCE = String.raw`
+require("node:fs").closeSync(0);
+process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "ready", params: {} }) + "\n");
+setTimeout(() => undefined, 10_000);
+`;
+
 test("stdio JSON-RPC correlates requests and notifications", async () => {
   const notifications: string[] = [];
   const client = createStdioJsonRpcClient(
@@ -41,4 +47,32 @@ test("stdio JSON-RPC rejects cancelled work", async () => {
   controller.abort();
   await assert.rejects(client.request("never", {}, controller.signal), /cancelled/u);
   await client.close();
+});
+
+test("stdio JSON-RPC rejects writes after the child closes its input", async () => {
+  let markReady = (): void => undefined;
+  const ready = new Promise<void>((resolve) => {
+    markReady = resolve;
+  });
+  const client = createStdioJsonRpcClient(
+    {
+      command: process.execPath,
+      arguments: ["-e", CLOSED_INPUT_CHILD_SOURCE],
+      environment: process.env,
+    },
+    {
+      onNotification: (notification) => {
+        if (notification.method === "ready") markReady();
+      },
+      requestTimeoutMilliseconds: 1_000,
+    },
+  );
+
+  try {
+    await ready;
+    await assert.rejects(client.request("echo", {}), /EPIPE|closed/iu);
+  } finally {
+    await client.close();
+  }
+  assert.equal(client.process.exitCode !== null || client.process.signalCode !== null, true);
 });

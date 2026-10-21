@@ -107,9 +107,10 @@ export const createStdioJsonRpcClient = (
   const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
   let nextRequestId = 1;
   let closed = false;
+  let closePromise: Promise<void> | undefined;
 
   const writeMessage = (message: Record<string, unknown>): void => {
-    if (closed || !child.stdin.writable) {
+    if (closed || child.stdin.destroyed || child.stdin.writableEnded || !child.stdin.writable) {
       throw new TiduError("INTERNAL_ERROR", "Agent protocol connection is closed.");
     }
     const encodedMessage = `${JSON.stringify(message)}\n`;
@@ -130,28 +131,75 @@ export const createStdioJsonRpcClient = (
     settle(pending);
   };
 
-  const respondToServer = (id: JsonRpcId, result?: unknown, error?: Error): void => {
-    if (error === undefined) {
-      writeMessage({ jsonrpc: "2.0", id, result: result ?? null });
+  const rejectAllPending = (reason: Error): void => {
+    for (const id of [...pendingRequests.keys()]) {
+      settlePending(id, (pending) => pending.reject(reason));
+    }
+  };
+
+  const closeConnection = (
+    reason: Error = new TiduError("INTERNAL_ERROR", "Agent protocol connection closed."),
+  ): Promise<void> => {
+    if (closePromise !== undefined) {
+      return closePromise;
+    }
+    closed = true;
+    lines.close();
+    rejectAllPending(reason);
+    if (!child.stdin.destroyed && !child.stdin.writableEnded) {
+      child.stdin.end();
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      closePromise = Promise.resolve();
+      return closePromise;
+    }
+    closePromise = new Promise<void>((resolve) => {
+      const forceTimer = setTimeout(() => child.kill("SIGKILL"), 1_000);
+      child.once("exit", () => {
+        clearTimeout(forceTimer);
+        resolve();
+      });
+      child.kill("SIGTERM");
+    });
+    return closePromise;
+  };
+
+  const failConnection = (error: Error): void => {
+    if (closed) {
       return;
     }
-    writeMessage({
-      jsonrpc: "2.0",
-      id,
-      error: { code: -32_000, message: error.message },
-    });
+    void closeConnection(toError(error, "Agent protocol connection failed."));
+  };
+
+  const respondToServer = (id: JsonRpcId, result?: unknown, error?: Error): void => {
+    if (closed) {
+      return;
+    }
+    try {
+      if (error === undefined) {
+        writeMessage({ jsonrpc: "2.0", id, result: result ?? null });
+        return;
+      }
+      writeMessage({
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32_000, message: error.message },
+      });
+    } catch (writeError) {
+      failConnection(toError(writeError, "Agent response write failed."));
+    }
   };
 
   lines.on("line", (line) => {
     if (Buffer.byteLength(line) > limits.maximumMessageBytes) {
-      void client.close();
+      void closeConnection();
       return;
     }
     let message: unknown;
     try {
       message = JSON.parse(line) as unknown;
     } catch {
-      void client.close();
+      void closeConnection();
       return;
     }
     if (!isRecord(message)) {
@@ -201,13 +249,8 @@ export const createStdioJsonRpcClient = (
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk: string) => options.onStandardError?.(chunk));
 
-  const rejectAllPending = (reason: Error): void => {
-    for (const id of [...pendingRequests.keys()]) {
-      settlePending(id, (pending) => pending.reject(reason));
-    }
-  };
-
-  child.once("error", (error) => rejectAllPending(error));
+  child.stdin.on("error", failConnection);
+  child.once("error", failConnection);
   child.once("exit", (exitCode, signal) => {
     lines.close();
     closed = true;
@@ -263,26 +306,7 @@ export const createStdioJsonRpcClient = (
     notify: (method: string, params?: unknown): void => {
       writeMessage({ jsonrpc: "2.0", method, ...(params === undefined ? {} : { params }) });
     },
-    close: async (): Promise<void> => {
-      if (closed) {
-        return;
-      }
-      closed = true;
-      lines.close();
-      rejectAllPending(new TiduError("INTERNAL_ERROR", "Agent protocol connection closed."));
-      child.stdin.end();
-      if (child.exitCode !== null || child.signalCode !== null) {
-        return;
-      }
-      await new Promise<void>((resolve) => {
-        const forceTimer = setTimeout(() => child.kill("SIGKILL"), 1_000);
-        child.once("exit", () => {
-          clearTimeout(forceTimer);
-          resolve();
-        });
-        child.kill("SIGTERM");
-      });
-    },
+    close: () => closeConnection(),
   };
 
   return client;
