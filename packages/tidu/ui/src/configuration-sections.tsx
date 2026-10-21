@@ -3061,16 +3061,9 @@ export const QuickStartWizard = ({
                                 key={`${specialist.host}:${specialist.model}`}
                               >
                                 <div className="capability-specialist-heading">
-                                  <div>
-                                    <span>
-                                      {english ? `Specialist ${index + 1}` : `副模型 ${index + 1}`}
-                                    </span>
-                                    <strong>
-                                      {selectedCatalogModel?.name ||
-                                        specialist.model ||
-                                        (english ? "Model not selected" : "尚未选择模型")}
-                                    </strong>
-                                  </div>
+                                  <span>
+                                    {english ? `Specialist ${index + 1}` : `副模型 ${index + 1}`}
+                                  </span>
                                   <button
                                     type="button"
                                     onClick={() =>

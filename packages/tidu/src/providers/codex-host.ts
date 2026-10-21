@@ -17,7 +17,7 @@ import {
   type CodexUsageSummary,
   createCodexAgentClient,
 } from "../connectors/codex-app-server.js";
-import { createCursorAcpClient } from "../connectors/cursor-acp.js";
+import { type CursorAcpModel, createCursorAcpClient } from "../connectors/cursor-acp.js";
 import type { ModelProvider, ProviderExecutionRequest, ProviderExecutionResult } from "./index.js";
 
 const CODEX_TURN_TIMEOUT_MILLISECONDS = 5 * 60_000;
@@ -352,12 +352,12 @@ export const cursorCapabilitiesForModel = (modelId: string): readonly string[] =
 
 export const createCursorModelCatalog = (
   currentModel: string,
-  availableModels: readonly string[],
+  availableModels: readonly CursorAcpModel[],
 ) => {
-  const publishedModels = availableModels.map((modelId) => ({
-    id: modelId,
-    name: modelId,
-    capabilities: cursorCapabilitiesForModel(modelId),
+  const publishedModels = availableModels.map((model) => ({
+    id: model.id,
+    name: model.name,
+    capabilities: cursorCapabilitiesForModel(model.id),
     capabilitySource: "provider-catalog" as const,
   }));
   return publishedModels.some((candidate) => candidate.id === currentModel)
@@ -365,7 +365,7 @@ export const createCursorModelCatalog = (
     : [
         {
           id: currentModel,
-          name: currentModel,
+          name: currentModel.replace(/\[[^\]]*\]$/u, ""),
           capabilities: cursorCapabilitiesForModel(currentModel),
           capabilitySource: "provider-catalog" as const,
         },
@@ -617,7 +617,7 @@ export const createCursorHostModelProvider = async (): Promise<ModelProvider | u
     mode: "ask",
   });
   let model: string | null = null;
-  let availableModels: readonly string[] = [];
+  let availableModels: readonly CursorAcpModel[] = [];
   const discoverySignal = AbortSignal.timeout(CURSOR_DISCOVERY_TIMEOUT_MILLISECONDS);
   try {
     await discoveryClient.initialize(discoverySignal);

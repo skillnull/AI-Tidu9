@@ -101,22 +101,50 @@ const startTestServer = async (
   };
 };
 
-test("publishes Cursor bridge capabilities and model-specific ACP parameters", () => {
-  assert.deepEqual(createCursorModelCatalog("cursor-default", ["cursor-default", "cursor-fast"]), [
+test("publishes Cursor bridge capabilities and provider model names", () => {
+  assert.deepEqual(
+    createCursorModelCatalog("cursor-default", [
+      { id: "cursor-default", name: "Cursor Default" },
+      { id: "cursor-fast", name: "Cursor Fast" },
+    ]),
+    [
+      {
+        id: "cursor-default",
+        name: "Cursor Default",
+        capabilities: ["text", "structured-output", "code"],
+        capabilitySource: "provider-catalog",
+      },
+      {
+        id: "cursor-fast",
+        name: "Cursor Fast",
+        capabilities: ["text", "structured-output", "code"],
+        capabilitySource: "provider-catalog",
+      },
+    ],
+  );
+  assert.deepEqual(
+    createCursorModelCatalog("cursor-current[reasoning=high]", [
+      { id: "cursor-fast", name: "Cursor Fast" },
+    ])[0],
     {
-      id: "cursor-default",
-      name: "cursor-default",
+      id: "cursor-current[reasoning=high]",
+      name: "cursor-current",
+      capabilities: ["text", "structured-output", "reasoning", "code"],
+      capabilitySource: "provider-catalog",
+    },
+  );
+  assert.deepEqual(
+    createCursorModelCatalog("gemini-3.5-flash[]", [
+      { id: "gemini-3.5-flash[]", name: "gemini-3.5-flash" },
+    ])[0],
+    {
+      id: "gemini-3.5-flash[]",
+      name: "gemini-3.5-flash",
       capabilities: ["text", "structured-output", "code"],
       capabilitySource: "provider-catalog",
     },
-    {
-      id: "cursor-fast",
-      name: "cursor-fast",
-      capabilities: ["text", "structured-output", "code"],
-      capabilitySource: "provider-catalog",
-    },
-  ]);
-  assert.deepEqual(createCursorModelCatalog("cursor-current", ["cursor-fast"])[0], {
+  );
+  assert.deepEqual(createCursorModelCatalog("cursor-current", [])[0], {
     id: "cursor-current",
     name: "cursor-current",
     capabilities: ["text", "structured-output", "code"],

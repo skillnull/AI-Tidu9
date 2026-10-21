@@ -30,7 +30,7 @@ readline.on("line", (line) => {
     send({ jsonrpc: "2.0", method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: "turn-1", tokenUsage: { last: { inputTokens: 11, outputTokens: 4, totalTokens: 15 } } } });
     send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
   }
-  else if (request.method === "session/new") send({ jsonrpc: "2.0", id: request.id, result: { sessionId: "session-1", configOptions: [{ configId: "model", category: "model", type: "select", currentValue: selectedModel, options: [{ value: "auto-smart" }, { value: "cursor-fast" }, { value: "claude-opus-5[thinking=true,context=300k,effort=high,fast=false]" }] }] } });
+  else if (request.method === "session/new") send({ jsonrpc: "2.0", id: request.id, result: { sessionId: "session-1", configOptions: [{ configId: "model", category: "model", type: "select", currentValue: selectedModel, options: [{ value: "auto-smart", name: "Auto Balance" }, { value: "cursor-fast", name: "Cursor Fast" }, { value: "claude-opus-5[thinking=true,context=300k,effort=high,fast=false]", name: "claude-opus-5" }] }] } });
   else if (request.method === "session/set_config_option") { selectedModel = request.params.value; send({ jsonrpc: "2.0", id: request.id, result: { configOptions: [{ configId: "model", category: "model", type: "select", currentValue: selectedModel }] } }); }
   else if (request.method === "session/prompt") {
     send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "cursor-result" } } } });
@@ -117,7 +117,10 @@ test("Cursor ACP preserves a provider-owned parameterized model ID end to end", 
     await client.initialize();
     const session = await client.createSession();
     assert.equal(session.model, requestedModel);
-    assert.equal(session.availableModels.includes(requestedModel), true);
+    assert.deepEqual(
+      session.availableModels.find((candidate) => candidate.id === requestedModel),
+      { id: requestedModel, name: "claude-opus-5" },
+    );
     assert.equal((await client.prompt(session.id, "test")).text, "cursor-result");
     await client.close();
   } finally {

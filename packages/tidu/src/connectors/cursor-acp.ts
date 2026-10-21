@@ -20,6 +20,13 @@ export interface CursorAcpEvent {
   params: unknown;
 }
 
+export interface CursorAcpModel {
+  /** Provider-owned model identifier required by Cursor ACP execution. */
+  id: string;
+  /** Provider-published model name intended for user interfaces. */
+  name: string;
+}
+
 export interface CursorAcpOptions extends CursorHostInspectionOptions {
   /** Working directory used when creating ACP sessions. */
   workingDirectory: string;
@@ -42,8 +49,8 @@ export interface CursorAcpSession {
   id: string;
   /** Model ID selected for this session, when Cursor reports it. */
   model: string | null;
-  /** Model IDs that this ACP session explicitly allows. */
-  availableModels: readonly string[];
+  /** Models that this ACP session explicitly allows. */
+  availableModels: readonly CursorAcpModel[];
 }
 
 export interface CursorAcpPromptResult {
@@ -112,7 +119,12 @@ const readCurrentModel = (value: unknown): string | undefined => {
 const readModelConfigOption = (
   value: unknown,
 ):
-  | { configId: string; type: string; currentValue: string | undefined; values: readonly string[] }
+  | {
+      configId: string;
+      type: string;
+      currentValue: string | undefined;
+      models: readonly CursorAcpModel[];
+    }
   | undefined => {
   if (!isRecord(value) || !Array.isArray(value.configOptions)) return undefined;
   for (const option of value.configOptions) {
@@ -120,18 +132,28 @@ const readModelConfigOption = (
     const configId = readString(option, "configId") ?? readString(option, "id");
     const category = readString(option, "category");
     if (configId === undefined || (category !== "model" && !/model/iu.test(configId))) continue;
-    const values = Array.isArray(option.options)
+    const models = Array.isArray(option.options)
       ? option.options.flatMap((candidate) => {
           if (!isRecord(candidate)) return [];
-          const value = readString(candidate, "value") ?? readString(candidate, "id");
-          return value === undefined ? [] : [value];
+          const id =
+            readString(candidate, "modelId") ??
+            readString(candidate, "value") ??
+            readString(candidate, "id");
+          if (id === undefined) return [];
+          const publishedName = readString(candidate, "name")?.trim();
+          return [
+            {
+              id,
+              name: publishedName === "" || publishedName === undefined ? id : publishedName,
+            },
+          ];
         })
       : [];
     return {
       configId,
       type: readString(option, "type") ?? "select",
       currentValue: readString(option, "currentValue"),
-      values,
+      models,
     };
   }
   return undefined;
@@ -249,8 +271,14 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
             "Cursor ACP did not expose a model selection option for this session.",
           );
         }
-        if (modelOption.values.length > 0 && !modelOption.values.includes(options.requestedModel)) {
-          const availableModels = modelOption.values.slice(0, 12).join(", ");
+        if (
+          modelOption.models.length > 0 &&
+          !modelOption.models.some((candidate) => candidate.id === options.requestedModel)
+        ) {
+          const availableModels = modelOption.models
+            .slice(0, 12)
+            .map((candidate) => candidate.id)
+            .join(", ");
           throw new TiduError(
             "CONFIGURATION_INVALID",
             `Cursor ACP does not offer the configured model ${options.requestedModel}. Session options: ${availableModels}.`,
@@ -268,7 +296,7 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
         );
         selectedModel = readCurrentModel(updateResponse) ?? options.requestedModel;
       }
-      return { id, model: selectedModel, availableModels: initialModelOption?.values ?? [] };
+      return { id, model: selectedModel, availableModels: initialModelOption?.models ?? [] };
     },
     prompt: async (
       sessionId: string,

@@ -2333,7 +2333,7 @@ h2 {
 
     .capability-specialist-fields {
       display: grid;
-      grid-template-columns: 150px minmax(220px, 1fr) minmax(260px, 1fr);
+      grid-template-columns: 150px minmax(0, 1fr);
       margin-top: 7px;
 
       > * {
