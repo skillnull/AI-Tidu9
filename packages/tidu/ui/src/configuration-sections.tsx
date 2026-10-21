@@ -247,18 +247,11 @@ const MODEL_CAPABILITIES = [
 
 export const selectableModelCapabilityIds: readonly string[] = [...MODEL_ROUTING_CAPABILITIES];
 
-const NON_ROUTABLE_CAPABILITY_IDS = new Set([
-  "document-analysis",
-  "domain-context",
-  "local-private",
-]);
-
-export const capabilityIdsForPicker = (selected: readonly string[]): readonly string[] => {
-  const baseIds: readonly string[] = selectableModelCapabilityIds;
-  const extraIds = [...new Set(selected)].filter((capability) => !baseIds.includes(capability));
-  return [...baseIds, ...extraIds].filter(
-    (capability) => selected.includes(capability) || !NON_ROUTABLE_CAPABILITY_IDS.has(capability),
-  );
+export const capabilityIdsForPicker = (
+  publishedCapabilities: readonly string[],
+): readonly string[] => {
+  const published = new Set(publishedCapabilities);
+  return selectableModelCapabilityIds.filter((capability) => published.has(capability));
 };
 
 type CatalogModel = {
@@ -271,7 +264,19 @@ type CatalogModel = {
   outputCostPerMillionTokens?: number | null;
 };
 
-export const defaultModelCapabilities = (): readonly string[] => [...MODEL_ROUTING_CAPABILITIES];
+export const defaultModelCapabilities = (
+  publishedCapabilities: readonly string[],
+): readonly string[] => capabilityIdsForPicker(publishedCapabilities);
+
+export const selectedModelCapabilities = (
+  selectedCapabilities: readonly string[],
+  publishedCapabilities: readonly string[],
+): readonly string[] => {
+  const selected = new Set(selectedCapabilities);
+  return capabilityIdsForPicker(publishedCapabilities).filter((capability) =>
+    selected.has(capability),
+  );
+};
 
 export const updateCapabilityCompletionEnabled = (
   configuration: CapabilityCompletionConfiguration,
@@ -281,11 +286,17 @@ export const updateCapabilityCompletionEnabled = (
 export const updatePrimaryModelSelection = (
   policy: HostCapabilityCompletionPolicy,
   mainModel: ModelSelection,
-): HostCapabilityCompletionPolicy => ({ ...policy, mainModel });
+  capabilities: readonly string[],
+): HostCapabilityCompletionPolicy => ({ ...policy, mainModel, mainCapabilities: capabilities });
 
 type SpecialistModelSelection = Pick<
   CapabilitySpecialistConfiguration,
-  "host" | "source" | "model" | "inputCostPerMillionTokens" | "outputCostPerMillionTokens"
+  | "host"
+  | "source"
+  | "model"
+  | "capabilities"
+  | "inputCostPerMillionTokens"
+  | "outputCostPerMillionTokens"
 >;
 
 export const updateSpecialistModelSelection = (
@@ -294,7 +305,6 @@ export const updateSpecialistModelSelection = (
 ): CapabilitySpecialistConfiguration => ({
   ...specialist,
   ...selection,
-  capabilities: specialist.capabilities,
 });
 
 const capabilityLabel = (capability: string, english: boolean): string => {
@@ -303,17 +313,19 @@ const capabilityLabel = (capability: string, english: boolean): string => {
 };
 
 const CapabilityPicker = ({
+  available,
   selected,
   english,
   disabled,
   onChange,
 }: {
+  available: readonly string[];
   selected: readonly string[];
   english: boolean;
   disabled: boolean;
   onChange: (capabilities: readonly string[]) => void;
 }) => {
-  const options = capabilityIdsForPicker(selected).map(
+  const options = capabilityIdsForPicker(available).map(
     (capability) =>
       MODEL_CAPABILITIES.find((item) => item.id === capability) ?? {
         id: capability,
@@ -1857,6 +1869,27 @@ const createEmptyHostCatalog = (): UpstreamModelCatalog["hosts"] => ({
   "openai-compatible": { available: false, models: [] },
 });
 
+const catalogModelForSelection = (
+  catalog: UpstreamModelCatalog,
+  host: AgentHostId,
+  selection: ModelSelection,
+  currentModelId?: string,
+): CatalogModel | undefined => {
+  if (selection.source === "custom") return undefined;
+  const catalogModels =
+    selection.source === "company" ? catalog.company : (catalog.hosts[host]?.models ?? []);
+  const modelId = selection.model === "current" ? currentModelId : selection.model;
+  return (
+    catalogModels.find((model) => model.id === modelId) ??
+    (selection.model === "current"
+      ? (catalogModels.find((model) => model.isDefault) ?? catalogModels[0])
+      : undefined)
+  );
+};
+
+const equalCapabilities = (left: readonly string[], right: readonly string[]): boolean =>
+  left.length === right.length && left.every((capability, index) => capability === right[index]);
+
 interface WizardAdvanceOptions {
   /** Current zero-based wizard step. */
   step: number;
@@ -2054,33 +2087,31 @@ export const QuickStartWizard = ({
     maximumSpecialists: form.capabilityCompletion.maximumSpecialists,
   };
   const customModel = modelChoiceMode === "custom" ? activeHostPolicy.mainModel.model : "";
-  const updateActiveHostPolicy = (
-    policy: typeof activeHostPolicy,
-    nextModelSelection = policy.mainModel,
-  ): void => {
-    onFormChange({
-      ...form,
-      modelSelection: nextModelSelection,
-      capabilityCompletion: {
-        ...form.capabilityCompletion,
-        mainCapabilities: policy.mainCapabilities,
-        specialists: policy.specialists,
-        maximumSpecialists: policy.maximumSpecialists,
-        hostPolicies: {
-          ...form.capabilityCompletion.hostPolicies,
-          [activeHostId]: { ...policy, mainModel: nextModelSelection },
+  const updateActiveHostPolicy = useCallback(
+    (policy: typeof activeHostPolicy, nextModelSelection = policy.mainModel): void => {
+      onFormChange({
+        ...form,
+        modelSelection: nextModelSelection,
+        capabilityCompletion: {
+          ...form.capabilityCompletion,
+          mainCapabilities: policy.mainCapabilities,
+          specialists: policy.specialists,
+          maximumSpecialists: policy.maximumSpecialists,
+          hostPolicies: {
+            ...form.capabilityCompletion.hostPolicies,
+            [activeHostId]: { ...policy, mainModel: nextModelSelection },
+          },
         },
-      },
-    });
-  };
-  const selectMainModel = (selection: ModelSelection): void =>
-    updateActiveHostPolicy(updatePrimaryModelSelection(activeHostPolicy, selection), selection);
+      });
+    },
+    [activeHostId, form, onFormChange],
+  );
   const specialistHostCandidates = (
     ["codex", "cursor", "ollama", "openai-compatible"] as const
   ).filter((host) => host !== activeHostId);
   const usableSpecialistModels = (host: AgentHostId) =>
     (upstreamCatalog.hosts[host]?.models ?? []).filter(
-      (model) => (model.capabilities?.length ?? 0) > 0,
+      (model) => defaultModelCapabilities(model.capabilities ?? []).length > 0,
     );
   const availableSpecialistHosts = specialistHostCandidates.filter(
     (host) =>
@@ -2113,6 +2144,28 @@ export const QuickStartWizard = ({
     activeHostPolicy.mainModel.model === "current"
       ? (detectedPrimaryModel ?? "")
       : activeHostPolicy.mainModel.model;
+  const selectedPrimaryCatalogModel = catalogModelForSelection(
+    upstreamCatalog,
+    activeHostId,
+    activeHostPolicy.mainModel,
+    selectedModelId,
+  );
+  const primaryModelCapabilities = defaultModelCapabilities(
+    selectedPrimaryCatalogModel?.capabilities ?? [],
+  );
+  const selectMainModel = (selection: ModelSelection): void => {
+    const selectedModel = catalogModelForSelection(
+      upstreamCatalog,
+      activeHostId,
+      selection,
+      selection.model === "current" ? detectedPrimaryModel : selection.model,
+    );
+    const nextCapabilities = defaultModelCapabilities(selectedModel?.capabilities ?? []);
+    updateActiveHostPolicy(
+      updatePrimaryModelSelection(activeHostPolicy, selection, nextCapabilities),
+      selection,
+    );
+  };
   const updateSpecialists = (specialists: readonly CapabilitySpecialistConfiguration[]): void =>
     updateActiveHostPolicy({
       ...activeHostPolicy,
@@ -2130,9 +2183,10 @@ export const QuickStartWizard = ({
       source: choice === "codex-host" || choice === "cursor-host" ? "official" : "company",
       model: "current",
     };
+    const nextModel = catalogModelForSelection(upstreamCatalog, nextHostId, nextModelSelection);
     const nextPolicy = savedPolicy ?? {
       mainModel: nextModelSelection,
-      mainCapabilities: defaultModelCapabilities(),
+      mainCapabilities: defaultModelCapabilities(nextModel?.capabilities ?? []),
       specialists: [],
       maximumSpecialists: 2,
     };
@@ -2171,14 +2225,14 @@ export const QuickStartWizard = ({
     }
     setModelChoiceMode(
       activeHostPolicy.mainModel.model === "current" ||
-        upstreamCatalog.official.some((model) => model.id === activeHostPolicy.mainModel.model)
+        hostModelOptions.some((model) => model.id === activeHostPolicy.mainModel.model)
         ? "host"
         : "custom",
     );
   }, [
     activeHostPolicy.mainModel.model,
     activeHostPolicy.mainModel.source,
-    upstreamCatalog.official,
+    hostModelOptions,
     upstreamCatalogStatus,
   ]);
   useEffect(() => {
@@ -2235,6 +2289,42 @@ export const QuickStartWizard = ({
       });
   }, [step]);
   useEffect(() => {
+    if (step !== 2 || upstreamCatalogStatus !== "ready") return;
+    const mainCapabilities = selectedModelCapabilities(
+      activeHostPolicy.mainCapabilities,
+      primaryModelCapabilities,
+    );
+    const specialists = activeHostPolicy.specialists.map((specialist) => {
+      const selectedModel = catalogModelForSelection(upstreamCatalog, specialist.host, specialist);
+      const publishedCapabilities = defaultModelCapabilities(selectedModel?.capabilities ?? []);
+      return {
+        ...specialist,
+        capabilities: selectedModelCapabilities(specialist.capabilities, publishedCapabilities),
+      };
+    });
+    const specialistsChanged = specialists.some(
+      (specialist, index) =>
+        !equalCapabilities(
+          specialist.capabilities,
+          activeHostPolicy.specialists[index]?.capabilities ?? [],
+        ),
+    );
+    if (
+      equalCapabilities(mainCapabilities, activeHostPolicy.mainCapabilities) &&
+      !specialistsChanged
+    ) {
+      return;
+    }
+    updateActiveHostPolicy({ ...activeHostPolicy, mainCapabilities, specialists });
+  }, [
+    activeHostPolicy,
+    primaryModelCapabilities,
+    step,
+    upstreamCatalog,
+    upstreamCatalogStatus,
+    updateActiveHostPolicy,
+  ]);
+  useEffect(() => {
     if (step !== 2 || activeProviderChoice === null) {
       setProviderCheck({ status: "idle" });
       return;
@@ -2289,15 +2379,29 @@ export const QuickStartWizard = ({
       current = false;
     };
   }, [step, activeProviderChoice]);
+  const primaryCapabilitiesAreValid =
+    primaryModelCapabilities.length > 0 &&
+    activeHostPolicy.mainCapabilities.length > 0 &&
+    equalCapabilities(
+      activeHostPolicy.mainCapabilities,
+      selectedModelCapabilities(activeHostPolicy.mainCapabilities, primaryModelCapabilities),
+    );
   const modelConfigurationIsValid =
     isValidModelIdentifier(activeHostPolicy.mainModel.model) &&
-    activeHostPolicy.mainCapabilities.length > 0 &&
-    activeHostPolicy.specialists.every(
-      (specialist) =>
+    primaryCapabilitiesAreValid &&
+    activeHostPolicy.specialists.every((specialist) => {
+      const selectedModel = catalogModelForSelection(upstreamCatalog, specialist.host, specialist);
+      const publishedCapabilities = defaultModelCapabilities(selectedModel?.capabilities ?? []);
+      return (
         specialist.host !== activeHostId &&
         isValidModelIdentifier(specialist.model) &&
-        specialist.capabilities.length > 0,
-    );
+        specialist.capabilities.length > 0 &&
+        equalCapabilities(
+          specialist.capabilities,
+          selectedModelCapabilities(specialist.capabilities, publishedCapabilities),
+        )
+      );
+    });
   const canAdvance =
     step === 1
       ? entryIsValid
@@ -2820,13 +2924,11 @@ export const QuickStartWizard = ({
                     <section className="capability-primary-card">
                       <div className="capability-section-heading">
                         <div>
-                          <h4>
-                            {english ? "1. Declare primary capabilities" : "1. 勾选主模型真实能力"}
-                          </h4>
+                          <h4>{english ? "1. Primary model capabilities" : "1. 主模型可用能力"}</h4>
                           <p>
                             {english
-                              ? "All capabilities are selected by default. Clear only capabilities you do not want this model to provide."
-                              : "默认全选；仅取消你明确不希望该模型提供的能力。"}
+                              ? "Only capabilities returned by the selected model catalog are shown and selected by default."
+                              : "仅展示所选模型接口返回的可用能力，并默认全选。"}
                           </p>
                         </div>
                       </div>
@@ -2841,8 +2943,9 @@ export const QuickStartWizard = ({
                             ? "Model capabilities could not be loaded. Refresh and try again."
                             : "模型能力读取失败，请刷新后重试。"}
                         </p>
-                      ) : (
+                      ) : primaryModelCapabilities.length > 0 ? (
                         <CapabilityPicker
+                          available={primaryModelCapabilities}
                           selected={activeHostPolicy.mainCapabilities}
                           english={english}
                           disabled={isPending || readOnly}
@@ -2853,6 +2956,12 @@ export const QuickStartWizard = ({
                             })
                           }
                         />
+                      ) : (
+                        <p className="capability-evidence warning">
+                          {english
+                            ? "The selected model did not return supported capability metadata and cannot be used for capability completion."
+                            : "所选模型接口未返回九门支持的能力，不能用于能力互补。"}
+                        </p>
                       )}
                     </section>
                     <div className="capability-specialists">
@@ -2861,8 +2970,8 @@ export const QuickStartWizard = ({
                           <h4>{english ? "2. Select secondary models" : "2. 选择副模型"}</h4>
                           <p>
                             {english
-                              ? "New secondary models start with all capabilities selected. Selecting at most two usually minimizes cost."
-                              : "新增副模型默认全选能力；建议最多选择 2 个，通常更省成本。"}
+                              ? "Each model shows only capabilities returned by its host catalog, selected by default. Selecting at most two usually minimizes cost."
+                              : "每个模型仅展示宿主接口返回的可用能力，并默认全选；建议最多选择 2 个。"}
                           </p>
                         </div>
                       </div>
@@ -2904,6 +3013,9 @@ export const QuickStartWizard = ({
                                 : specialist.model;
                             const selectedCatalogModel = modelOptions.find(
                               (model) => model.id === resolvedSpecialistModelId,
+                            );
+                            const selectedCatalogCapabilities = defaultModelCapabilities(
+                              selectedCatalogModel?.capabilities ?? [],
                             );
                             if (!hostAvailable) {
                               return (
@@ -2991,6 +3103,9 @@ export const QuickStartWizard = ({
                                           host,
                                           source: modelSourceForHost(host),
                                           model: selectedModel.id,
+                                          capabilities: defaultModelCapabilities(
+                                            selectedModel.capabilities ?? [],
+                                          ),
                                           inputCostPerMillionTokens:
                                             selectedModel.inputCostPerMillionTokens ?? null,
                                           outputCostPerMillionTokens:
@@ -3026,6 +3141,9 @@ export const QuickStartWizard = ({
                                           host: specialist.host,
                                           source: specialist.source,
                                           model: event.target.value,
+                                          capabilities: defaultModelCapabilities(
+                                            selectedModel?.capabilities ?? [],
+                                          ),
                                           inputCostPerMillionTokens:
                                             selectedModel?.inputCostPerMillionTokens ?? null,
                                           outputCostPerMillionTokens:
@@ -3052,9 +3170,9 @@ export const QuickStartWizard = ({
                                     ))}
                                   </select>
                                 </div>
-                                {selectedCatalogModel === undefined ? null : selectedCatalogModel
-                                    .capabilities?.length ? (
+                                {selectedCatalogCapabilities.length > 0 ? (
                                   <CapabilityPicker
+                                    available={selectedCatalogCapabilities}
                                     selected={specialist.capabilities}
                                     english={english}
                                     disabled={isPending || readOnly}
@@ -3137,7 +3255,9 @@ export const QuickStartWizard = ({
                                   host: choice.host,
                                   source: modelSourceForHost(choice.host),
                                   model: choice.model.id,
-                                  capabilities: defaultModelCapabilities(),
+                                  capabilities: defaultModelCapabilities(
+                                    choice.model.capabilities ?? [],
+                                  ),
                                   inputCostPerMillionTokens:
                                     choice.model.inputCostPerMillionTokens ?? null,
                                   outputCostPerMillionTokens:

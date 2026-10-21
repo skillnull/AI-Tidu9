@@ -8,6 +8,7 @@ import {
   resolveWizardAdvance,
   resolveWizardEntryState,
   selectableModelCapabilityIds,
+  selectedModelCapabilities,
   updateCapabilityCompletionEnabled,
   updatePrimaryModelSelection,
   updateSpecialistModelSelection,
@@ -31,17 +32,25 @@ test("offers only capabilities implemented by the model-routing contract", () =>
   assert.equal(capabilityIds.includes("local-private"), false);
 });
 
-test("always offers every standard capability and keeps saved custom capabilities removable", () => {
-  assert.deepEqual(capabilityIdsForPicker(["code"]), selectableModelCapabilityIds);
-  assert.deepEqual(capabilityIdsForPicker([]), selectableModelCapabilityIds);
-  assert.deepEqual(capabilityIdsForPicker(["document-analysis"]), [
-    ...selectableModelCapabilityIds,
-    "document-analysis",
-  ]);
+test("offers only interface-published capabilities supported by the routing contract", () => {
+  assert.deepEqual(capabilityIdsForPicker(["code", "text", "vision"]), ["text", "code", "vision"]);
+  assert.deepEqual(capabilityIdsForPicker([]), []);
+  assert.deepEqual(capabilityIdsForPicker(["document-analysis", "local-private"]), []);
 });
 
-test("defaults every newly selected primary or secondary model to all standard capabilities", () => {
-  assert.deepEqual(defaultModelCapabilities(), selectableModelCapabilityIds);
+test("defaults a model to all and only its interface-published capabilities", () => {
+  assert.deepEqual(defaultModelCapabilities(["code", "text", "vision"]), [
+    "text",
+    "code",
+    "vision",
+  ]);
+  assert.deepEqual(
+    selectedModelCapabilities(
+      ["text", "reasoning", "vision", "web-research"],
+      ["text", "code", "vision"],
+    ),
+    ["text", "vision"],
+  );
 });
 
 test("enabling or disabling capability completion preserves every saved model selection", () => {
@@ -79,7 +88,7 @@ test("enabling or disabling capability completion preserves every saved model se
   assert.deepEqual(disabled.hostPolicies?.codex, policy);
 });
 
-test("changing a configured model preserves explicit capability selections", () => {
+test("changing a configured model replaces capabilities with the selected model catalog", () => {
   const policy = {
     mainModel: { source: "official" as const, model: "gpt-primary" },
     mainCapabilities: ["text"],
@@ -95,20 +104,25 @@ test("changing a configured model preserves explicit capability selections", () 
     outputCostPerMillionTokens: null,
   };
 
-  const nextPolicy = updatePrimaryModelSelection(policy, {
-    source: "custom",
-    model: "custom-primary",
-  });
+  const nextPolicy = updatePrimaryModelSelection(
+    policy,
+    {
+      source: "custom",
+      model: "custom-primary",
+    },
+    ["text", "vision"],
+  );
   const nextSpecialist = updateSpecialistModelSelection(specialist, {
     host: "cursor",
     source: "official",
     model: "cursor-secondary",
+    capabilities: ["text", "structured-output"],
     inputCostPerMillionTokens: 1,
     outputCostPerMillionTokens: 2,
   });
 
-  assert.deepEqual(nextPolicy.mainCapabilities, ["text"]);
-  assert.deepEqual(nextSpecialist.capabilities, ["code"]);
+  assert.deepEqual(nextPolicy.mainCapabilities, ["text", "vision"]);
+  assert.deepEqual(nextSpecialist.capabilities, ["text", "structured-output"]);
 });
 
 test("opens a target-host editor without synthesizing or changing its policy", () => {

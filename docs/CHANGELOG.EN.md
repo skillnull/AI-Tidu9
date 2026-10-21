@@ -9,7 +9,7 @@ This file records user-visible changes in every public AI-Tidu9 release. Compati
 
 ## Unreleased
 
-- Correct capability defaults and display. A primary model's first configuration and every new secondary now select all eight standard capabilities. Model catalogs, model changes, and the capability-completion switch no longer overwrite user selections, hide standard capabilities, or mark them as unpublished manual declarations.
+- Correct capability provenance and display. Primary and secondary models now show only capabilities returned by the host model catalog and supported by the routing contract, selecting that verified set by default. Model changes refresh capabilities and stale out-of-catalog selections are removed.
 - Handle the JSON-RPC race where a child closes standard input before a write. The connection now fails explicitly, rejects pending requests, and reaps the child instead of emitting an unhandled `EPIPE`.
 
 ## 1.1.0 - 2026-10-20
