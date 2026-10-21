@@ -13,9 +13,11 @@ import {
   getDistributionTag,
   getDistributionTags,
   getNextPrereleaseVersion,
+  getNextReleaseVersion,
   getUnexpectedChangedPaths,
   parseGitStatusPaths,
   prepareChangelog,
+  selectQualityWorkflowRun,
   toPythonVersion,
   updateJsonVersion,
   updatePythonVersion,
@@ -53,6 +55,11 @@ test("increments prerelease versions without changing their channel", () => {
   assert.equal(getNextPrereleaseVersion("1.2.3-alpha.9"), "1.2.3-alpha.10");
   assert.equal(getNextPrereleaseVersion("1.2.3-beta.2"), "1.2.3-beta.3");
   assert.throws(() => getNextPrereleaseVersion("1.2.3"), /Cannot automatically increment/u);
+});
+
+test("increments a published stable version as a patch release", () => {
+  assert.equal(getNextReleaseVersion("1.1.0"), "1.1.1");
+  assert.equal(getNextReleaseVersion("1.2.3-rc.2"), "1.2.3-rc.3");
 });
 
 test("moves unreleased notes under an automatically generated release heading", () => {
@@ -223,9 +230,48 @@ test("prints a concise color-aware release summary", () => {
 
   assert.match(summary, /1\.2\.3-alpha\.1 → 1\.2\.3-alpha\.2/u);
   assert.match(summary, /npm tags:\s+alpha, latest/u);
-  assert.match(summary, /local commit\/tag → npm publish → push/u);
+  assert.match(summary, /release commit → branch CI → immutable tag CI → npm publish/u);
   assert.doesNotMatch(summary, /diff --git/u);
   assert.equal(coloredSummary.includes("\u001b[1;36mRelease summary"), true);
+});
+
+test("selects only the newest Quality run for the exact release ref and commit", () => {
+  const selected = selectQualityWorkflowRun(
+    [
+      {
+        id: 10,
+        name: "Quality",
+        event: "push",
+        head_branch: "main",
+        head_sha: "release-commit",
+        status: "completed",
+        conclusion: "failure",
+      },
+      {
+        id: 12,
+        name: "Quality",
+        event: "push",
+        head_branch: "main",
+        head_sha: "release-commit",
+        status: "completed",
+        conclusion: "success",
+      },
+      {
+        id: 14,
+        name: "Quality",
+        event: "push",
+        head_branch: "v1.2.3",
+        head_sha: "release-commit",
+        status: "completed",
+        conclusion: "success",
+      },
+    ],
+    "release-commit",
+    "main",
+  );
+
+  assert.equal(selected?.id, 12);
+  assert.equal(selectQualityWorkflowRun([], "release-commit", "main"), undefined);
 });
 
 test("accepts a clean tagged release context", () => {

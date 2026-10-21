@@ -127,9 +127,12 @@ npm run check
 flowchart LR
   Prepare[准备版本与 Changelog] --> Verify[质量门禁]
   Verify --> Confirm[维护者确认精确版本]
-  Confirm --> Tag[本地发布提交与不可变 Tag]
-  Tag --> NPM[发布 npm 精确制品]
-  NPM --> Push[成功后推送提交与 Tag]
+  Confirm --> Commit[推送发布提交]
+  Commit --> BranchCI[分支 Quality 成功]
+  BranchCI --> Tag[推送不可变 Tag]
+  Tag --> TagCI[Tag Quality 成功]
+  TagCI --> NPM[发布 npm 精确制品]
+  NPM --> Release[创建 GitHub Release]
 ```
 
 - 私有根工作区不持有发布版本；每个公开包独立持有并同步内部引用。
@@ -138,6 +141,7 @@ flowchart LR
 - 同一 Commit 只构建一次；已验证制品在发布渠道间晋级，不重复构建。
 - 首个稳定版之前，最新公开预发布同时更新所属渠道和 `latest`；稳定版之后，只有稳定版本更新 `latest`。
 - 发布入口是 `npm run publish:tidu`。它准备版本和 Changelog、展示摘要并要求输入完整版本号确认。
+- 发布脚本先推送发布提交并等待分支 `Quality` 成功，再推送不可变 Tag 并等待 Tag `Quality` 成功；任一远端门禁失败都会在 npm 发布前停止。
 - `npm run publish:tidu -- --dry-run` 只验证已准备版本，不写入、不打 Tag、不发布。
 - 未经维护者明确确认，禁止提交发布变更、推送、打 Tag 或发布 npm。
 

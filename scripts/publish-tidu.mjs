@@ -7,10 +7,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { validateVersion } from "./project-policy.mjs";
 
 const RELEASE = Object.freeze({
+  githubRepository: "skillnull/AI-Tidu9",
   packageName: "@skillnull/tidu",
   packagePath: "packages/tidu",
   supportedArguments: new Set(["--dry-run"]),
 });
+const QUALITY_WORKFLOW_POLL_INTERVAL_MILLISECONDS = 15_000;
+const QUALITY_WORKFLOW_TIMEOUT_MILLISECONDS = 15 * 60_000;
 const TERMINAL_COLOR = Object.freeze({
   blue: "\u001b[1;34m",
   cyan: "\u001b[1;36m",
@@ -74,6 +77,15 @@ export const getNextPrereleaseVersion = (version) => {
   return `${major}.${minor}.${patch}-${channel}.${Number(sequence) + 1}`;
 };
 
+export const getNextReleaseVersion = (version) => {
+  const stableMatch = version.match(/^(\d+)\.(\d+)\.(\d+)$/u);
+  if (stableMatch !== null) {
+    const [, major, minor, patch] = stableMatch;
+    return `${major}.${minor}.${Number(patch) + 1}`;
+  }
+  return getNextPrereleaseVersion(version);
+};
+
 export const prepareChangelog = (changelog, version, releaseDate, marker = "## Unreleased") => {
   if (getChangelogVersionPattern(version).test(changelog)) {
     return changelog;
@@ -120,7 +132,7 @@ export const formatReleaseSummary = (
     `  ${applyTerminalColor("npm tags:", "yellow", colorEnabled)}  ${getDistributionTags(version, publishedVersions).join(", ")}`,
     `  ${applyTerminalColor("Changelogs:", "yellow", colorEnabled)} ${version} (${releaseDate})`,
     `  ${applyTerminalColor("Files:", "magenta", colorEnabled)}      npm, Python, connector metadata, Chinese and English changelogs`,
-    `  ${applyTerminalColor("Next:", "magenta", colorEnabled)}      local commit/tag → npm publish → push`,
+    `  ${applyTerminalColor("Next:", "magenta", colorEnabled)}      release commit → branch CI → immutable tag CI → npm publish`,
     "",
   ].join("\n");
 
@@ -223,6 +235,55 @@ const readGitStatus = (repositoryRoot) =>
   readCommandOutput("git", ["status", "--porcelain"], {
     cwd: repositoryRoot,
   }).replace(/\r?\n$/u, "");
+
+export const selectQualityWorkflowRun = (workflowRuns, headCommit, headBranch) =>
+  workflowRuns
+    .filter(
+      (workflowRun) =>
+        workflowRun?.name === "Quality" &&
+        workflowRun.head_sha === headCommit &&
+        workflowRun.head_branch === headBranch &&
+        workflowRun.event === "push",
+    )
+    .sort((left, right) => Number(right.id) - Number(left.id))[0];
+
+const waitForQualityWorkflow = async (headCommit, headBranch) => {
+  const deadline = Date.now() + QUALITY_WORKFLOW_TIMEOUT_MILLISECONDS;
+  const endpoint = new URL(
+    `https://api.github.com/repos/${RELEASE.githubRepository}/actions/workflows/quality.yml/runs`,
+  );
+  endpoint.searchParams.set("event", "push");
+  endpoint.searchParams.set("branch", headBranch);
+  endpoint.searchParams.set("head_sha", headCommit);
+  endpoint.searchParams.set("per_page", "10");
+
+  while (Date.now() < deadline) {
+    const response = await fetch(endpoint, {
+      headers: {
+        accept: "application/vnd.github+json",
+        "user-agent": "AI-Tidu9 release gate",
+        "x-github-api-version": "2022-11-28",
+      },
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!response.ok) {
+      throw new Error(`Unable to read GitHub Quality status (HTTP ${response.status}).`);
+    }
+    const body = await response.json();
+    const workflowRuns = Array.isArray(body?.workflow_runs) ? body.workflow_runs : [];
+    const workflowRun = selectQualityWorkflowRun(workflowRuns, headCommit, headBranch);
+    if (workflowRun?.status === "completed") {
+      if (workflowRun.conclusion === "success") return;
+      throw new Error(
+        `GitHub Quality failed for ${headBranch}. Fix or rerun ${workflowRun.html_url ?? "the workflow"} before publishing.`,
+      );
+    }
+    await new Promise((resolveWait) =>
+      setTimeout(resolveWait, QUALITY_WORKFLOW_POLL_INTERVAL_MILLISECONDS),
+    );
+  }
+  throw new Error(`Timed out waiting for GitHub Quality on ${headBranch}.`);
+};
 
 export const parseGitStatusPaths = (status) =>
   status
@@ -549,7 +610,7 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
   let candidateVersion = remoteSyncPending
     ? initialContext.repositoryVersion
     : versionAlreadyPublished || (versionAlreadyTagged && !changelogAlreadyPrepared)
-      ? getNextPrereleaseVersion(initialContext.repositoryVersion)
+      ? getNextReleaseVersion(initialContext.repositoryVersion)
       : initialContext.repositoryVersion;
   let releaseConfirmed = false;
   let packagePublished = false;
@@ -663,8 +724,20 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
       });
     }
 
-    const releaseTag = `v${candidateVersion}`;
     const releaseCommit = readCommand("git", ["rev-parse", "HEAD"], {
+      cwd: repositoryRoot,
+    });
+    releaseCommitPrepared = true;
+    runCommand("git", ["push", "origin", initialContext.branchName], {
+      cwd: repositoryRoot,
+    });
+    process.stdout.write(
+      `${applyTerminalColor("Waiting for branch Quality checks...", "magenta", colorEnabled)}\n`,
+    );
+    await waitForQualityWorkflow(releaseCommit, initialContext.branchName);
+
+    const releaseTag = `v${candidateVersion}`;
+    runCommand("npm", ["run", "policy", "--", "tag", releaseTag], {
       cwd: repositoryRoot,
     });
     const existingTagCommit = readTagCommit(repositoryRoot, releaseTag);
@@ -675,7 +748,18 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
     } else if (existingTagCommit !== releaseCommit) {
       throw new Error(`${releaseTag} already points to another commit.`);
     }
-    releaseCommitPrepared = true;
+    const existingRemoteTagCommit = readRemoteTagCommit(repositoryRoot, releaseTag);
+    if (existingRemoteTagCommit === "") {
+      runCommand("git", ["push", "origin", releaseTag], {
+        cwd: repositoryRoot,
+      });
+    } else if (existingRemoteTagCommit !== releaseCommit) {
+      throw new Error(`The origin ${releaseTag} tag points to another commit.`);
+    }
+    process.stdout.write(
+      `${applyTerminalColor("Waiting for tag Quality checks...", "magenta", colorEnabled)}\n`,
+    );
+    await waitForQualityWorkflow(releaseCommit, releaseTag);
 
     const synchronizingPublishedVersion =
       remoteSyncPending && candidateVersion === initialContext.repositoryVersion;
@@ -706,18 +790,6 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
     }
 
     synchronizeDistributionTags(repositoryRoot, candidateVersion, publishResult.distributionTags);
-
-    runCommand("git", ["push", "origin", initialContext.branchName], {
-      cwd: repositoryRoot,
-    });
-    const existingRemoteTagCommit = readRemoteTagCommit(repositoryRoot, releaseTag);
-    if (existingRemoteTagCommit === "") {
-      runCommand("git", ["push", "origin", releaseTag], {
-        cwd: repositoryRoot,
-      });
-    } else if (existingRemoteTagCommit !== releaseCommit) {
-      throw new Error(`The origin ${releaseTag} tag points to another commit.`);
-    }
     return publishResult;
   } catch (error) {
     if (!packagePublished && !releaseCommitPrepared) {
@@ -725,7 +797,9 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
     }
     if (!packagePublished && releaseCommitPrepared) {
       const message = error instanceof Error ? error.message : "Package publication failed.";
-      throw new Error(`${message}\nLocal release commit and tag were retained for a safe retry.`);
+      throw new Error(
+        `${message}\nThe release commit and any created tag were retained for a safe retry. npm was not published.`,
+      );
     }
     if (packagePublished && !(error instanceof PublishedPackageSyncError)) {
       const message = error instanceof Error ? error.message : "Git synchronization failed.";
