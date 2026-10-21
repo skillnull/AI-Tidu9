@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   formatPublishedPackageSyncFailure,
@@ -36,6 +37,17 @@ const validContext = Object.freeze({
   remoteTagCommit: "release-commit",
   status: "",
   tagCommit: "release-commit",
+});
+
+test("forwards npm release arguments to the publishing script", () => {
+  const repositoryPackage = JSON.parse(
+    readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"),
+  );
+
+  assert.equal(
+    repositoryPackage.scripts["publish:tidu"],
+    `sh -c '. ./scripts/use-project-node.sh && node scripts/publish-tidu.mjs "$@"' --`,
+  );
 });
 
 test("maps semantic versions to safe npm distribution tags", () => {
