@@ -27,7 +27,10 @@ test("creates a safe managed configuration", () => {
   assert.equal(configuration.activeMode, "managed");
   assert.equal(configuration.activeProfileId, "ai-tidu9-config");
   assert.equal(configuration.virtualModelName, "九门赛博提督");
-  assert.deepEqual(configuration.modelSelection, { source: "official", model: "current" });
+  assert.deepEqual(configuration.modelSelection, {
+    source: "official",
+    model: "current",
+  });
   assert.equal(configuration.capabilityCompletion.enabled, false);
   assert.deepEqual(configuration.capabilityCompletion.mainCapabilities, [
     ...MODEL_ROUTING_CAPABILITIES,
@@ -88,6 +91,42 @@ test("accepts published provider model identifiers with routing metadata", () =>
     }).valid,
     true,
   );
+});
+
+test("accepts models with zero assigned capabilities for fail-closed routing", () => {
+  const configuration = createDefaultConfiguration();
+  const result = validateConfiguration({
+    ...configuration,
+    capabilityCompletion: {
+      ...configuration.capabilityCompletion,
+      mainCapabilities: [],
+      specialists: [
+        {
+          host: "cursor",
+          source: "official",
+          model: "secondary-model",
+          capabilities: [],
+        },
+      ],
+      hostPolicies: {
+        codex: {
+          mainModel: { source: "official", model: "gpt-5.6-sol" },
+          mainCapabilities: [],
+          specialists: [
+            {
+              host: "cursor",
+              source: "official",
+              model: "secondary-model",
+              capabilities: [],
+            },
+          ],
+          maximumSpecialists: 1,
+        },
+      },
+    },
+  });
+
+  assert.equal(result.valid, true);
 });
 
 test("rejects invalid or cross-mode configuration", () => {

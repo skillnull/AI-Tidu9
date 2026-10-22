@@ -149,6 +149,18 @@ const extractStreamTextDelta = (body: unknown): string => {
   return typeof firstChoice.delta.content === "string" ? firstChoice.delta.content : "";
 };
 
+const extractStreamProcessDelta = (body: unknown): string => {
+  if (!isRecord(body) || typeof body.type !== "string" || typeof body.delta !== "string") {
+    return "";
+  }
+  const eventSegments = body.type.toLowerCase().split(/[./_-]+/u);
+  const isDelta = eventSegments.at(-1) === "delta";
+  const isPublicProcess = ["reasoning", "summary", "thought"].some((segment) =>
+    eventSegments.includes(segment),
+  );
+  return isDelta && isPublicProcess ? body.delta : "";
+};
+
 const extractCompletedStreamText = (body: unknown): string => {
   if (!isRecord(body) || body.type !== "response.completed" || !isRecord(body.response)) {
     return "";
@@ -164,6 +176,7 @@ const consumeProviderTextStream = async (
   source: ReadableStream<Uint8Array>,
   protocol: ProviderExecutionRequest["protocol"],
   onOutputDelta: (delta: string) => void,
+  onProcessDelta?: (delta: string) => void,
 ): Promise<string> => {
   const reader = source.getReader();
   const decoder = new TextDecoder();
@@ -271,6 +284,8 @@ const consumeProviderTextStream = async (
       streamedText += delta;
       onOutputDelta(delta);
     }
+    const processDelta = extractStreamProcessDelta(body);
+    if (processDelta !== "") onProcessDelta?.(processDelta);
     const terminalText = extractCompletedStreamText(body);
     if (terminalText !== "") completedText = terminalText;
   };
@@ -341,7 +356,12 @@ export const createModelProviderAgentAdapters = (
       protocol: "chat-completions",
       virtualModelId: resolvedVirtualModelId,
       signal,
-      routing: { role: routingRole, securityScopeId, requiredCapabilities, host },
+      routing: {
+        role: routingRole,
+        securityScopeId,
+        requiredCapabilities,
+        host,
+      },
       body: {
         model: resolvedVirtualModelId,
         stream: false,
@@ -432,10 +452,23 @@ export const createModelProviderAgentAdapters = (
     execute: async (input) => {
       if (input.modelRequest !== undefined) {
         const shouldStream = input.modelRequest.onOutputDelta !== undefined;
+        let providerProcessStarted = false;
+        const forwardProcessDelta =
+          input.modelRequest.onProcessDelta === undefined
+            ? undefined
+            : (delta: string): void => {
+                if (!providerProcessStarted) {
+                  input.modelRequest?.onProcessDelta?.("\n\n");
+                  providerProcessStarted = true;
+                }
+                input.modelRequest?.onProcessDelta?.(delta);
+              };
         const directResult = await provider.execute({
           protocol: input.modelRequest.protocol,
           virtualModelId: input.modelRequest.virtualModelId,
           signal: input.signal,
+          onProcessDelta: forwardProcessDelta,
+          onExecutionReceipt: input.modelRequest.onExecutionReceipt,
           routing: {
             role: "worker",
             securityScopeId: input.task.taskId,
@@ -468,7 +501,6 @@ export const createModelProviderAgentAdapters = (
             "Agent execution model did not return a successful response.",
           );
         }
-        input.modelRequest.onProgress?.("执行路径已确认，正在接收模型输出…");
         if (directResult.kind === "stream") {
           if (input.modelRequest.onOutputDelta === undefined) {
             throw new Error("Agent execution model unexpectedly returned a stream.");
@@ -478,6 +510,7 @@ export const createModelProviderAgentAdapters = (
               directResult.stream,
               input.modelRequest.protocol,
               input.modelRequest.onOutputDelta,
+              forwardProcessDelta,
             ),
           };
         }

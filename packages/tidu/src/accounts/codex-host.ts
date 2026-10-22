@@ -243,12 +243,19 @@ export const createCodexAppServerLaunch = (
       "No reusable Codex login is available. Run `tidu account relogin` explicitly.",
     );
   }
+  const officialModelCatalog = join(resolveCodexHome(options), "models_cache.json");
   return {
     command: resolveCodexCommand(options),
     arguments: [
       ...(options.modelProvider === undefined
         ? []
-        : ["-c", `model_provider=${JSON.stringify(options.modelProvider)}`]),
+        : [
+            "-c",
+            `model_provider=${JSON.stringify(options.modelProvider)}`,
+            ...(options.modelProvider === "openai" && existsSync(officialModelCatalog)
+              ? ["-c", `model_catalog_json=${JSON.stringify(officialModelCatalog)}`]
+              : []),
+          ]),
       "app-server",
       "--listen",
       "stdio://",

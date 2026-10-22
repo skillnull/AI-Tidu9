@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { MODEL_ROUTING_CAPABILITIES } from "../config/index.js";
 import type { ModelProvider, ProviderExecutionRequest } from "../providers/index.js";
 import {
   createCapabilityCompletionProvider,
@@ -103,6 +104,36 @@ test("treats auto tools as optional and infers capabilities only from required e
   );
 });
 
+test("infers workspace and web capabilities from explicit user actions only", () => {
+  assert.deepEqual(
+    inferModelRequestCapabilities({
+      protocol: "responses",
+      virtualModelId: "tidu",
+      body: { input: "查看本地 SKILL 文件并检查内容。" },
+    }),
+    ["code", "text"],
+  );
+  assert.deepEqual(
+    inferModelRequestCapabilities({
+      protocol: "responses",
+      virtualModelId: "tidu",
+      body: {
+        instructions: "Inspect repository files when needed.",
+        input: [{ role: "user", content: "Explain dependency injection." }],
+      },
+    }),
+    ["text"],
+  );
+  assert.deepEqual(
+    inferModelRequestCapabilities({
+      protocol: "responses",
+      virtualModelId: "tidu",
+      body: { input: "请联网搜索官方网站的最新说明。" },
+    }),
+    ["text", "web-research"],
+  );
+});
+
 test("infers long context only when textual input reaches 100000 characters", () => {
   const inferForInput = (input: string): readonly string[] =>
     inferModelRequestCapabilities({
@@ -137,13 +168,17 @@ test("infers long context only when textual input reaches 100000 characters", ()
 
 test("records primary and secondary results for the shared Agent policy", async () => {
   const calls: string[] = [];
+  const progress: string[] = [];
   const provider: ModelProvider = {
     descriptor: { type: "openai-compatible", model: "main-model" },
     execute: async (request) => {
-      calls.push(request.routing?.targetModel ?? "current");
+      const targetModel = request.routing?.targetModel ?? "current";
+      calls.push(targetModel);
+      request.onModelConfirmed?.(targetModel);
       return {
         kind: "json",
         statusCode: 200,
+        upstreamModel: request.routing?.targetModel ?? "main-model",
         body:
           request.routing?.role === "specialist"
             ? {
@@ -180,9 +215,11 @@ test("records primary and secondary results for the shared Agent policy", async 
     virtualModelId: "ai-tidu9-config",
     body: { messages: [{ role: "user", content: "inspect image" }] },
     routing: { requiredCapabilities: ["vision"], role: "worker" },
+    onProcessDelta: (delta) => progress.push(delta),
   });
 
   assert.deepEqual(calls, ["vision-model[context=300k,effort=high]", "main-model"]);
+  assert.deepEqual(progress, []);
   const status = await completion.inspectCapabilityCompletion();
   assert.equal(status.records[0]?.complemented, true);
   assert.deepEqual(status.records[0]?.specialistModelIds, ["specialist-0:cursor:official"]);
@@ -194,6 +231,7 @@ test("records primary and secondary results for the shared Agent policy", async 
     role: "main",
     capabilities: ["text"],
     outcome: "succeeded",
+    executedModel: "main-model",
     statusCode: 200,
     durationMilliseconds: status.records[0]?.mainResult.durationMilliseconds,
     message: "",
@@ -205,10 +243,161 @@ test("records primary and secondary results for the shared Agent policy", async 
     role: "secondary",
     capabilities: ["vision"],
     outcome: "succeeded",
+    executedModel: "vision-model[context=300k,effort=high]",
     statusCode: 200,
     durationMilliseconds: status.records[0]?.secondaryResults[0]?.durationMilliseconds,
     message: "",
   });
+});
+
+test("executes only the secondary model when the primary has zero assigned capabilities", async () => {
+  const calls: string[] = [];
+  const provider: ModelProvider = {
+    descriptor: { type: "codex-host", model: "primary-model" },
+    execute: async (request) => {
+      const targetModel = request.routing?.targetModel ?? "primary-model";
+      calls.push(`${request.routing?.host ?? "unknown"}:${targetModel}`);
+      request.onModelConfirmed?.(targetModel);
+      return {
+        kind: "json",
+        statusCode: 200,
+        upstreamModel: targetModel,
+        body: { output_text: "completed" },
+      };
+    },
+  };
+  const completion = createCapabilityCompletionProvider(provider, async () => ({
+    modelSelection: { source: "official", model: "primary-model" },
+    capabilityCompletion: {
+      enabled: true,
+      mainCapabilities: [],
+      specialists: [
+        {
+          host: "cursor",
+          source: "official",
+          model: "secondary-model",
+          capabilities: [...MODEL_ROUTING_CAPABILITIES],
+        },
+      ],
+      maximumSpecialists: 1,
+    },
+  }));
+
+  const result = await completion.execute({
+    protocol: "responses",
+    virtualModelId: "ai-tidu9-config",
+    body: { input: "complete the request" },
+    routing: {
+      host: "codex",
+      requiredCapabilities: [...MODEL_ROUTING_CAPABILITIES],
+    },
+  });
+
+  assert.equal(result.statusCode, 200);
+  assert.deepEqual(calls, ["cursor:secondary-model"]);
+  const record = (await completion.inspectCapabilityCompletion()).records[0];
+  assert.equal(record?.outcome, "succeeded");
+  assert.equal(record?.complemented, true);
+  assert.equal(record?.mainResult.outcome, "not-run");
+  assert.equal(record?.mainResult.executedModel, null);
+  assert.equal(record?.secondaryResults[0]?.outcome, "succeeded");
+  assert.equal(record?.secondaryResults[0]?.executedModel, "secondary-model");
+});
+
+test("records a fail-closed result when no configured model has any capability", async () => {
+  const calls: string[] = [];
+  const provider: ModelProvider = {
+    descriptor: { type: "codex-host", model: "primary-model" },
+    execute: async () => {
+      calls.push("unexpected");
+      return {
+        kind: "json",
+        statusCode: 200,
+        body: { output_text: "unexpected" },
+      };
+    },
+  };
+  const completion = createCapabilityCompletionProvider(provider, async () => ({
+    modelSelection: { source: "official", model: "primary-model" },
+    capabilityCompletion: {
+      enabled: true,
+      mainCapabilities: [],
+      specialists: [
+        {
+          host: "cursor",
+          source: "official",
+          model: "secondary-model",
+          capabilities: [],
+        },
+      ],
+      maximumSpecialists: 1,
+    },
+  }));
+
+  await assert.rejects(
+    completion.execute({
+      protocol: "responses",
+      virtualModelId: "ai-tidu9-config",
+      body: { input: "complete the request" },
+      routing: { host: "codex" },
+    }),
+    /No configured model combination covers required capabilities/u,
+  );
+
+  assert.deepEqual(calls, []);
+  const record = (await completion.inspectCapabilityCompletion()).records[0];
+  assert.equal(record?.outcome, "failed");
+  assert.deepEqual(record?.missingCapabilities, ["text"]);
+  assert.equal(record?.mainResult.outcome, "not-run");
+  assert.equal(record?.secondaryResults[0]?.outcome, "not-run");
+});
+
+test("does not call a zero-capability primary when capability completion is disabled", async () => {
+  const calls: string[] = [];
+  const provider: ModelProvider = {
+    descriptor: { type: "codex-host", model: "primary-model" },
+    execute: async () => {
+      calls.push("unexpected");
+      return {
+        kind: "json",
+        statusCode: 200,
+        body: { output_text: "unexpected" },
+      };
+    },
+  };
+  const completion = createCapabilityCompletionProvider(provider, async () => ({
+    modelSelection: { source: "official", model: "primary-model" },
+    capabilityCompletion: {
+      enabled: false,
+      mainCapabilities: [],
+      specialists: [
+        {
+          host: "cursor",
+          source: "official",
+          model: "secondary-model",
+          capabilities: [...MODEL_ROUTING_CAPABILITIES],
+        },
+      ],
+      maximumSpecialists: 1,
+    },
+  }));
+
+  await assert.rejects(
+    completion.execute({
+      protocol: "responses",
+      virtualModelId: "ai-tidu9-config",
+      body: { input: "complete the request" },
+      routing: { host: "codex" },
+    }),
+    /No configured model combination covers required capabilities/u,
+  );
+
+  assert.deepEqual(calls, []);
+  const record = (await completion.inspectCapabilityCompletion()).records[0];
+  assert.equal(record?.outcome, "failed");
+  assert.equal(record?.mainResult.outcome, "not-run");
+  assert.equal(record?.secondaryResults[0]?.outcome, "not-run");
+  assert.match(record?.secondaryResults[0]?.message ?? "", /disabled/u);
 });
 
 test("isolates primary and specialist models by request host", async () => {
@@ -685,6 +874,7 @@ const profile = (
   overrides: Partial<ModelRouteProfile> & Pick<ModelRouteProfile, "id">,
 ): ModelRouteProfile => ({
   id: overrides.id,
+  host: overrides.host,
   capabilities: overrides.capabilities ?? ["text", "structured-output"],
   inputCostPerMillionTokens: overrides.inputCostPerMillionTokens ?? 0.1,
   outputCostPerMillionTokens: overrides.outputCostPerMillionTokens ?? 0.2,
@@ -713,6 +903,7 @@ test("records a routed stream only after live output reaches a successful termin
     execute: async () => ({
       kind: "stream",
       statusCode: 200,
+      upstreamModel: "streaming",
       stream: new ReadableStream<Uint8Array>({
         start: (controller) => {
           upstreamController = controller;
@@ -760,6 +951,7 @@ test("records a routed stream only after live output reaches a successful termin
       modelId: "cheap-main",
       role: "main",
       outcome: "succeeded",
+      executedModel: "streaming",
       statusCode: 200,
       durationMilliseconds: router.inspectAttempts()[0]?.durationMilliseconds,
       message: "",
@@ -821,7 +1013,10 @@ test("marks unsuccessful stream terminals, EOF, reader errors, and cancellation 
         new ReadableStream<Uint8Array>({
           start: (controller) => {
             controller.enqueue(
-              encodeSseData({ type: "response.completed", response: { status: "failed" } }),
+              encodeSseData({
+                type: "response.completed",
+                response: { status: "failed" },
+              }),
             );
             controller.close();
           },
@@ -835,7 +1030,10 @@ test("marks unsuccessful stream terminals, EOF, reader errors, and cancellation 
         new ReadableStream<Uint8Array>({
           start: (controller) => {
             controller.enqueue(
-              encodeSseData({ type: "response.completed", response: { status: "incomplete" } }),
+              encodeSseData({
+                type: "response.completed",
+                response: { status: "incomplete" },
+              }),
             );
             controller.close();
           },
@@ -870,7 +1068,10 @@ test("marks unsuccessful stream terminals, EOF, reader errors, and cancellation 
         new ReadableStream<Uint8Array>({
           start: (controller) => {
             controller.enqueue(
-              encodeSseData({ type: "response.output_text.delta", delta: "partial" }),
+              encodeSseData({
+                type: "response.output_text.delta",
+                delta: "partial",
+              }),
             );
             controller.close();
           },
@@ -1130,6 +1331,104 @@ test("uses an opt-in specialist to complete a cheap main model capability", asyn
   assert.ok(Math.abs((router.inspect()?.estimatedCostPerMillionTokens ?? 0) - 0.6) < 0.000001);
 });
 
+test("waits for the required specialist's official terminal response", async () => {
+  const calls: string[] = [];
+  const router = createDynamicModelRouter(
+    [
+      {
+        profile: profile({ id: "cheap-main", capabilities: ["text"] }),
+        provider: jsonProvider("main", async () => {
+          calls.push("cheap-main");
+          return { statusCode: 200, body: { output_text: "main result" } };
+        }),
+      },
+      {
+        profile: profile({
+          id: "vision-specialist",
+          capabilities: ["text", "vision"],
+        }),
+        provider: {
+          descriptor: { type: "openai-compatible", model: "secondary" },
+          execute: async (request) => {
+            calls.push("vision-specialist");
+            request.onModelConfirmed?.("vision-model[reasoning_effort=high]");
+            await new Promise<void>((resolve) => setTimeout(resolve, 40));
+            return {
+              kind: "json",
+              statusCode: 200,
+              upstreamModel: "vision-model[reasoning_effort=high]",
+              body: { output_text: "official specialist result" },
+            };
+          },
+        },
+      },
+    ],
+    policy,
+  );
+
+  await router.execute({
+    protocol: "responses",
+    virtualModelId: "tidu",
+    body: {
+      input: [
+        {
+          role: "user",
+          content: [{ type: "input_image", image_url: "local" }],
+        },
+      ],
+    },
+  });
+
+  assert.deepEqual(calls, ["vision-specialist", "cheap-main"]);
+  assert.deepEqual(
+    router.inspectAttempts().map((attempt) => attempt.outcome),
+    ["succeeded", "succeeded"],
+  );
+  assert.equal(router.inspectAttempts()[0]?.executedModel, "vision-model[reasoning_effort=high]");
+});
+
+test("routes an explicit local-file request to a code-capable secondary model", async () => {
+  const calls: string[] = [];
+  const router = createDynamicModelRouter(
+    [
+      {
+        profile: profile({ id: "cheap-main", capabilities: ["text"] }),
+        provider: jsonProvider("main", async () => {
+          calls.push("cheap-main");
+          return {
+            statusCode: 200,
+            body: { choices: [{ message: { content: "combined" } }] },
+          };
+        }),
+      },
+      {
+        profile: profile({
+          id: "vision-specialist",
+          capabilities: ["text", "code"],
+        }),
+        provider: jsonProvider("secondary", async () => {
+          calls.push("vision-specialist");
+          return {
+            statusCode: 200,
+            body: { choices: [{ message: { content: "file inspected" } }] },
+          };
+        }),
+      },
+    ],
+    policy,
+  );
+
+  await router.execute({
+    protocol: "responses",
+    virtualModelId: "tidu",
+    body: { input: "查看本地 SKILL 文件并检查内容。" },
+  });
+
+  assert.deepEqual(calls, ["vision-specialist", "cheap-main"]);
+  assert.deepEqual(router.inspect()?.requiredCapabilities, ["code", "text"]);
+  assert.deepEqual(router.inspect()?.missingCapabilities, []);
+});
+
 test("explicitly verifies an overlapping secondary model without requiring a capability gap", async () => {
   const calls: string[] = [];
   const router = createDynamicModelRouter(
@@ -1167,6 +1466,60 @@ test("explicitly verifies an overlapping secondary model without requiring a cap
 
   assert.deepEqual(calls, ["vision-specialist", "cheap-main"]);
   assert.equal(router.inspect()?.reason, "explicit-secondary-test");
+});
+
+test("does not synthesize model or capability process messages", async () => {
+  const progress: string[] = [];
+  const router = createDynamicModelRouter(
+    [
+      {
+        profile: profile({
+          id: "cheap-main",
+          host: "codex",
+          capabilities: ["reasoning"],
+        }),
+        provider: {
+          descriptor: { type: "cursor-host", model: "main" },
+          execute: async (request) => {
+            request.onModelConfirmed?.("gpt-5.6-sol");
+            return {
+              kind: "json",
+              statusCode: 200,
+              body: { output_text: "combined" },
+            };
+          },
+        },
+      },
+      {
+        profile: profile({
+          id: "vision-specialist",
+          host: "cursor",
+          capabilities: ["text"],
+        }),
+        provider: {
+          descriptor: { type: "codex-host", model: "secondary" },
+          execute: async (request) => {
+            request.onModelConfirmed?.("gemini-3.8-flash[reasoning_effort=high]");
+            return {
+              kind: "json",
+              statusCode: 200,
+              body: { output_text: "evidence" },
+            };
+          },
+        },
+      },
+    ],
+    policy,
+  );
+
+  await router.execute({
+    protocol: "responses",
+    virtualModelId: "tidu",
+    body: { input: "explain", reasoning_effort: "medium" },
+    onProcessDelta: (delta) => progress.push(delta),
+  });
+
+  assert.deepEqual(progress, []);
 });
 
 test("selects a fully capable model with lower observed latency", async () => {
@@ -1287,7 +1640,7 @@ test("does not require tool capabilities when the caller disables declared tools
   assert.deepEqual(router.inspect()?.requiredCapabilities, ["text"]);
 });
 
-test("calls the main model for every capability metadata gap", async () => {
+test("fails closed without calling a model when configured capabilities leave a gap", async () => {
   const cases: ReadonlyArray<{
     body: Readonly<Record<string, unknown>>;
     missingCapabilities: readonly string[];
@@ -1341,7 +1694,10 @@ test("calls the main model for every capability metadata gap", async () => {
           profile: profile({ id: "cheap-main", capabilities: ["text"] }),
           provider: jsonProvider("main", async () => {
             calls.push("cheap-main");
-            return { statusCode: 200, body: { output_text: "upstream accepted the request" } };
+            return {
+              statusCode: 200,
+              body: { output_text: "upstream accepted the request" },
+            };
           }),
         },
         {
@@ -1355,17 +1711,166 @@ test("calls the main model for every capability metadata gap", async () => {
       policy,
     );
 
-    const result = await router.execute({
-      protocol: "responses",
-      virtualModelId: "tidu",
-      body: regressionCase.body,
-    });
+    await assert.rejects(
+      router.execute({
+        protocol: "responses",
+        virtualModelId: "tidu",
+        body: regressionCase.body,
+      }),
+      /No configured model combination covers required capabilities/u,
+    );
 
-    assert.equal(result.statusCode, 200);
-    assert.deepEqual(calls, ["cheap-main"]);
+    assert.deepEqual(calls, []);
     assert.equal(router.inspect()?.reason, "capability-gap");
     assert.deepEqual(router.inspect()?.missingCapabilities, regressionCase.missingCapabilities);
   }
+});
+
+test("covers all 65,536 primary and secondary capability checkbox allocations", async () => {
+  const capabilities = [...MODEL_ROUTING_CAPABILITIES];
+  const allocationCount = 2 ** capabilities.length;
+  const fullAllocation = allocationCount - 1;
+  const capabilitiesForAllocation = (allocation: number): string[] =>
+    capabilities.filter((_capability, index) => (allocation & (1 << index)) !== 0);
+
+  for (let primaryAllocation = 0; primaryAllocation < allocationCount; primaryAllocation += 1) {
+    for (
+      let secondaryAllocation = 0;
+      secondaryAllocation < allocationCount;
+      secondaryAllocation += 1
+    ) {
+      const calls: string[] = [];
+      const router = createDynamicModelRouter(
+        [
+          {
+            profile: profile({
+              id: "cheap-main",
+              capabilities: capabilitiesForAllocation(primaryAllocation),
+            }),
+            provider: {
+              descriptor: { type: "codex-host", model: "primary-model" },
+              execute: async (request) => {
+                calls.push("primary");
+                request.onModelConfirmed?.("primary-model");
+                return {
+                  kind: "json",
+                  statusCode: 200,
+                  upstreamModel: "primary-model",
+                  body: { output_text: "primary result" },
+                };
+              },
+            },
+          },
+          {
+            profile: profile({
+              id: "vision-specialist",
+              capabilities: capabilitiesForAllocation(secondaryAllocation),
+            }),
+            provider: {
+              descriptor: { type: "cursor-host", model: "secondary-model" },
+              execute: async (request) => {
+                calls.push("secondary");
+                request.onModelConfirmed?.("secondary-model");
+                return {
+                  kind: "json",
+                  statusCode: 200,
+                  upstreamModel: "secondary-model",
+                  body: { output_text: "secondary result" },
+                };
+              },
+            },
+          },
+        ],
+        policy,
+      );
+      const request = {
+        protocol: "responses" as const,
+        virtualModelId: "tidu",
+        body: { input: "capability matrix" },
+        routing: { requiredCapabilities: capabilities },
+      };
+      const covered = (primaryAllocation | secondaryAllocation) === fullAllocation;
+
+      if (!covered) {
+        await assert.rejects(
+          router.execute(request),
+          /No configured model combination covers required capabilities/u,
+        );
+        assert.deepEqual(calls, []);
+        continue;
+      }
+
+      const result = await router.execute(request);
+      assert.equal(result.statusCode, 200);
+      assert.deepEqual(router.inspect()?.missingCapabilities, []);
+      const expectedCalls =
+        primaryAllocation === fullAllocation
+          ? ["primary"]
+          : primaryAllocation === 0
+            ? ["secondary"]
+            : ["secondary", "primary"];
+      assert.deepEqual(calls, expectedCalls);
+      assert.equal(
+        router
+          .inspectAttempts()
+          .every((attempt) => attempt.outcome === "succeeded" && attempt.executedModel !== null),
+        true,
+      );
+    }
+  }
+});
+
+test("uses one secondary as the final model when multiple secondaries cover a zero-capability primary", async () => {
+  const calls: string[] = [];
+  const router = createDynamicModelRouter(
+    [
+      {
+        profile: profile({ id: "cheap-main", capabilities: [] }),
+        provider: jsonProvider("primary", async () => {
+          calls.push("primary");
+          return { statusCode: 200, body: { output_text: "unexpected" } };
+        }),
+      },
+      {
+        profile: profile({ id: "vision-specialist", capabilities: ["vision"] }),
+        provider: jsonProvider("vision", async () => {
+          calls.push("vision");
+          return { statusCode: 200, body: { output_text: "visual evidence" } };
+        }),
+      },
+      {
+        profile: profile({
+          id: "final-specialist",
+          capabilities: ["text", "reasoning"],
+        }),
+        provider: jsonProvider("final", async () => {
+          calls.push("final");
+          return { statusCode: 200, body: { output_text: "final result" } };
+        }),
+      },
+    ],
+    {
+      ...policy,
+      capabilityCompletion: {
+        enabled: true,
+        poolModelIds: ["vision-specialist", "final-specialist"],
+        maximumSpecialists: 2,
+      },
+    },
+  );
+
+  const result = await router.execute({
+    protocol: "responses",
+    virtualModelId: "tidu",
+    body: { input: "inspect and explain" },
+    routing: { requiredCapabilities: ["text", "reasoning", "vision"] },
+  });
+
+  assert.equal(result.statusCode, 200);
+  assert.deepEqual(calls, ["vision", "final"]);
+  assert.equal(router.inspect()?.mainModelId, "final-specialist");
+  assert.deepEqual(router.inspect()?.specialistModelIds, ["vision-specialist"]);
+  assert.deepEqual(router.inspect()?.missingCapabilities, []);
 });
 
 test("keeps the main model when fewer observed tokens still cost more", async () => {
@@ -1580,7 +2085,10 @@ test("preserves the explicit bridge limitation when every fallback is unavailabl
   const router = createDynamicModelRouter(
     [
       {
-        profile: profile({ id: "cheap-main", capabilities: ["text"] }),
+        profile: profile({
+          id: "cheap-main",
+          capabilities: ["text", "tool-use"],
+        }),
         provider: jsonProvider("host-bridge", async () => {
           calls.push("cheap-main");
           return {
@@ -1595,12 +2103,17 @@ test("preserves the explicit bridge limitation when every fallback is unavailabl
         }),
       },
       {
-        profile: profile({ id: "vision-specialist", capabilities: ["text", "code"] }),
+        profile: profile({
+          id: "vision-specialist",
+          capabilities: ["text", "code", "tool-use"],
+        }),
         provider: jsonProvider("unavailable", async () => {
           calls.push("vision-specialist");
           return {
             statusCode: 503,
-            body: { error: { code: "provider_unavailable", message: "Unavailable." } },
+            body: {
+              error: { code: "provider_unavailable", message: "Unavailable." },
+            },
           };
         }),
       },

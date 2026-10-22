@@ -11,6 +11,8 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { request as requestHttp } from "node:http";
+import { request as requestHttps } from "node:https";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_VIRTUAL_MODEL_ID } from "../config/index.js";
@@ -45,7 +47,7 @@ export interface CodexOfficialModel {
   id: string;
   /** Human-readable official model name. */
   name: string;
-  /** Capabilities executable through the text bridge and grounded in the official host catalog. */
+  /** Capabilities executable through the Codex bridge and grounded in the official host catalog. */
   capabilities: readonly string[];
   /** Evidence source for the displayed capability declaration. */
   capabilitySource: "host-catalog";
@@ -290,13 +292,13 @@ const activateDefaultCodexConfiguration = (
     MANAGED_PROVIDER_START,
     "# Local Agent runtime only. Official Codex credentials are never sent to this endpoint.",
     "[model_providers.ai_tidu9]",
-    'name = "九门赛博提督"',
+    'name = "AI-Tidu9 (local)"',
     `base_url = ${JSON.stringify(`${endpoint}/v1/hosts/codex`)}`,
     'wire_api = "responses"',
     "requires_openai_auth = false",
     "supports_websockets = false",
-    "request_max_retries = 1",
-    "stream_max_retries = 1",
+    "request_max_retries = 0",
+    "stream_max_retries = 0",
     MANAGED_PROVIDER_END,
   );
   writePrivateFileAtomically(
@@ -457,6 +459,52 @@ const activeProviderSupportsCodexReasoningEffort = async (
   }
 };
 
+const requestInferenceWithoutDeadline: typeof fetch = async (input, init) => {
+  const endpoint = new URL(input instanceof Request ? input.url : String(input));
+  const body = init?.body;
+  if (body !== undefined && body !== null && typeof body !== "string") {
+    throw new TiduError(
+      "CONFIGURATION_INVALID",
+      "The Codex inference probe supports only a text request body.",
+    );
+  }
+  const headers = Object.fromEntries(new Headers(init?.headers).entries());
+  const sendRequest = endpoint.protocol === "https:" ? requestHttps : requestHttp;
+  return new Promise<Response>((resolve, reject) => {
+    const outgoing = sendRequest(
+      endpoint,
+      {
+        headers,
+        method: init?.method ?? "GET",
+      },
+      (incoming) => {
+        const chunks: Buffer[] = [];
+        incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
+        incoming.once("error", reject);
+        incoming.once("end", () => {
+          const responseHeaders = new Headers();
+          for (const [name, value] of Object.entries(incoming.headers)) {
+            if (Array.isArray(value)) {
+              for (const item of value) responseHeaders.append(name, item);
+            } else if (value !== undefined) {
+              responseHeaders.set(name, value);
+            }
+          }
+          resolve(
+            new Response(Buffer.concat(chunks), {
+              headers: responseHeaders,
+              status: incoming.statusCode ?? 500,
+            }),
+          );
+        });
+      },
+    );
+    outgoing.once("error", reject);
+    if (body !== undefined && body !== null) outgoing.write(body);
+    outgoing.end();
+  });
+};
+
 const verifyEndpoint = async (
   candidate: string,
   request: typeof fetch,
@@ -517,12 +565,8 @@ const verifyInference = async (
         model,
         input: "Reply with OK.",
         metadata: { ai_tidu9_probe: true },
-        response_format: { type: "json_object" },
-        tools: [{ type: "tool_search" }],
-        tool_choice: "none",
         stream: false,
       }),
-      signal: AbortSignal.timeout(30_000),
     });
   } catch (error) {
     throw createCodexFailure(
@@ -584,44 +628,54 @@ const createCodexProfile = (endpoint: string, model: string, modelCatalogPath: s
     `model_catalog_json = ${JSON.stringify(modelCatalogPath)}`,
     "",
     "[model_providers.ai_tidu9]",
-    'name = "AI-Tidu9"',
+    'name = "AI-Tidu9 (local)"',
     `base_url = ${JSON.stringify(`${endpoint}/v1/hosts/codex`)}`,
     'wire_api = "responses"',
     "requires_openai_auth = false",
     "supports_websockets = false",
+    "request_max_retries = 0",
+    "stream_max_retries = 0",
     "",
   ].join("\n");
 
-const createCodexModelCatalog = (
-  model: string,
-  displayName: string,
-  reasoningEffortSupported: boolean,
-): string =>
+const createCodexModelCatalog = (model: string, reasoningEffortSupported: boolean): string =>
   `${JSON.stringify(
     {
       models: [
         {
           slug: model,
-          display_name: displayName,
-          description: "AI-Tidu9 active virtual model",
+          display_name: "AI-Tidu9",
+          description: "AI-Tidu9 local Agent service",
           ...(reasoningEffortSupported ? { default_reasoning_level: "medium" } : {}),
           supported_reasoning_levels: reasoningEffortSupported
             ? [
-                { effort: "low", description: "Fast" },
-                { effort: "medium", description: "Balanced" },
-                { effort: "high", description: "Deep reasoning" },
+                { effort: "low", description: "Fast responses with lighter reasoning" },
+                {
+                  effort: "medium",
+                  description: "Balances speed and reasoning depth for everyday tasks",
+                },
+                { effort: "high", description: "Greater reasoning depth for complex problems" },
+                {
+                  effort: "xhigh",
+                  description: "Extra high reasoning depth for complex problems",
+                },
+                { effort: "max", description: "Maximum reasoning depth for the hardest problems" },
+                {
+                  effort: "ultra",
+                  description: "Maximum reasoning with automatic task delegation",
+                },
               ]
             : [],
-          shell_type: "shell_command",
+          shell_type: "unified_exec",
           visibility: "list",
           supported_in_api: true,
           priority: 1,
           additional_speed_tiers: [],
           service_tiers: [],
           upgrade: null,
-          base_instructions: "You are an AI coding agent routed through AI-Tidu9.",
+          base_instructions: "You are Codex, an AI coding agent.",
           model_messages: {
-            instructions_template: "You are an AI coding agent routed through AI-Tidu9.",
+            instructions_template: "You are Codex, an AI coding agent.",
             instructions_variables: {
               personality_default: "",
               personality_friendly: "",
@@ -633,14 +687,15 @@ const createCodexModelCatalog = (
           },
           include_skills_usage_instructions: true,
           default_reasoning_summary: "auto",
-          support_verbosity: false,
+          support_verbosity: true,
           default_verbosity: "low",
-          apply_patch_tool_type: null,
+          apply_patch_tool_type: "freeform",
           truncation_policy: { mode: "tokens", limit: 10_000 },
-          input_modalities: ["text"],
-          supports_parallel_tool_calls: false,
-          supports_image_detail_original: false,
-          supports_search_tool: false,
+          input_modalities: ["text", "image"],
+          supports_parallel_tool_calls: true,
+          supports_image_detail_original: true,
+          supports_search_tool: true,
+          web_search_tool_type: "text_and_image",
           context_window: 128_000,
           max_context_window: 128_000,
           comp_hash: "ai-tidu9-1",
@@ -739,6 +794,7 @@ export const listCodexOfficialModels = (
         capabilities.add("text");
         capabilities.add("structured-output");
       }
+      if (inputModalities.includes("image")) capabilities.add("vision");
       if (
         Array.isArray(model.supported_reasoning_levels) &&
         model.supported_reasoning_levels.length > 0
@@ -747,10 +803,14 @@ export const listCodexOfficialModels = (
       }
       if (
         (typeof model.tool_mode === "string" && model.tool_mode.includes("code")) ||
-        typeof model.apply_patch_tool_type === "string"
+        typeof model.apply_patch_tool_type === "string" ||
+        typeof model.shell_type === "string"
       ) {
         capabilities.add("code");
+        capabilities.add("tool-use");
       }
+      if (model.supports_parallel_tool_calls === true) capabilities.add("tool-use");
+      if (model.supports_search_tool === true) capabilities.add("web-research");
       if (contextWindow >= 100_000) capabilities.add("long-context");
       modelsById.set(id, {
         id,
@@ -1041,7 +1101,6 @@ export const configureCodexClient = async (
   }
   const expectedCatalog = createCodexModelCatalog(
     verified.model,
-    verified.displayName,
     verified.reasoningEffortSupported,
   );
   const expectedProfile = createCodexProfile(verified.endpoint, verified.model, paths.modelCatalog);
@@ -1145,7 +1204,7 @@ export const refreshCodexClientModelCatalog = async (
   }
   writePrivateFileAtomically(
     paths.modelCatalog,
-    createCodexModelCatalog(state.model, verified.displayName, verified.reasoningEffortSupported),
+    createCodexModelCatalog(state.model, verified.reasoningEffortSupported),
   );
   return inspectCodexClientConfiguration(options);
 };
@@ -1178,16 +1237,16 @@ export const switchCodexClientConfiguration = async (
     const request = options.request ?? fetch;
     try {
       await verifyEndpoint(state.endpoint, request);
-      await verifyInference(state.endpoint, state.model, request);
+      await verifyInference(
+        state.endpoint,
+        state.model,
+        options.request ?? requestInferenceWithoutDeadline,
+      );
       activateDefaultCodexConfiguration(paths, state.endpoint, state.model);
       const verified = await verifyEndpoint(state.endpoint, request);
       writePrivateFileAtomically(
         paths.modelCatalog,
-        createCodexModelCatalog(
-          state.model,
-          verified.displayName,
-          verified.reasoningEffortSupported,
-        ),
+        createCodexModelCatalog(state.model, verified.reasoningEffortSupported),
       );
     } catch (error) {
       restoreDefaultConfigurationValues(paths, state.originalBackupId);

@@ -6,6 +6,7 @@ import type {
   CapabilityAssetPrivacy,
   CapabilityRegistry,
 } from "../capabilities/index.js";
+import type { AgentHostId } from "../config/index.js";
 import {
   type AgentEvent,
   type AgentEventType,
@@ -56,8 +57,28 @@ export interface AgentModelRequest {
   virtualModelId: string;
   /** Live assistant text forwarded only to the active streaming caller. */
   onOutputDelta?: (delta: string) => void;
-  /** Truthful execution-stage updates forwarded only to the active streaming caller. */
-  onProgress?: (message: string) => void;
+  /** Public model process output forwarded only to the active streaming caller. */
+  onProcessDelta?: (delta: string) => void;
+  /** Actual per-model execution receipts retained only for the active caller. */
+  onExecutionReceipt?: (receipt: {
+    /** Host that executed this model call. */
+    host: AgentHostId;
+    /** Exact upstream model confirmed for this call. */
+    model: string;
+    /** Semantic role performed by this model call. */
+    role: "main" | "planning" | "specialist" | "verification" | "worker";
+    /** Configured capabilities assigned to this model call. */
+    capabilities: readonly string[];
+    /** Provider-authoritative token usage, or null when unavailable. */
+    usage: {
+      /** Input tokens consumed by this call. */
+      inputTokens: number;
+      /** Output tokens consumed by this call. */
+      outputTokens: number;
+      /** Total tokens consumed by this call. */
+      totalTokens: number;
+    } | null;
+  }) => void;
 }
 
 export interface TaskBudgetLimits {
@@ -244,6 +265,8 @@ export interface TaskCapsuleStore {
   list: (limit?: number) => Promise<readonly TaskCapsule[]>;
   /** Saves a capsule only when its expected revision still matches. */
   save: (capsule: TaskCapsule, expectedRevision: number) => Promise<TaskCapsule>;
+  /** Removes one completed or cancelled capsule after its terminal result is returned. */
+  remove: (taskId: string) => Promise<void>;
 }
 
 export interface TaskPlanner {
@@ -412,6 +435,8 @@ export interface TaskControlView {
   pendingApprovalStepId?: string;
   /** Resource usage and limits. */
   budget: { limits: TaskBudgetLimits; usage: TaskBudgetUsage };
+  /** ISO timestamp captured when the task was created. */
+  createdAt: string;
   /** ISO timestamp of the latest durable update. */
   updatedAt: string;
 }
@@ -654,6 +679,7 @@ export const createTaskControlView = (capsule: TaskCapsule): TaskControlView => 
     trustLevel: capsule.result?.trustLevel ?? "unverified",
     ...(pendingApprovalStepId === undefined ? {} : { pendingApprovalStepId }),
     budget: { limits: capsule.budget, usage: capsule.usage },
+    createdAt: capsule.task.createdAt,
     updatedAt: capsule.updatedAt,
   };
 };
@@ -708,6 +734,9 @@ export const createInMemoryTaskCapsuleStore = (): TaskCapsuleStore => {
       capsules.set(saved.task.taskId, saved);
       return clone(saved);
     },
+    remove: async (taskId) => {
+      capsules.delete(taskId);
+    },
   };
 };
 
@@ -746,6 +775,14 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
     const saved = await options.store.save(capsule, capsule.revision);
     if (TERMINAL_STATUSES.has(saved.task.status)) {
       secretGate.closeScope(saved.task.taskId);
+    }
+    return saved;
+  };
+
+  const persistAndRemoveDisposableTask = async (capsule: TaskCapsule): Promise<TaskCapsule> => {
+    const saved = await persist(capsule);
+    if (saved.task.status === "completed" || saved.task.status === "cancelled") {
+      await options.store.remove(saved.task.taskId);
     }
     return saved;
   };
@@ -917,7 +954,7 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
       nextCapsule = transition(nextCapsule, "cancelled", "task.cancelled", {
         reason: "Human approval denied.",
       });
-      return { capsule: await persist(nextCapsule), approved: false };
+      return { capsule: await persistAndRemoveDisposableTask(nextCapsule), approved: false };
     }
     nextCapsule = {
       ...nextCapsule,
@@ -1048,7 +1085,9 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
             capsule = transition(capsule, status, eventType, {
               stepId: step.id,
             });
-            return persist(capsule);
+            return status === "cancelled"
+              ? persistAndRemoveDisposableTask(capsule)
+              : persist(capsule);
           }
           const completedAt = now();
           const suppliedEvidence = output.evidence ?? [];
@@ -1126,7 +1165,9 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
             capsule = transition(capsule, status, eventType, {
               stepId: step.id,
             });
-            return persist(capsule);
+            return status === "cancelled"
+              ? persistAndRemoveDisposableTask(capsule)
+              : persist(capsule);
           }
           if (
             options.planner.replan !== undefined &&
@@ -1252,7 +1293,7 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
         accepted ? "task.completed" : "task.failed",
         { accepted, trustLevel: result.trustLevel },
       );
-      return persist(capsule);
+      return persistAndRemoveDisposableTask(capsule);
     } catch (error) {
       if (
         capsule.task.status !== "failed" &&
@@ -1295,7 +1336,7 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
       requested === "cancel" ? "task.cancelled" : "task.paused",
       { source: "control" },
     );
-    return persist(capsule);
+    return requested === "cancel" ? persistAndRemoveDisposableTask(capsule) : persist(capsule);
   };
 
   return {
@@ -1316,7 +1357,7 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
         { kind: "human" },
       );
       if (!approved) {
-        return persist(
+        return persistAndRemoveDisposableTask(
           transition(capsule, "cancelled", "task.cancelled", {
             reason: "Human approval denied.",
           }),

@@ -114,6 +114,7 @@ test("defaults a model to all and only its interface-published capabilities", ()
     ),
     ["text", "vision"],
   );
+  assert.deepEqual(selectedModelCapabilities([], ["text", "code", "vision"]), []);
 });
 
 test("retries a transiently missing configured secondary-model catalog", () => {

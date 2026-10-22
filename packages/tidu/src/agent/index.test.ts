@@ -124,6 +124,63 @@ test("uses deterministic understanding and planning for response-only tasks", as
   assert.equal(created.plan?.steps[0]?.kind, "reason");
   assert.equal(completed.task.status, "completed");
   assert.equal(completed.result?.summary, "Delivered");
+  assert.equal(await kernel.getTask(created.task.taskId), undefined);
+  assert.deepEqual(await kernel.listTasks(), []);
+});
+
+test("removes a cancelled task after returning its terminal result", async () => {
+  const kernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    planner: createPlanner({
+      revision: 1,
+      steps: [{ id: "deliver", title: "Deliver", kind: "reason" }],
+    }),
+    worker: successfulWorker,
+  });
+  const created = await kernel.createTask({ goal: "Cancel this task" });
+
+  const cancelled = await kernel.cancelTask(created.task.taskId);
+
+  assert.equal(cancelled.task.status, "cancelled");
+  assert.equal(await kernel.getTask(created.task.taskId), undefined);
+  assert.deepEqual(await kernel.listTasks(), []);
+});
+
+test("removes an active task after cancellation reaches its terminal result", async () => {
+  let markStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const kernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    planner: createPlanner({
+      revision: 1,
+      steps: [{ id: "wait", title: "Wait", kind: "reason" }],
+    }),
+    worker: {
+      execute: async ({ signal }) => {
+        markStarted?.();
+        await new Promise<void>((_resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => reject(new DOMException("Task cancelled", "AbortError")),
+            { once: true },
+          );
+        });
+        return { summary: "Unreachable" };
+      },
+    },
+  });
+  const created = await kernel.createTask({ goal: "Cancel active work" });
+  const running = kernel.runTask(created.task.taskId);
+  await started;
+
+  await kernel.cancelTask(created.task.taskId);
+  const cancelled = await running;
+
+  assert.equal(cancelled.task.status, "cancelled");
+  assert.equal(await kernel.getTask(created.task.taskId), undefined);
+  assert.deepEqual(await kernel.listTasks(), []);
 });
 
 test("forwards response capabilities and reasoning strength in one model call", async () => {

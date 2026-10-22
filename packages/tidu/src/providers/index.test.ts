@@ -13,6 +13,7 @@ import {
   cursorCapabilitiesForModel,
   findUnsupportedHostBridgeRequest,
   requestPrompt,
+  requestTurnInput,
   requireCompletedCursorPrompt,
   requireValidHostModelText,
 } from "./codex-host.js";
@@ -43,12 +44,29 @@ readline.on("line", (line) => {
   if (request.id === undefined) return;
   if (request.method === "initialize") send({ jsonrpc: "2.0", id: request.id, result: {} });
   else if (request.method === "thread/start") send({ jsonrpc: "2.0", id: request.id, result: { thread: { id: "thread-1" }, model: "gpt-test" } });
+  else if (request.method === "thread/inject_items") {
+    fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "history:" + JSON.stringify(request.params.items) + "\\n");
+    send({ jsonrpc: "2.0", id: request.id, result: {} });
+  }
   else if (request.method === "turn/start") {
     turnCount += 1;
     const turnId = "turn-" + turnCount;
+    const finalText = request.params.outputSchema
+      ? JSON.stringify({ result: request.params.effort + "-result" })
+      : request.params.effort + "-result";
     fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "effort:" + request.params.effort + "\\n");
+    fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "input:" + JSON.stringify(request.params.input) + "\\n");
+    fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "outputSchema:" + JSON.stringify(request.params.outputSchema) + "\\n");
     send({ jsonrpc: "2.0", id: request.id, result: { turn: { id: turnId } } });
-    send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId, itemId: "item-1", delta: request.params.effort + "-result" } });
+    send({ jsonrpc: "2.0", method: "item/reasoning/summaryTextDelta", params: { threadId: "thread-1", turnId, itemId: "reasoning-1", summaryIndex: 0, delta: "reasoning-" } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, item: { type: "commandExecution", id: "command-1", command: "npm test" } } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, item: { type: "fileChange", id: "file-1", changes: [{ path: "src/index.ts" }] } } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, item: { type: "webSearch", id: "search-1", query: "official docs" } } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, startedAtMs: Date.now(), item: { type: "agentMessage", id: "commentary-1", text: "", phase: "commentary", memoryCitation: null, delivery: null, questions: null } } });
+    send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId, itemId: "commentary-1", delta: "working-" } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, startedAtMs: Date.now(), item: { type: "agentMessage", id: "final-1", text: "", phase: "final_answer", memoryCitation: null, delivery: null, questions: null } } });
+    send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId, itemId: "final-1", delta: finalText } });
+    send({ jsonrpc: "2.0", method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId, tokenUsage: { last: { inputTokens: 11, outputTokens: 4, totalTokens: 15 } } } });
     send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: "thread-1", turn: { id: turnId, status: "completed" } } });
   }
   else send({ jsonrpc: "2.0", id: request.id, result: {} });
@@ -189,22 +207,29 @@ test("preserves Responses instructions and JSON format constraints in host promp
       },
     },
     virtualModelId: "ai-tidu9-config",
+    routing: {
+      requiredCapabilities: ["code", "text"],
+      availableCapabilities: ["code", "text"],
+    },
   };
   const prompt = requestPrompt(request);
 
   assert.match(prompt, /Caller instructions:\nUse the caller's requested field names\./u);
   assert.match(prompt, /"type":"json_schema"/u);
   assert.match(prompt, /"required":\["summary"\]/u);
+  assert.match(prompt, /delegated Codex host's workspace tools/u);
+  assert.match(prompt, /approval and sandbox rules/u);
+  assert.doesNotMatch(prompt, /Do not use tools/u);
   assert.equal(requireValidHostModelText(request, '{"summary":"done"}'), '{"summary":"done"}');
   assert.throws(() => requireValidHostModelText(request, "not json"), /did not return valid JSON/u);
 });
 
-test("fails closed for images and required tools while allowing optional tool declarations", () => {
+test("passes images and tool-capable requests through the Codex bridge", () => {
   const baseRequest = {
     protocol: "responses" as const,
     virtualModelId: "ai-tidu9-config",
   };
-  const imageResult = findUnsupportedHostBridgeRequest({
+  const imageRequest = {
     ...baseRequest,
     body: {
       input: [
@@ -214,7 +239,9 @@ test("fails closed for images and required tools while allowing optional tool de
         },
       ],
     },
-  });
+  };
+  const unsupportedImageResult = findUnsupportedHostBridgeRequest(imageRequest);
+  const codexImageResult = findUnsupportedHostBridgeRequest(imageRequest, true);
   const optionalToolResult = findUnsupportedHostBridgeRequest({
     ...baseRequest,
     body: {
@@ -240,11 +267,14 @@ test("fails closed for images and required tools while allowing optional tool de
     },
   });
 
-  assert.equal(imageResult?.statusCode, 400);
-  assert.match(JSON.stringify(imageResult), /host_bridge_image_unsupported/u);
+  assert.equal(unsupportedImageResult?.statusCode, 400);
+  assert.match(JSON.stringify(unsupportedImageResult), /host_bridge_image_unsupported/u);
+  assert.equal(codexImageResult, undefined);
+  assert.deepEqual(requestTurnInput(imageRequest).input, [
+    { type: "image", url: "data:image/png;base64,test" },
+  ]);
   assert.equal(optionalToolResult, undefined);
-  assert.equal(requiredToolResult?.statusCode, 400);
-  assert.match(JSON.stringify(requiredToolResult), /host_bridge_tools_unsupported/u);
+  assert.equal(requiredToolResult, undefined);
   assert.equal(disabledToolResult, undefined);
 });
 
@@ -272,6 +302,7 @@ test("reuses one Codex model session while forwarding effort and live deltas per
       virtualModelId: "ai-tidu9-config",
     });
     assert.equal(lowResult.kind, "json");
+    assert.equal(lowResult.upstreamModel, "gpt-test");
     assert.match(JSON.stringify(lowResult), /low-result/u);
 
     const highResult = await provider.execute({
@@ -285,19 +316,124 @@ test("reuses one Codex model session while forwarding effort and live deltas per
       virtualModelId: "ai-tidu9-config",
     });
     assert.equal(highResult.kind, "stream");
+    assert.equal(highResult.upstreamModel, "gpt-test");
     if (highResult.kind !== "stream") throw new Error("Expected a streaming provider result.");
     const streamBody = await readStreamText(highResult.stream);
+    assert.match(streamBody, /response\.reasoning_summary_text\.delta/u);
+    assert.match(streamBody, /reasoning-/u);
+    assert.match(streamBody, /working-/u);
+    assert.match(streamBody, /运行命令 `npm test`/u);
+    assert.match(streamBody, /编辑文件 `src\/index\.ts`/u);
+    assert.match(streamBody, /搜索网页 `official docs`/u);
     assert.match(streamBody, /response\.output_text\.delta/u);
     assert.match(streamBody, /high-result/u);
     assert.match(streamBody, /response\.completed/u);
+    assert.match(streamBody, /"created_at":\d+/u);
+    assert.match(streamBody, /"completed_at":\d+/u);
+    assert.match(streamBody, /"input_tokens":11/u);
+    assert.match(streamBody, /"output_tokens":4/u);
+    assert.match(streamBody, /"total_tokens":15/u);
     assert.match(streamBody, /data: \[DONE\]/u);
 
+    const imageResult = await provider.execute({
+      protocol: "responses",
+      body: {
+        model: "ai-tidu9-config",
+        instructions: "Preserve official input.",
+        text: {
+          format: {
+            type: "json_schema",
+            name: "image_result",
+            schema: {
+              type: "object",
+              properties: { result: { type: "string" } },
+              required: ["result"],
+              additionalProperties: false,
+            },
+          },
+        },
+        input: [
+          {
+            role: "user",
+            content: [{ type: "input_text", text: "previous question" }],
+          },
+          {
+            role: "assistant",
+            content: [{ type: "output_text", text: "previous answer" }],
+          },
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: "inspect" },
+              { type: "input_image", image_url: "data:image/png;base64,test" },
+            ],
+          },
+        ],
+      },
+      virtualModelId: "ai-tidu9-config",
+    });
+    assert.equal(imageResult.statusCode, 200);
+
     await provider.close?.();
-    assert.deepEqual(readFileSync(processLog, "utf8").trim().split("\n"), [
-      "start",
-      "effort:low",
-      "effort:high",
-    ]);
+    const processLogText = readFileSync(processLog, "utf8");
+    assert.match(processLogText, /effort:low/u);
+    assert.match(processLogText, /effort:high/u);
+    assert.match(processLogText, /"type":"image","url":"data:image\/png;base64,test"/u);
+    assert.match(processLogText, /"role":"developer"/u);
+    assert.match(processLogText, /Preserve official input\./u);
+    assert.match(processLogText, /previous question/u);
+    assert.match(processLogText, /previous answer/u);
+    assert.match(processLogText, /outputSchema:\{"type":"object"/u);
+    assert.doesNotMatch(processLogText, /Caller instructions:/u);
+    assert.doesNotMatch(processLogText, /Conversation:/u);
+  } finally {
+    await provider?.close?.();
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("rejects a Codex provider when the host does not confirm the configured model", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "tidu-codex-model-mismatch-"));
+  const codexHomeDirectory = join(temporaryDirectory, "codex-home");
+  const processLog = join(temporaryDirectory, "provider.log");
+  mkdirSync(codexHomeDirectory, { recursive: true });
+  const command = createFakeCodexProviderCommand(temporaryDirectory);
+  try {
+    const provider = await createCodexHostModelProvider("configured-model", {
+      codexHomeDirectory,
+      command,
+      environment: { TIDU_CODEX_PROVIDER_TEST_LOG: processLog },
+    });
+    assert.equal(provider, undefined);
+  } finally {
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("rejects a later Codex target when the host confirms a different model", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "tidu-codex-target-mismatch-"));
+  const codexHomeDirectory = join(temporaryDirectory, "codex-home");
+  const processLog = join(temporaryDirectory, "provider.log");
+  mkdirSync(codexHomeDirectory, { recursive: true });
+  const command = createFakeCodexProviderCommand(temporaryDirectory);
+  const provider = await createCodexHostModelProvider(undefined, {
+    codexHomeDirectory,
+    command,
+    environment: { TIDU_CODEX_PROVIDER_TEST_LOG: processLog },
+  });
+  try {
+    assert.notEqual(provider, undefined);
+    if (provider === undefined) throw new Error("Expected a Codex host provider.");
+    await assert.rejects(
+      () =>
+        provider.execute({
+          protocol: "responses",
+          body: { model: "ai-tidu9-config", input: "test" },
+          virtualModelId: "ai-tidu9-config",
+          routing: { targetModel: "configured-model" },
+        }),
+      /confirmed model gpt-test instead of configured model configured-model/iu,
+    );
   } finally {
     await provider?.close?.();
     rmSync(temporaryDirectory, { recursive: true, force: true });
@@ -886,7 +1022,11 @@ test("publishes only Ollama capabilities that the adapter forwards", async () =>
   const server = await startTestServer((request, response) => {
     if (request.url === "/api/tags") {
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ models: [{ model: "qwen-vision" }, { model: "qwen-tools" }] }));
+      response.end(
+        JSON.stringify({
+          models: [{ model: "qwen-vision" }, { model: "qwen-tools" }],
+        }),
+      );
       return;
     }
     assert.equal(request.url, "/api/show");

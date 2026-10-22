@@ -68,6 +68,23 @@ test("reuses a Codex-owned login without reading credential contents", () => {
     assert.deepEqual(launch.arguments, ["app-server", "--listen", "stdio://"]);
     assert.equal(launch.environment.CODEX_HOME, codexHomeDirectory);
     assert.equal("CODEX_ACCESS_TOKEN" in launch.environment, false);
+
+    writeFileSync(join(codexHomeDirectory, "models_cache.json"), '{"models":[]}\n');
+    const officialLaunch = createCodexAppServerLaunch({
+      codexHomeDirectory,
+      command: join(temporaryDirectory, "codex"),
+      environment: { CODEX_TEST_LOG: join(temporaryDirectory, "commands.log") },
+      modelProvider: "openai",
+    });
+    assert.deepEqual(officialLaunch.arguments, [
+      "-c",
+      'model_provider="openai"',
+      "-c",
+      `model_catalog_json=${JSON.stringify(join(codexHomeDirectory, "models_cache.json"))}`,
+      "app-server",
+      "--listen",
+      "stdio://",
+    ]);
   } finally {
     rmSync(temporaryDirectory, { force: true, recursive: true });
   }

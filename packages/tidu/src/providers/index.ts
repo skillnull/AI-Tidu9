@@ -23,6 +23,10 @@ export interface ProviderRoutingContext {
   host?: AgentHostId;
   /** Capabilities required by the caller in addition to those inferred from the request. */
   requiredCapabilities?: readonly string[];
+  /** Capabilities available on the concrete model selected for this execution. */
+  availableCapabilities?: readonly string[];
+  /** Required capabilities already fulfilled by bounded secondary-model evidence. */
+  completedCapabilities?: readonly string[];
   /** Diagnostic-only request that forces one configured secondary route without validating its semantic capability. */
   requireSpecialist?: boolean;
   /** Most permissive data boundary allowed for this request. */
@@ -53,8 +57,34 @@ export interface ProviderExecutionRequest {
   virtualModelId: string;
   /** Optional cancellation signal propagated from the client connection. */
   signal?: AbortSignal;
+  /** Live, truthful execution progress forwarded through the caller's native reasoning stream. */
+  onProcessDelta?: (delta: string) => void;
+  /** Reports the exact upstream model after the provider or host confirms selection. */
+  onModelConfirmed?: (model: string) => void;
+  /** Reports one actual model execution for the user-visible terminal summary. */
+  onExecutionReceipt?: (receipt: ProviderExecutionReceipt) => void;
   /** Optional routing and security constraints that never leave the local runtime. */
   routing?: ProviderRoutingContext;
+}
+
+export interface ProviderExecutionReceipt {
+  /** Host that executed this model call. */
+  host: AgentHostId;
+  /** Exact upstream model confirmed for this call. */
+  model: string;
+  /** Semantic role performed by this model call. */
+  role: NonNullable<ProviderRoutingContext["role"]>;
+  /** Configured capabilities assigned to this model call. */
+  capabilities: readonly string[];
+  /** Provider-authoritative token usage, or null when the provider did not report it. */
+  usage: {
+    /** Input tokens consumed by this call. */
+    inputTokens: number;
+    /** Output tokens consumed by this call. */
+    outputTokens: number;
+    /** Total tokens consumed by this call. */
+    totalTokens: number;
+  } | null;
 }
 
 export interface ProviderJsonExecutionResult {
@@ -64,6 +94,8 @@ export interface ProviderJsonExecutionResult {
   statusCode: number;
   /** OpenAI-compatible response body. */
   body: unknown;
+  /** Upstream model explicitly confirmed by the provider or host for this execution. */
+  upstreamModel?: string;
 }
 
 export interface ProviderStreamExecutionResult {
@@ -73,6 +105,8 @@ export interface ProviderStreamExecutionResult {
   statusCode: number;
   /** OpenAI-compatible Server-Sent Events byte stream. */
   stream: ReadableStream<Uint8Array>;
+  /** Upstream model explicitly confirmed by the provider or host for this execution. */
+  upstreamModel?: string;
 }
 
 export type ProviderExecutionResult = ProviderJsonExecutionResult | ProviderStreamExecutionResult;

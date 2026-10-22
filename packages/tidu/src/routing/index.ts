@@ -28,6 +28,8 @@ export interface RoutingMetricWeights {
 export interface ModelRouteProfile {
   /** Stable model identifier used by routing policies. */
   id: string;
+  /** Host that owns and executes this model when routing is host-backed. */
+  host?: AgentHostId;
   /** Capabilities the model is configured and verified to provide. */
   capabilities: readonly string[];
   /** Configured input price per million tokens; zero is free and null is unknown. */
@@ -131,6 +133,8 @@ export interface RoutingModelAttempt {
   role: "main" | "secondary";
   /** Result of this individual model call. */
   outcome: "failed" | "succeeded";
+  /** Upstream model explicitly confirmed by the provider or host, or null without a receipt. */
+  executedModel: string | null;
   /** Upstream HTTP status, or null when the provider threw before returning one. */
   statusCode: number | null;
   /** Wall-clock duration for this individual model call. */
@@ -146,6 +150,8 @@ export interface CapabilityCompletionModelResult {
   host: AgentHostId;
   /** Configured upstream model identifier. */
   model: string;
+  /** Upstream model explicitly confirmed for this call, or null when no receipt was obtained. */
+  executedModel: string | null;
   /** Whether this entry is the primary or a secondary model. */
   role: "main" | "secondary";
   /** Required capabilities assigned to this model for the request. */
@@ -217,6 +223,14 @@ const CODE_EXECUTION_TOOL_NAMES = new Set([
   "shell_command",
   "terminal",
 ]);
+const WORKSPACE_REFERENCE_PATTERN =
+  /(?:\/(?:Users|home|workspace|tmp|var)\/[^\s"'`]+|[A-Za-z]:\\[^\s"'`]+|\b(?:local|workspace|repository|repo|file|directory|codebase)\b|(?:本地|仓库|文件|目录|代码|SKILL))/iu;
+const WORKSPACE_ACTION_PATTERN =
+  /(?:\b(?:read|inspect|open|edit|modify|update|fix|implement|review|check)\b|(?:查看|读取|打开|编辑|修改|更新|修复|实现|审查|检查))/iu;
+const WEB_RESEARCH_REFERENCE_PATTERN =
+  /(?:\b(?:web|internet|online|website)\b|(?:联网|网上|网页|网站))/iu;
+const WEB_RESEARCH_ACTION_PATTERN =
+  /(?:\b(?:search|research|browse|look\s+up)\b|(?:搜索|检索|查找|查询|调研))/iu;
 const HOST_BRIDGE_CAPABILITY_UNSUPPORTED_CODES = new Set([
   "host_bridge_image_unsupported",
   "host_bridge_vision_unsupported",
@@ -261,12 +275,44 @@ const inputTextCharacterCount = (value: unknown): number => {
   );
 };
 
+const collectUserRequestText = (value: unknown, output: string[]): void => {
+  if (typeof value === "string") {
+    if (value.trim() !== "") output.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectUserRequestText(item, output);
+    return;
+  }
+  if (!isRecord(value)) return;
+  if (typeof value.role === "string" && value.role !== "user") return;
+  for (const key of ["content", "text", "input_text"]) {
+    if (key in value) collectUserRequestText(value[key], output);
+  }
+};
+
+const inferCapabilitiesFromUserRequest = (request: ProviderExecutionRequest): readonly string[] => {
+  const parts: string[] = [];
+  const input = request.protocol === "responses" ? request.body.input : request.body.messages;
+  collectUserRequestText(input, parts);
+  const text = parts.join("\n");
+  const capabilities: string[] = [];
+  if (WORKSPACE_REFERENCE_PATTERN.test(text) && WORKSPACE_ACTION_PATTERN.test(text)) {
+    capabilities.push("code");
+  }
+  if (WEB_RESEARCH_REFERENCE_PATTERN.test(text) && WEB_RESEARCH_ACTION_PATTERN.test(text)) {
+    capabilities.push("web-research");
+  }
+  return capabilities;
+};
+
 export const inferModelRequestCapabilities = (
   request: ProviderExecutionRequest,
 ): readonly string[] => {
   const inferred = new Set<string>([
     DEFAULT_REQUIRED_CAPABILITY,
     ...(request.routing?.requiredCapabilities ?? []),
+    ...inferCapabilitiesFromUserRequest(request),
   ]);
   const tools = Array.isArray(request.body.tools) ? request.body.tools : [];
   const toolExecutionRequired = requestRequiresToolExecution(request.body);
@@ -317,9 +363,6 @@ const validateProfile = (profile: ModelRouteProfile): ModelRouteProfile => {
     throw new Error("Routable models require a safe stable identifier.");
   }
   const capabilities = normalizeCapabilities(profile.capabilities);
-  if (capabilities.length === 0) {
-    throw new Error(`Routable model ${profile.id} must declare at least one capability.`);
-  }
   const costs = [profile.inputCostPerMillionTokens, profile.outputCostPerMillionTokens];
   if (costs.some((cost) => cost !== null && (!Number.isFinite(cost) || cost < 0))) {
     throw new Error(`Routable model ${profile.id} has an invalid configured cost.`);
@@ -886,10 +929,14 @@ const injectSpecialistContext = (
       "Use these bounded specialist results as evidence. Validate them and do not claim capabilities beyond the supplied results.",
     contributions,
   };
+  const completedCapabilities = [
+    ...new Set(contributions.flatMap((contribution) => contribution.capabilities)),
+  ];
   if (request.protocol === "chat-completions") {
     const messages = Array.isArray(request.body.messages) ? request.body.messages : [];
     return {
       ...request,
+      routing: { ...request.routing, completedCapabilities },
       body: {
         ...request.body,
         messages: [{ role: "system", content: JSON.stringify(context) }, ...messages],
@@ -907,9 +954,48 @@ const injectSpecialistContext = (
       ];
   return {
     ...request,
+    routing: { ...request.routing, completedCapabilities },
     body: {
       ...request.body,
       input: [{ role: "system", content: JSON.stringify(context) }, ...normalizedInput],
+    },
+  };
+};
+
+const injectMissingCapabilityContext = (
+  request: ProviderExecutionRequest,
+  missingCapabilities: readonly string[],
+): ProviderExecutionRequest => {
+  if (missingCapabilities.length === 0) return request;
+  const content = JSON.stringify({
+    instruction:
+      "The current configured model route does not provide the required capabilities listed below. Explain this limitation briefly and helpfully in the user's language, recommend enabling a capable primary or secondary model, and do not attribute the limitation to the user unless their request explicitly contains it. Do not claim the requested action was completed.",
+    missingCapabilities,
+  });
+  if (request.protocol === "chat-completions") {
+    const messages = Array.isArray(request.body.messages) ? request.body.messages : [];
+    return {
+      ...request,
+      body: {
+        ...request.body,
+        messages: [{ role: "system", content }, ...messages],
+      },
+    };
+  }
+  const input = request.body.input;
+  const normalizedInput = Array.isArray(input)
+    ? input
+    : [
+        {
+          role: "user",
+          content: typeof input === "string" ? input : JSON.stringify(input ?? ""),
+        },
+      ];
+  return {
+    ...request,
+    body: {
+      ...request.body,
+      input: [{ role: "system", content }, ...normalizedInput],
     },
   };
 };
@@ -1060,7 +1146,20 @@ export const createDynamicModelRouter = (
         }
       }
       if (missing.size === 0) {
-        main = preferredMain;
+        const preferredMainCapabilities = requiredCapabilities.filter((capability) =>
+          preferredMain.profile.capabilities.includes(capability),
+        );
+        if (preferredMainCapabilities.length === 0) {
+          const finalSpecialist = rankModels(
+            specialists.filter((specialist) => specialist.profile.capabilities.includes("text")),
+            requiredCapabilities,
+          )[0];
+          if (finalSpecialist !== undefined) {
+            main = finalSpecialist;
+            specialists.splice(specialists.indexOf(finalSpecialist), 1);
+          }
+        }
+        main ??= preferredMain;
         reason = "capability-gap";
       } else {
         specialists.length = 0;
@@ -1132,6 +1231,11 @@ export const createDynamicModelRouter = (
         throw lastFailure ?? error;
       }
       latestDecision = route.decision;
+      if (route.decision.missingCapabilities.length > 0) {
+        throw new Error(
+          `No configured model combination covers required capabilities: ${route.decision.missingCapabilities.join(", ")}.`,
+        );
+      }
       const cancellationBeforeRoute = requestCancellationError(request);
       if (cancellationBeforeRoute !== undefined) throw cancellationBeforeRoute;
       let contributions: Array<{
@@ -1149,15 +1253,28 @@ export const createDynamicModelRouter = (
           route.specialists.map(async (specialist) => {
             const startedAt = performance.now();
             let statusCode: number | null = null;
+            let executedModel: string | null = null;
             try {
+              const assignedCapabilities = route.decision.requiredCapabilities.filter(
+                (capability) => specialist.profile.capabilities.includes(capability),
+              );
               const cancellationBeforeSpecialist = requestCancellationError(request);
               if (cancellationBeforeSpecialist !== undefined) {
                 throw cancellationBeforeSpecialist;
               }
               const specialistResult = await specialist.provider.execute({
                 ...request,
+                onModelConfirmed: (model) => {
+                  executedModel = model;
+                },
                 body: { ...request.body, stream: false },
-                routing: { ...request.routing, role: "specialist" },
+                routing: {
+                  ...request.routing,
+                  host: specialist.profile.host ?? request.routing?.host,
+                  role: "specialist",
+                  requiredCapabilities: assignedCapabilities,
+                  availableCapabilities: assignedCapabilities,
+                },
               });
               statusCode = specialistResult.statusCode;
               if (specialistResult.statusCode === 429) {
@@ -1172,21 +1289,33 @@ export const createDynamicModelRouter = (
                 );
               }
               const result = extractModelText(specialistResult);
+              const tokenUsage = extractTokenUsage(specialistResult);
               requestAttempts.push({
                 modelId: specialist.profile.id,
                 role: "secondary",
                 outcome: "succeeded",
+                executedModel: specialistResult.upstreamModel ?? executedModel,
                 statusCode,
                 durationMilliseconds: Math.round(performance.now() - startedAt),
                 message: "",
               });
+              const confirmedSpecialistModel = specialistResult.upstreamModel ?? executedModel;
+              if (confirmedSpecialistModel !== null) {
+                request.onExecutionReceipt?.({
+                  host: specialist.profile.host ?? request.routing?.host ?? "openai-compatible",
+                  model: confirmedSpecialistModel,
+                  role: "specialist",
+                  capabilities: assignedCapabilities,
+                  usage: tokenUsage,
+                });
+              }
               return {
                 modelId: specialist.profile.id,
                 capabilities: specialist.profile.capabilities.filter((capability) =>
                   route.decision.requiredCapabilities.includes(capability),
                 ),
                 result,
-                tokenUsage: extractTokenUsage(specialistResult),
+                tokenUsage,
               };
             } catch (error) {
               const message = error instanceof Error ? error.message : "Secondary model failed.";
@@ -1194,6 +1323,7 @@ export const createDynamicModelRouter = (
                 modelId: specialist.profile.id,
                 role: "secondary",
                 outcome: "failed",
+                executedModel,
                 statusCode,
                 durationMilliseconds: Math.round(performance.now() - startedAt),
                 message: message.slice(0, 500),
@@ -1205,20 +1335,34 @@ export const createDynamicModelRouter = (
       } catch (error) {
         const cancellation = requestCancellationError(request, error);
         if (cancellation !== undefined) throw cancellation;
-        for (const specialist of route.specialists) exhaustedModels.add(specialist.profile.id);
         lastFailure =
           error instanceof Error ? error : new Error("Capability secondary model failed.");
-        continue;
+        throw lastFailure;
       }
       const cancellationAfterSpecialists = requestCancellationError(request);
       if (cancellationAfterSpecialists !== undefined) throw cancellationAfterSpecialists;
       let result: ProviderExecutionResult;
       const mainStartedAt = performance.now();
+      let mainExecutedModel: string | null = null;
       try {
+        const mainCapabilities = route.decision.requiredCapabilities.filter((capability) =>
+          route.main.profile.capabilities.includes(capability),
+        );
+        const complementedRequest = injectSpecialistContext(request, contributions);
+        const routedRequest = injectMissingCapabilityContext(
+          complementedRequest,
+          route.decision.missingCapabilities,
+        );
         result = await route.main.provider.execute({
-          ...injectSpecialistContext(request, contributions),
+          ...routedRequest,
+          onModelConfirmed: (model) => {
+            mainExecutedModel = model;
+          },
           routing: {
-            ...request.routing,
+            ...routedRequest.routing,
+            host: route.main.profile.host ?? routedRequest.routing?.host,
+            requiredCapabilities: route.decision.requiredCapabilities,
+            availableCapabilities: mainCapabilities,
             role: request.routing?.role ?? "main",
           },
         });
@@ -1230,6 +1374,7 @@ export const createDynamicModelRouter = (
           modelId: route.main.profile.id,
           role: "main",
           outcome: "failed",
+          executedModel: mainExecutedModel,
           statusCode: null,
           durationMilliseconds: Math.round(performance.now() - mainStartedAt),
           message: lastFailure.message.slice(0, 500),
@@ -1250,6 +1395,7 @@ export const createDynamicModelRouter = (
           modelId: route.main.profile.id,
           role: "main",
           outcome: "failed",
+          executedModel: result.upstreamModel ?? mainExecutedModel,
           statusCode: result.statusCode,
           durationMilliseconds: Math.round(performance.now() - mainStartedAt),
           message: cancellationAfterMain.message.slice(0, 500),
@@ -1268,6 +1414,7 @@ export const createDynamicModelRouter = (
           modelId: route.main.profile.id,
           role: "main",
           outcome: "failed",
+          executedModel: result.upstreamModel ?? mainExecutedModel,
           statusCode: result.statusCode,
           durationMilliseconds: Math.round(performance.now() - mainStartedAt),
           message: lastFailure.message.slice(0, 500),
@@ -1306,6 +1453,18 @@ export const createDynamicModelRouter = (
           ],
         };
         if (result.kind === "stream") {
+          const confirmedMainModel = result.upstreamModel ?? mainExecutedModel;
+          if (confirmedMainModel !== null) {
+            request.onExecutionReceipt?.({
+              host: route.main.profile.host ?? request.routing?.host ?? "openai-compatible",
+              model: confirmedMainModel,
+              role: request.routing?.role ?? "main",
+              capabilities: route.main.profile.capabilities.filter((capability) =>
+                route.decision.requiredCapabilities.includes(capability),
+              ),
+              usage: null,
+            });
+          }
           return observeProviderStream(
             result,
             (observation) => {
@@ -1313,6 +1472,7 @@ export const createDynamicModelRouter = (
                 modelId: route.main.profile.id,
                 role: "main",
                 outcome: observation.succeeded ? "succeeded" : "failed",
+                executedModel: result.upstreamModel ?? mainExecutedModel,
                 statusCode: result.statusCode,
                 durationMilliseconds: Math.round(performance.now() - mainStartedAt),
                 message: observation.message,
@@ -1326,6 +1486,7 @@ export const createDynamicModelRouter = (
           modelId: route.main.profile.id,
           role: "main",
           outcome: result.statusCode >= 200 && result.statusCode < 300 ? "succeeded" : "failed",
+          executedModel: result.upstreamModel ?? null,
           statusCode: result.statusCode,
           durationMilliseconds: Math.round(performance.now() - mainStartedAt),
           message:
@@ -1333,6 +1494,18 @@ export const createDynamicModelRouter = (
               ? ""
               : `Primary model returned HTTP ${result.statusCode}.`,
         });
+        const confirmedMainModel = result.upstreamModel ?? mainExecutedModel;
+        if (confirmedMainModel !== null) {
+          request.onExecutionReceipt?.({
+            host: route.main.profile.host ?? request.routing?.host ?? "openai-compatible",
+            model: confirmedMainModel,
+            role: request.routing?.role ?? "main",
+            capabilities: route.main.profile.capabilities.filter((capability) =>
+              route.decision.requiredCapabilities.includes(capability),
+            ),
+            usage: resultTokenUsage,
+          });
+        }
         return result;
       }
       lastFailure = new Error(
@@ -1342,6 +1515,7 @@ export const createDynamicModelRouter = (
         modelId: route.main.profile.id,
         role: "main",
         outcome: "failed",
+        executedModel: result.upstreamModel ?? mainExecutedModel,
         statusCode: result.statusCode,
         durationMilliseconds: Math.round(performance.now() - mainStartedAt),
         message: lastFailure.message.slice(0, 500),
@@ -1416,6 +1590,7 @@ export const createCapabilityCompletionProvider = (
     return {
       profile: {
         id,
+        host,
         capabilities,
         inputCostPerMillionTokens: costs?.inputCostPerMillionTokens ?? null,
         outputCostPerMillionTokens: costs?.outputCostPerMillionTokens ?? null,
@@ -1478,6 +1653,7 @@ export const createCapabilityCompletionProvider = (
                 ...request.routing,
                 host,
                 modelSource: selection.source,
+                availableCapabilities: capabilities,
                 ...(selection.model === "current" ? {} : { targetModel: selection.model }),
               },
             });
@@ -1541,6 +1717,7 @@ export const createCapabilityCompletionProvider = (
           role,
           capabilities: [],
           outcome: "not-run",
+          executedModel: null,
           skipReason,
           statusCode: null,
           durationMilliseconds: null,
@@ -1556,6 +1733,7 @@ export const createCapabilityCompletionProvider = (
           role,
           capabilities,
           outcome: attempt.outcome,
+          executedModel: attempt.executedModel,
           statusCode: attempt.statusCode,
           durationMilliseconds: attempt.durationMilliseconds,
           message: attempt.message,
@@ -1602,6 +1780,63 @@ export const createCapabilityCompletionProvider = (
       );
       if (!active.capabilityCompletion.enabled || specialists.length === 0) {
         const requiredCapabilities = inferCapabilities(request);
+        const missingCapabilities = requiredCapabilities.filter(
+          (capability) => !hostPolicy.mainCapabilities.includes(capability),
+        );
+        if (missingCapabilities.length > 0) {
+          records.unshift({
+            host: requestHost,
+            mainModelId: mainId,
+            specialistModelIds: [],
+            requiredCapabilities,
+            missingCapabilities,
+            score: 0,
+            estimatedCostPerMillionTokens: null,
+            reason: "capability-gap",
+            tokenUsage: null,
+            modelTokenUsage: [],
+            occurredAt: new Date().toISOString(),
+            role: request.routing?.role ?? "main",
+            complemented: false,
+            outcome: "failed",
+            mainResult: {
+              modelId: mainId,
+              host: requestHost,
+              model: hostPolicy.modelSelection.model,
+              executedModel: null,
+              role: "main",
+              capabilities: assignedCapabilities(
+                requiredCapabilities,
+                hostPolicy.mainCapabilities,
+                true,
+              ),
+              outcome: "not-run",
+              skipReason: "not-selected",
+              statusCode: null,
+              durationMilliseconds: null,
+              message: "Not called because the configured capabilities do not cover the request.",
+            },
+            secondaryResults: hostPolicy.specialists.map((specialist, index) => ({
+              modelId: `specialist-${index}:${specialist.host}:${specialist.source}`,
+              host: specialist.host,
+              model: specialist.model,
+              executedModel: null,
+              role: "secondary",
+              capabilities: [],
+              outcome: "not-run",
+              skipReason: "not-selected",
+              statusCode: null,
+              durationMilliseconds: null,
+              message: active.capabilityCompletion.enabled
+                ? "Not selected because the configured capability union does not cover the request."
+                : "Not selected because capability completion is disabled.",
+            })),
+          });
+          pruneRecords();
+          throw new Error(
+            `No configured model combination covers required capabilities: ${missingCapabilities.join(", ")}.`,
+          );
+        }
         const startedAt = performance.now();
         const recordMainResult = (
           mainAttempt: RoutingModelAttempt,
@@ -1612,9 +1847,7 @@ export const createCapabilityCompletionProvider = (
             mainModelId: mainId,
             specialistModelIds: [],
             requiredCapabilities,
-            missingCapabilities: requiredCapabilities.filter(
-              (capability) => !hostPolicy.mainCapabilities.includes(capability),
-            ),
+            missingCapabilities,
             score: 0,
             estimatedCostPerMillionTokens: null,
             reason: "main-capability-match",
@@ -1638,18 +1871,33 @@ export const createCapabilityCompletionProvider = (
           pruneRecords();
         };
         let result: ProviderExecutionResult;
+        const mainCapabilities = assignedCapabilities(
+          requiredCapabilities,
+          hostPolicy.mainCapabilities,
+          true,
+        );
         try {
+          const routedRequest = injectMissingCapabilityContext(request, missingCapabilities);
           result = await bindModel(
             requestHost,
             hostPolicy.modelSelection,
             hostPolicy.mainCapabilities,
             mainId,
-          ).provider.execute(request);
+          ).provider.execute({
+            ...routedRequest,
+            routing: {
+              ...routedRequest.routing,
+              host: requestHost,
+              requiredCapabilities,
+              availableCapabilities: mainCapabilities,
+            },
+          });
         } catch (error) {
           const mainAttempt: RoutingModelAttempt = {
             modelId: mainId,
             role: "main",
             outcome: "failed",
+            executedModel: null,
             statusCode: null,
             durationMilliseconds: Math.round(performance.now() - startedAt),
             message: (error instanceof Error ? error.message : "Primary model failed.").slice(
@@ -1661,6 +1909,15 @@ export const createCapabilityCompletionProvider = (
           throw error;
         }
         if (result.kind === "stream") {
+          if (result.upstreamModel !== undefined) {
+            request.onExecutionReceipt?.({
+              host: requestHost,
+              model: result.upstreamModel,
+              role: request.routing?.role ?? "main",
+              capabilities: mainCapabilities,
+              usage: null,
+            });
+          }
           return observeProviderStream(
             result,
             (observation) => {
@@ -1669,6 +1926,7 @@ export const createCapabilityCompletionProvider = (
                   modelId: mainId,
                   role: "main",
                   outcome: observation.succeeded ? "succeeded" : "failed",
+                  executedModel: result.upstreamModel ?? null,
                   statusCode: result.statusCode,
                   durationMilliseconds: Math.round(performance.now() - startedAt),
                   message: observation.message,
@@ -1681,17 +1939,28 @@ export const createCapabilityCompletionProvider = (
           );
         }
         const mainSucceeded = result.statusCode >= 200 && result.statusCode < 300;
+        const mainTokenUsage = extractTokenUsage(result);
         recordMainResult(
           {
             modelId: mainId,
             role: "main",
             outcome: mainSucceeded ? "succeeded" : "failed",
+            executedModel: result.upstreamModel ?? null,
             statusCode: result.statusCode,
             durationMilliseconds: Math.round(performance.now() - startedAt),
             message: mainSucceeded ? "" : `Primary model returned HTTP ${result.statusCode}.`,
           },
-          extractTokenUsage(result),
+          mainTokenUsage,
         );
+        if (result.upstreamModel !== undefined) {
+          request.onExecutionReceipt?.({
+            host: requestHost,
+            model: result.upstreamModel,
+            role: request.routing?.role ?? "main",
+            capabilities: mainCapabilities,
+            usage: mainTokenUsage,
+          });
+        }
         return result;
       }
       const router = createDynamicModelRouter(
@@ -1758,7 +2027,7 @@ export const createCapabilityCompletionProvider = (
           ...decision,
           occurredAt: new Date().toISOString(),
           role: request.routing?.role ?? "main",
-          complemented: decision.specialistModelIds.length > 0,
+          complemented: decision.mainModelId !== mainId || decision.specialistModelIds.length > 0,
           outcome,
           mainResult: modelResult(
             mainId,

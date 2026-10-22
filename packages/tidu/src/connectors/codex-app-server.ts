@@ -97,8 +97,37 @@ export interface CodexTurnResult {
   /** Concatenated assistant message deltas. */
   text: string;
   /** Per-turn token usage reported by the official app-server. */
-  usage: { inputTokens: number; outputTokens: number; totalTokens: number } | null;
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  } | null;
 }
+
+export type CodexTurnInput =
+  | {
+      /** Text input forwarded to the Codex turn. */
+      type: "text";
+      /** User-visible text supplied to the model. */
+      text: string;
+      /** Optional rich-text metadata supported by app-server. */
+      text_elements?: readonly unknown[];
+    }
+  | {
+      /** Remote or data-URL image input. */
+      type: "image";
+      /** Fully qualified URL or base64 data URL. */
+      url: string;
+    }
+  | {
+      /** Local image input available to the Codex host. */
+      type: "localImage";
+      /** Absolute local filesystem path. */
+      path: string;
+    };
+
+/** Host-defined message phase; known values are hints, not a closed compatibility gate. */
+export type CodexMessagePhase = "commentary" | "final_answer" | (string & {});
 
 export interface CodexAgentClient {
   /** Negotiates protocol capabilities and sends the initialized notification. */
@@ -112,10 +141,13 @@ export interface CodexAgentClient {
   /** Sends one user turn, streams text deltas, and resolves after a terminal notification. */
   prompt: (
     threadId: string,
-    text: string,
+    input: readonly CodexTurnInput[],
     signal?: AbortSignal,
     onTextDelta?: (delta: string) => void,
     reasoningEffort?: CodexReasoningEffort,
+    onProcessDelta?: (delta: string) => void,
+    historyItems?: readonly Record<string, unknown>[],
+    outputSchema?: Record<string, unknown>,
   ) => Promise<CodexTurnResult>;
   /** Interrupts one active turn. */
   cancel: (threadId: string, turnId: string) => Promise<void>;
@@ -134,6 +166,10 @@ interface TurnState {
   cleanup: () => void;
   /** Receives text as soon as the official app-server emits it. */
   onTextDelta?: (delta: string) => void;
+  /** Receives public reasoning summaries and commentary as soon as they are emitted. */
+  onProcessDelta?: (delta: string) => void;
+  /** Process item whose deltas were most recently forwarded. */
+  processItemKey?: string;
   /** Latest per-turn token usage reported by the official app-server. */
   usage: CodexTurnResult["usage"];
 }
@@ -141,6 +177,8 @@ interface TurnState {
 interface BufferedTurnNotifications {
   /** Text deltas received before the turn was registered locally. */
   deltas: string[];
+  /** Public process deltas received before the turn was registered locally. */
+  processDeltas: Array<{ itemKey: string; delta: string }>;
   /** Terminal result received before the turn was registered locally. */
   completion?: Omit<CodexTurnResult, "text" | "usage">;
   /** Token usage received before the turn was registered locally. */
@@ -162,6 +200,97 @@ const readNumber = (value: unknown, key: string): number | null => {
     return Number.isSafeInteger(numeric) ? numeric : null;
   }
   return null;
+};
+
+const markdownCode = (value: string): string => `\`${value.replaceAll("`", "\\`")}\``;
+
+const describeCommandAction = (value: unknown): string | undefined => {
+  if (!isRecord(value)) return undefined;
+  const type = readString(value, "type");
+  if (type === "read") {
+    const path = readString(value, "path") ?? readString(value, "name");
+    return path === undefined ? undefined : `读取 ${markdownCode(path)}`;
+  }
+  if (type === "listFiles") {
+    const path = readString(value, "path");
+    if (path !== undefined) return `列出 ${markdownCode(path)} 中的文件`;
+    const command = readString(value, "command");
+    return command === undefined ? "列出文件" : `运行命令 ${markdownCode(command)}`;
+  }
+  if (type === "search") {
+    const query = readString(value, "query");
+    const path = readString(value, "path");
+    if (query !== undefined && path !== undefined) {
+      return `在 ${markdownCode(path)} 中搜索 ${markdownCode(query)}`;
+    }
+    if (query !== undefined) return `搜索 ${markdownCode(query)}`;
+  }
+  return undefined;
+};
+
+const describeProcessItem = (value: unknown): readonly string[] => {
+  if (!isRecord(value)) return [];
+  const type = readString(value, "type");
+  if (type === "commandExecution") {
+    const actions = Array.isArray(value.commandActions)
+      ? value.commandActions.flatMap((action) => {
+          const description = describeCommandAction(action);
+          return description === undefined ? [] : [description];
+        })
+      : [];
+    if (actions.length > 0) return actions;
+    const command = readString(value, "command");
+    return command === undefined ? [] : [`运行命令 ${markdownCode(command)}`];
+  }
+  if (type === "fileChange") {
+    const paths = Array.isArray(value.changes)
+      ? value.changes.flatMap((change) => {
+          const path = readString(change, "path");
+          return path === undefined ? [] : [markdownCode(path)];
+        })
+      : [];
+    if (paths.length === 0) return ["编辑文件"];
+    return [`编辑文件 ${paths.join("、")}`];
+  }
+  if (type === "webSearch") {
+    const action = isRecord(value.action) ? value.action : undefined;
+    const actionType = readString(action, "type");
+    if (actionType === "openPage") {
+      const url = readString(action, "url");
+      return [url === undefined ? "打开网页" : `打开网页 ${markdownCode(url)}`];
+    }
+    if (actionType === "findInPage") {
+      const pattern = readString(action, "pattern");
+      return [pattern === undefined ? "在网页中查找" : `在网页中查找 ${markdownCode(pattern)}`];
+    }
+    const query = readString(value, "query") ?? readString(action, "query");
+    return [query === undefined ? "搜索网页" : `搜索网页 ${markdownCode(query)}`];
+  }
+  if (type === "mcpToolCall") {
+    const server = readString(value, "server");
+    const tool = readString(value, "tool");
+    const name = [server, tool].filter((part): part is string => part !== undefined).join("/");
+    return [name === "" ? "调用 MCP 工具" : `调用 MCP 工具 ${markdownCode(name)}`];
+  }
+  if (type === "dynamicToolCall") {
+    const namespace = readString(value, "namespace");
+    const tool = readString(value, "tool");
+    const name = [namespace, tool].filter((part): part is string => part !== undefined).join("/");
+    return [name === "" ? "调用工具" : `调用工具 ${markdownCode(name)}`];
+  }
+  if (type === "imageView") {
+    const path = readString(value, "path");
+    return [path === undefined ? "查看图片" : `查看图片 ${markdownCode(path)}`];
+  }
+  if (type === "imageGeneration") return ["生成图片"];
+  if (type === "contextCompaction") return ["上下文已自动压缩"];
+  if (type === "sleep") {
+    const durationMilliseconds = readNumber(value, "durationMs");
+    return [
+      durationMilliseconds === null ? "等待" : `等待 ${String(durationMilliseconds / 1_000)} 秒`,
+    ];
+  }
+  return [];
 };
 
 const readWindow = (value: unknown): CodexRateLimitWindow | null => {
@@ -194,13 +323,18 @@ const defaultServerRequest = async (
 export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentClient => {
   const activeTurns = new Map<string, TurnState>();
   const bufferedTurnNotifications = new Map<string, BufferedTurnNotifications>();
+  const messagePhases = new Map<string, CodexMessagePhase>();
+  const forwardedProcessItems = new Set<string>();
   let initialized = false;
 
   const bufferTurnNotification = (
     turnId: string,
     update: (buffer: BufferedTurnNotifications) => void,
   ): void => {
-    const buffer = bufferedTurnNotifications.get(turnId) ?? { deltas: [] };
+    const buffer = bufferedTurnNotifications.get(turnId) ?? {
+      deltas: [],
+      processDeltas: [],
+    };
     update(buffer);
     bufferedTurnNotifications.set(turnId, buffer);
     if (bufferedTurnNotifications.size > 32) {
@@ -209,11 +343,45 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     }
   };
 
+  const forwardProcessDelta = (turnId: string, itemKey: string, delta: string): void => {
+    const state = activeTurns.get(turnId);
+    if (state === undefined) {
+      bufferTurnNotification(turnId, (buffer) => buffer.processDeltas.push({ itemKey, delta }));
+      return;
+    }
+    if (state.processItemKey !== undefined && state.processItemKey !== itemKey) {
+      state.onProcessDelta?.("\n\n");
+    }
+    state.processItemKey = itemKey;
+    state.onProcessDelta?.(delta);
+  };
+
+  const forwardProcessItem = (turnId: string, item: Record<string, unknown>): void => {
+    const itemId = readString(item, "id");
+    if (itemId === undefined) return;
+    const processItemKey = `${turnId}\u0000${itemId}`;
+    if (forwardedProcessItems.has(processItemKey)) return;
+    const descriptions = describeProcessItem(item);
+    if (descriptions.length === 0) return;
+    forwardedProcessItems.add(processItemKey);
+    descriptions.forEach((description, index) => {
+      forwardProcessDelta(turnId, `activity:${itemId}:${String(index)}`, description);
+    });
+  };
+
+  const clearTurnProcessItems = (turnId: string): void => {
+    const prefix = `${turnId}\u0000`;
+    for (const processItemKey of forwardedProcessItems) {
+      if (processItemKey.startsWith(prefix)) forwardedProcessItems.delete(processItemKey);
+    }
+  };
+
   const completeTurn = (
     completion: Omit<CodexTurnResult, "text" | "usage">,
     state: TurnState,
   ): void => {
     activeTurns.delete(completion.turnId);
+    clearTurnProcessItems(completion.turnId);
     state.cleanup();
     state.resolve({ ...completion, text: state.text, usage: state.usage });
   };
@@ -221,6 +389,24 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
   const onNotification = (notification: JsonRpcNotification): void => {
     options.onEvent?.(notification);
     const turnId = readString(notification.params, "turnId");
+    if (
+      notification.method === "item/started" &&
+      turnId !== undefined &&
+      isRecord(notification.params) &&
+      isRecord(notification.params.item)
+    ) {
+      const item = notification.params.item;
+      if (item.type === "agentMessage") {
+        const itemId = readString(item, "id");
+        const phase = readString(item, "phase");
+        if (itemId !== undefined && phase !== undefined && phase !== "") {
+          messagePhases.set(itemId, phase);
+        }
+      } else {
+        forwardProcessItem(turnId, item);
+      }
+      return;
+    }
     if (
       notification.method === "thread/tokenUsage/updated" &&
       turnId !== undefined &&
@@ -248,12 +434,37 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     if (notification.method === "item/agentMessage/delta" && turnId !== undefined) {
       const state = activeTurns.get(turnId);
       const delta = readString(notification.params, "delta");
-      if (state !== undefined && delta !== undefined) {
+      const itemId = readString(notification.params, "itemId");
+      const phase = itemId === undefined ? undefined : messagePhases.get(itemId);
+      if (delta !== undefined && phase === "commentary") {
+        forwardProcessDelta(turnId, `commentary:${itemId ?? "unknown"}`, delta);
+      } else if (state !== undefined && delta !== undefined) {
         state.text += delta;
         state.onTextDelta?.(delta);
       } else if (delta !== undefined) {
         bufferTurnNotification(turnId, (buffer) => buffer.deltas.push(delta));
       }
+      return;
+    }
+    if (notification.method === "item/reasoning/summaryTextDelta" && turnId !== undefined) {
+      const delta = readString(notification.params, "delta");
+      if (delta !== undefined) {
+        const itemId = readString(notification.params, "itemId") ?? "unknown";
+        const summaryIndex = readNumber(notification.params, "summaryIndex") ?? 0;
+        forwardProcessDelta(turnId, `reasoning:${itemId}:${summaryIndex}`, delta);
+      }
+      return;
+    }
+    if (
+      notification.method === "item/completed" &&
+      turnId !== undefined &&
+      isRecord(notification.params) &&
+      isRecord(notification.params.item)
+    ) {
+      const item = notification.params.item;
+      const itemId = readString(item, "id");
+      if (itemId !== undefined) messagePhases.delete(itemId);
+      forwardProcessItem(turnId, item);
       return;
     }
     if (notification.method !== "turn/completed" || !isRecord(notification.params)) {
@@ -303,7 +514,11 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
         return;
       }
       await client.request("initialize", {
-        clientInfo: { name: "ai_tidu9", title: "九门赛博提督", version: "0.2.0-alpha.1" },
+        clientInfo: {
+          name: "ai_tidu9",
+          title: "九门赛博提督",
+          version: "0.2.0-alpha.1",
+        },
         capabilities: {
           experimentalApi: false,
           requestAttestation: false,
@@ -390,22 +605,32 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     },
     prompt: async (
       threadId: string,
-      text: string,
+      input: readonly CodexTurnInput[],
       signal?: AbortSignal,
       onTextDelta?: (delta: string) => void,
       reasoningEffort?: CodexReasoningEffort,
+      onProcessDelta?: (delta: string) => void,
+      historyItems: readonly Record<string, unknown>[] = [],
+      outputSchema?: Record<string, unknown>,
     ): Promise<CodexTurnResult> => {
       requireInitialized();
-      if (text.trim() === "") {
-        throw new TiduError("CONFIGURATION_INVALID", "Codex prompt cannot be empty.");
+      if (
+        input.length === 0 ||
+        input.every((item) => item.type === "text" && item.text.trim() === "")
+      ) {
+        throw new TiduError("CONFIGURATION_INVALID", "Codex turn input cannot be empty.");
+      }
+      if (historyItems.length > 0) {
+        await client.request("thread/inject_items", { threadId, items: historyItems }, signal);
       }
       const response = await client.request<Record<string, unknown>>(
         "turn/start",
         {
           threadId,
-          input: [{ type: "text", text, text_elements: [] }],
+          input,
           approvalPolicy: "on-request",
           effort: reasoningEffort ?? options.reasoningEffort ?? null,
+          outputSchema: outputSchema ?? null,
         },
         signal,
       );
@@ -427,6 +652,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           reject,
           cleanup: () => signal?.removeEventListener("abort", abort),
           onTextDelta,
+          onProcessDelta,
           usage: null,
         };
         activeTurns.set(turnId, state);
@@ -436,6 +662,13 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
         for (const delta of buffered.deltas) {
           state.text += delta;
           state.onTextDelta?.(delta);
+        }
+        for (const processDelta of buffered.processDeltas) {
+          if (state.processItemKey !== undefined && state.processItemKey !== processDelta.itemKey) {
+            state.onProcessDelta?.("\n\n");
+          }
+          state.processItemKey = processDelta.itemKey;
+          state.onProcessDelta?.(processDelta.delta);
         }
         if (buffered.usage !== undefined) state.usage = buffered.usage;
         if (buffered.completion !== undefined) completeTurn(buffered.completion, state);
@@ -452,6 +685,8 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       }
       activeTurns.clear();
       bufferedTurnNotifications.clear();
+      messagePhases.clear();
+      forwardedProcessItems.clear();
       await client.close();
     },
   };

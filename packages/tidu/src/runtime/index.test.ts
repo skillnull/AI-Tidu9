@@ -53,7 +53,7 @@ test("exposes bounded Agent task creation and control through the local API", as
     });
     assert.equal(createResponse.status, 201);
     const created = (await createResponse.json()) as {
-      task: { taskId: string; status: string };
+      task: { taskId: string; status: string; createdAt: string };
     };
     assert.equal(created.task.status, "created");
 
@@ -61,13 +61,14 @@ test("exposes bounded Agent task creation and control through the local API", as
     assert.equal(listResponse.status, 200);
     const list = (await listResponse.json()) as {
       available: boolean;
-      tasks: Array<{ taskId: string }>;
+      tasks: Array<{ taskId: string; createdAt: string }>;
     };
     assert.equal(list.available, true);
     assert.deepEqual(
       list.tasks.map((task) => task.taskId),
       [created.task.taskId],
     );
+    assert.equal(list.tasks[0]?.createdAt, created.task.createdAt);
 
     const resumeResponse = await fetch(
       `${runtime.origin}/api/tasks/${created.task.taskId}/control`,
@@ -82,6 +83,34 @@ test("exposes bounded Agent task creation and control through the local API", as
       ((await resumeResponse.json()) as { task: { status: string } }).task.status,
       "completed",
     );
+    const completedTaskResponse = await fetch(`${runtime.origin}/api/tasks/${created.task.taskId}`);
+    assert.equal(completedTaskResponse.status, 404);
+
+    const cancellableResponse = await fetch(`${runtime.origin}/api/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ goal: "Cancel a controlled task" }),
+    });
+    const cancellable = (await cancellableResponse.json()) as {
+      task: { taskId: string };
+    };
+    const cancelResponse = await fetch(
+      `${runtime.origin}/api/tasks/${cancellable.task.taskId}/control`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "cancel" }),
+      },
+    );
+    assert.equal(cancelResponse.status, 200);
+    assert.equal(
+      ((await cancelResponse.json()) as { task: { status: string } }).task.status,
+      "cancelled",
+    );
+    const cancelledTaskResponse = await fetch(
+      `${runtime.origin}/api/tasks/${cancellable.task.taskId}`,
+    );
+    assert.equal(cancelledTaskResponse.status, 404);
   } finally {
     await runtime.close();
   }
@@ -179,15 +208,7 @@ test("routes Responses and Chat Completions hosts through the same Agent kernel"
     const taskList = (await (await fetch(`${runtime.origin}/api/tasks`)).json()) as {
       tasks: Array<{ objective: string; originHost?: string }>;
     };
-    assert.deepEqual(taskList.tasks.map((task) => task.objective).sort(), [
-      "Chat host goal",
-      "Cursor host goal",
-      "Responses host goal",
-    ]);
-    assert.equal(
-      taskList.tasks.find((task) => task.objective === "Cursor host goal")?.originHost,
-      "cursor",
-    );
+    assert.deepEqual(taskList.tasks, []);
   } finally {
     await runtime.close();
   }
@@ -241,6 +262,7 @@ const createCapabilityDiagnosticRecord = (secondaryOutcome: "failed" | "succeede
     role: "main" as const,
     capabilities: ["text"],
     outcome: "succeeded" as const,
+    executedModel: "primary-model",
     statusCode: 200,
     durationMilliseconds: 12,
     message: "",
@@ -253,6 +275,7 @@ const createCapabilityDiagnosticRecord = (secondaryOutcome: "failed" | "succeede
       role: "secondary" as const,
       capabilities: ["code"],
       outcome: secondaryOutcome,
+      executedModel: "secondary-model",
       statusCode: secondaryOutcome === "succeeded" ? 200 : 503,
       durationMilliseconds: 18,
       message: secondaryOutcome === "succeeded" ? "" : "Secondary model unavailable.",
@@ -287,6 +310,48 @@ test("passes the capability-completion diagnostic only after primary and seconda
   assert.equal(result.secondaryInvoked, true);
   assert.equal(result.allSelectedInvocationsSucceeded, true);
   assert.match(result.message, /completed successfully/iu);
+});
+
+test("passes the capability-completion diagnostic when a zero-capability primary is correctly skipped", () => {
+  const record = createCapabilityDiagnosticRecord("succeeded");
+  const result = evaluateCapabilityCompletionDiagnostic(
+    {
+      ...record,
+      mainResult: {
+        ...record.mainResult,
+        outcome: "not-run",
+        executedModel: null,
+        skipReason: "not-selected",
+        statusCode: null,
+        durationMilliseconds: null,
+      },
+    },
+    200,
+  );
+
+  assert.equal(result.httpStatus, 200);
+  assert.equal(result.passed, true);
+  assert.equal(result.mainInvoked, false);
+  assert.equal(result.secondaryInvoked, true);
+  assert.equal(result.allSelectedInvocationsSucceeded, true);
+});
+
+test("fails the capability-completion diagnostic without model execution receipts", () => {
+  const record = createCapabilityDiagnosticRecord("succeeded");
+  const result = evaluateCapabilityCompletionDiagnostic(
+    {
+      ...record,
+      secondaryResults: record.secondaryResults.map((secondary) => ({
+        ...secondary,
+        executedModel: null,
+      })),
+    },
+    200,
+  );
+
+  assert.equal(result.passed, false);
+  assert.equal(result.httpStatus, 502);
+  assert.match(result.message, /no execution receipt/iu);
 });
 
 test("starts a loopback runtime with a verifiable health endpoint", async () => {
@@ -682,6 +747,7 @@ test("routes ordinary inference through one Agent model call and preserves reaso
       return {
         kind: "json",
         statusCode: 200,
+        upstreamModel: "upstream-test-model",
         body:
           request.protocol === "chat-completions"
             ? {
@@ -689,6 +755,11 @@ test("routes ordinary inference through one Agent model call and preserves reaso
                 object: "chat.completion",
                 model: request.virtualModelId,
                 choices: [{ message: { content: "hello from chat" } }],
+                usage: {
+                  prompt_tokens: 12,
+                  completion_tokens: 5,
+                  total_tokens: 17,
+                },
               }
             : {
                 id: "resp-test",
@@ -702,6 +773,7 @@ test("routes ordinary inference through one Agent model call and preserves reaso
                     content: [{ type: "output_text", text: "hello from responses" }],
                   },
                 ],
+                usage: { input_tokens: 20, output_tokens: 8, total_tokens: 28 },
               },
       };
     },
@@ -726,12 +798,18 @@ test("routes ordinary inference through one Agent model call and preserves reaso
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         model: "ai-tidu9-config",
-        messages: [{ role: "user", content: "hello" }],
+        messages: [{ role: "user", content: "你好" }],
       }),
     });
     assert.equal(chatResponse.status, 200);
     assert.equal(chatResponse.headers.get("x-ai-tidu9"), "true");
-    assert.equal(((await chatResponse.json()) as { model: string }).model, "ai-tidu9-config");
+    const chatBody = (await chatResponse.json()) as {
+      model: string;
+      choices: Array<{ message: { content: string } }>;
+    };
+    assert.equal(chatBody.model, "ai-tidu9-config");
+    const chatText = chatBody.choices[0]?.message.content ?? "";
+    assert.equal(chatText, "hello from chat");
 
     const responsesResponse = await fetch(`${runtime.origin}/v1/responses`, {
       method: "POST",
@@ -751,7 +829,16 @@ test("routes ordinary inference through one Agent model call and preserves reaso
       }),
     });
     assert.equal(responsesResponse.status, 200);
-    assert.equal(((await responsesResponse.json()) as { model: string }).model, "ai-tidu9-config");
+    const responsesBody = (await responsesResponse.json()) as {
+      model: string;
+      output: Array<{ content?: Array<{ text?: string }> }>;
+    };
+    assert.equal(responsesBody.model, "ai-tidu9-config");
+    const responsesText = responsesBody.output
+      .flatMap((item) => item.content ?? [])
+      .map((content) => content.text ?? "")
+      .join("");
+    assert.equal(responsesText, "hello from responses");
     assert.deepEqual(requests, [
       {
         protocol: "chat-completions",
@@ -801,6 +888,16 @@ test("streams real upstream output deltas through the Agent Responses lifecycle"
             upstreamController = controller;
             controller.enqueue(
               encoder.encode(
+                'event: response.reasoning_summary_text.delta\ndata: {"type":"response.reasoning_summary_text.delta","delta":"checking source"}\n\n',
+              ),
+            );
+            controller.enqueue(
+              encoder.encode(
+                'event: response.reasoning_brief.delta\ndata: {"type":"response.reasoning_brief.delta","delta":"; future summary"}\n\n',
+              ),
+            );
+            controller.enqueue(
+              encoder.encode(
                 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello "}\n\n',
               ),
             );
@@ -837,8 +934,12 @@ test("streams real upstream output deltas through the Agent Responses lifecycle"
       events += decoder.decode(chunk?.value, { stream: true });
     }
     assert.doesNotMatch(events, /event: response\.completed/u);
-    assert.match(events, /正在接收任务并选择执行路径/u);
-    assert.match(events, /执行路径已确认，正在接收模型输出/u);
+    assert.match(events, /response\.reasoning_summary_text\.delta/u);
+    assert.match(events, /checking source/u);
+    assert.match(events, /future summary/u);
+    assert.doesNotMatch(events, /"phase":"final_answer"/u);
+    assert.doesNotMatch(events, /执行路径已确认/u);
+    assert.doesNotMatch(events, /Request: Codex|Execution task:|Codex · .* · text/u);
     upstreamController?.enqueue(
       encoder.encode(
         'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"world"}\n\n',
@@ -860,7 +961,68 @@ test("streams real upstream output deltas through the Agent Responses lifecycle"
     assert.equal(events.match(/event: response\.output_text\.delta/gu)?.length, 2);
     assert.match(events, /"delta":"hello "/u);
     assert.match(events, /"delta":"world"/u);
-    assert.match(events, /"text":"hello world"/u);
+    assert.match(events, /"text":"hello world/u);
+    assert.match(events, /event: response\.completed/u);
+    assert.match(events, /data: \[DONE\]/u);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("preserves the Codex process lifecycle when the host turn only emits a final answer", async () => {
+  const encoder = new TextEncoder();
+  const provider: ModelProvider = {
+    descriptor: { type: "codex-host", model: "gpt-test" },
+    execute: async () => ({
+      kind: "stream",
+      statusCode: 200,
+      upstreamModel: "gpt-test",
+      stream: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n',
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]}}\n\n',
+            ),
+          );
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        },
+      }),
+    }),
+  };
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    port: 0,
+    provider,
+  });
+
+  try {
+    const response = await fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "ai-tidu9-config", input: "hello", stream: true }),
+    });
+    assert.equal(response.status, 200);
+    const events = await response.text();
+    const reasoningStartedAt = events.indexOf(
+      '"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"',
+    );
+    const messageStartedAt = events.indexOf('"type":"message","status":"in_progress"');
+    assert.notEqual(reasoningStartedAt, -1);
+    assert.ok(reasoningStartedAt < messageStartedAt);
+    assert.match(
+      events,
+      /"type":"reasoning","status":"completed","summary":\[\{"type":"summary_text","text":"Working on the request…"\}\]/u,
+    );
+    assert.match(events, /response\.reasoning_summary_text\.delta/u);
+    assert.match(events, /response\.reasoning_summary_part\.added/u);
+    assert.match(events, /response\.reasoning_summary_part\.done/u);
+    assert.match(events, /"output_index":1/u);
     assert.match(events, /event: response\.completed/u);
     assert.match(events, /data: \[DONE\]/u);
   } finally {
@@ -939,9 +1101,9 @@ test("fails the public stream when Agent execution fails without hiding it behin
     assert.equal(providerCalls, 0);
     assert.doesNotMatch(events, /fallback OK/u);
     assert.doesNotMatch(events, /event: response\.completed/u);
-    assert.match(events, /event: response\.reasoning_summary_text\.done/u);
-    assert.match(events, /event: response\.reasoning_summary_part\.done/u);
-    assert.match(events, /event: response\.output_item\.done/u);
+    assert.doesNotMatch(events, /reasoning_summary/u);
+    assert.match(events, /event: response\.output_text\.delta/u);
+    assert.match(events, /Request failed: Agent orchestration failed before delivery\./u);
     assert.match(events, /event: response\.failed/u);
     assert.match(events, /Agent orchestration failed before delivery/u);
     assert.match(events, /data: \[DONE\]/u);
@@ -1072,12 +1234,103 @@ test("completes the Agent Responses stream with explicit lifecycle events", asyn
 
     assert.equal(response.status, 200);
     assert.match(events, /event: response\.created/u);
-    assert.match(events, /event: response\.reasoning_summary_text\.delta/u);
-    assert.match(events, /正在接收任务并选择执行路径/u);
+    assert.match(events, /event: response\.output_item\.added/u);
+    assert.match(events, /event: response\.content_part\.added/u);
+    assert.match(events, /event: response\.reasoning_summary_part\.added/u);
+    assert.match(events, /event: response\.reasoning_summary_text\.done/u);
+    assert.match(events, /event: response\.reasoning_summary_part\.done/u);
+    assert.doesNotMatch(events, /Request: Codex|Execution task:/u);
+    assert.doesNotMatch(events, /configured model route/u);
+    assert.doesNotMatch(events, /执行路径已确认/u);
     assert.match(events, /event: response\.output_text\.delta/u);
+    assert.match(events, /event: response\.output_text\.done/u);
+    assert.match(events, /event: response\.content_part\.done/u);
+    assert.match(events, /event: response\.output_item\.done/u);
     assert.match(events, /event: response\.completed/u);
+    assert.match(events, /"created_at":\d+/u);
+    assert.match(events, /"completed_at":\d+/u);
+    assert.ok(
+      events.indexOf("event: response.output_text.done") <
+        events.indexOf("event: response.completed"),
+    );
+    assert.equal(events.match(/event: response\.in_progress/gu)?.length, 1);
     assert.match(events, /data: \[DONE\]/u);
   } finally {
+    await runtime.close();
+  }
+});
+
+test("waits for host events before opening the assistant message", async () => {
+  let releaseWorker: (() => void) | undefined;
+  const workerGate = new Promise<void>((resolveWorker) => {
+    releaseWorker = resolveWorker;
+  });
+  const agentKernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    planner: {
+      understand: async (task) => ({
+        objective: task.goal.objective,
+        acceptanceCriteria: [...task.goal.acceptanceCriteria],
+        constraints: [],
+        assumptions: [],
+        requiredCapabilities: [],
+      }),
+      plan: async () => ({
+        revision: 1,
+        steps: [{ id: "deliver", title: "Deliver", kind: "reason" }],
+      }),
+    },
+    worker: {
+      execute: async () => {
+        await workerGate;
+        return { summary: "OK" };
+      },
+    },
+  });
+  const runtime = await startLocalRuntime({
+    agentKernel,
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
+    port: 0,
+  });
+
+  try {
+    const response = await fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        input: "Reply with OK",
+        stream: true,
+      }),
+    });
+    const reader = response.body?.getReader();
+    assert.notEqual(reader, undefined);
+    const decoder = new TextDecoder();
+    let initialEvents = "";
+    while (!initialEvents.includes("response.reasoning_summary_part.added")) {
+      const chunk = await reader?.read();
+      assert.equal(chunk?.done, false);
+      initialEvents += decoder.decode(chunk?.value, { stream: true });
+    }
+    assert.doesNotMatch(initialEvents, /response\.output_text\.delta/u);
+    assert.match(initialEvents, /"type":"reasoning","status":"in_progress"/u);
+    assert.match(initialEvents, /response\.reasoning_summary_part\.added/u);
+    assert.doesNotMatch(initialEvents, /Request: Codex|Execution task:/u);
+
+    releaseWorker?.();
+    let completedEvents = initialEvents;
+    while (true) {
+      const chunk = await reader?.read();
+      if (chunk?.done !== false) break;
+      completedEvents += decoder.decode(chunk.value, { stream: true });
+    }
+    completedEvents += decoder.decode();
+    assert.match(completedEvents, /event: response\.content_part\.added/u);
+    assert.match(completedEvents, /event: response\.output_text\.delta/u);
+    assert.match(completedEvents, /event: response\.completed/u);
+  } finally {
+    releaseWorker?.();
     await runtime.close();
   }
 });
@@ -1477,6 +1730,57 @@ test("keeps mode drafts isolated until a valid draft is explicitly activated", a
     assert.deepEqual(
       activated.configuration.workspace.active.configuration.capabilityCompletion,
       selectedCapabilityCompletion,
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("saves a managed draft with zero capability assignments", async () => {
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
+    port: 0,
+  });
+
+  try {
+    const initial = (await (
+      await fetch(`${runtime.origin}/api/config-center`)
+    ).json()) as ConfigCenterBootstrap;
+    const managedDraft = initial.configuration.workspace.drafts.managed;
+    const capabilityCompletion = {
+      ...managedDraft.configuration.capabilityCompletion,
+      enabled: true,
+      mainCapabilities: [],
+      specialists: [
+        {
+          host: "cursor" as const,
+          source: "official" as const,
+          model: "secondary-model",
+          capabilities: [],
+          inputCostPerMillionTokens: null,
+          outputCostPerMillionTokens: null,
+        },
+      ],
+      maximumSpecialists: 1,
+    };
+    const saveResponse = await fetch(`${runtime.origin}/api/configuration/drafts/managed`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedRevision: managedDraft.revision,
+        configuration: {
+          ...managedDraft.configuration,
+          capabilityCompletion,
+        },
+      }),
+    });
+
+    assert.equal(saveResponse.status, 200);
+    const saved = (await saveResponse.json()) as ConfigCenterBootstrap;
+    assert.deepEqual(
+      saved.configuration.workspace.drafts.managed.configuration.capabilityCompletion,
+      capabilityCompletion,
     );
   } finally {
     await runtime.close();

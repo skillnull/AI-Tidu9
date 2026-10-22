@@ -605,11 +605,16 @@ const createAgentResponsesBody = (
   model: string,
   text: string,
   responseId = `resp_${randomUUID()}`,
-  reasoningSummary?: string,
+  reasoningSummary?: readonly string[],
+  createdAt = Math.floor(Date.now() / 1_000),
 ): Record<string, unknown> => ({
   id: responseId,
   object: "response",
+  created_at: createdAt,
   status: "completed",
+  completed_at: Math.floor(Date.now() / 1_000),
+  error: null,
+  incomplete_details: null,
   model,
   output: [
     ...(reasoningSummary === undefined
@@ -619,7 +624,10 @@ const createAgentResponsesBody = (
             id: `${responseId}_reasoning`,
             type: "reasoning",
             status: "completed",
-            summary: [{ type: "summary_text", text: reasoningSummary }],
+            summary: reasoningSummary.map((summary) => ({
+              type: "summary_text",
+              text: summary,
+            })),
           },
         ]),
     {
@@ -659,13 +667,16 @@ const createAgentResponsesStream = (
   model: string,
   run: (
     signal: AbortSignal,
-    reportProgress: (message: string) => void,
+    onProcessDelta: (delta: string) => void,
     onOutputDelta: (delta: string) => void,
   ) => Promise<string>,
+  chineseRequest: boolean,
+  preserveProcessLifecycle: boolean,
 ): ReadableStream<Uint8Array> => {
   const responseId = `resp_${randomUUID()}`;
   const reasoningId = `${responseId}_reasoning`;
   const messageId = `${responseId}_message`;
+  const createdAt = Math.floor(Date.now() / 1_000);
   const encoder = new TextEncoder();
   let closed = false;
   let keepAlive: NodeJS.Timeout | undefined;
@@ -673,10 +684,6 @@ const createAgentResponsesStream = (
   return new ReadableStream<Uint8Array>({
     start(controller) {
       let sequenceNumber = 0;
-      keepAlive = setInterval(() => {
-        if (!closed) controller.enqueue(encoder.encode(": ai-tidu9 keep-alive\n\n"));
-      }, 10_000);
-      keepAlive.unref();
       const close = (): void => {
         if (closed) return;
         closed = true;
@@ -696,7 +703,11 @@ const createAgentResponsesStream = (
         response: {
           id: responseId,
           object: "response",
+          created_at: createdAt,
           status: "in_progress",
+          completed_at: null,
+          error: null,
+          incomplete_details: null,
           model,
           output: [],
         },
@@ -705,53 +716,85 @@ const createAgentResponsesStream = (
         response: {
           id: responseId,
           object: "response",
+          created_at: createdAt,
           status: "in_progress",
+          completed_at: null,
+          error: null,
+          incomplete_details: null,
           model,
           output: [],
         },
       });
-      write("response.output_item.added", {
-        output_index: 0,
-        item: {
-          id: reasoningId,
-          type: "reasoning",
-          status: "in_progress",
-          summary: [],
-        },
-      });
-      write("response.reasoning_summary_part.added", {
-        item_id: reasoningId,
-        output_index: 0,
-        summary_index: 0,
-        part: { type: "summary_text", text: "" },
-      });
-      const progressMessages: string[] = [];
+      keepAlive = setInterval(() => {
+        if (!closed) controller.enqueue(encoder.encode(": ai-tidu9 keep-alive\n\n"));
+      }, 10_000);
+      keepAlive.unref();
+      const processParts: string[] = [];
+      let processPartText = "";
+      let processPartStarted = false;
+      let reasoningStarted = false;
       let reasoningFinished = false;
       let messageStarted = false;
+      let messageOutputIndex = 0;
       let outputText = "";
-      const finishReasoning = (): void => {
-        if (reasoningFinished) return;
-        reasoningFinished = true;
-        const reasoningSummary = progressMessages.join("\n");
+      const startReasoning = (): void => {
+        if (reasoningStarted || reasoningFinished) return;
+        reasoningStarted = true;
+        write("response.output_item.added", {
+          output_index: 0,
+          item: {
+            id: reasoningId,
+            type: "reasoning",
+            status: "in_progress",
+            summary: [],
+          },
+        });
+      };
+      const startReasoningPart = (): void => {
+        if (processPartStarted || reasoningFinished) return;
+        startReasoning();
+        processPartStarted = true;
+        write("response.reasoning_summary_part.added", {
+          item_id: reasoningId,
+          output_index: 0,
+          summary_index: processParts.length,
+          part: { type: "summary_text", text: "" },
+        });
+      };
+      const finishReasoningPart = (): void => {
+        if (!processPartStarted) return;
+        const summaryIndex = processParts.length;
         write("response.reasoning_summary_text.done", {
           item_id: reasoningId,
           output_index: 0,
-          summary_index: 0,
-          text: reasoningSummary,
+          summary_index: summaryIndex,
+          text: processPartText,
         });
         write("response.reasoning_summary_part.done", {
           item_id: reasoningId,
           output_index: 0,
-          summary_index: 0,
-          part: { type: "summary_text", text: reasoningSummary },
+          summary_index: summaryIndex,
+          part: { type: "summary_text", text: processPartText },
         });
+        processParts.push(processPartText);
+        processPartText = "";
+        processPartStarted = false;
+      };
+      const finishReasoning = (): void => {
+        if (reasoningFinished) return;
+        reasoningFinished = true;
+        if (!reasoningStarted) return;
+        finishReasoningPart();
         write("response.output_item.done", {
           output_index: 0,
           item: {
             id: reasoningId,
             type: "reasoning",
             status: "completed",
-            summary: [{ type: "summary_text", text: reasoningSummary }],
+            summary: processParts.map((summary) => ({
+              type: "summary_text",
+              text: summary,
+            })),
           },
         });
       };
@@ -759,8 +802,9 @@ const createAgentResponsesStream = (
         if (messageStarted) return;
         finishReasoning();
         messageStarted = true;
+        messageOutputIndex = reasoningStarted ? 1 : 0;
         write("response.output_item.added", {
-          output_index: 1,
+          output_index: messageOutputIndex,
           item: {
             id: messageId,
             type: "message",
@@ -771,27 +815,23 @@ const createAgentResponsesStream = (
         });
         write("response.content_part.added", {
           item_id: messageId,
-          output_index: 1,
+          output_index: messageOutputIndex,
           content_index: 0,
           part: { type: "output_text", text: "", annotations: [] },
         });
       };
-      const reportProgress = (message: string): void => {
-        const normalized = message.trim();
-        if (
-          closed ||
-          reasoningFinished ||
-          normalized === "" ||
-          progressMessages.at(-1) === normalized
-        ) {
+      const emitProcessDelta = (delta: string): void => {
+        if (closed || reasoningFinished || delta === "") return;
+        if (delta === "\n\n") {
+          finishReasoningPart();
           return;
         }
-        const delta = `${progressMessages.length === 0 ? "" : "\n"}${normalized}`;
-        progressMessages.push(normalized);
+        startReasoningPart();
+        processPartText += delta;
         write("response.reasoning_summary_text.delta", {
           item_id: reasoningId,
           output_index: 0,
-          summary_index: 0,
+          summary_index: processParts.length,
           delta,
         });
       };
@@ -801,13 +841,15 @@ const createAgentResponsesStream = (
         outputText += delta;
         write("response.output_text.delta", {
           item_id: messageId,
-          output_index: 1,
+          output_index: messageOutputIndex,
           content_index: 0,
           delta,
         });
       };
-      reportProgress("正在接收任务并选择执行路径…");
-      void run(abortController.signal, reportProgress, emitOutputDelta)
+      if (preserveProcessLifecycle) {
+        emitProcessDelta(chineseRequest ? "正在处理请求…" : "Working on the request…");
+      }
+      void run(abortController.signal, emitProcessDelta, emitOutputDelta)
         .then((text) => {
           if (outputText === "") {
             emitOutputDelta(text);
@@ -815,21 +857,20 @@ const createAgentResponsesStream = (
             emitOutputDelta(text.slice(outputText.length));
           }
           startMessage();
-          const reasoningSummary = progressMessages.join("\n");
           write("response.output_text.done", {
             item_id: messageId,
-            output_index: 1,
+            output_index: messageOutputIndex,
             content_index: 0,
             text: outputText,
           });
           write("response.content_part.done", {
             item_id: messageId,
-            output_index: 1,
+            output_index: messageOutputIndex,
             content_index: 0,
             part: { type: "output_text", text: outputText, annotations: [] },
           });
           write("response.output_item.done", {
-            output_index: 1,
+            output_index: messageOutputIndex,
             item: {
               id: messageId,
               type: "message",
@@ -839,7 +880,13 @@ const createAgentResponsesStream = (
             },
           });
           write("response.completed", {
-            response: createAgentResponsesBody(model, outputText, responseId, reasoningSummary),
+            response: createAgentResponsesBody(
+              model,
+              outputText,
+              responseId,
+              reasoningStarted ? processParts : undefined,
+              createdAt,
+            ),
           });
           if (!closed) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
           close();
@@ -847,61 +894,60 @@ const createAgentResponsesStream = (
         .catch((error: unknown) => {
           const failure = resolveAgentFailure(error);
           finishReasoning();
-          if (messageStarted) {
-            write("response.output_text.done", {
-              item_id: messageId,
-              output_index: 1,
-              content_index: 0,
-              text: outputText,
-            });
-            write("response.content_part.done", {
-              item_id: messageId,
-              output_index: 1,
-              content_index: 0,
-              part: { type: "output_text", text: outputText, annotations: [] },
-            });
-            write("response.output_item.done", {
-              output_index: 1,
-              item: {
-                id: messageId,
-                type: "message",
-                status: "incomplete",
-                role: "assistant",
-                content: [{ type: "output_text", text: outputText, annotations: [] }],
-              },
-            });
-          }
-          const reasoningSummary = progressMessages.join("\n");
+          const failureText = `${chineseRequest ? "请求失败" : "Request failed"}: ${failure.message}`;
+          emitOutputDelta(`${outputText === "" ? "" : "\n\n"}${failureText}`);
+          write("response.output_text.done", {
+            item_id: messageId,
+            output_index: messageOutputIndex,
+            content_index: 0,
+            text: outputText,
+          });
+          write("response.content_part.done", {
+            item_id: messageId,
+            output_index: messageOutputIndex,
+            content_index: 0,
+            part: { type: "output_text", text: outputText, annotations: [] },
+          });
+          write("response.output_item.done", {
+            output_index: messageOutputIndex,
+            item: {
+              id: messageId,
+              type: "message",
+              status: "incomplete",
+              role: "assistant",
+              content: [{ type: "output_text", text: outputText, annotations: [] }],
+            },
+          });
           write("response.failed", {
             response: {
               id: responseId,
               object: "response",
+              created_at: createdAt,
               status: "failed",
+              completed_at: null,
+              incomplete_details: null,
               model,
               output: [
-                {
-                  id: reasoningId,
-                  type: "reasoning",
-                  status: "completed",
-                  summary: [{ type: "summary_text", text: reasoningSummary }],
-                },
-                ...(messageStarted
+                ...(reasoningStarted
                   ? [
                       {
-                        id: messageId,
-                        type: "message",
-                        status: "incomplete",
-                        role: "assistant",
-                        content: [
-                          {
-                            type: "output_text",
-                            text: outputText,
-                            annotations: [],
-                          },
-                        ],
+                        id: reasoningId,
+                        type: "reasoning",
+                        status: "completed",
+                        summary: processParts.map((summary) => ({
+                          type: "summary_text",
+                          text: summary,
+                        })),
                       },
                     ]
                   : []),
+                {
+                  id: messageId,
+                  type: "message",
+                  status: "incomplete",
+                  role: "assistant",
+                  content: [{ type: "output_text", text: outputText, annotations: [] }],
+                },
               ],
               error: failure,
             },
@@ -922,7 +968,7 @@ const createAgentChatStream = (
   model: string,
   run: (
     signal?: AbortSignal,
-    reportProgress?: (message: string) => void,
+    onProcessDelta?: (delta: string) => void,
     onOutputDelta?: (delta: string) => void,
   ) => Promise<string>,
 ): ReadableStream<Uint8Array> => {
@@ -990,7 +1036,7 @@ const runAgentResponsesTask = async (
   protocol: "chat-completions" | "responses",
   originHost: AgentHostId,
   signal?: AbortSignal,
-  reportProgress?: (message: string) => void,
+  onProcessDelta?: (delta: string) => void,
   onOutputDelta?: (delta: string) => void,
 ): Promise<string> => {
   const objective = createAgentObjective(body);
@@ -1019,7 +1065,6 @@ const runAgentResponsesTask = async (
     virtualModelId: model,
     routing: { host: originHost },
   });
-  reportProgress?.("正在解析请求并确认所需能力…");
   const created = await agentKernel.createTask({
     goal: {
       objective,
@@ -1035,14 +1080,9 @@ const runAgentResponsesTask = async (
       body,
       virtualModelId: model,
       ...(onOutputDelta === undefined ? {} : { onOutputDelta }),
-      ...(reportProgress === undefined ? {} : { onProgress: reportProgress }),
+      ...(onProcessDelta === undefined ? {} : { onProcessDelta }),
     },
   });
-  reportProgress?.(
-    reasoningEffort === undefined
-      ? "执行任务已创建，正在按动态路由调用模型…"
-      : `执行任务已创建，正在按 ${reasoningEffort} 强度调用模型…`,
-  );
   const cancel = (): void => {
     void agentKernel.cancelTask(created.task.taskId).catch(() => undefined);
   };
@@ -1072,7 +1112,6 @@ const runAgentResponsesTask = async (
       ? new Error(message)
       : new AgentExecutionError(failureCode, message);
   }
-  reportProgress?.("模型输出已完成，正在确认响应完整性…");
   return completed.result.summary;
 };
 
@@ -1150,7 +1189,7 @@ const handleOpenAiInference = async (
     const model = typeof requestBody.model === "string" ? requestBody.model : "ai-tidu9-config";
     const run = async (
       signal?: AbortSignal,
-      reportProgress?: (message: string) => void,
+      onProcessDelta?: (delta: string) => void,
       onOutputDelta?: (delta: string) => void,
     ): Promise<string> =>
       runAgentResponsesTask(
@@ -1159,14 +1198,19 @@ const handleOpenAiInference = async (
         protocol,
         originHost,
         signal,
-        reportProgress,
+        onProcessDelta,
         onOutputDelta,
       );
     try {
       if (requestBody.stream === true) {
         const stream =
           protocol === "responses"
-            ? createAgentResponsesStream(model, run)
+            ? createAgentResponsesStream(
+                model,
+                run,
+                /\p{Script=Han}/u.test(createAgentObjective(requestBody)),
+                originHost === "codex",
+              )
             : createAgentChatStream(model, run);
         await sendOpenAiStream(response, 200, stream, requestId);
       } else {
@@ -1638,38 +1682,50 @@ export const evaluateCapabilityCompletionDiagnostic = (
     record?.secondaryResults.filter(
       (result) => result.outcome !== "not-run" || result.skipReason === "blocked-by-failure",
     ) ?? [];
+  const selectedModelResults = [
+    ...(record !== undefined &&
+    (record.mainResult.outcome !== "not-run" ||
+      record.mainResult.skipReason === "blocked-by-failure")
+      ? [record.mainResult]
+      : []),
+    ...selectedSecondaryResults,
+  ];
   const secondaryInvoked = selectedSecondaryResults.some(
     (result) => result.outcome === "succeeded" || result.outcome === "failed",
   );
   const allSelectedInvocationsSucceeded =
-    record?.mainResult.outcome === "succeeded" &&
-    selectedSecondaryResults.length > 0 &&
-    selectedSecondaryResults.every((result) => result.outcome === "succeeded");
+    selectedModelResults.length > 0 &&
+    selectedModelResults.every(
+      (result) => result.outcome === "succeeded" && result.executedModel !== null,
+    );
   const upstreamSucceeded =
     upstreamStatusCode !== null && upstreamStatusCode >= 200 && upstreamStatusCode < 300;
   const passed =
-    upstreamSucceeded &&
-    record?.outcome === "succeeded" &&
-    mainInvoked &&
-    secondaryInvoked &&
-    allSelectedInvocationsSucceeded;
+    upstreamSucceeded && record?.outcome === "succeeded" && allSelectedInvocationsSucceeded;
   let message =
     "The configured primary and secondary routing path completed successfully. This diagnostic does not verify the model's claimed semantic capability.";
   if (!passed) {
     if (record === undefined) {
       message = "The routing-path diagnostic did not produce a fresh execution record.";
-    } else if (!mainInvoked) {
-      message = "The routing-path diagnostic failed because the primary model was not invoked.";
-    } else if (record.mainResult.outcome !== "succeeded") {
+    } else if (record.mainResult.outcome === "failed") {
       message = "The routing-path diagnostic failed because the primary invocation failed.";
-    } else if (!secondaryInvoked) {
-      message = "The routing-path diagnostic failed because no secondary model was invoked.";
+    } else if (
+      record.mainResult.outcome === "succeeded" &&
+      record.mainResult.executedModel === null
+    ) {
+      message =
+        "The routing-path diagnostic failed because the primary model returned no execution receipt.";
     } else if (selectedSecondaryResults.some((result) => result.outcome === "failed")) {
       message =
         "The routing-path diagnostic failed because at least one selected secondary invocation failed.";
     } else if (selectedSecondaryResults.some((result) => result.outcome === "not-run")) {
       message =
         "The routing-path diagnostic failed because at least one selected secondary invocation did not run.";
+    } else if (selectedSecondaryResults.some((result) => result.executedModel === null)) {
+      message =
+        "The routing-path diagnostic failed because at least one selected secondary model returned no execution receipt.";
+    } else if (selectedModelResults.length === 0) {
+      message = "The routing-path diagnostic failed because no configured model was invoked.";
     } else if (!upstreamSucceeded) {
       message = `The routing-path diagnostic returned HTTP ${String(upstreamStatusCode)}.`;
     } else {

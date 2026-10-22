@@ -36,8 +36,10 @@ export interface CursorAcpOptions extends CursorHostInspectionOptions {
   requestedModel?: string;
   /** Optional notification observer for streaming UI integration. */
   onEvent?: (event: CursorAcpEvent) => void;
-  /** Per-request ACP deadline; defaults to the normal interactive watchdog. */
-  requestTimeoutMilliseconds?: number;
+  /** Public model thought summaries forwarded as native reasoning progress. */
+  onProcessDelta?: (delta: string) => void;
+  /** Per-request ACP deadline; null waits for Cursor's official terminal response. */
+  requestTimeoutMilliseconds?: number | null;
   /** Explicit reviewer for Cursor tool permission requests. */
   onPermission?: (request: JsonRpcServerRequest) => Promise<CursorPermissionDecision>;
   /** Explicit handler for Cursor blocking extension methods. */
@@ -61,8 +63,6 @@ export interface CursorAcpPromptResult {
   /** Concatenated Agent message chunks. */
   text: string;
 }
-
-const CURSOR_REQUEST_WATCHDOG_MILLISECONDS = 5 * 60_000;
 
 export interface CursorAcpClient {
   /** Negotiates ACP capabilities and authenticates with Cursor-owned login. */
@@ -197,14 +197,16 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
     if (sessionId === undefined || !isRecord(update)) {
       return;
     }
-    if (update.sessionUpdate !== "agent_message_chunk" || !isRecord(update.content)) {
+    if (!isRecord(update.content)) return;
+    const text = readString(update.content, "text");
+    if (text === undefined) return;
+    const updateType = readString(update, "sessionUpdate")?.toLowerCase() ?? "";
+    if (updateType.includes("thought") || updateType.includes("reasoning")) {
+      options.onProcessDelta?.(text);
       return;
     }
-    const text = readString(update.content, "text");
-    if (text !== undefined) {
-      messageChunks.set(sessionId, `${messageChunks.get(sessionId) ?? ""}${text}`);
-      textDeltaListeners.get(sessionId)?.(text);
-    }
+    messageChunks.set(sessionId, `${messageChunks.get(sessionId) ?? ""}${text}`);
+    textDeltaListeners.get(sessionId)?.(text);
   };
 
   const client: JsonRpcClient = createStdioJsonRpcClient(
@@ -212,8 +214,7 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
     {
       onNotification: handleNotification,
       onRequest: handleRequest,
-      requestTimeoutMilliseconds:
-        options.requestTimeoutMilliseconds ?? CURSOR_REQUEST_WATCHDOG_MILLISECONDS,
+      requestTimeoutMilliseconds: options.requestTimeoutMilliseconds ?? null,
     },
   );
 
@@ -261,9 +262,10 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
       if (options.mode !== undefined && options.mode !== "agent") {
         await client.request("session/set_mode", { sessionId: id, modeId: options.mode }, signal);
       }
-      let selectedModel = readCurrentModel(response) ?? initializedModel ?? null;
+      const sessionModel = readCurrentModel(response);
+      let selectedModel = sessionModel ?? initializedModel ?? null;
       const initialModelOption = readModelConfigOption(response);
-      if (options.requestedModel !== undefined && options.requestedModel !== selectedModel) {
+      if (options.requestedModel !== undefined && options.requestedModel !== sessionModel) {
         const modelOption = initialModelOption;
         if (modelOption === undefined) {
           throw new TiduError(
@@ -294,9 +296,32 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
           },
           signal,
         );
-        selectedModel = readCurrentModel(updateResponse) ?? options.requestedModel;
+        const confirmedModel = readCurrentModel(updateResponse);
+        if (confirmedModel === undefined) {
+          throw new TiduError(
+            "CONFIGURATION_CONFLICT",
+            `Cursor ACP did not confirm that model ${options.requestedModel} was selected.`,
+          );
+        }
+        if (confirmedModel !== options.requestedModel) {
+          throw new TiduError(
+            "CONFIGURATION_CONFLICT",
+            `Cursor ACP confirmed model ${confirmedModel} instead of configured model ${options.requestedModel}.`,
+          );
+        }
+        selectedModel = confirmedModel;
       }
-      return { id, model: selectedModel, availableModels: initialModelOption?.models ?? [] };
+      if (options.requestedModel !== undefined && selectedModel !== options.requestedModel) {
+        throw new TiduError(
+          "CONFIGURATION_CONFLICT",
+          `Cursor ACP did not confirm configured model ${options.requestedModel} for this session.`,
+        );
+      }
+      return {
+        id,
+        model: selectedModel,
+        availableModels: initialModelOption?.models ?? [],
+      };
     },
     prompt: async (
       sessionId: string,

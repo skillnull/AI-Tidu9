@@ -125,7 +125,10 @@ const readSharedConfiguration = (row: ConfigurationRow): TiduConfiguration => {
     activeMode: "managed",
     activeProfileId: storedConfiguration.activeProfileId ?? DEFAULT_VIRTUAL_MODEL_ID,
     virtualModelName: storedConfiguration.virtualModelName ?? "九门赛博提督",
-    modelSelection: storedConfiguration.modelSelection ?? { source: "official", model: "current" },
+    modelSelection: storedConfiguration.modelSelection ?? {
+      source: "official",
+      model: "current",
+    },
     capabilityCompletion:
       storedConfiguration.capabilityCompletion ??
       createDefaultConfiguration("managed").capabilityCompletion,

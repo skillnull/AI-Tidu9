@@ -27,6 +27,15 @@ const packageVersion = (
   }
 ).version;
 
+const cliTestDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-cli-suite-"));
+const originalCodexHome = process.env.CODEX_HOME;
+process.env.CODEX_HOME = join(cliTestDirectory, ".codex");
+test.after(() => {
+  if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+  else process.env.CODEX_HOME = originalCodexHome;
+  rmSync(cliTestDirectory, { force: true, recursive: true });
+});
+
 test("checks the minimum Node.js version before loading the CLI", () => {
   assert.equal(supportsNodeVersion("18.20.8"), false);
   assert.equal(supportsNodeVersion("22.13.1"), false);

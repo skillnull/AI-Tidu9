@@ -222,7 +222,6 @@ export const validateConfiguration = (
         !Number.isInteger(policy.maximumSpecialists) ||
         policy.maximumSpecialists < 1 ||
         policy.maximumSpecialists > 8 ||
-        policy.mainCapabilities.length === 0 ||
         policy.mainCapabilities.some((capability) => !safeCapability.test(capability)) ||
         new Set(
           policy.specialists.map((specialist) => `${specialist.host}\u0000${specialist.model}`),
@@ -238,7 +237,6 @@ export const validateConfiguration = (
               specialist.host !== "openai-compatible") ||
             specialist.host === policy.host ||
             !isValidModelIdentifier(specialist.model) ||
-            specialist.capabilities.length === 0 ||
             specialist.capabilities.some((capability) => !safeCapability.test(capability)) ||
             (specialist.inputCostPerMillionTokens != null &&
               (!Number.isFinite(specialist.inputCostPerMillionTokens) ||
@@ -252,7 +250,7 @@ export const validateConfiguration = (
     issues.push({
       code: "INVALID_MODEL_SELECTION",
       field: "capabilityCompletion",
-      message: "Capability completion requires valid primary capabilities and specialist models.",
+      message: "Capability completion requires valid model selections and capability identifiers.",
     });
   }
   if (expectedMode === "expert" && configuration.expertServices !== undefined) {

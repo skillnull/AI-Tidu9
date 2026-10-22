@@ -35,8 +35,8 @@ export interface JsonRpcNotification {
 export interface JsonRpcClientOptions {
   /** Maximum accepted UTF-8 bytes for one newline-framed message. */
   maximumMessageBytes?: number;
-  /** Default request timeout before the pending call is rejected. */
-  requestTimeoutMilliseconds?: number;
+  /** Default request timeout before the pending call is rejected; null disables the local timer. */
+  requestTimeoutMilliseconds?: number | null;
   /** Maximum number of concurrent pending client requests. */
   maximumPendingRequests?: number;
   /** Handler for server-initiated permission and interaction requests. */
@@ -64,7 +64,7 @@ interface PendingRequest {
   /** Rejects the original client request. */
   reject: (reason: Error) => void;
   /** Clears the request timeout. */
-  timeout: NodeJS.Timeout;
+  timeout?: NodeJS.Timeout;
   /** Removes the AbortSignal listener when present. */
   removeAbortListener: () => void;
 }
@@ -96,7 +96,9 @@ export const createStdioJsonRpcClient = (
     maximumMessageBytes: options.maximumMessageBytes ?? DEFAULT_LIMITS.maximumMessageBytes,
     maximumPendingRequests: options.maximumPendingRequests ?? DEFAULT_LIMITS.maximumPendingRequests,
     requestTimeoutMilliseconds:
-      options.requestTimeoutMilliseconds ?? DEFAULT_LIMITS.requestTimeoutMilliseconds,
+      options.requestTimeoutMilliseconds === undefined
+        ? DEFAULT_LIMITS.requestTimeoutMilliseconds
+        : options.requestTimeoutMilliseconds,
   };
   const child = spawn(launch.command, [...launch.arguments], {
     cwd: launch.workingDirectory,
@@ -126,7 +128,7 @@ export const createStdioJsonRpcClient = (
       return;
     }
     pendingRequests.delete(id);
-    clearTimeout(pending.timeout);
+    if (pending.timeout !== undefined) clearTimeout(pending.timeout);
     pending.removeAbortListener();
     settle(pending);
   };
@@ -285,11 +287,16 @@ export const createStdioJsonRpcClient = (
           return;
         }
         signal?.addEventListener("abort", abort, { once: true });
-        const timeout = setTimeout(() => {
-          settlePending(id, (pending) =>
-            pending.reject(new TiduError("INTERNAL_ERROR", "Agent protocol request timed out.")),
-          );
-        }, limits.requestTimeoutMilliseconds);
+        const timeout =
+          limits.requestTimeoutMilliseconds === null
+            ? undefined
+            : setTimeout(() => {
+                settlePending(id, (pending) =>
+                  pending.reject(
+                    new TiduError("INTERNAL_ERROR", "Agent protocol request timed out."),
+                  ),
+                );
+              }, limits.requestTimeoutMilliseconds);
         pendingRequests.set(id, {
           resolve: (value) => resolve(value as Result),
           reject,

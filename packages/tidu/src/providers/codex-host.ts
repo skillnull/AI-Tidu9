@@ -13,15 +13,15 @@ import {
   type CodexAgentClient,
   type CodexReasoningEffort,
   type CodexThread,
+  type CodexTurnInput,
   type CodexTurnResult,
   type CodexUsageSummary,
   createCodexAgentClient,
 } from "../connectors/codex-app-server.js";
 import { type CursorAcpModel, createCursorAcpClient } from "../connectors/cursor-acp.js";
-import { requestRequiresToolExecution } from "../openai/index.js";
+import { TiduError } from "../core/index.js";
 import type { ModelProvider, ProviderExecutionRequest, ProviderExecutionResult } from "./index.js";
 
-const CODEX_TURN_TIMEOUT_MILLISECONDS = 5 * 60_000;
 const CURSOR_DISCOVERY_TIMEOUT_MILLISECONDS = 15_000;
 const CODEX_REASONING_EFFORTS = new Set<CodexReasoningEffort>([
   "none",
@@ -37,7 +37,7 @@ const CODEX_REASONING_EFFORTS = new Set<CodexReasoningEffort>([
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const imageTypes = new Set(["image", "image_url", "input_image"]);
+const imageTypes = new Set(["image", "image_url", "input_image", "localImage"]);
 
 const containsImageContent = (value: unknown): boolean => {
   if (Array.isArray(value)) return value.some((item) => containsImageContent(item));
@@ -58,30 +58,18 @@ const structuredOutputFormat = (
 
 export const findUnsupportedHostBridgeRequest = (
   request: ProviderExecutionRequest,
+  imageInputSupported = false,
 ): ProviderExecutionResult | undefined => {
   const conversation =
     request.protocol === "chat-completions" ? request.body.messages : request.body.input;
-  if (containsImageContent(conversation)) {
+  if (!imageInputSupported && containsImageContent(conversation)) {
     return {
       kind: "json",
       statusCode: 400,
       body: {
         error: {
           code: "host_bridge_image_unsupported",
-          message: "The Codex and Cursor text bridge does not support image input.",
-          type: "invalid_request_error",
-        },
-      },
-    };
-  }
-  if (requestRequiresToolExecution(request.body)) {
-    return {
-      kind: "json",
-      statusCode: 400,
-      body: {
-        error: {
-          code: "host_bridge_tools_unsupported",
-          message: "The Codex and Cursor text bridge cannot satisfy a required tool call.",
+          message: "The selected host bridge does not support image input.",
           type: "invalid_request_error",
         },
       },
@@ -90,13 +78,62 @@ export const findUnsupportedHostBridgeRequest = (
   return undefined;
 };
 
+const readImageTurnInput = (value: Record<string, unknown>): CodexTurnInput | undefined => {
+  if (value.type === "localImage" && typeof value.path === "string" && value.path !== "") {
+    return { type: "localImage", path: value.path };
+  }
+  const imageUrlValue = value.image_url;
+  const url =
+    typeof value.url === "string"
+      ? value.url
+      : typeof imageUrlValue === "string"
+        ? imageUrlValue
+        : isRecord(imageUrlValue) && typeof imageUrlValue.url === "string"
+          ? imageUrlValue.url
+          : undefined;
+  if (url === undefined || url === "") return undefined;
+  return url.startsWith("/") ? { type: "localImage", path: url } : { type: "image", url };
+};
+
+const summarizeImageContent = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map((item) => summarizeImageContent(item));
+  if (!isRecord(value)) return value;
+  if (typeof value.type === "string" && imageTypes.has(value.type)) {
+    return { type: value.type, attachedSeparately: true };
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, child]) => [key, summarizeImageContent(child)]),
+  );
+};
+
 export const requestPrompt = (request: ProviderExecutionRequest): string => {
   const conversation =
     request.protocol === "chat-completions" ? request.body.messages : request.body.input;
+  const availableCapabilities = request.routing?.availableCapabilities;
+  const completedCapabilities = request.routing?.completedCapabilities ?? [];
+  const requiredCapabilities = request.routing?.requiredCapabilities ?? [];
+  const effectiveCapabilities = new Set([
+    ...(availableCapabilities ?? []),
+    ...completedCapabilities,
+  ]);
+  const missingCapabilities = requiredCapabilities.filter(
+    (capability) => !effectiveCapabilities.has(capability),
+  );
   const instructions = [
     "Answer this single model request using the conversation and instructions supplied below.",
-    "Do not use tools, access files, or perform actions. Return only the assistant response.",
+    "Give concise, concrete progress updates while working, then provide the final result.",
+    "Never attribute a route or capability limitation to the user unless the conversation explicitly contains that restriction.",
   ];
+  if (availableCapabilities?.includes("code") === true) {
+    instructions.push(
+      "Use the delegated Codex host's workspace tools when the request requires reading, changing, or verifying local files. Preserve the host's normal approval and sandbox rules.",
+    );
+  }
+  if (missingCapabilities.length > 0) {
+    instructions.push(
+      `The current configured route does not provide these required capabilities: ${missingCapabilities.join(", ")}. Explain the limitation briefly and helpfully in the user's language. Recommend enabling a capable primary or secondary model. Do not pretend the requested action was completed.`,
+    );
+  }
   const outputFormat = structuredOutputFormat(request);
   if (outputFormat?.type === "json_object") {
     instructions.push("Return a valid JSON object only, with no markdown fences or extra text.");
@@ -109,7 +146,117 @@ export const requestPrompt = (request: ProviderExecutionRequest): string => {
     typeof request.body.instructions === "string" && request.body.instructions.trim() !== ""
       ? `\n\nCaller instructions:\n${request.body.instructions}`
       : "";
-  return `${instructions.join(" ")}${callerInstructions}\n\nConversation:\n${JSON.stringify(conversation)}`;
+  return `${instructions.join(" ")}${callerInstructions}\n\nConversation:\n${JSON.stringify(summarizeImageContent(conversation))}`;
+};
+
+export const requestTurnInput = (
+  request: ProviderExecutionRequest,
+): {
+  /** Native app-server input items for the active user turn. */
+  input: readonly CodexTurnInput[];
+  /** Earlier official conversation items injected before the active turn. */
+  historyItems: readonly Record<string, unknown>[];
+} => {
+  const conversation =
+    request.protocol === "chat-completions" ? request.body.messages : request.body.input;
+  const conversationItems = Array.isArray(conversation) ? conversation.filter(isRecord) : [];
+  const messages = conversationItems.filter(
+    (item): item is Record<string, unknown> => typeof item.role === "string",
+  );
+  let lastUserIndex = -1;
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    if (messages[messageIndex]?.role === "user") {
+      lastUserIndex = messageIndex;
+      break;
+    }
+  }
+  const activeContent =
+    lastUserIndex >= 0
+      ? messages[lastUserIndex]?.content
+      : typeof conversation === "string"
+        ? conversation
+        : conversation;
+  const input: CodexTurnInput[] = [];
+  const collectActiveInput = (value: unknown): void => {
+    if (typeof value === "string") {
+      if (value !== "") input.push({ type: "text", text: value, text_elements: [] });
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) collectActiveInput(item);
+      return;
+    }
+    if (!isRecord(value)) return;
+    if (typeof value.type === "string" && imageTypes.has(value.type)) {
+      const imageInput = readImageTurnInput(value);
+      if (imageInput !== undefined) input.push(imageInput);
+      return;
+    }
+    if (
+      (value.type === "text" || value.type === "input_text" || value.type === "output_text") &&
+      typeof value.text === "string"
+    ) {
+      collectActiveInput(value.text);
+      return;
+    }
+    collectActiveInput(value.content);
+  };
+  collectActiveInput(activeContent);
+  const normalizeHistoryMessage = (message: Record<string, unknown>): Record<string, unknown> => {
+    const role = typeof message.role === "string" ? message.role : "user";
+    const content = Array.isArray(message.content) ? message.content : [message.content];
+    const normalizedContent = content.flatMap((part): Record<string, unknown>[] => {
+      if (typeof part === "string") {
+        return [{ type: role === "assistant" ? "output_text" : "input_text", text: part }];
+      }
+      if (!isRecord(part)) return [];
+      if (typeof part.type === "string" && imageTypes.has(part.type)) {
+        const imageInput = readImageTurnInput(part);
+        if (imageInput?.type === "image") {
+          return [{ type: "input_image", image_url: imageInput.url }];
+        }
+        return imageInput?.type === "localImage"
+          ? [{ type: "input_image", image_url: `file://${imageInput.path}` }]
+          : [];
+      }
+      if (typeof part.text === "string") {
+        return [
+          {
+            ...part,
+            type: role === "assistant" ? "output_text" : "input_text",
+            text: part.text,
+          },
+        ];
+      }
+      return [part];
+    });
+    return { type: "message", role, content: normalizedContent };
+  };
+  const historyItems: Record<string, unknown>[] = [];
+  if (typeof request.body.instructions === "string" && request.body.instructions !== "") {
+    historyItems.push({
+      type: "message",
+      role: "developer",
+      content: [{ type: "input_text", text: request.body.instructions }],
+    });
+  }
+  if (lastUserIndex >= 0) {
+    if (request.protocol === "chat-completions") {
+      historyItems.push(...messages.slice(0, lastUserIndex).map(normalizeHistoryMessage));
+    } else {
+      const activeUserMessage = messages[lastUserIndex];
+      const activeItemIndex = conversationItems.indexOf(
+        activeUserMessage as Record<string, unknown>,
+      );
+      historyItems.push(
+        ...conversationItems
+          .slice(0, activeItemIndex)
+          .map((item) => (typeof item.role === "string" ? normalizeHistoryMessage(item) : item)),
+      );
+    }
+  }
+  if (input.length === 0) input.push({ type: "text", text: " ", text_elements: [] });
+  return { input, historyItems };
 };
 
 export const requireValidHostModelText = (
@@ -149,7 +296,12 @@ const createResponse = (
   request: ProviderExecutionRequest,
   text: string,
   responseId = `tidu_${randomUUID()}`,
-  usage?: { inputTokens: number; outputTokens: number; totalTokens: number } | null,
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  } | null,
+  createdAt = Math.floor(Date.now() / 1_000),
 ): unknown => {
   if (request.protocol === "chat-completions") {
     return {
@@ -178,7 +330,11 @@ const createResponse = (
   return {
     id: responseId,
     object: "response",
+    created_at: createdAt,
     status: "completed",
+    completed_at: Math.floor(Date.now() / 1_000),
+    error: null,
+    incomplete_details: null,
     model: responseModel(request),
     output: [
       {
@@ -203,9 +359,21 @@ const createResponse = (
 
 export const createLiveJsonStream = (
   request: ProviderExecutionRequest,
-  run: (onTextDelta: (delta: string) => void) => Promise<string>,
+  run: (
+    onTextDelta: (delta: string) => void,
+    onProcessDelta: (delta: string) => void,
+  ) => Promise<
+    | string
+    | {
+        /** Complete assistant text returned by the host. */
+        text: string;
+        /** Provider-authoritative token usage, when available. */
+        usage: CodexTurnResult["usage"];
+      }
+  >,
 ): ReadableStream<Uint8Array> => {
   const responseId = `tidu_${randomUUID()}`;
+  const createdAt = Math.floor(Date.now() / 1_000);
   const encoder = new TextEncoder();
   let streamOpen = true;
   return new ReadableStream<Uint8Array>({
@@ -221,7 +389,7 @@ export const createLiveJsonStream = (
         streamOpen = false;
         controller.close();
       };
-      void run((delta) => {
+      const emitTextDelta = (delta: string): void => {
         if (request.protocol === "chat-completions") {
           if (
             !write(
@@ -251,9 +419,18 @@ export const createLiveJsonStream = (
         write(
           `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta })}\n\n`,
         );
-      })
-        .then((text) => {
+      };
+      const emitProcessDelta = (delta: string): void => {
+        if (request.protocol !== "responses" || delta === "") return;
+        write(
+          `event: response.reasoning_summary_text.delta\ndata: ${JSON.stringify({ type: "response.reasoning_summary_text.delta", delta })}\n\n`,
+        );
+      };
+      void run(emitTextDelta, emitProcessDelta)
+        .then((result) => {
           if (!streamOpen) return;
+          const text = typeof result === "string" ? result : result.text;
+          const usage = typeof result === "string" ? null : result.usage;
           if (request.protocol === "chat-completions") {
             write(
               `data: ${JSON.stringify({
@@ -268,7 +445,7 @@ export const createLiveJsonStream = (
             write(
               `event: response.completed\ndata: ${JSON.stringify({
                 type: "response.completed",
-                response: createResponse(request, text, responseId),
+                response: createResponse(request, text, responseId, usage, createdAt),
               })}\n\n`,
             );
           }
@@ -373,66 +550,104 @@ export const createCursorModelCatalog = (
 interface CodexClientSession {
   /** Initialized long-lived official Codex app-server client. */
   client: CodexAgentClient;
-  /** Temporary read-only working directory owned by this session. */
-  workingDirectory: string;
   /** First empty thread created during model discovery and reused by the first request. */
   initialThread?: CodexThread;
+  /** Model identifier explicitly confirmed by the Codex host for this session. */
+  model: string;
 }
 
 const createCodexClientSession = async (
   model?: string,
   hostOptions: CodexHostInspectionOptions = {},
 ): Promise<CodexClientSession> => {
-  const workingDirectory = await mkdtemp(join(tmpdir(), "tidu-model-"));
   const client = createCodexAgentClient({
     ...hostOptions,
-    workingDirectory,
+    workingDirectory: process.cwd(),
     ...(model === undefined ? {} : { model }),
     modelProvider: hostOptions.modelProvider ?? "openai",
     ephemeral: true,
-    sandbox: "read-only",
+    sandbox: "workspace-write",
   });
   try {
     await client.initialize();
+    const initialThread = await client.startThread();
     return {
       client,
-      workingDirectory,
-      initialThread: await client.startThread(),
+      initialThread,
+      model: initialThread.model,
     };
   } catch (error) {
     await client.close().catch(() => undefined);
-    await rm(workingDirectory, { recursive: true, force: true }).catch(() => undefined);
     throw error;
   }
 };
 
 const closeCodexClientSession = async (session: CodexClientSession): Promise<void> => {
   await session.client.close().catch(() => undefined);
-  await rm(session.workingDirectory, { recursive: true, force: true }).catch(() => undefined);
+};
+
+const requireCodexSessionModel = (session: CodexClientSession, requestedModel: string): string => {
+  const confirmedModel = session.model;
+  if (confirmedModel !== requestedModel) {
+    throw new TiduError(
+      "CONFIGURATION_CONFLICT",
+      `Codex host confirmed model ${confirmedModel} instead of configured model ${requestedModel}.`,
+    );
+  }
+  return confirmedModel;
 };
 
 const runCodexTurn = async (
   session: CodexClientSession,
   request: ProviderExecutionRequest,
   onTextDelta?: (delta: string) => void,
+  onProcessDelta?: (delta: string) => void,
 ): Promise<CodexTurnResult> => {
   const thread = session.initialThread ?? (await session.client.startThread());
   session.initialThread = undefined;
-  const signal =
-    request.signal === undefined
-      ? AbortSignal.timeout(CODEX_TURN_TIMEOUT_MILLISECONDS)
-      : AbortSignal.any([request.signal, AbortSignal.timeout(CODEX_TURN_TIMEOUT_MILLISECONDS)]);
+  if (thread.model !== session.model) {
+    throw new TiduError(
+      "CONFIGURATION_CONFLICT",
+      `Codex host confirmed model ${thread.model} instead of session model ${session.model}.`,
+    );
+  }
+  const turnPayload = requestTurnInput(request);
+  const outputFormat = structuredOutputFormat(request);
+  const outputSchema =
+    outputFormat?.type === "json_schema" && isRecord(outputFormat.schema)
+      ? outputFormat.schema
+      : outputFormat?.type === "json_object"
+        ? { type: "object" }
+        : undefined;
   const result = await session.client.prompt(
     thread.id,
-    requestPrompt(request),
-    signal,
+    turnPayload.input,
+    request.signal,
     onTextDelta,
     requestReasoningEffort(request),
+    onProcessDelta,
+    turnPayload.historyItems,
+    outputSchema,
   );
   if (result.status !== "completed") {
     throw new Error("The current host model did not complete the request.");
   }
   return { ...result, text: requireValidHostModelText(request, result.text) };
+};
+
+const reportCodexExecution = (
+  request: ProviderExecutionRequest,
+  model: string,
+  usage: CodexTurnResult["usage"],
+): void => {
+  request.onExecutionReceipt?.({
+    host: request.routing?.host ?? "codex",
+    model,
+    role: request.routing?.role ?? "main",
+    capabilities:
+      request.routing?.availableCapabilities ?? request.routing?.requiredCapabilities ?? [],
+    usage,
+  });
 };
 
 export interface CodexHostConfiguration {
@@ -529,12 +744,13 @@ export const createCodexHostModelProvider = async (
     await closeCodexClientSession(initialSession);
     return undefined;
   }
+  if (modelOverride !== undefined && initialModel !== modelOverride) {
+    await closeCodexClientSession(initialSession);
+    return undefined;
+  }
   const sessions = new Map<string, Promise<CodexClientSession>>();
   const initialSessionPromise = Promise.resolve(initialSession);
   sessions.set(initialModel, initialSessionPromise);
-  if (modelOverride !== undefined) {
-    sessions.set(modelOverride, initialSessionPromise);
-  }
   const resolveSession = (request: ProviderExecutionRequest): Promise<CodexClientSession> => {
     const requestedModel =
       request.routing?.targetModel ??
@@ -543,12 +759,20 @@ export const createCodexHostModelProvider = async (
         : (modelOverride ?? initialModel));
     const current = sessions.get(requestedModel);
     if (current !== undefined) return current;
-    const created = createCodexClientSession(requestedModel, hostOptions).catch(
-      (error: unknown) => {
+    const created = createCodexClientSession(requestedModel, hostOptions)
+      .then(async (session) => {
+        try {
+          requireCodexSessionModel(session, requestedModel);
+          return session;
+        } catch (error) {
+          await closeCodexClientSession(session);
+          throw error;
+        }
+      })
+      .catch((error: unknown) => {
         sessions.delete(requestedModel);
         throw error;
-      },
-    );
+      });
     sessions.set(requestedModel, created);
     return created;
   };
@@ -556,10 +780,17 @@ export const createCodexHostModelProvider = async (
   return {
     descriptor: { type: "codex-host", model: initialModel },
     execute: async (request): Promise<ProviderExecutionResult> => {
-      const unsupported = findUnsupportedHostBridgeRequest(request);
+      const unsupported = findUnsupportedHostBridgeRequest(request, true);
       if (unsupported !== undefined) return unsupported;
       const sessionPromise = resolveSession(request);
       const session = await sessionPromise;
+      const requestedModel =
+        request.routing?.targetModel ??
+        (typeof request.body.model === "string" && request.body.model !== request.virtualModelId
+          ? request.body.model
+          : (modelOverride ?? initialModel));
+      const upstreamModel = requireCodexSessionModel(session, requestedModel);
+      request.onModelConfirmed?.(upstreamModel);
       const invalidateFailedSession = async (): Promise<void> => {
         if (request.signal?.aborted) return;
         for (const [model, candidate] of sessions) {
@@ -572,9 +803,12 @@ export const createCodexHostModelProvider = async (
           return {
             kind: "stream",
             statusCode: 200,
-            stream: createLiveJsonStream(request, async (onTextDelta) => {
+            upstreamModel,
+            stream: createLiveJsonStream(request, async (onTextDelta, onProcessDelta) => {
               try {
-                return (await runCodexTurn(session, request, onTextDelta)).text;
+                const result = await runCodexTurn(session, request, onTextDelta, onProcessDelta);
+                reportCodexExecution(request, upstreamModel, result.usage);
+                return { text: result.text, usage: result.usage };
               } catch (error) {
                 await invalidateFailedSession();
                 throw error;
@@ -583,9 +817,11 @@ export const createCodexHostModelProvider = async (
           };
         }
         const result = await runCodexTurn(session, request);
+        reportCodexExecution(request, upstreamModel, result.usage);
         return {
           kind: "json",
           statusCode: 200,
+          upstreamModel,
           body: createResponse(request, result.text, undefined, result.usage),
         };
       } catch (error) {
@@ -660,7 +896,12 @@ export const createCursorHostModelProvider = async (): Promise<ModelProvider | u
         };
       }
       const workingDirectory = await mkdtemp(join(tmpdir(), "tidu-model-"));
-      const client = createCursorAcpClient({ workingDirectory, mode: "ask", requestedModel });
+      const client = createCursorAcpClient({
+        workingDirectory,
+        mode: "ask",
+        requestedModel,
+        onProcessDelta: request.onProcessDelta,
+      });
       const closeClient = async (): Promise<void> => {
         try {
           await client.close();
@@ -668,9 +909,21 @@ export const createCursorHostModelProvider = async (): Promise<ModelProvider | u
           await rm(workingDirectory, { recursive: true, force: true });
         }
       };
-      const run = async (onTextDelta?: (delta: string) => void): Promise<string> => {
+      const createConfirmedSession = async () => {
         await client.initialize(request.signal);
         const session = await client.createSession(request.signal);
+        if (session.model === null) {
+          throw new TiduError(
+            "CONFIGURATION_CONFLICT",
+            "Cursor ACP did not confirm the model selected for this session.",
+          );
+        }
+        return { ...session, model: session.model };
+      };
+      const run = async (
+        session: Awaited<ReturnType<typeof createConfirmedSession>>,
+        onTextDelta?: (delta: string) => void,
+      ): Promise<string> => {
         const result = await client.prompt(
           session.id,
           requestPrompt(request),
@@ -682,13 +935,33 @@ export const createCursorHostModelProvider = async (): Promise<ModelProvider | u
           requireCompletedCursorPrompt(session.model, result),
         );
       };
+      let session: Awaited<ReturnType<typeof createConfirmedSession>>;
+      try {
+        session = await createConfirmedSession();
+        request.onModelConfirmed?.(session.model);
+      } catch (error) {
+        await closeClient().catch(() => undefined);
+        throw error;
+      }
       if (request.body.stream === true) {
         return {
           kind: "stream",
           statusCode: 200,
+          upstreamModel: session.model,
           stream: createLiveJsonStream(request, async (onTextDelta) => {
             try {
-              return await run(onTextDelta);
+              const text = await run(session, onTextDelta);
+              request.onExecutionReceipt?.({
+                host: request.routing?.host ?? "cursor",
+                model: session.model,
+                role: request.routing?.role ?? "main",
+                capabilities:
+                  request.routing?.availableCapabilities ??
+                  request.routing?.requiredCapabilities ??
+                  [],
+                usage: null,
+              });
+              return text;
             } finally {
               await closeClient();
             }
@@ -696,10 +969,20 @@ export const createCursorHostModelProvider = async (): Promise<ModelProvider | u
         };
       }
       try {
+        const text = await run(session);
+        request.onExecutionReceipt?.({
+          host: request.routing?.host ?? "cursor",
+          model: session.model,
+          role: request.routing?.role ?? "main",
+          capabilities:
+            request.routing?.availableCapabilities ?? request.routing?.requiredCapabilities ?? [],
+          usage: null,
+        });
         return {
           kind: "json",
           statusCode: 200,
-          body: createResponse(request, await run()),
+          upstreamModel: session.model,
+          body: createResponse(request, text),
         };
       } finally {
         try {

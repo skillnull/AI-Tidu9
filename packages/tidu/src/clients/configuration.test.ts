@@ -92,7 +92,16 @@ test("lists current and retained official Codex models without managed entries",
       {
         id: "user-default",
         name: "Official Default",
-        capabilities: ["text", "structured-output", "reasoning", "code", "long-context"],
+        capabilities: [
+          "text",
+          "structured-output",
+          "vision",
+          "reasoning",
+          "code",
+          "tool-use",
+          "web-research",
+          "long-context",
+        ],
         capabilitySource: "host-catalog",
       },
       {
@@ -135,6 +144,9 @@ test("writes an isolated Codex profile and switches back to the official configu
     assert.equal(result.model, "ai-tidu9-config");
     assert.match(profile, /model_provider = "ai_tidu9"/u);
     assert.match(profile, /requires_openai_auth = false/u);
+    assert.match(profile, /name = "AI-Tidu9 \(local\)"/u);
+    assert.match(profile, /request_max_retries = 0/u);
+    assert.match(profile, /stream_max_retries = 0/u);
     assert.match(profile, new RegExp(`base_url = "${runtime.origin}/v1/hosts/codex"`, "u"));
     assert.doesNotMatch(profile, /api[_-]?key|token|secret/iu);
     const activeDefaultConfiguration = readFileSync(defaultConfiguration, "utf8");
@@ -163,13 +175,13 @@ test("writes an isolated Codex profile and switches back to the official configu
       ["ai-tidu9-config"],
     );
     assert.equal(catalog.models[0]?.default_reasoning_summary, "auto");
-    assert.deepEqual(catalog.models[0]?.input_modalities, ["text"]);
-    assert.equal(catalog.models[0]?.supports_image_detail_original, false);
-    assert.equal(catalog.models[0]?.supports_parallel_tool_calls, false);
-    assert.equal(catalog.models[0]?.supports_search_tool, false);
-    assert.equal(catalog.models[0]?.support_verbosity, false);
-    assert.equal(catalog.models[0]?.apply_patch_tool_type, null);
-    assert.equal(catalog.models[0]?.web_search_tool_type, undefined);
+    assert.deepEqual(catalog.models[0]?.input_modalities, ["text", "image"]);
+    assert.equal(catalog.models[0]?.supports_image_detail_original, true);
+    assert.equal(catalog.models[0]?.supports_parallel_tool_calls, true);
+    assert.equal(catalog.models[0]?.supports_search_tool, true);
+    assert.equal(catalog.models[0]?.support_verbosity, true);
+    assert.equal(catalog.models[0]?.apply_patch_tool_type, "freeform");
+    assert.equal(catalog.models[0]?.web_search_tool_type, "text_and_image");
 
     await switchCodexClientConfiguration({
       mode: "ai-tidu9",
@@ -177,6 +189,7 @@ test("writes an isolated Codex profile and switches back to the official configu
       request: async (input, init) => {
         const url = String(input);
         if (url.endsWith("/v1/hosts/codex/responses") && init?.method === "POST") {
+          assert.equal(init.signal, undefined);
           return Response.json({
             id: "verified",
             object: "response",
@@ -190,7 +203,9 @@ test("writes an isolated Codex profile and switches back to the official configu
     assert.match(tiduDefaultConfiguration, /model = "ai-tidu9-config"/u);
     assert.match(tiduDefaultConfiguration, /model_provider = "ai_tidu9"/u);
     assert.match(tiduDefaultConfiguration, /\[model_providers\.ai_tidu9\]/u);
-    assert.match(tiduDefaultConfiguration, /name = "九门赛博提督"/u);
+    assert.match(tiduDefaultConfiguration, /name = "AI-Tidu9 \(local\)"/u);
+    assert.match(tiduDefaultConfiguration, /request_max_retries = 0/u);
+    assert.match(tiduDefaultConfiguration, /stream_max_retries = 0/u);
     assert.doesNotMatch(tiduDefaultConfiguration, /requires_openai_auth = true/u);
 
     await switchCodexClientConfiguration({
@@ -244,9 +259,12 @@ test("keeps company service models behind the single virtual-model catalog entry
       catalog.models.map(({ slug }) => slug),
       ["ai-tidu9-config"],
     );
-    assert.equal(catalog.models[0]?.display_name, "九门赛博提督");
+    assert.equal(catalog.models[0]?.display_name, "AI-Tidu9");
     assert.equal(catalog.models[0]?.default_reasoning_level, undefined);
     assert.deepEqual(catalog.models[0]?.supported_reasoning_levels, []);
+    const serializedCatalog = JSON.stringify(catalog);
+    assert.doesNotMatch(serializedCatalog, /routed through AI-Tidu9/iu);
+    assert.doesNotMatch(serializedCatalog, /\[AI-TIDU9\] Loaded/iu);
   } finally {
     await runtime.close();
     rmSync(temporaryDirectory, { force: true, recursive: true });
@@ -307,7 +325,7 @@ test("publishes reasoning strength only for an executable Codex primary provider
   assert.equal(codexCatalog.models[0]?.default_reasoning_level, "medium");
   assert.deepEqual(
     codexCatalog.models[0]?.supported_reasoning_levels?.map(({ effort }) => effort),
-    ["low", "medium", "high"],
+    ["low", "medium", "high", "xhigh", "max", "ultra"],
   );
 
   for (const providerType of ["cursor-host", "ollama", "openai-compatible"]) {
@@ -695,7 +713,7 @@ test("keeps the official configuration active when inference verification fails"
       return Response.json(
         {
           error: {
-            message: "tools contains unsupported definitions: tool_search.",
+            message: "official probe rejected.",
           },
         },
         { status: 400 },
@@ -713,7 +731,7 @@ test("keeps the official configuration active when inference verification fails"
         if (!(error instanceof TiduError)) return false;
         assert.equal(error.details.failureSource, "ai-tidu9");
         assert.equal(error.details.reasonCode, "tidu_inference_failed");
-        assert.match(String(error.details.reason), /tool_search/u);
+        assert.match(String(error.details.reason), /official probe rejected/u);
         assert.equal(Array.isArray(error.details.nextSteps), true);
         return true;
       },

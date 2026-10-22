@@ -146,8 +146,8 @@ const formatConfigurationMutationError = (error: unknown, locale: "en-US" | "zh-
     const issueCodes = new Set(error.issues.map((issue) => issue.code));
     if (issueCodes.has("INVALID_MODEL_SELECTION")) {
       return locale === "zh-CN"
-        ? "模型配置无效：请确认主模型和每个副模型均已选择有效模型，并至少勾选一项能力。"
-        : "The model configuration is invalid. Select a valid primary model and secondary models, with at least one capability for each.";
+        ? "模型配置无效：请确认主模型和每个副模型均已选择有效模型，并且只分配宿主已发布的能力。"
+        : "The model configuration is invalid. Select valid primary and secondary models, and assign only host-published capabilities.";
     }
     if (issueCodes.has("INVALID_PROFILE_ID")) {
       return locale === "zh-CN"
@@ -222,7 +222,10 @@ const App = () => {
   const [upstreamModelCatalog, setUpstreamModelCatalog] = useState<UpstreamModelCatalog>();
   const [connectingCursor, setConnectingCursor] = useState(false);
   const [cursorConnectionError, setCursorConnectionError] = useState<string | null>(null);
-  const [codexConnection, setCodexConnection] = useState<ClientConnectionState>({
+  const [codexSetupConnection, setCodexSetupConnection] = useState<ClientConnectionState>({
+    status: "idle",
+  });
+  const [codexModeConnection, setCodexModeConnection] = useState<ClientConnectionState>({
     status: "idle",
   });
   const [codexConfiguration, setCodexConfiguration] = useState<CodexConfigurationStatus>({
@@ -305,7 +308,7 @@ const App = () => {
     }
   }, [locale, refreshHostUsage]);
   const connectCodex = useCallback(async () => {
-    setCodexConnection({ status: "pending" });
+    setCodexSetupConnection({ status: "pending" });
     try {
       const response = await fetch("/api/clients/codex/connect", {
         method: "POST",
@@ -319,7 +322,7 @@ const App = () => {
       if (!response.ok) {
         throw new Error(formatCodexFailure(result, locale));
       }
-      setCodexConnection({
+      setCodexSetupConnection({
         status: "success",
         message:
           locale === "zh-CN"
@@ -328,7 +331,7 @@ const App = () => {
       });
       await refreshCodexConfiguration();
     } catch (error) {
-      setCodexConnection({
+      setCodexSetupConnection({
         status: "error",
         message:
           error instanceof Error
@@ -343,7 +346,7 @@ const App = () => {
   const updateCodexConfiguration = useCallback(
     async (mode: "official" | "ai-tidu9") => {
       setCodexConfigurationPending(true);
-      setCodexConnection({ status: "pending" });
+      setCodexModeConnection({ status: "pending" });
       try {
         const response = await fetch("/api/clients/codex/configuration", {
           method: "POST",
@@ -356,7 +359,7 @@ const App = () => {
         }
         setCodexConfiguration(result);
         setCodexSelectedMode(result.activeMode);
-        setCodexConnection({
+        setCodexModeConnection({
           status: "success",
           message:
             mode === "official"
@@ -369,7 +372,7 @@ const App = () => {
         });
       } catch (error) {
         await refreshCodexConfiguration().catch(() => undefined);
-        setCodexConnection({
+        setCodexModeConnection({
           status: "error",
           message: error instanceof Error ? error.message : "Codex configuration switch failed.",
         });
@@ -453,7 +456,7 @@ const App = () => {
   useEffect(() => {
     if (activeSection === "clients") {
       void refreshCodexConfiguration().catch((error: unknown) => {
-        setCodexConnection({
+        setCodexSetupConnection({
           status: "error",
           message:
             error instanceof Error
@@ -1128,7 +1131,10 @@ const App = () => {
                           codexConfigurationPending ||
                           !codexConfiguration.installed
                         }
-                        onClick={() => setCodexSelectedMode("ai-tidu9")}
+                        onClick={() => {
+                          setCodexSelectedMode("ai-tidu9");
+                          setCodexModeConnection({ status: "idle" });
+                        }}
                       >
                         <strong>{locale === "zh-CN" ? "九门模式" : "AI-Tidu9 mode"}</strong>
                         <span>
@@ -1145,7 +1151,10 @@ const App = () => {
                             : "codex-configuration-mode"
                         }
                         disabled={codexConfigurationLoading || codexConfigurationPending}
-                        onClick={() => setCodexSelectedMode("official")}
+                        onClick={() => {
+                          setCodexSelectedMode("official");
+                          setCodexModeConnection({ status: "idle" });
+                        }}
                       >
                         <strong>{locale === "zh-CN" ? "官方直连" : "Official direct"}</strong>
                         <span>
@@ -1165,7 +1174,9 @@ const App = () => {
                         <button
                           type="button"
                           className="primary-button"
-                          disabled={codexConfigurationPending}
+                          disabled={
+                            codexConfigurationPending || codexSetupConnection.status === "pending"
+                          }
                           onClick={() => void updateCodexConfiguration(codexSelectedMode)}
                           aria-busy={codexConfigurationPending}
                         >
@@ -1180,11 +1191,22 @@ const App = () => {
                         <button
                           type="button"
                           disabled={codexConfigurationPending}
-                          onClick={() => setCodexSelectedMode(codexConfiguration.activeMode)}
+                          onClick={() => {
+                            setCodexSelectedMode(codexConfiguration.activeMode);
+                            setCodexModeConnection({ status: "idle" });
+                          }}
                         >
                           {locale === "zh-CN" ? "取消" : "Cancel"}
                         </button>
                       </div>
+                    ) : null}
+                    {codexModeConnection.status === "success" ||
+                    codexModeConnection.status === "error" ? (
+                      <p
+                        className={`client-connect-message client-connect-message-${codexModeConnection.status}`}
+                      >
+                        {codexModeConnection.message}
+                      </p>
                     ) : null}
                     <div className="codex-global-setup">
                       <div>
@@ -1200,11 +1222,13 @@ const App = () => {
                       <button
                         type="button"
                         className="primary-button"
-                        disabled={codexConnection.status === "pending"}
+                        disabled={
+                          codexSetupConnection.status === "pending" || codexConfigurationPending
+                        }
                         onClick={() => void connectCodex()}
-                        aria-busy={codexConnection.status === "pending"}
+                        aria-busy={codexSetupConnection.status === "pending"}
                       >
-                        {codexConnection.status === "pending"
+                        {codexSetupConnection.status === "pending"
                           ? locale === "zh-CN"
                             ? "正在更新…"
                             : "Updating…"
@@ -1217,11 +1241,12 @@ const App = () => {
                               : "Prepare global setup"}
                       </button>
                     </div>
-                    {codexConnection.status === "success" || codexConnection.status === "error" ? (
+                    {codexSetupConnection.status === "success" ||
+                    codexSetupConnection.status === "error" ? (
                       <p
-                        className={`client-connect-message client-connect-message-${codexConnection.status}`}
+                        className={`client-connect-message client-connect-message-${codexSetupConnection.status}`}
                       >
-                        {codexConnection.message}
+                        {codexSetupConnection.message}
                       </p>
                     ) : null}
                   </div>

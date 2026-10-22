@@ -114,6 +114,8 @@ interface CapabilityCompletionModelResultView {
   host: AgentHostId;
   /** Configured upstream model identifier. */
   model: string;
+  /** Upstream model explicitly confirmed for this call, or null without a host receipt. */
+  executedModel: string | null;
   /** Whether this is the primary or a secondary model. */
   role: "main" | "secondary";
   /** Required capabilities assigned to this model. */
@@ -283,7 +285,11 @@ export const updatePrimaryModelSelection = (
   policy: HostCapabilityCompletionPolicy,
   mainModel: ModelSelection,
   capabilities: readonly string[],
-): HostCapabilityCompletionPolicy => ({ ...policy, mainModel, mainCapabilities: capabilities });
+): HostCapabilityCompletionPolicy => ({
+  ...policy,
+  mainModel,
+  mainCapabilities: capabilities,
+});
 
 type SpecialistModelSelection = Pick<
   CapabilitySpecialistConfiguration,
@@ -619,7 +625,7 @@ export const CapabilityCompletionPanel = ({
                                 <span key={capability}>{capabilityLabel(capability, english)}</span>
                               ))
                             ) : (
-                              <small>{english ? "Not configured" : "未配置"}</small>
+                              <small>{english ? "No assigned capabilities" : "未分配能力"}</small>
                             )}
                           </div>
                         </div>
@@ -645,7 +651,9 @@ export const CapabilityCompletionPanel = ({
                                     </span>
                                   ))
                                 ) : (
-                                  <small>{english ? "Not configured" : "未配置"}</small>
+                                  <small>
+                                    {english ? "No assigned capabilities" : "未分配能力"}
+                                  </small>
                                 )}
                               </div>
                             </div>
@@ -772,12 +780,17 @@ export const CapabilityCompletionPanel = ({
                                   </small>
                                 </div>
                                 <p>
+                                  {english ? "Configured" : "配置模型"}：
                                   {displayModel(modelResult.host, {
                                     source: modelResult.modelId.endsWith(":custom")
                                       ? "custom"
                                       : modelSourceForHost(modelResult.host),
                                     model: modelResult.model,
                                   })}
+                                  {` · ${english ? "Host-confirmed" : "宿主回执"}：${
+                                    modelResult.executedModel ??
+                                    (english ? "No execution receipt" : "未获得执行回执")
+                                  }`}
                                 </p>
                                 <div className="capability-model-result-meta">
                                   <span>
@@ -845,6 +858,7 @@ export const TaskControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
   const [snapshot, setSnapshot] = useState<TaskListResponse | undefined>();
   const [message, setMessage] = useState(english ? "Loading task capsules…" : "正在读取任务胶囊…");
   const [pendingTaskId, setPendingTaskId] = useState<string | undefined>();
+  const [expandedTask, setExpandedTask] = useState<TaskControlView | undefined>();
 
   const refreshTasks = useCallback(async () => {
     setMessage(english ? "Loading task capsules…" : "正在读取任务胶囊…");
@@ -873,6 +887,15 @@ export const TaskControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
   useEffect(() => {
     void refreshTasks();
   }, [refreshTasks]);
+
+  useEffect(() => {
+    if (expandedTask === undefined) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setExpandedTask(undefined);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [expandedTask]);
 
   const mutateTask = async (
     task: TaskControlView,
@@ -903,7 +926,7 @@ export const TaskControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
         );
       }
       await refreshTasks();
-      setMessage(english ? "Control action applied." : "控制指令已生效。");
+      setMessage("");
     } catch (error) {
       setMessage(
         error instanceof Error ? error.message : english ? "Task control failed" : "任务控制失败",
@@ -919,11 +942,6 @@ export const TaskControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
         <div>
           <p className="card-label">BOUNDED AGENT TASKS</p>
           <h2>{english ? "Task control" : "任务控制"}</h2>
-          <p>
-            {english
-              ? "Inspect progress, budgets, and trust. Every control action passes through the Agent state machine."
-              : "查看计划进度、预算与信任等级；暂停、恢复、取消和审批都经过内核状态机。"}
-          </p>
         </div>
         <button
           type="button"
@@ -940,6 +958,14 @@ export const TaskControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
               : "刷新任务"}
         </button>
       </div>
+      <aside className="task-guide">
+        <strong>{english ? "About tasks" : "任务说明"}</strong>
+        <span>
+          {english
+            ? "Manage Agent SDK/API tasks: inspect progress, pause, resume, cancel, or approve; click task text for the full content."
+            : "管理 Agent SDK/API 创建的任务：查看进度，暂停、恢复、取消或审批；点击任务文字查看全文。"}
+        </span>
+      </aside>
       {snapshot?.available === false ? (
         <div className="task-empty">
           {english
@@ -963,7 +989,19 @@ export const TaskControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
                 <div className="task-card-heading">
                   <div>
                     <p className="task-id">{task.taskId}</p>
-                    <h3>{task.objective}</h3>
+                    <h3>
+                      <button
+                        type="button"
+                        className="task-objective-trigger"
+                        onClick={() => setExpandedTask(task)}
+                      >
+                        {task.objective}
+                      </button>
+                    </h3>
+                    <p className="task-created-at">
+                      {english ? "Created" : "创建时间"} ·{" "}
+                      {new Date(task.createdAt).toLocaleString(locale)}
+                    </p>
                   </div>
                   <span className={`task-status task-status-${task.status}`}>
                     {taskStatusLabel(task.status, locale)}
@@ -1058,13 +1096,42 @@ export const TaskControlPanel = ({ locale }: { locale: "en-US" | "zh-CN" }) => {
           })}
         </div>
       )}
-      <p
-        className={`operation-message${pendingTaskId !== undefined || snapshot === undefined ? " loading-indicator" : ""}`}
-        aria-live="polite"
-        aria-busy={pendingTaskId !== undefined || snapshot === undefined}
-      >
-        {message}
-      </p>
+      {expandedTask !== undefined ? (
+        <div className="task-detail-dialog-backdrop">
+          <section
+            className="task-detail-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="task-detail-dialog-title"
+          >
+            <div className="task-detail-dialog-heading">
+              <div>
+                <p>{expandedTask.taskId}</p>
+                <h3 id="task-detail-dialog-title">
+                  {english ? "Full task content" : "完整任务内容"}
+                </h3>
+                <span>
+                  {english ? "Created" : "创建时间"} ·{" "}
+                  {new Date(expandedTask.createdAt).toLocaleString(locale)}
+                </span>
+              </div>
+              <button type="button" onClick={() => setExpandedTask(undefined)}>
+                {english ? "Close" : "关闭"}
+              </button>
+            </div>
+            <p className="task-detail-content">{expandedTask.objective}</p>
+          </section>
+        </div>
+      ) : null}
+      {message === "" ? null : (
+        <p
+          className={`operation-message${pendingTaskId !== undefined || snapshot === undefined ? " loading-indicator" : ""}`}
+          aria-live="polite"
+          aria-busy={pendingTaskId !== undefined || snapshot === undefined}
+        >
+          {message}
+        </p>
+      )}
     </section>
   );
 };
@@ -2256,7 +2323,9 @@ export const QuickStartWizard = ({
     let current = true;
     setUpstreamCatalogStatus("loading");
     const readCatalog = async (): Promise<UpstreamModelCatalog> => {
-      const response = await fetch("/api/models/upstreams", { cache: "no-store" });
+      const response = await fetch("/api/models/upstreams", {
+        cache: "no-store",
+      });
       if (!response.ok) throw new Error("Model catalog unavailable");
       const catalog = (await response.json()) as Omit<UpstreamModelCatalog, "hosts"> & {
         hosts?: UpstreamModelCatalog["hosts"];
@@ -2302,7 +2371,7 @@ export const QuickStartWizard = ({
     return () => {
       current = false;
     };
-  }, [step]);
+  }, [activeHostPolicy.specialists, step]);
   useEffect(() => {
     if (step !== 2 || upstreamCatalogStatus !== "ready") return;
     const mainCapabilities = selectedModelCapabilities(
@@ -2330,7 +2399,11 @@ export const QuickStartWizard = ({
     ) {
       return;
     }
-    updateActiveHostPolicy({ ...activeHostPolicy, mainCapabilities, specialists });
+    updateActiveHostPolicy({
+      ...activeHostPolicy,
+      mainCapabilities,
+      specialists,
+    });
   }, [
     activeHostPolicy,
     primaryModelCapabilities,
@@ -2396,7 +2469,6 @@ export const QuickStartWizard = ({
   }, [step, activeProviderChoice]);
   const primaryCapabilitiesAreValid =
     primaryModelCapabilities.length > 0 &&
-    activeHostPolicy.mainCapabilities.length > 0 &&
     equalCapabilities(
       activeHostPolicy.mainCapabilities,
       selectedModelCapabilities(activeHostPolicy.mainCapabilities, primaryModelCapabilities),
@@ -2408,9 +2480,10 @@ export const QuickStartWizard = ({
       const selectedModel = catalogModelForSelection(upstreamCatalog, specialist.host, specialist);
       const publishedCapabilities = defaultModelCapabilities(selectedModel?.capabilities ?? []);
       return (
+        selectedModel !== undefined &&
+        publishedCapabilities.length > 0 &&
         specialist.host !== activeHostId &&
         isValidModelIdentifier(specialist.model) &&
-        specialist.capabilities.length > 0 &&
         equalCapabilities(
           specialist.capabilities,
           selectedModelCapabilities(specialist.capabilities, publishedCapabilities),
@@ -2432,8 +2505,8 @@ export const QuickStartWizard = ({
         : "请先完成入口必填项。"
       : step === 2 && !modelConfigurationIsValid
         ? english
-          ? "Select a valid primary model and at least one capability for every configured model. Model IDs cannot contain spaces."
-          : "请选择有效的主模型，并为每个已配置模型至少保留一项能力；模型 ID 不能包含空格。"
+          ? "Select valid model IDs and assign only capabilities published for each model. Model IDs cannot contain spaces."
+          : "请选择有效的模型，并且只能分配各模型已发布的能力；模型 ID 不能包含空格。"
         : step === 3 && !clientSetupIsAvailable
           ? english
             ? "Activate this configuration before continuing."
