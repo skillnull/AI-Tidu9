@@ -12,6 +12,7 @@ import {
   type CodexAccountSummary,
   type CodexAgentClient,
   type CodexReasoningEffort,
+  type CodexReasoningSummary,
   type CodexThread,
   type CodexTurnInput,
   type CodexTurnResult,
@@ -33,6 +34,21 @@ const CODEX_REASONING_EFFORTS = new Set<CodexReasoningEffort>([
   "max",
   "ultra",
 ]);
+const CODEX_REASONING_SUMMARIES = new Set<CodexReasoningSummary>([
+  "auto",
+  "concise",
+  "detailed",
+  "none",
+]);
+
+type HostTokenUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cachedInputTokens?: number;
+  cacheWriteInputTokens?: number;
+  reasoningTokens?: number;
+};
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -159,23 +175,38 @@ export const requestTurnInput = (
 } => {
   const conversation =
     request.protocol === "chat-completions" ? request.body.messages : request.body.input;
-  const conversationItems = Array.isArray(conversation) ? conversation.filter(isRecord) : [];
+  const conversationItems = Array.isArray(conversation)
+    ? conversation.filter(isRecord)
+    : isRecord(conversation)
+      ? [conversation]
+      : [];
   const messages = conversationItems.filter(
     (item): item is Record<string, unknown> => typeof item.role === "string",
   );
   let lastUserIndex = -1;
-  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
-    if (messages[messageIndex]?.role === "user") {
-      lastUserIndex = messageIndex;
-      break;
+  let activeItemIndex = -1;
+  if (request.protocol === "chat-completions") {
+    for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+      if (messages[messageIndex]?.role === "user") {
+        lastUserIndex = messageIndex;
+        break;
+      }
     }
+  } else if (conversationItems.at(-1)?.role === "user") {
+    activeItemIndex = conversationItems.length - 1;
   }
+  const activeUserMessage =
+    request.protocol === "chat-completions"
+      ? messages[lastUserIndex]
+      : conversationItems[activeItemIndex];
   const activeContent =
-    lastUserIndex >= 0
-      ? messages[lastUserIndex]?.content
+    activeUserMessage !== undefined
+      ? activeUserMessage.content
       : typeof conversation === "string"
         ? conversation
-        : conversation;
+        : conversationItems.length === 0
+          ? conversation
+          : undefined;
   const input: CodexTurnInput[] = [];
   const collectActiveInput = (value: unknown): void => {
     if (typeof value === "string") {
@@ -230,7 +261,7 @@ export const requestTurnInput = (
       }
       return [part];
     });
-    return { type: "message", role, content: normalizedContent };
+    return { ...message, type: "message", role, content: normalizedContent };
   };
   const historyItems: Record<string, unknown>[] = [];
   if (typeof request.body.instructions === "string" && request.body.instructions !== "") {
@@ -240,22 +271,25 @@ export const requestTurnInput = (
       content: [{ type: "input_text", text: request.body.instructions }],
     });
   }
-  if (lastUserIndex >= 0) {
-    if (request.protocol === "chat-completions") {
+  if (request.protocol === "chat-completions") {
+    if (lastUserIndex >= 0) {
       historyItems.push(...messages.slice(0, lastUserIndex).map(normalizeHistoryMessage));
-    } else {
-      const activeUserMessage = messages[lastUserIndex];
-      const activeItemIndex = conversationItems.indexOf(
-        activeUserMessage as Record<string, unknown>,
-      );
-      historyItems.push(
-        ...conversationItems
-          .slice(0, activeItemIndex)
-          .map((item) => (typeof item.role === "string" ? normalizeHistoryMessage(item) : item)),
-      );
     }
+  } else {
+    const historyEndIndex = activeItemIndex >= 0 ? activeItemIndex : conversationItems.length;
+    historyItems.push(
+      ...conversationItems
+        .slice(0, historyEndIndex)
+        .map((item) => (typeof item.role === "string" ? normalizeHistoryMessage(item) : item)),
+    );
   }
-  if (input.length === 0) input.push({ type: "text", text: " ", text_elements: [] });
+  if (input.length === 0) {
+    input.push({
+      type: "text",
+      text: historyItems.length > 0 ? "Continue from the supplied conversation." : " ",
+      text_elements: [],
+    });
+  }
   return { input, historyItems };
 };
 
@@ -292,15 +326,20 @@ const requestReasoningEffort = (request: ProviderExecutionRequest): CodexReasoni
     : "medium";
 };
 
+const requestReasoningSummary = (request: ProviderExecutionRequest): CodexReasoningSummary => {
+  const reasoning = isRecord(request.body.reasoning) ? request.body.reasoning : undefined;
+  const candidate = reasoning?.summary;
+  return typeof candidate === "string" &&
+    CODEX_REASONING_SUMMARIES.has(candidate as CodexReasoningSummary)
+    ? (candidate as CodexReasoningSummary)
+    : "auto";
+};
+
 const createResponse = (
   request: ProviderExecutionRequest,
   text: string,
   responseId = `tidu_${randomUUID()}`,
-  usage?: {
-    inputTokens: number;
-    outputTokens: number;
-    totalTokens: number;
-  } | null,
+  usage?: HostTokenUsage | null,
   createdAt = Math.floor(Date.now() / 1_000),
 ): unknown => {
   if (request.protocol === "chat-completions") {
@@ -350,7 +389,12 @@ const createResponse = (
       : {
           usage: {
             input_tokens: usage.inputTokens,
+            input_tokens_details: {
+              cached_tokens: usage.cachedInputTokens ?? 0,
+              cache_write_tokens: usage.cacheWriteInputTokens ?? 0,
+            },
             output_tokens: usage.outputTokens,
+            output_tokens_details: { reasoning_tokens: usage.reasoningTokens ?? 0 },
             total_tokens: usage.totalTokens,
           },
         }),
@@ -368,7 +412,7 @@ export const createLiveJsonStream = (
         /** Complete assistant text returned by the host. */
         text: string;
         /** Provider-authoritative token usage, when available. */
-        usage: CodexTurnResult["usage"];
+        usage: HostTokenUsage | null;
       }
   >,
 ): ReadableStream<Uint8Array> => {
@@ -439,6 +483,15 @@ export const createLiveJsonStream = (
                 created: Math.floor(Date.now() / 1_000),
                 model: responseModel(request),
                 choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                ...(usage === null
+                  ? {}
+                  : {
+                      usage: {
+                        prompt_tokens: usage.inputTokens,
+                        completion_tokens: usage.outputTokens,
+                        total_tokens: usage.totalTokens,
+                      },
+                    }),
               })}\n\n`,
             );
           } else {
@@ -628,6 +681,8 @@ const runCodexTurn = async (
     onProcessDelta,
     turnPayload.historyItems,
     outputSchema,
+    (usage) => reportCodexExecution(request, session.model, usage),
+    requestReasoningSummary(request),
   );
   if (result.status !== "completed") {
     throw new Error("The current host model did not complete the request.");

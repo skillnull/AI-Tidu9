@@ -29,7 +29,12 @@ readline.on("line", (line) => {
   else if (request.method === "thread/start") send({ jsonrpc: "2.0", id: request.id, result: { thread: { id: "thread-1" }, model: "gpt-test" } });
   else if (request.method === "turn/start") {
     send({ jsonrpc: "2.0", id: request.id, result: { turn: { id: "turn-1" } } });
-    send({ jsonrpc: "2.0", method: "item/reasoning/summaryTextDelta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "reasoning-1", summaryIndex: 0, delta: "reasoning-" } });
+    if (request.params.input.some((item) => item.type === "localImage")) {
+      const userMessage = { type: "userMessage", id: "user-1", clientId: null, content: [{ type: "text", text: "test", text_elements: [] }, { type: "localImage", path: "/tmp/input.png" }] };
+      send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", startedAtMs: Date.now(), item: userMessage } });
+      send({ jsonrpc: "2.0", method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", completedAtMs: Date.now(), item: userMessage } });
+    }
+    if (request.params.summary === "auto") send({ jsonrpc: "2.0", method: "item/reasoning/summaryTextDelta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "reasoning-1", summaryIndex: 0, delta: "reasoning-" } });
     send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", startedAtMs: Date.now(), item: { type: "agentMessage", id: "commentary-1", text: "", phase: "commentary", memoryCitation: null, delivery: null, questions: null } } });
     send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "commentary-1", delta: "working-" } });
     send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", startedAtMs: Date.now(), item: { type: "commandExecution", id: "command-1", command: "rg process src", cwd: ".", processId: null, source: "agent", status: "inProgress", commandActions: [{ type: "search", command: "rg process src", query: "process", path: "src" }], aggregatedOutput: null, exitCode: null, durationMs: null } } });
@@ -40,7 +45,7 @@ readline.on("line", (line) => {
     send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "future-1", delta: "future-" } });
     send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", startedAtMs: Date.now(), item: { type: "agentMessage", id: "final-1", text: "", phase: "final_answer", memoryCitation: null, delivery: null, questions: null } } });
     send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "final-1", delta: request.params.effort + "-codex-result" } });
-    send({ jsonrpc: "2.0", method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: "turn-1", tokenUsage: { last: { inputTokens: 11, outputTokens: 4, totalTokens: 15 } } } });
+    send({ jsonrpc: "2.0", method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: "turn-1", tokenUsage: { last: { inputTokens: 11, cachedInputTokens: 3, cacheWriteInputTokens: 2, outputTokens: 4, reasoningOutputTokens: 1, totalTokens: 15 } } } });
     send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
   }
   else if (request.method === "session/new") send({ jsonrpc: "2.0", id: request.id, result: { sessionId: "session-1", configOptions: [{ configId: "model", category: "model", type: "select", currentValue: selectedModel, options: [{ value: "auto-smart", name: "Auto Balance" }, { value: "cursor-fast", name: "Cursor Fast" }, { value: "claude-opus-5[thinking=true,context=300k,effort=high,fast=false]", name: "claude-opus-5" }] }] } });
@@ -79,23 +84,39 @@ test("Codex app-server adapter negotiates, streams, and completes a turn", async
     const thread = await client.startThread();
     const deltas: string[] = [];
     const processDeltas: string[] = [];
+    const usageUpdates: unknown[] = [];
     const result = await client.prompt(
       thread.id,
-      [{ type: "text", text: "test" }],
+      [
+        { type: "text", text: "test" },
+        { type: "localImage", path: join(root, "input.png") },
+      ],
       undefined,
       (delta) => deltas.push(delta),
       undefined,
       (delta) => processDeltas.push(delta),
+      [],
+      undefined,
+      (usage) => usageUpdates.push(usage),
     );
     assert.deepEqual(result, {
       threadId: "thread-1",
       turnId: "turn-1",
       status: "completed",
       text: "future-low-codex-result",
-      usage: { inputTokens: 11, outputTokens: 4, totalTokens: 15 },
+      usage: {
+        inputTokens: 11,
+        outputTokens: 4,
+        totalTokens: 15,
+        cachedInputTokens: 3,
+        cacheWriteInputTokens: 2,
+        reasoningTokens: 1,
+      },
     });
     assert.deepEqual(deltas, ["future-", "low-codex-result"]);
     assert.deepEqual(processDeltas, [
+      "读取图片内容",
+      "\n\n",
       "reasoning-",
       "\n\n",
       "working-",
@@ -107,6 +128,16 @@ test("Codex app-server adapter negotiates, streams, and completes a turn", async
       "搜索网页 `Responses API events`",
       "\n\n",
       "上下文已自动压缩",
+    ]);
+    assert.deepEqual(usageUpdates, [
+      {
+        inputTokens: 11,
+        outputTokens: 4,
+        totalTokens: 15,
+        cachedInputTokens: 3,
+        cacheWriteInputTokens: 2,
+        reasoningTokens: 1,
+      },
     ]);
     const highDeltas: string[] = [];
     const highResult = await client.prompt(

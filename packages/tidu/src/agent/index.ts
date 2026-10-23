@@ -77,6 +77,12 @@ export interface AgentModelRequest {
       outputTokens: number;
       /** Total tokens consumed by this call. */
       totalTokens: number;
+      /** Cached input tokens, when reported by the provider. */
+      cachedInputTokens?: number;
+      /** Cache-write input tokens, when reported by the provider. */
+      cacheWriteInputTokens?: number;
+      /** Reasoning output tokens, when reported by the provider. */
+      reasoningTokens?: number;
     } | null;
   }) => void;
 }

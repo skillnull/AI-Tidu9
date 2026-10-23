@@ -84,6 +84,12 @@ export interface ProviderExecutionReceipt {
     outputTokens: number;
     /** Total tokens consumed by this call. */
     totalTokens: number;
+    /** Cached input tokens, when the provider reports the breakdown. */
+    cachedInputTokens?: number;
+    /** Cache-write input tokens, when the provider reports the breakdown. */
+    cacheWriteInputTokens?: number;
+    /** Reasoning output tokens, when the provider reports the breakdown. */
+    reasoningTokens?: number;
   } | null;
 }
 

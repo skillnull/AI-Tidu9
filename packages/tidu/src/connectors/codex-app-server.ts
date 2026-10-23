@@ -20,6 +20,7 @@ export type CodexReasoningEffort =
   | "xhigh"
   | "max"
   | "ultra";
+export type CodexReasoningSummary = "auto" | "concise" | "detailed" | "none";
 
 export interface CodexAgentEvent {
   /** App-server notification method. */
@@ -101,6 +102,9 @@ export interface CodexTurnResult {
     inputTokens: number;
     outputTokens: number;
     totalTokens: number;
+    cachedInputTokens?: number;
+    cacheWriteInputTokens?: number;
+    reasoningTokens?: number;
   } | null;
 }
 
@@ -148,6 +152,8 @@ export interface CodexAgentClient {
     onProcessDelta?: (delta: string) => void,
     historyItems?: readonly Record<string, unknown>[],
     outputSchema?: Record<string, unknown>,
+    onUsageUpdate?: (usage: NonNullable<CodexTurnResult["usage"]>) => void,
+    reasoningSummary?: CodexReasoningSummary,
   ) => Promise<CodexTurnResult>;
   /** Interrupts one active turn. */
   cancel: (threadId: string, turnId: string) => Promise<void>;
@@ -172,6 +178,8 @@ interface TurnState {
   processItemKey?: string;
   /** Latest per-turn token usage reported by the official app-server. */
   usage: CodexTurnResult["usage"];
+  /** Receives provider-authoritative usage before the turn reaches a terminal state. */
+  onUsageUpdate?: (usage: NonNullable<CodexTurnResult["usage"]>) => void;
 }
 
 interface BufferedTurnNotifications {
@@ -231,6 +239,19 @@ const describeCommandAction = (value: unknown): string | undefined => {
 const describeProcessItem = (value: unknown): readonly string[] => {
   if (!isRecord(value)) return [];
   const type = readString(value, "type");
+  if (type === "userMessage") {
+    const hasImage =
+      Array.isArray(value.content) &&
+      value.content.some(
+        (part) =>
+          isRecord(part) &&
+          (part.type === "image" ||
+            part.type === "localImage" ||
+            part.type === "input_image" ||
+            part.type === "image_url"),
+      );
+    return hasImage ? ["读取图片内容"] : [];
+  }
   if (type === "commandExecution") {
     const actions = Array.isArray(value.commandActions)
       ? value.commandActions.flatMap((action) => {
@@ -419,7 +440,17 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       const outputTokens = readNumber(last, "outputTokens");
       const totalTokens = readNumber(last, "totalTokens");
       if (inputTokens !== null && outputTokens !== null && totalTokens !== null) {
-        const usage = { inputTokens, outputTokens, totalTokens };
+        const cachedInputTokens = readNumber(last, "cachedInputTokens");
+        const cacheWriteInputTokens = readNumber(last, "cacheWriteInputTokens");
+        const reasoningTokens = readNumber(last, "reasoningOutputTokens");
+        const usage = {
+          inputTokens,
+          outputTokens,
+          totalTokens,
+          ...(cachedInputTokens === null ? {} : { cachedInputTokens }),
+          ...(cacheWriteInputTokens === null ? {} : { cacheWriteInputTokens }),
+          ...(reasoningTokens === null ? {} : { reasoningTokens }),
+        };
         const state = activeTurns.get(turnId);
         if (state === undefined) {
           bufferTurnNotification(turnId, (buffer) => {
@@ -427,6 +458,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           });
         } else {
           state.usage = usage;
+          state.onUsageUpdate?.(usage);
         }
       }
       return;
@@ -612,6 +644,8 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       onProcessDelta?: (delta: string) => void,
       historyItems: readonly Record<string, unknown>[] = [],
       outputSchema?: Record<string, unknown>,
+      onUsageUpdate?: (usage: NonNullable<CodexTurnResult["usage"]>) => void,
+      reasoningSummary: CodexReasoningSummary = "auto",
     ): Promise<CodexTurnResult> => {
       requireInitialized();
       if (
@@ -630,6 +664,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           input,
           approvalPolicy: "on-request",
           effort: reasoningEffort ?? options.reasoningEffort ?? null,
+          summary: reasoningSummary,
           outputSchema: outputSchema ?? null,
         },
         signal,
@@ -654,6 +689,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           onTextDelta,
           onProcessDelta,
           usage: null,
+          onUsageUpdate,
         };
         activeTurns.set(turnId, state);
         const buffered = bufferedTurnNotifications.get(turnId);
@@ -670,7 +706,10 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           state.processItemKey = processDelta.itemKey;
           state.onProcessDelta?.(processDelta.delta);
         }
-        if (buffered.usage !== undefined) state.usage = buffered.usage;
+        if (buffered.usage !== undefined) {
+          state.usage = buffered.usage;
+          state.onUsageUpdate?.(buffered.usage);
+        }
         if (buffered.completion !== undefined) completeTurn(buffered.completion, state);
       });
     },

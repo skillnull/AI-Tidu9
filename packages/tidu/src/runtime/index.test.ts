@@ -806,10 +806,20 @@ test("routes ordinary inference through one Agent model call and preserves reaso
     const chatBody = (await chatResponse.json()) as {
       model: string;
       choices: Array<{ message: { content: string } }>;
+      usage: {
+        prompt_tokens: number;
+        completion_tokens: number;
+        total_tokens: number;
+      };
     };
     assert.equal(chatBody.model, "ai-tidu9-config");
     const chatText = chatBody.choices[0]?.message.content ?? "";
     assert.equal(chatText, "hello from chat");
+    assert.deepEqual(chatBody.usage, {
+      prompt_tokens: 12,
+      completion_tokens: 5,
+      total_tokens: 17,
+    });
 
     const responsesResponse = await fetch(`${runtime.origin}/v1/responses`, {
       method: "POST",
@@ -832,6 +842,11 @@ test("routes ordinary inference through one Agent model call and preserves reaso
     const responsesBody = (await responsesResponse.json()) as {
       model: string;
       output: Array<{ content?: Array<{ text?: string }> }>;
+      usage: {
+        input_tokens: number;
+        output_tokens: number;
+        total_tokens: number;
+      };
     };
     assert.equal(responsesBody.model, "ai-tidu9-config");
     const responsesText = responsesBody.output
@@ -839,6 +854,27 @@ test("routes ordinary inference through one Agent model call and preserves reaso
       .map((content) => content.text ?? "")
       .join("");
     assert.equal(responsesText, "hello from responses");
+    assert.deepEqual(responsesBody.usage, {
+      input_tokens: 20,
+      input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+      output_tokens: 8,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 28,
+    });
+    const streamedChatResponse = await fetch(`${runtime.origin}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        messages: [{ role: "user", content: "stream usage" }],
+        stream: true,
+      }),
+    });
+    assert.equal(streamedChatResponse.status, 200);
+    assert.match(
+      await streamedChatResponse.text(),
+      /"usage":\{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17\}/u,
+    );
     assert.deepEqual(requests, [
       {
         protocol: "chat-completions",
@@ -866,7 +902,73 @@ test("routes ordinary inference through one Agent model call and preserves reaso
           },
         ],
       },
+      {
+        protocol: "chat-completions",
+        model: "ai-tidu9-config",
+        virtualModelId: "ai-tidu9-config",
+        reasoning: undefined,
+        reasoningEffort: undefined,
+        role: "worker",
+        toolChoice: undefined,
+        tools: undefined,
+      },
     ]);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("routes the standard OpenAI endpoint through the configured host adapter", async () => {
+  const routedHosts: Array<string | undefined> = [];
+  const provider: ModelProvider = {
+    descriptor: { type: "codex-host", model: "gpt-test" },
+    execute: async (request) => {
+      routedHosts.push(request.routing?.host);
+      request.onExecutionReceipt?.({
+        host: "codex",
+        model: "gpt-test",
+        role: request.routing?.role ?? "main",
+        capabilities: request.routing?.availableCapabilities ?? ["text"],
+        usage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 },
+      });
+      return {
+        kind: "json",
+        statusCode: 200,
+        upstreamModel: "gpt-test",
+        body: {
+          id: "resp-host-route",
+          object: "response",
+          status: "completed",
+          output: [
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "ok" }],
+            },
+          ],
+          usage: { input_tokens: 4, output_tokens: 2, total_tokens: 6 },
+        },
+      };
+    },
+  };
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    port: 0,
+    provider,
+  });
+
+  try {
+    const response = await fetch(`${runtime.origin}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "ai-tidu9-config", input: "hello" }),
+    });
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as {
+      usage?: { total_tokens?: number };
+    };
+    assert.equal(body.usage?.total_tokens, 6);
+    assert.deepEqual(routedHosts, ["codex"]);
   } finally {
     await runtime.close();
   }
@@ -888,7 +990,12 @@ test("streams real upstream output deltas through the Agent Responses lifecycle"
             upstreamController = controller;
             controller.enqueue(
               encoder.encode(
-                'event: response.reasoning_summary_text.delta\ndata: {"type":"response.reasoning_summary_text.delta","delta":"checking source"}\n\n',
+                'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"id":"upstream-commentary","type":"message","status":"in_progress","role":"assistant","phase":"commentary","content":[]}}\n\nevent: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"upstream-commentary","output_index":0,"content_index":0,"delta":"checking source"}\n\nevent: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"id":"upstream-commentary","type":"message","status":"completed","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"checking source"}]}}\n\n',
+              ),
+            );
+            controller.enqueue(
+              encoder.encode(
+                'event: response.reasoning_summary_text.delta\ndata: {"type":"response.reasoning_summary_text.delta","delta":"verifying config\\n\\n"}\n\n',
               ),
             );
             controller.enqueue(
@@ -934,10 +1041,11 @@ test("streams real upstream output deltas through the Agent Responses lifecycle"
       events += decoder.decode(chunk?.value, { stream: true });
     }
     assert.doesNotMatch(events, /event: response\.completed/u);
-    assert.match(events, /response\.reasoning_summary_text\.delta/u);
+    assert.match(events, /"phase":"commentary"/u);
     assert.match(events, /checking source/u);
+    assert.match(events, /verifying config/u);
     assert.match(events, /future summary/u);
-    assert.doesNotMatch(events, /"phase":"final_answer"/u);
+    assert.match(events, /"phase":"final_answer"/u);
     assert.doesNotMatch(events, /执行路径已确认/u);
     assert.doesNotMatch(events, /Request: Codex|Execution task:|Codex · .* · text/u);
     upstreamController?.enqueue(
@@ -947,7 +1055,7 @@ test("streams real upstream output deltas through the Agent Responses lifecycle"
     );
     upstreamController?.enqueue(
       encoder.encode(
-        'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello world"}]}]}}\n\n',
+        'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"checking source"}]},{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"hello world"}]}],"usage":{"input_tokens":30,"input_tokens_details":{"cached_tokens":7,"cache_write_tokens":2},"output_tokens":12,"output_tokens_details":{"reasoning_tokens":3},"total_tokens":42}}}\n\n',
       ),
     );
     upstreamController?.enqueue(encoder.encode("data: [DONE]\n\n"));
@@ -958,12 +1066,81 @@ test("streams real upstream output deltas through the Agent Responses lifecycle"
       events += decoder.decode(chunk.value, { stream: true });
     }
     events += decoder.decode();
-    assert.equal(events.match(/event: response\.output_text\.delta/gu)?.length, 2);
     assert.match(events, /"delta":"hello "/u);
     assert.match(events, /"delta":"world"/u);
     assert.match(events, /"text":"hello world/u);
     assert.match(events, /event: response\.completed/u);
+    assert.match(events, /"input_tokens_details":\{"cached_tokens":7,"cache_write_tokens":2\}/u);
+    assert.match(events, /"output_tokens_details":\{"reasoning_tokens":3\}/u);
     assert.match(events, /data: \[DONE\]/u);
+    const responseEvents = events
+      .split(/\r?\n\r?\n/u)
+      .flatMap((eventBlock): Record<string, unknown>[] => {
+        const dataLine = eventBlock.split(/\r?\n/u).find((line) => line.startsWith("data: "));
+        if (dataLine === undefined || dataLine === "data: [DONE]") return [];
+        return [JSON.parse(dataLine.slice("data: ".length)) as Record<string, unknown>];
+      });
+    const commentaryItems = responseEvents.filter((event) => {
+      if (event.type !== "response.output_item.added") return false;
+      const item = event.item;
+      return (
+        typeof item === "object" &&
+        item !== null &&
+        "type" in item &&
+        item.type === "message" &&
+        "phase" in item &&
+        item.phase === "commentary"
+      );
+    });
+    assert.deepEqual(
+      commentaryItems.map((event) => event.output_index),
+      [0, 1, 2],
+    );
+    const finalMessageItems = responseEvents.filter((event) => {
+      if (event.type !== "response.output_item.added") return false;
+      const item = event.item;
+      return (
+        typeof item === "object" &&
+        item !== null &&
+        "type" in item &&
+        item.type === "message" &&
+        "phase" in item &&
+        item.phase === "final_answer"
+      );
+    });
+    assert.deepEqual(
+      finalMessageItems.map((event) => event.output_index),
+      [3],
+    );
+    const createdEvent = responseEvents.find((event) => event.type === "response.created");
+    const completedEvent = responseEvents.find((event) => event.type === "response.completed");
+    const createdResponse = createdEvent?.response as Record<string, unknown> | undefined;
+    const completedResponse = completedEvent?.response as Record<string, unknown> | undefined;
+    assert.equal(typeof createdResponse?.created_at, "number");
+    assert.equal(typeof completedResponse?.completed_at, "number");
+    assert.ok(
+      (completedResponse?.completed_at as number) >= (createdResponse?.created_at as number),
+    );
+    assert.deepEqual(completedResponse?.usage, {
+      input_tokens: 30,
+      input_tokens_details: { cached_tokens: 7, cache_write_tokens: 2 },
+      output_tokens: 12,
+      output_tokens_details: { reasoning_tokens: 3 },
+      total_tokens: 42,
+    });
+    const terminalOutput = completedResponse?.output as Record<string, unknown>[] | undefined;
+    assert.deepEqual(
+      terminalOutput?.map((item) => item.type),
+      ["message", "message", "message", "message"],
+    );
+    assert.deepEqual(
+      terminalOutput?.map((item) => item.phase),
+      ["commentary", "commentary", "commentary", "final_answer"],
+    );
+    assert.deepEqual(
+      terminalOutput?.map((item) => item.status),
+      ["completed", "completed", "completed", "completed"],
+    );
   } finally {
     await runtime.close();
   }
@@ -1005,23 +1182,26 @@ test("preserves the Codex process lifecycle when the host turn only emits a fina
     const response = await fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "ai-tidu9-config", input: "hello", stream: true }),
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        input: "hello",
+        stream: true,
+      }),
     });
     assert.equal(response.status, 200);
     const events = await response.text();
-    const reasoningStartedAt = events.indexOf(
+    const processStartedAt = events.indexOf(
       '"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"',
     );
-    const messageStartedAt = events.indexOf('"type":"message","status":"in_progress"');
-    assert.notEqual(reasoningStartedAt, -1);
-    assert.ok(reasoningStartedAt < messageStartedAt);
-    assert.match(
-      events,
-      /"type":"reasoning","status":"completed","summary":\[\{"type":"summary_text","text":"Working on the request…"\}\]/u,
-    );
-    assert.match(events, /response\.reasoning_summary_text\.delta/u);
-    assert.match(events, /response\.reasoning_summary_part\.added/u);
-    assert.match(events, /response\.reasoning_summary_part\.done/u);
+    const finalMessageStartedAt = events.indexOf('"phase":"final_answer"');
+    assert.notEqual(processStartedAt, -1);
+    assert.ok(processStartedAt < finalMessageStartedAt);
+    assert.doesNotMatch(events, /Starting the task execution environment/u);
+    assert.doesNotMatch(events, /response\.reasoning_summary/u);
+    assert.match(events, /Working on the request/u);
+    assert.match(events, /"phase":"commentary"/u);
+    assert.match(events, /response\.content_part\.added/u);
+    assert.match(events, /response\.content_part\.done/u);
     assert.match(events, /"output_index":1/u);
     assert.match(events, /event: response\.completed/u);
     assert.match(events, /data: \[DONE\]/u);
@@ -1236,9 +1416,8 @@ test("completes the Agent Responses stream with explicit lifecycle events", asyn
     assert.match(events, /event: response\.created/u);
     assert.match(events, /event: response\.output_item\.added/u);
     assert.match(events, /event: response\.content_part\.added/u);
-    assert.match(events, /event: response\.reasoning_summary_part\.added/u);
-    assert.match(events, /event: response\.reasoning_summary_text\.done/u);
-    assert.match(events, /event: response\.reasoning_summary_part\.done/u);
+    assert.match(events, /"phase":"commentary"/u);
+    assert.doesNotMatch(events, /event: response\.reasoning_summary/u);
     assert.doesNotMatch(events, /Request: Codex|Execution task:/u);
     assert.doesNotMatch(events, /configured model route/u);
     assert.doesNotMatch(events, /执行路径已确认/u);
@@ -1260,7 +1439,7 @@ test("completes the Agent Responses stream with explicit lifecycle events", asyn
   }
 });
 
-test("waits for host events before opening the assistant message", async () => {
+test("opens a native process item before the assistant message", async () => {
   let releaseWorker: (() => void) | undefined;
   const workerGate = new Promise<void>((resolveWorker) => {
     releaseWorker = resolveWorker;
@@ -1308,14 +1487,22 @@ test("waits for host events before opening the assistant message", async () => {
     assert.notEqual(reader, undefined);
     const decoder = new TextDecoder();
     let initialEvents = "";
-    while (!initialEvents.includes("response.reasoning_summary_part.added")) {
+    while (!initialEvents.includes("event: response.output_item.done")) {
       const chunk = await reader?.read();
       assert.equal(chunk?.done, false);
       initialEvents += decoder.decode(chunk?.value, { stream: true });
     }
-    assert.doesNotMatch(initialEvents, /response\.output_text\.delta/u);
-    assert.match(initialEvents, /"type":"reasoning","status":"in_progress"/u);
-    assert.match(initialEvents, /response\.reasoning_summary_part\.added/u);
+    assert.match(initialEvents, /response\.content_part\.added/u);
+    assert.match(
+      initialEvents,
+      /"type":"message","status":"in_progress","role":"assistant","phase":"commentary","content":\[\]/u,
+    );
+    assert.match(initialEvents, /"delta":"Working on the request…"/u);
+    assert.match(initialEvents, /response\.output_text\.done/u);
+    assert.match(
+      initialEvents,
+      /"type":"message","status":"completed","role":"assistant","phase":"commentary","content":\[\{"type":"output_text","text":"Working on the request…","annotations":\[\]\}\]/u,
+    );
     assert.doesNotMatch(initialEvents, /Request: Codex|Execution task:/u);
 
     releaseWorker?.();
@@ -1339,13 +1526,27 @@ test("reports Agent stream failures as terminal events instead of disconnecting"
   const agentKernel = createAgentKernel({
     store: createInMemoryTaskCapsuleStore(),
     planner: {
-      understand: async () => {
-        throw new Error("routing unavailable");
-      },
-      plan: async () => ({ revision: 1, steps: [] }),
+      understand: async (task) => ({
+        objective: task.goal.objective,
+        acceptanceCriteria: [...task.goal.acceptanceCriteria],
+        constraints: [],
+        assumptions: [],
+        requiredCapabilities: [],
+      }),
+      plan: async () => ({
+        revision: 1,
+        steps: [{ id: "deliver", title: "Deliver", kind: "reason" }],
+      }),
     },
     worker: {
-      execute: async () => {
+      execute: async (input) => {
+        input.modelRequest?.onExecutionReceipt?.({
+          host: "codex",
+          model: "gpt-test",
+          role: "worker",
+          capabilities: ["text"],
+          usage: { inputTokens: 19, outputTokens: 3, totalTokens: 22 },
+        });
         throw new Error("routing unavailable");
       },
     },
@@ -1373,6 +1574,10 @@ test("reports Agent stream failures as terminal events instead of disconnecting"
     assert.equal(response.status, 200);
     assert.match(events, /event: response\.failed/u);
     assert.match(events, /routing unavailable/u);
+    assert.match(
+      events,
+      /"usage":\{"input_tokens":19,"input_tokens_details":\{"cached_tokens":0,"cache_write_tokens":0\},"output_tokens":3,"output_tokens_details":\{"reasoning_tokens":0\},"total_tokens":22\}/u,
+    );
     assert.match(events, /data: \[DONE\]/u);
   } finally {
     await runtime.close();

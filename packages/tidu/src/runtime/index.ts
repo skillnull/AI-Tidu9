@@ -65,6 +65,7 @@ import {
   createProviderFromEnvironment,
   discoverOllamaModels,
   type ModelProvider,
+  type ProviderExecutionReceipt,
   type ProviderExecutionResult,
 } from "../providers/index.js";
 import {
@@ -601,12 +602,58 @@ const createAgentObjective = (body: Record<string, unknown>): string => {
   return objective.slice(0, MAXIMUM_INFERENCE_JSON_BODY_BYTES);
 };
 
+type AgentTokenUsage = NonNullable<ProviderExecutionReceipt["usage"]>;
+
+const createAgentUsageCollector = (): {
+  /** Records the most authoritative usage for one concrete host/model/role execution. */
+  record: (receipt: ProviderExecutionReceipt) => void;
+  /** Returns combined provider-reported usage for the active user turn. */
+  read: () => AgentTokenUsage | null;
+} => {
+  const usageByExecution = new Map<string, AgentTokenUsage>();
+  return {
+    record: (receipt) => {
+      if (receipt.usage === null) return;
+      const executionKey = JSON.stringify([
+        receipt.host,
+        receipt.model,
+        receipt.role,
+        [...receipt.capabilities].sort(),
+      ]);
+      usageByExecution.set(executionKey, receipt.usage);
+    },
+    read: () => {
+      if (usageByExecution.size === 0) return null;
+      return [...usageByExecution.values()].reduce<AgentTokenUsage>(
+        (total, usage) => ({
+          inputTokens: total.inputTokens + usage.inputTokens,
+          outputTokens: total.outputTokens + usage.outputTokens,
+          totalTokens: total.totalTokens + usage.totalTokens,
+          cachedInputTokens: (total.cachedInputTokens ?? 0) + (usage.cachedInputTokens ?? 0),
+          cacheWriteInputTokens:
+            (total.cacheWriteInputTokens ?? 0) + (usage.cacheWriteInputTokens ?? 0),
+          reasoningTokens: (total.reasoningTokens ?? 0) + (usage.reasoningTokens ?? 0),
+        }),
+        {
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          cachedInputTokens: 0,
+          cacheWriteInputTokens: 0,
+          reasoningTokens: 0,
+        },
+      );
+    },
+  };
+};
+
 const createAgentResponsesBody = (
   model: string,
   text: string,
   responseId = `resp_${randomUUID()}`,
-  reasoningSummary?: readonly string[],
+  outputItems?: readonly Record<string, unknown>[],
   createdAt = Math.floor(Date.now() / 1_000),
+  usage?: AgentTokenUsage | null,
 ): Record<string, unknown> => ({
   id: responseId,
   object: "response",
@@ -616,34 +663,37 @@ const createAgentResponsesBody = (
   error: null,
   incomplete_details: null,
   model,
-  output: [
-    ...(reasoningSummary === undefined
-      ? []
-      : [
-          {
-            id: `${responseId}_reasoning`,
-            type: "reasoning",
-            status: "completed",
-            summary: reasoningSummary.map((summary) => ({
-              type: "summary_text",
-              text: summary,
-            })),
-          },
-        ]),
+  output: outputItems ?? [
     {
       id: `${responseId}_message`,
       type: "message",
       status: "completed",
       role: "assistant",
+      phase: "final_answer",
       content: [{ type: "output_text", text, annotations: [] }],
     },
   ],
+  ...(usage == null
+    ? {}
+    : {
+        usage: {
+          input_tokens: usage.inputTokens,
+          input_tokens_details: {
+            cached_tokens: usage.cachedInputTokens ?? 0,
+            cache_write_tokens: usage.cacheWriteInputTokens ?? 0,
+          },
+          output_tokens: usage.outputTokens,
+          output_tokens_details: { reasoning_tokens: usage.reasoningTokens ?? 0 },
+          total_tokens: usage.totalTokens,
+        },
+      }),
 });
 
 const createAgentChatBody = (
   model: string,
   text: string,
   responseId = `chatcmpl_${randomUUID()}`,
+  usage?: AgentTokenUsage | null,
 ): Record<string, unknown> => ({
   id: responseId,
   object: "chat.completion",
@@ -656,6 +706,15 @@ const createAgentChatBody = (
       finish_reason: "stop",
     },
   ],
+  ...(usage == null
+    ? {}
+    : {
+        usage: {
+          prompt_tokens: usage.inputTokens,
+          completion_tokens: usage.outputTokens,
+          total_tokens: usage.totalTokens,
+        },
+      }),
 });
 
 const resolveAgentFailure = (error: unknown): { code: string; message: string } => ({
@@ -672,9 +731,9 @@ const createAgentResponsesStream = (
   ) => Promise<string>,
   chineseRequest: boolean,
   preserveProcessLifecycle: boolean,
+  readUsage: () => AgentTokenUsage | null,
 ): ReadableStream<Uint8Array> => {
   const responseId = `resp_${randomUUID()}`;
-  const reasoningId = `${responseId}_reasoning`;
   const messageId = `${responseId}_message`;
   const createdAt = Math.floor(Date.now() / 1_000);
   const encoder = new TextEncoder();
@@ -729,80 +788,82 @@ const createAgentResponsesStream = (
         if (!closed) controller.enqueue(encoder.encode(": ai-tidu9 keep-alive\n\n"));
       }, 10_000);
       keepAlive.unref();
-      const processParts: string[] = [];
-      let processPartText = "";
-      let processPartStarted = false;
-      let reasoningStarted = false;
-      let reasoningFinished = false;
+      const completedOutputItems = new Map<number, Record<string, unknown>>();
+      let activeProcess: { id: string; outputIndex: number; text: string } | undefined;
+      let nextOutputIndex = 0;
+      let processCount = 0;
       let messageStarted = false;
       let messageOutputIndex = 0;
       let outputText = "";
-      const startReasoning = (): void => {
-        if (reasoningStarted || reasoningFinished) return;
-        reasoningStarted = true;
+      const startProcessLifecycle = (): void => {
+        if (activeProcess !== undefined) return;
+        const stepIndex = processCount;
+        const processItemId =
+          stepIndex === 0
+            ? `${responseId}_commentary`
+            : `${responseId}_commentary_${String(stepIndex + 1)}`;
+        processCount += 1;
+        activeProcess = {
+          id: processItemId,
+          outputIndex: nextOutputIndex,
+          text: "",
+        };
+        nextOutputIndex += 1;
         write("response.output_item.added", {
-          output_index: 0,
+          output_index: activeProcess.outputIndex,
           item: {
-            id: reasoningId,
-            type: "reasoning",
+            id: processItemId,
+            type: "message",
             status: "in_progress",
-            summary: [],
+            role: "assistant",
+            phase: "commentary",
+            content: [],
           },
         });
-      };
-      const startReasoningPart = (): void => {
-        if (processPartStarted || reasoningFinished) return;
-        startReasoning();
-        processPartStarted = true;
-        write("response.reasoning_summary_part.added", {
-          item_id: reasoningId,
-          output_index: 0,
-          summary_index: processParts.length,
-          part: { type: "summary_text", text: "" },
+        write("response.content_part.added", {
+          item_id: processItemId,
+          output_index: activeProcess.outputIndex,
+          content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] },
         });
       };
-      const finishReasoningPart = (): void => {
-        if (!processPartStarted) return;
-        const summaryIndex = processParts.length;
-        write("response.reasoning_summary_text.done", {
-          item_id: reasoningId,
-          output_index: 0,
-          summary_index: summaryIndex,
-          text: processPartText,
+      const finishProcessLifecycle = (): void => {
+        const process = activeProcess;
+        if (process === undefined) return;
+        activeProcess = undefined;
+        if (process.text === "") return;
+        write("response.output_text.done", {
+          item_id: process.id,
+          output_index: process.outputIndex,
+          content_index: 0,
+          text: process.text,
         });
-        write("response.reasoning_summary_part.done", {
-          item_id: reasoningId,
-          output_index: 0,
-          summary_index: summaryIndex,
-          part: { type: "summary_text", text: processPartText },
+        write("response.content_part.done", {
+          item_id: process.id,
+          output_index: process.outputIndex,
+          content_index: 0,
+          part: { type: "output_text", text: process.text, annotations: [] },
         });
-        processParts.push(processPartText);
-        processPartText = "";
-        processPartStarted = false;
-      };
-      const finishReasoning = (): void => {
-        if (reasoningFinished) return;
-        reasoningFinished = true;
-        if (!reasoningStarted) return;
-        finishReasoningPart();
+        const completedItem = {
+          id: process.id,
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          phase: "commentary",
+          content: [{ type: "output_text", text: process.text, annotations: [] }],
+        };
+        completedOutputItems.set(process.outputIndex, completedItem);
         write("response.output_item.done", {
-          output_index: 0,
-          item: {
-            id: reasoningId,
-            type: "reasoning",
-            status: "completed",
-            summary: processParts.map((summary) => ({
-              type: "summary_text",
-              text: summary,
-            })),
-          },
+          output_index: process.outputIndex,
+          item: completedItem,
         });
       };
       const startMessage = (): void => {
         if (messageStarted) return;
-        finishReasoning();
+        finishProcessLifecycle();
         messageStarted = true;
-        messageOutputIndex = reasoningStarted ? 1 : 0;
+        messageOutputIndex = nextOutputIndex;
+        nextOutputIndex += 1;
         write("response.output_item.added", {
           output_index: messageOutputIndex,
           item: {
@@ -810,6 +871,7 @@ const createAgentResponsesStream = (
             type: "message",
             status: "in_progress",
             role: "assistant",
+            phase: "final_answer",
             content: [],
           },
         });
@@ -821,19 +883,23 @@ const createAgentResponsesStream = (
         });
       };
       const emitProcessDelta = (delta: string): void => {
-        if (closed || reasoningFinished || delta === "") return;
-        if (delta === "\n\n") {
-          finishReasoningPart();
-          return;
+        if (closed || delta === "") return;
+        for (const chunk of delta.split(/((?:\r?\n){2,})/u)) {
+          if (chunk === "") continue;
+          if (/^(?:\r?\n){2,}$/u.test(chunk)) {
+            finishProcessLifecycle();
+            continue;
+          }
+          startProcessLifecycle();
+          if (activeProcess === undefined) continue;
+          activeProcess.text += chunk;
+          write("response.output_text.delta", {
+            item_id: activeProcess.id,
+            output_index: activeProcess.outputIndex,
+            content_index: 0,
+            delta: chunk,
+          });
         }
-        startReasoningPart();
-        processPartText += delta;
-        write("response.reasoning_summary_text.delta", {
-          item_id: reasoningId,
-          output_index: 0,
-          summary_index: processParts.length,
-          delta,
-        });
       };
       const emitOutputDelta = (delta: string): void => {
         if (closed || delta === "") return;
@@ -848,6 +914,7 @@ const createAgentResponsesStream = (
       };
       if (preserveProcessLifecycle) {
         emitProcessDelta(chineseRequest ? "正在处理请求…" : "Working on the request…");
+        finishProcessLifecycle();
       }
       void run(abortController.signal, emitProcessDelta, emitOutputDelta)
         .then((text) => {
@@ -856,6 +923,7 @@ const createAgentResponsesStream = (
           } else if (text.startsWith(outputText) && text.length > outputText.length) {
             emitOutputDelta(text.slice(outputText.length));
           }
+          finishProcessLifecycle();
           startMessage();
           write("response.output_text.done", {
             item_id: messageId,
@@ -869,23 +937,29 @@ const createAgentResponsesStream = (
             content_index: 0,
             part: { type: "output_text", text: outputText, annotations: [] },
           });
+          const completedMessage = {
+            id: messageId,
+            type: "message",
+            status: "completed",
+            role: "assistant",
+            phase: "final_answer",
+            content: [{ type: "output_text", text: outputText, annotations: [] }],
+          };
+          completedOutputItems.set(messageOutputIndex, completedMessage);
           write("response.output_item.done", {
             output_index: messageOutputIndex,
-            item: {
-              id: messageId,
-              type: "message",
-              status: "completed",
-              role: "assistant",
-              content: [{ type: "output_text", text: outputText, annotations: [] }],
-            },
+            item: completedMessage,
           });
           write("response.completed", {
             response: createAgentResponsesBody(
               model,
               outputText,
               responseId,
-              reasoningStarted ? processParts : undefined,
+              [...completedOutputItems.entries()]
+                .sort(([left], [right]) => left - right)
+                .map(([, item]) => item),
               createdAt,
+              readUsage(),
             ),
           });
           if (!closed) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
@@ -893,31 +967,37 @@ const createAgentResponsesStream = (
         })
         .catch((error: unknown) => {
           const failure = resolveAgentFailure(error);
-          finishReasoning();
+          const failureUsage = readUsage();
+          finishProcessLifecycle();
           const failureText = `${chineseRequest ? "请求失败" : "Request failed"}: ${failure.message}`;
           emitOutputDelta(`${outputText === "" ? "" : "\n\n"}${failureText}`);
-          write("response.output_text.done", {
-            item_id: messageId,
-            output_index: messageOutputIndex,
-            content_index: 0,
-            text: outputText,
-          });
-          write("response.content_part.done", {
-            item_id: messageId,
-            output_index: messageOutputIndex,
-            content_index: 0,
-            part: { type: "output_text", text: outputText, annotations: [] },
-          });
-          write("response.output_item.done", {
-            output_index: messageOutputIndex,
-            item: {
+          if (messageStarted) {
+            write("response.output_text.done", {
+              item_id: messageId,
+              output_index: messageOutputIndex,
+              content_index: 0,
+              text: outputText,
+            });
+            write("response.content_part.done", {
+              item_id: messageId,
+              output_index: messageOutputIndex,
+              content_index: 0,
+              part: { type: "output_text", text: outputText, annotations: [] },
+            });
+            const incompleteMessage = {
               id: messageId,
               type: "message",
               status: "incomplete",
               role: "assistant",
+              phase: "final_answer",
               content: [{ type: "output_text", text: outputText, annotations: [] }],
-            },
-          });
+            };
+            completedOutputItems.set(messageOutputIndex, incompleteMessage);
+            write("response.output_item.done", {
+              output_index: messageOutputIndex,
+              item: incompleteMessage,
+            });
+          }
           write("response.failed", {
             response: {
               id: responseId,
@@ -927,29 +1007,26 @@ const createAgentResponsesStream = (
               completed_at: null,
               incomplete_details: null,
               model,
-              output: [
-                ...(reasoningStarted
-                  ? [
-                      {
-                        id: reasoningId,
-                        type: "reasoning",
-                        status: "completed",
-                        summary: processParts.map((summary) => ({
-                          type: "summary_text",
-                          text: summary,
-                        })),
-                      },
-                    ]
-                  : []),
-                {
-                  id: messageId,
-                  type: "message",
-                  status: "incomplete",
-                  role: "assistant",
-                  content: [{ type: "output_text", text: outputText, annotations: [] }],
-                },
-              ],
+              output: [...completedOutputItems.entries()]
+                .sort(([left], [right]) => left - right)
+                .map(([, item]) => item),
               error: failure,
+              ...(failureUsage === null
+                ? {}
+                : {
+                    usage: {
+                      input_tokens: failureUsage.inputTokens,
+                      input_tokens_details: {
+                        cached_tokens: failureUsage.cachedInputTokens ?? 0,
+                        cache_write_tokens: failureUsage.cacheWriteInputTokens ?? 0,
+                      },
+                      output_tokens: failureUsage.outputTokens,
+                      output_tokens_details: {
+                        reasoning_tokens: failureUsage.reasoningTokens ?? 0,
+                      },
+                      total_tokens: failureUsage.totalTokens,
+                    },
+                  }),
             },
           });
           if (!closed) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
@@ -971,6 +1048,7 @@ const createAgentChatStream = (
     onProcessDelta?: (delta: string) => void,
     onOutputDelta?: (delta: string) => void,
   ) => Promise<string>,
+  readUsage: () => AgentTokenUsage | null,
 ): ReadableStream<Uint8Array> => {
   const responseId = `chatcmpl_${randomUUID()}`;
   const encoder = new TextEncoder();
@@ -1009,15 +1087,19 @@ const createAgentChatStream = (
           } else if (text.startsWith(outputText) && text.length > outputText.length) {
             emitOutputDelta(text.slice(outputText.length));
           }
+          const usage = readUsage();
           write(
-            `data: ${JSON.stringify({ id: responseId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1_000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+            `data: ${JSON.stringify({ id: responseId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1_000), model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], ...(usage === null ? {} : { usage: { prompt_tokens: usage.inputTokens, completion_tokens: usage.outputTokens, total_tokens: usage.totalTokens } }) })}\n\n`,
           );
           write("data: [DONE]\n\n");
           close();
         })
         .catch((error: unknown) => {
           const failure = resolveAgentFailure(error);
-          write(`data: ${JSON.stringify({ error: { ...failure, type: "server_error" } })}\n\n`);
+          const usage = readUsage();
+          write(
+            `data: ${JSON.stringify({ error: { ...failure, type: "server_error" }, ...(usage === null ? {} : { usage: { prompt_tokens: usage.inputTokens, completion_tokens: usage.outputTokens, total_tokens: usage.totalTokens } }) })}\n\n`,
+          );
           write("data: [DONE]\n\n");
           close();
         });
@@ -1038,6 +1120,7 @@ const runAgentResponsesTask = async (
   signal?: AbortSignal,
   onProcessDelta?: (delta: string) => void,
   onOutputDelta?: (delta: string) => void,
+  onExecutionReceipt?: (receipt: ProviderExecutionReceipt) => void,
 ): Promise<string> => {
   const objective = createAgentObjective(body);
   if (objective === "") throw new Error("The Agent request does not contain a usable goal.");
@@ -1081,6 +1164,7 @@ const runAgentResponsesTask = async (
       virtualModelId: model,
       ...(onOutputDelta === undefined ? {} : { onOutputDelta }),
       ...(onProcessDelta === undefined ? {} : { onProcessDelta }),
+      ...(onExecutionReceipt === undefined ? {} : { onExecutionReceipt }),
     },
   });
   const cancel = (): void => {
@@ -1115,6 +1199,43 @@ const runAgentResponsesTask = async (
   return completed.result.summary;
 };
 
+const resolveInferenceHost = (
+  configuration: TiduConfiguration,
+  provider: ModelProvider | undefined,
+  requestedHost?: AgentHostId,
+): AgentHostId => {
+  if (requestedHost !== undefined) return requestedHost;
+  switch (provider?.descriptor.type) {
+    case "codex-host":
+      return "codex";
+    case "cursor-host":
+      return "cursor";
+    case "ollama":
+      return "ollama";
+    case "openai-compatible":
+      return "openai-compatible";
+  }
+  const matchingPolicyHosts = Object.entries(
+    configuration.capabilityCompletion.hostPolicies ?? {},
+  ).flatMap(([host, policy]): AgentHostId[] =>
+    policy !== undefined &&
+    policy.mainModel.source === configuration.modelSelection.source &&
+    policy.mainModel.model === configuration.modelSelection.model
+      ? [host as AgentHostId]
+      : [],
+  );
+  if (matchingPolicyHosts.length === 1 && matchingPolicyHosts[0] !== undefined) {
+    return matchingPolicyHosts[0];
+  }
+  if (
+    configuration.modelSelection.source === "official" &&
+    configuration.capabilityCompletion.hostPolicies?.codex !== undefined
+  ) {
+    return "codex";
+  }
+  return "openai-compatible";
+};
+
 const handleOpenAiInference = async (
   request: import("node:http").IncomingMessage,
   response: import("node:http").ServerResponse,
@@ -1122,7 +1243,7 @@ const handleOpenAiInference = async (
   protocol: "chat-completions" | "responses",
   provider: ModelProvider | undefined,
   agentKernel: AgentKernel | undefined,
-  originHost: AgentHostId,
+  requestedHost?: AgentHostId,
 ): Promise<void> => {
   const requestId = randomUUID();
   let body: unknown;
@@ -1139,6 +1260,7 @@ const handleOpenAiInference = async (
     return;
   }
   const workspace = await storage.configurationStore.loadWorkspace();
+  const originHost = resolveInferenceHost(workspace.active.configuration, provider, requestedHost);
   const activeModelId = workspace.active.configuration.activeProfileId;
   const validation =
     protocol === "chat-completions"
@@ -1187,6 +1309,7 @@ const handleOpenAiInference = async (
       return;
     }
     const model = typeof requestBody.model === "string" ? requestBody.model : "ai-tidu9-config";
+    const usageCollector = createAgentUsageCollector();
     const run = async (
       signal?: AbortSignal,
       onProcessDelta?: (delta: string) => void,
@@ -1200,6 +1323,7 @@ const handleOpenAiInference = async (
         signal,
         onProcessDelta,
         onOutputDelta,
+        usageCollector.record,
       );
     try {
       if (requestBody.stream === true) {
@@ -1210,8 +1334,9 @@ const handleOpenAiInference = async (
                 run,
                 /\p{Script=Han}/u.test(createAgentObjective(requestBody)),
                 originHost === "codex",
+                usageCollector.read,
               )
-            : createAgentChatStream(model, run);
+            : createAgentChatStream(model, run, usageCollector.read);
         await sendOpenAiStream(response, 200, stream, requestId);
       } else {
         const text = await run();
@@ -1219,8 +1344,15 @@ const handleOpenAiInference = async (
           response,
           200,
           protocol === "responses"
-            ? createAgentResponsesBody(model, text)
-            : createAgentChatBody(model, text),
+            ? createAgentResponsesBody(
+                model,
+                text,
+                undefined,
+                undefined,
+                undefined,
+                usageCollector.read(),
+              )
+            : createAgentChatBody(model, text, undefined, usageCollector.read()),
           requestId,
         );
       }
@@ -2888,7 +3020,7 @@ const handleRequest = async (
     /^\/v1\/hosts\/(codex|cursor|ollama|openai-compatible)\/(chat\/completions|responses)$/u.exec(
       pathname,
     );
-  const inferenceHost = (hostInferenceRoute?.[1] as AgentHostId | undefined) ?? "openai-compatible";
+  const inferenceHost = hostInferenceRoute?.[1] as AgentHostId | undefined;
   const inferenceRoute = hostInferenceRoute?.[2];
   if (
     request.method === "POST" &&

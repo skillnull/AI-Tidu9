@@ -5,7 +5,11 @@ import { join } from "node:path";
 import test from "node:test";
 import { createCapabilityRegistry } from "../capabilities/index.js";
 import { createTask } from "../protocol/index.js";
-import type { ModelProvider, ProviderExecutionRequest } from "../providers/index.js";
+import type {
+  ModelProvider,
+  ProviderExecutionReceipt,
+  ProviderExecutionRequest,
+} from "../providers/index.js";
 import { createDynamicModelRouter, type RoutableModel } from "../routing/index.js";
 import { createSecretGate } from "../security/index.js";
 import { openNodeSqliteStorage } from "../storage/index.js";
@@ -259,6 +263,88 @@ test("accepts fast response streams only after a successful terminal event", asy
 
   assert.equal(result.output.summary, "complete");
   assert.deepEqual(result.deltas, ["complete"]);
+});
+
+test("keeps worker terminal usage after a specialist reports usage first", async () => {
+  const receipts: ProviderExecutionReceipt[] = [];
+  const provider: ModelProvider = {
+    descriptor: { type: "openai-compatible", model: "worker-model" },
+    execute: async (request) => {
+      request.onExecutionReceipt?.({
+        host: "cursor",
+        model: "specialist-model",
+        role: "specialist",
+        capabilities: ["vision"],
+        usage: { inputTokens: 4, outputTokens: 1, totalTokens: 5 },
+      });
+      return {
+        kind: "stream",
+        statusCode: 200,
+        upstreamModel: "worker-model",
+        stream: new ReadableStream<Uint8Array>({
+          start: (controller) => {
+            controller.enqueue(
+              encodeAgentSseData({ type: "response.output_text.delta", delta: "complete" }),
+            );
+            controller.enqueue(
+              encodeAgentSseData({
+                type: "response.completed",
+                response: {
+                  status: "completed",
+                  output_text: "complete",
+                  usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 },
+                },
+              }),
+            );
+            controller.enqueue(encodeAgentSseData("[DONE]"));
+            controller.close();
+          },
+        }),
+      };
+    },
+  };
+  const plan: AgentPlan = {
+    revision: 1,
+    steps: [{ id: "deliver", title: "Deliver", kind: "reason" }],
+  };
+  const step = plan.steps[0];
+  if (step === undefined) throw new Error("Usage test requires one step.");
+
+  const output = await createModelProviderAgentAdapters(provider, "ai-tidu9-config").worker.execute(
+    {
+      task: createTask({ taskId: "usage-test", goal: "Return a streamed result" }),
+      understanding: { ...understanding, requiredCapabilities: ["text"] },
+      plan,
+      step,
+      previousResults: [],
+      signal: new AbortController().signal,
+      modelRequest: {
+        protocol: "responses",
+        virtualModelId: "ai-tidu9-config",
+        body: { input: "stream" },
+        onOutputDelta: () => undefined,
+        onExecutionReceipt: (receipt) => receipts.push(receipt),
+      },
+    },
+  );
+
+  assert.equal(output.summary, "complete");
+  assert.deepEqual(receipts, [
+    {
+      host: "cursor",
+      model: "specialist-model",
+      role: "specialist",
+      capabilities: ["vision"],
+      usage: { inputTokens: 4, outputTokens: 1, totalTokens: 5 },
+    },
+    {
+      host: "openai-compatible",
+      model: "worker-model",
+      role: "worker",
+      capabilities: ["text"],
+      usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+    },
+  ]);
 });
 
 test("rejects every unsuccessful fast-stream terminal and partial EOF", async () => {

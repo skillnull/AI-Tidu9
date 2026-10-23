@@ -1653,7 +1653,7 @@ export const createCapabilityCompletionProvider = (
                 ...request.routing,
                 host,
                 modelSource: selection.source,
-                availableCapabilities: capabilities,
+                availableCapabilities: request.routing?.availableCapabilities ?? capabilities,
                 ...(selection.model === "current" ? {} : { targetModel: selection.model }),
               },
             });

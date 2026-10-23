@@ -1,6 +1,7 @@
 import { type AgentHostId, MODEL_ROUTING_CAPABILITIES } from "../config/index.js";
 import type {
   ModelProvider,
+  ProviderExecutionReceipt,
   ProviderExecutionRequest,
   ProviderExecutionResult,
 } from "../providers/index.js";
@@ -138,9 +139,52 @@ const extractTextContent = (body: unknown): string => {
   throw new Error("Agent model response does not contain text content.");
 };
 
-const extractStreamTextDelta = (body: unknown): string => {
+type ProviderTokenUsage = NonNullable<ProviderExecutionReceipt["usage"]>;
+
+const readTokenCount = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+
+const extractProviderUsage = (value: unknown): ProviderTokenUsage | null => {
+  if (!isRecord(value)) return null;
+  const inputTokens = readTokenCount(value.input_tokens ?? value.prompt_tokens);
+  const outputTokens = readTokenCount(value.output_tokens ?? value.completion_tokens);
+  if (inputTokens === undefined || outputTokens === undefined) return null;
+  const totalTokens = readTokenCount(value.total_tokens) ?? inputTokens + outputTokens;
+  const inputDetails = isRecord(value.input_tokens_details)
+    ? value.input_tokens_details
+    : undefined;
+  const outputDetails = isRecord(value.output_tokens_details)
+    ? value.output_tokens_details
+    : undefined;
+  const cachedInputTokens = readTokenCount(inputDetails?.cached_tokens);
+  const cacheWriteInputTokens = readTokenCount(inputDetails?.cache_write_tokens);
+  const reasoningTokens = readTokenCount(outputDetails?.reasoning_tokens);
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
+    ...(cacheWriteInputTokens === undefined ? {} : { cacheWriteInputTokens }),
+    ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
+  };
+};
+
+const extractStreamUsage = (body: unknown): ProviderTokenUsage | null => {
+  if (!isRecord(body)) return null;
+  if (body.type === "response.completed" && isRecord(body.response)) {
+    return extractProviderUsage(body.response.usage);
+  }
+  return extractProviderUsage(body.usage);
+};
+
+const extractStreamTextDelta = (
+  body: unknown,
+  messagePhases: ReadonlyMap<string, string>,
+): string => {
   if (!isRecord(body)) return "";
   if (body.type === "response.output_text.delta" && typeof body.delta === "string") {
+    const itemId = typeof body.item_id === "string" ? body.item_id : undefined;
+    if (itemId !== undefined && messagePhases.get(itemId) === "commentary") return "";
     return body.delta;
   }
   if (!Array.isArray(body.choices)) return "";
@@ -149,9 +193,15 @@ const extractStreamTextDelta = (body: unknown): string => {
   return typeof firstChoice.delta.content === "string" ? firstChoice.delta.content : "";
 };
 
-const extractStreamProcessDelta = (body: unknown): string => {
+const extractStreamProcessDelta = (
+  body: unknown,
+  messagePhases: ReadonlyMap<string, string>,
+): string => {
   if (!isRecord(body) || typeof body.type !== "string" || typeof body.delta !== "string") {
     return "";
+  }
+  if (body.type === "response.output_text.delta" && typeof body.item_id === "string") {
+    return messagePhases.get(body.item_id) === "commentary" ? body.delta : "";
   }
   const eventSegments = body.type.toLowerCase().split(/[./_-]+/u);
   const isDelta = eventSegments.at(-1) === "delta";
@@ -165,11 +215,22 @@ const extractCompletedStreamText = (body: unknown): string => {
   if (!isRecord(body) || body.type !== "response.completed" || !isRecord(body.response)) {
     return "";
   }
-  try {
-    return extractTextContent(body.response);
-  } catch {
-    return "";
-  }
+  const output = Array.isArray(body.response.output) ? body.response.output : [];
+  const messages = output.filter(
+    (item): item is Record<string, unknown> =>
+      isRecord(item) &&
+      item.type === "message" &&
+      (item.role === undefined || item.role === "assistant") &&
+      item.phase !== "commentary",
+  );
+  const finalMessages = messages.filter((item) => item.phase === "final_answer");
+  const candidates = finalMessages.length > 0 ? finalMessages : messages;
+  return candidates
+    .flatMap((item) => (Array.isArray(item.content) ? item.content : []))
+    .flatMap((content) =>
+      isRecord(content) && typeof content.text === "string" ? [content.text] : [],
+    )
+    .join("");
 };
 
 const consumeProviderTextStream = async (
@@ -177,6 +238,7 @@ const consumeProviderTextStream = async (
   protocol: ProviderExecutionRequest["protocol"],
   onOutputDelta: (delta: string) => void,
   onProcessDelta?: (delta: string) => void,
+  onTerminalUsage?: (usage: ProviderTokenUsage) => void,
 ): Promise<string> => {
   const reader = source.getReader();
   const decoder = new TextDecoder();
@@ -184,6 +246,8 @@ const consumeProviderTextStream = async (
   let streamedText = "";
   let completedText = "";
   let sawSuccessfulTerminal = false;
+  const messagePhases = new Map<string, string>();
+  const publicProcessItemIds = new Set<string>();
 
   const consumeEvent = (event: string): void => {
     const data = event
@@ -198,6 +262,19 @@ const consumeProviderTextStream = async (
       return;
     }
     const body = JSON.parse(data) as unknown;
+    if (
+      isRecord(body) &&
+      body.type === "response.output_item.added" &&
+      isRecord(body.item) &&
+      typeof body.item.id === "string"
+    ) {
+      if (body.item.type === "message" && typeof body.item.phase === "string") {
+        messagePhases.set(body.item.id, body.item.phase);
+        if (body.item.phase === "commentary") publicProcessItemIds.add(body.item.id);
+      } else if (body.item.type === "reasoning") {
+        publicProcessItemIds.add(body.item.id);
+      }
+    }
     if (isRecord(body) && isRecord(body.error)) {
       throw createProviderExecutionError(
         body,
@@ -279,13 +356,24 @@ const consumeProviderTextStream = async (
       );
       if (protocol === "chat-completions" && hasFinishReason) sawSuccessfulTerminal = true;
     }
-    const delta = extractStreamTextDelta(body);
+    const delta = extractStreamTextDelta(body, messagePhases);
     if (delta !== "") {
       streamedText += delta;
       onOutputDelta(delta);
     }
-    const processDelta = extractStreamProcessDelta(body);
+    const processDelta = extractStreamProcessDelta(body, messagePhases);
     if (processDelta !== "") onProcessDelta?.(processDelta);
+    if (
+      isRecord(body) &&
+      body.type === "response.output_item.done" &&
+      isRecord(body.item) &&
+      typeof body.item.id === "string" &&
+      publicProcessItemIds.delete(body.item.id)
+    ) {
+      onProcessDelta?.("\n\n");
+    }
+    const usage = extractStreamUsage(body);
+    if (usage !== null) onTerminalUsage?.(usage);
     const terminalText = extractCompletedStreamText(body);
     if (terminalText !== "") completedText = terminalText;
   };
@@ -452,6 +540,25 @@ export const createModelProviderAgentAdapters = (
     execute: async (input) => {
       if (input.modelRequest !== undefined) {
         const shouldStream = input.modelRequest.onOutputDelta !== undefined;
+        const executionCapabilities = filterModelRoutingCapabilities(
+          input.understanding.requiredCapabilities,
+        );
+        const executionHost: AgentHostId =
+          input.task.originHost ??
+          (provider.descriptor.type === "codex-host"
+            ? "codex"
+            : provider.descriptor.type === "cursor-host"
+              ? "cursor"
+              : provider.descriptor.type === "ollama"
+                ? "ollama"
+                : "openai-compatible");
+        let providerReportedWorkerUsage = false;
+        const forwardExecutionReceipt = (receipt: ProviderExecutionReceipt): void => {
+          if (receipt.role === "worker" && receipt.usage !== null) {
+            providerReportedWorkerUsage = true;
+          }
+          input.modelRequest?.onExecutionReceipt?.(receipt);
+        };
         let providerProcessStarted = false;
         const forwardProcessDelta =
           input.modelRequest.onProcessDelta === undefined
@@ -468,13 +575,11 @@ export const createModelProviderAgentAdapters = (
           virtualModelId: input.modelRequest.virtualModelId,
           signal: input.signal,
           onProcessDelta: forwardProcessDelta,
-          onExecutionReceipt: input.modelRequest.onExecutionReceipt,
+          onExecutionReceipt: forwardExecutionReceipt,
           routing: {
             role: "worker",
             securityScopeId: input.task.taskId,
-            requiredCapabilities: filterModelRoutingCapabilities(
-              input.understanding.requiredCapabilities,
-            ),
+            requiredCapabilities: executionCapabilities,
             host: input.task.originHost,
           },
           body: {
@@ -505,14 +610,26 @@ export const createModelProviderAgentAdapters = (
           if (input.modelRequest.onOutputDelta === undefined) {
             throw new Error("Agent execution model unexpectedly returned a stream.");
           }
-          return {
-            summary: await consumeProviderTextStream(
-              directResult.stream,
-              input.modelRequest.protocol,
-              input.modelRequest.onOutputDelta,
-              forwardProcessDelta,
-            ),
-          };
+          let terminalUsage: ProviderTokenUsage | null = null;
+          const summary = await consumeProviderTextStream(
+            directResult.stream,
+            input.modelRequest.protocol,
+            input.modelRequest.onOutputDelta,
+            forwardProcessDelta,
+            (usage) => {
+              terminalUsage = usage;
+            },
+          );
+          if (!providerReportedWorkerUsage && terminalUsage !== null) {
+            forwardExecutionReceipt({
+              host: executionHost,
+              model: directResult.upstreamModel ?? provider.descriptor.model,
+              role: "worker",
+              capabilities: executionCapabilities,
+              usage: terminalUsage,
+            });
+          }
+          return { summary };
         }
         if (directResult.kind !== "json") {
           throw createProviderResultError(
@@ -522,6 +639,19 @@ export const createModelProviderAgentAdapters = (
           );
         }
         const summary = extractTextContent(directResult.body);
+        const responseUsage =
+          isRecord(directResult.body) && !providerReportedWorkerUsage
+            ? extractProviderUsage(directResult.body.usage)
+            : null;
+        if (responseUsage !== null) {
+          forwardExecutionReceipt({
+            host: executionHost,
+            model: directResult.upstreamModel ?? provider.descriptor.model,
+            role: "worker",
+            capabilities: executionCapabilities,
+            usage: responseUsage,
+          });
+        }
         input.modelRequest.onOutputDelta?.(summary);
         return { summary };
       }
