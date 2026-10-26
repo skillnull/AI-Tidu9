@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+if ! IFS=' ' read -r local_ref local_object remote_ref remote_object; then
+  exit 0
+fi
+
+while IFS=' ' read -r local_ref local_object remote_ref remote_object; do
+  :
+done
+
 . "$(git rev-parse --show-toplevel)/scripts/use-project-node.sh"
 
 npm run policy -- branch
