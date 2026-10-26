@@ -3284,7 +3284,9 @@ export const startLocalRuntime = async (
       host === "codex"
         ? createCodexHostModelProvider()
         : host === "cursor"
-          ? createCursorHostModelProvider()
+          ? createCursorHostModelProvider().then(
+              async (provider) => provider ?? (await createCursorHostModelProvider()),
+            )
           : host === "ollama"
             ? discoverOllamaModels({
                 baseUrl:

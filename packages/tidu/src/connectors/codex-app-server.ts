@@ -137,7 +137,7 @@ export interface CodexAgentClient {
   /** Negotiates protocol capabilities and sends the initialized notification. */
   initialize: () => Promise<void>;
   /** Starts a persistent Codex thread under the configured workspace. */
-  startThread: () => Promise<CodexThread>;
+  startThread: (model?: string) => Promise<CodexThread>;
   /** Reads non-secret account metadata through the official app-server. */
   readAccount: () => Promise<CodexAccountSummary | null>;
   /** Reads account quota and token totals without running a model turn. */
@@ -526,11 +526,22 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
   };
 
   const launch = createCodexAppServerLaunch(options);
+  const failActiveTurns = (error: Error): void => {
+    for (const state of activeTurns.values()) {
+      state.cleanup();
+      state.reject(error);
+    }
+    activeTurns.clear();
+    bufferedTurnNotifications.clear();
+    messagePhases.clear();
+    forwardedProcessItems.clear();
+  };
   const client: JsonRpcClient = createStdioJsonRpcClient(
     { ...launch, workingDirectory: options.workingDirectory },
     {
       onNotification,
       onRequest: (request) => defaultServerRequest(request, options.onApproval),
+      onClose: failActiveTurns,
     },
   );
 
@@ -560,11 +571,12 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       client.notify("initialized");
       initialized = true;
     },
-    startThread: async (): Promise<CodexThread> => {
+    startThread: async (modelOverride?: string): Promise<CodexThread> => {
       requireInitialized();
+      const requestedModel = modelOverride ?? options.model;
       const response = await client.request<Record<string, unknown>>("thread/start", {
         cwd: options.workingDirectory,
-        model: options.model ?? null,
+        model: requestedModel ?? null,
         approvalPolicy: "on-request",
         sandbox: options.sandbox ?? "workspace-write",
         ephemeral: options.ephemeral ?? false,
@@ -572,7 +584,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       const thread = response.thread;
       const id = readString(thread, "id");
       const model =
-        readString(response, "model") ?? readString(thread, "model") ?? options.model ?? undefined;
+        readString(response, "model") ?? readString(thread, "model") ?? requestedModel ?? undefined;
       if (id === undefined) {
         throw new TiduError("INTERNAL_ERROR", "Codex returned an invalid thread response.");
       }
@@ -676,9 +688,13 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       }
       return new Promise<CodexTurnResult>((resolve, reject) => {
         const abort = (): void => {
-          void client.request("turn/interrupt", { threadId, turnId }).catch(() => undefined);
+          const active = activeTurns.get(turnId);
+          if (active === undefined) return;
           activeTurns.delete(turnId);
-          reject(new TiduError("INTERNAL_ERROR", "Codex turn cancelled."));
+          clearTurnProcessItems(turnId);
+          active.cleanup();
+          void client.request("turn/interrupt", { threadId, turnId }).catch(() => undefined);
+          active.reject(new TiduError("INTERNAL_ERROR", "Codex turn cancelled."));
         };
         signal?.addEventListener("abort", abort, { once: true });
         const state: TurnState = {
@@ -718,14 +734,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       await client.request("turn/interrupt", { threadId, turnId });
     },
     close: async (): Promise<void> => {
-      for (const state of activeTurns.values()) {
-        state.cleanup();
-        state.reject(new TiduError("INTERNAL_ERROR", "Codex connection closed."));
-      }
-      activeTurns.clear();
-      bufferedTurnNotifications.clear();
-      messagePhases.clear();
-      forwardedProcessItems.clear();
+      failActiveTurns(new TiduError("INTERNAL_ERROR", "Codex connection closed."));
       await client.close();
     },
   };

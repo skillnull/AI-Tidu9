@@ -8,14 +8,16 @@ import test from "node:test";
 import { TiduError } from "../core/index.js";
 import {
   createCodexHostModelProvider,
+  createCursorHostModelProvider,
   createCursorModelCatalog,
   createLiveJsonStream,
-  cursorCapabilitiesForModel,
-  findUnsupportedHostBridgeRequest,
+  cursorRoutableCapabilitiesForModel,
+  requestCursorPromptContent,
   requestPrompt,
   requestTurnInput,
   requireCompletedCursorPrompt,
   requireValidHostModelText,
+  resolveCursorHeadlessModel,
 } from "./codex-host.js";
 import {
   createCatalogModelRouter,
@@ -37,13 +39,22 @@ if (args[0] === "login" && args[1] === "status") { console.log("Logged in"); pro
 const fs = require("node:fs");
 fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "start\\n");
 let turnCount = 0;
+let threadCount = 0;
 const readline = require("node:readline").createInterface({ input: process.stdin });
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 readline.on("line", (line) => {
   const request = JSON.parse(line);
   if (request.id === undefined) return;
   if (request.method === "initialize") send({ jsonrpc: "2.0", id: request.id, result: {} });
-  else if (request.method === "thread/start") send({ jsonrpc: "2.0", id: request.id, result: { thread: { id: "thread-1" }, model: "gpt-test" } });
+  else if (request.method === "thread/start") {
+    threadCount += 1;
+    const requestedModel = request.params.model;
+    const confirmedModel = process.env.TIDU_CODEX_PROVIDER_IGNORE_REQUESTED_MODEL === "true"
+      ? "gpt-test"
+      : requestedModel || (threadCount === 1 ? "gpt-test" : "ai-tidu9-config");
+    fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "threadModel:" + JSON.stringify(requestedModel) + "\\n");
+    send({ jsonrpc: "2.0", id: request.id, result: { thread: { id: "thread-" + threadCount }, model: confirmedModel } });
+  }
   else if (request.method === "thread/inject_items") {
     fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "history:" + JSON.stringify(request.params.items) + "\\n");
     send({ jsonrpc: "2.0", id: request.id, result: {} });
@@ -51,14 +62,26 @@ readline.on("line", (line) => {
   else if (request.method === "turn/start") {
     turnCount += 1;
     const turnId = "turn-" + turnCount;
+    const exitOnceMarker = process.env.TIDU_CODEX_PROVIDER_EXIT_ONCE_MARKER;
+    if (exitOnceMarker && !fs.existsSync(exitOnceMarker)) {
+      fs.writeFileSync(exitOnceMarker, "exited\\n");
+      process.exit(0);
+    }
     const finalText = request.params.outputSchema
       ? JSON.stringify({ result: request.params.effort + "-result" })
       : request.params.effort + "-result";
     fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "effort:" + request.params.effort + "\\n");
+    fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "summary:" + request.params.summary + "\\n");
     fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "input:" + JSON.stringify(request.params.input) + "\\n");
     fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "outputSchema:" + JSON.stringify(request.params.outputSchema) + "\\n");
     send({ jsonrpc: "2.0", id: request.id, result: { turn: { id: turnId } } });
-    send({ jsonrpc: "2.0", method: "item/reasoning/summaryTextDelta", params: { threadId: "thread-1", turnId, itemId: "reasoning-1", summaryIndex: 0, delta: "reasoning-" } });
+    if (process.env.TIDU_CODEX_PROVIDER_DELAY_FIRST_TURN === "true" && turnCount === 1) return;
+    if (request.params.input.some((item) => item.type === "image" || item.type === "localImage")) {
+      const userMessage = { type: "userMessage", id: "user-" + turnId, clientId: null, content: request.params.input };
+      send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, startedAtMs: Date.now(), item: userMessage } });
+      send({ jsonrpc: "2.0", method: "item/completed", params: { threadId: "thread-1", turnId, completedAtMs: Date.now(), item: userMessage } });
+    }
+    if (request.params.summary === "auto") send({ jsonrpc: "2.0", method: "item/reasoning/summaryTextDelta", params: { threadId: "thread-1", turnId, itemId: "reasoning-1", summaryIndex: 0, delta: "reasoning-" } });
     send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, item: { type: "commandExecution", id: "command-1", command: "npm test" } } });
     send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, item: { type: "fileChange", id: "file-1", changes: [{ path: "src/index.ts" }] } } });
     send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, item: { type: "webSearch", id: "search-1", query: "official docs" } } });
@@ -66,8 +89,59 @@ readline.on("line", (line) => {
     send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId, itemId: "commentary-1", delta: "working-" } });
     send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, startedAtMs: Date.now(), item: { type: "agentMessage", id: "final-1", text: "", phase: "final_answer", memoryCitation: null, delivery: null, questions: null } } });
     send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId, itemId: "final-1", delta: finalText } });
-    send({ jsonrpc: "2.0", method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId, tokenUsage: { last: { inputTokens: 11, outputTokens: 4, totalTokens: 15 } } } });
+    send({ jsonrpc: "2.0", method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId, tokenUsage: { last: { inputTokens: 11, cachedInputTokens: 3, cacheWriteInputTokens: 2, outputTokens: 4, reasoningOutputTokens: 1, totalTokens: 15 } } } });
     send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: "thread-1", turn: { id: turnId, status: "completed" } } });
+  }
+  else if (request.method === "turn/interrupt") {
+    send({ jsonrpc: "2.0", id: request.id, result: {} });
+  }
+  else send({ jsonrpc: "2.0", id: request.id, result: {} });
+});
+`;
+  writeFileSync(executable, source, { mode: 0o700 });
+  chmodSync(executable, 0o700);
+  return executable;
+};
+
+const createFakeCursorProviderCommand = (directory: string): string => {
+  const executable = join(directory, "fake-cursor-provider");
+  const source = `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === "status") { console.log("Authenticated"); process.exit(0); }
+if (args[0] === "acp" && args[1] === "--help") { console.log("Agent Client Protocol ACP"); process.exit(0); }
+if (args[0] === "--list-models") { console.log("cursor-text-model - Cursor Text (default)"); process.exit(0); }
+if (args[0] !== "acp") {
+  if (!args.includes("--print") || !args.includes("--trust") || args[args.indexOf("--mode") + 1] !== "ask" || args[args.indexOf("--output-format") + 1] !== "stream-json" || args[args.indexOf("--model") + 1] !== "cursor-text-model") {
+    console.error("unexpected Cursor headless arguments");
+    process.exit(2);
+  }
+  let prompt = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => { prompt += chunk; });
+  process.stdin.on("end", () => {
+    const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+    send({ type: "thinking", subtype: "delta", text: "分析普通文本请求" });
+    send({ type: "tool_call", subtype: "started", call_id: "call-1", tool_call: { searchToolCall: { args: { query: "公开资料" } } } });
+    send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Cursor 中文回答" }] } });
+    send({ type: "result", subtype: "success", is_error: false, result: "Cursor 中文回答", usage: { inputTokens: 21, outputTokens: 5, cacheReadTokens: 8, cacheWriteTokens: 2 } });
+  });
+  return;
+}
+let selectedModel = "cursor-text-model";
+if (process.env.TIDU_CURSOR_PROVIDER_TEST_LOG) {
+  require("node:fs").appendFileSync(process.env.TIDU_CURSOR_PROVIDER_TEST_LOG, "acpProcess\\n");
+}
+const readline = require("node:readline").createInterface({ input: process.stdin });
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+readline.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.id === undefined) return;
+  if (request.method === "initialize") send({ jsonrpc: "2.0", id: request.id, result: { agentCapabilities: { promptCapabilities: { image: true } } } });
+  else if (request.method === "authenticate") send({ jsonrpc: "2.0", id: request.id, result: {} });
+  else if (request.method === "session/new") send({ jsonrpc: "2.0", id: request.id, result: { sessionId: "session-1", configOptions: [{ configId: "model", category: "model", type: "select", currentValue: selectedModel, options: [{ value: "cursor-text-model", name: "Cursor Text" }] }] } });
+  else if (request.method === "session/set_config_option") {
+    selectedModel = request.params.value;
+    send({ jsonrpc: "2.0", id: request.id, result: { configOptions: [{ configId: "model", category: "model", type: "select", currentValue: selectedModel }] } });
   }
   else send({ jsonrpc: "2.0", id: request.id, result: {} });
 });
@@ -119,24 +193,32 @@ const startTestServer = async (
   };
 };
 
-test("publishes Cursor bridge capabilities and provider model names", () => {
+test("publishes only capabilities routable through the Cursor model path", () => {
   assert.deepEqual(
-    createCursorModelCatalog("cursor-default", [
-      { id: "cursor-default", name: "Cursor Default" },
-      { id: "cursor-fast", name: "Cursor Fast" },
-    ]),
+    createCursorModelCatalog(
+      "cursor-default",
+      [
+        { id: "cursor-default", name: "Cursor Default" },
+        {
+          id: "cursor-fast",
+          name: "Cursor Fast",
+          capabilities: ["vision", "vendor-capability", "vision"],
+        },
+      ],
+      { imageInput: true },
+    ),
     [
       {
         id: "cursor-default",
         name: "Cursor Default",
-        capabilities: ["text", "structured-output", "code"],
-        capabilitySource: "provider-catalog",
+        capabilities: ["text", "vision"],
+        capabilitySource: "effective-route",
       },
       {
         id: "cursor-fast",
         name: "Cursor Fast",
-        capabilities: ["text", "structured-output", "code"],
-        capabilitySource: "provider-catalog",
+        capabilities: ["text", "vision"],
+        capabilitySource: "effective-route",
       },
     ],
   );
@@ -147,8 +229,8 @@ test("publishes Cursor bridge capabilities and provider model names", () => {
     {
       id: "cursor-current[reasoning=high]",
       name: "cursor-current",
-      capabilities: ["text", "structured-output", "reasoning", "code"],
-      capabilitySource: "provider-catalog",
+      capabilities: ["text", "reasoning"],
+      capabilitySource: "effective-route",
     },
   );
   assert.deepEqual(
@@ -158,37 +240,63 @@ test("publishes Cursor bridge capabilities and provider model names", () => {
     {
       id: "gemini-3.5-flash[]",
       name: "gemini-3.5-flash",
-      capabilities: ["text", "structured-output", "code"],
-      capabilitySource: "provider-catalog",
+      capabilities: ["text"],
+      capabilitySource: "effective-route",
     },
   );
   assert.deepEqual(createCursorModelCatalog("cursor-current", [])[0], {
     id: "cursor-current",
     name: "cursor-current",
-    capabilities: ["text", "structured-output", "code"],
-    capabilitySource: "provider-catalog",
+    capabilities: ["text"],
+    capabilitySource: "effective-route",
   });
   assert.deepEqual(
-    cursorCapabilitiesForModel("grok-4.7[context=256k,reasoning_effort=high,fast=true]"),
-    ["text", "structured-output", "reasoning", "code", "long-context"],
+    cursorRoutableCapabilitiesForModel("gpt-5.6-sol[context=272k,reasoning=medium,fast=false]", {
+      imageInput: true,
+    }),
+    ["text", "reasoning", "vision", "long-context"],
   );
-  assert.deepEqual(cursorCapabilitiesForModel("composer-2.5[fast=true]"), [
-    "text",
-    "structured-output",
-    "code",
-  ]);
-  assert.deepEqual(cursorCapabilitiesForModel("claude-sonnet-4[thinking=false,context=200k]"), [
-    "text",
-    "structured-output",
-    "code",
-    "long-context",
-  ]);
-  assert.deepEqual(cursorCapabilitiesForModel("gpt-5.6-sol[reasoning=none,context=272k]"), [
-    "text",
-    "structured-output",
-    "code",
-    "long-context",
-  ]);
+  assert.deepEqual(
+    cursorRoutableCapabilitiesForModel("claude-sonnet-4[thinking=false,context=200k]", {
+      imageInput: false,
+    }),
+    ["text", "long-context"],
+  );
+  const headlessModels = [
+    { id: "grok-4.7-high-fast", name: "Grok 4.7 High Fast", default: false },
+    { id: "gpt-5.6-sol-medium", name: "GPT-5.6 Sol", default: false },
+    { id: "claude-4.6-sonnet-medium-thinking", name: "Claude Sonnet 4.6", default: false },
+    { id: "claude-4-sonnet", name: "Claude Sonnet 4", default: false },
+  ];
+  assert.equal(
+    resolveCursorHeadlessModel(
+      "grok-4.7[context=256k,reasoning_effort=high,fast=true]",
+      headlessModels,
+    ),
+    "grok-4.7-high-fast",
+  );
+  assert.equal(
+    resolveCursorHeadlessModel(
+      "gpt-5.6-sol[context=272k,reasoning=medium,fast=false]",
+      headlessModels,
+    ),
+    "gpt-5.6-sol-medium",
+  );
+  assert.equal(
+    resolveCursorHeadlessModel(
+      "claude-sonnet-4-6[thinking=true,context=200k,effort=medium]",
+      headlessModels,
+    ),
+    "claude-4.6-sonnet-medium-thinking",
+  );
+  assert.equal(
+    resolveCursorHeadlessModel("claude-sonnet-4[thinking=false,context=200k]", headlessModels),
+    "claude-4-sonnet",
+  );
+  assert.equal(
+    resolveCursorHeadlessModel("unavailable-model[reasoning=high]", headlessModels),
+    undefined,
+  );
 });
 
 test("preserves Responses instructions and JSON format constraints in host prompts", () => {
@@ -220,11 +328,21 @@ test("preserves Responses instructions and JSON format constraints in host promp
   assert.match(prompt, /delegated Codex host's workspace tools/u);
   assert.match(prompt, /approval and sandbox rules/u);
   assert.doesNotMatch(prompt, /Do not use tools/u);
+  assert.match(
+    requestPrompt({
+      ...request,
+      routing: {
+        requiredCapabilities: ["text"],
+        availableCapabilities: ["text"],
+      },
+    }),
+    /no delegated workspace capability/u,
+  );
   assert.equal(requireValidHostModelText(request, '{"summary":"done"}'), '{"summary":"done"}');
   assert.throws(() => requireValidHostModelText(request, "not json"), /did not return valid JSON/u);
 });
 
-test("passes images and tool-capable requests through the Codex bridge", () => {
+test("passes images through host adapters without a static capability rejection", async () => {
   const baseRequest = {
     protocol: "responses" as const,
     virtualModelId: "ai-tidu9-config",
@@ -240,42 +358,202 @@ test("passes images and tool-capable requests through the Codex bridge", () => {
       ],
     },
   };
-  const unsupportedImageResult = findUnsupportedHostBridgeRequest(imageRequest);
-  const codexImageResult = findUnsupportedHostBridgeRequest(imageRequest, true);
-  const optionalToolResult = findUnsupportedHostBridgeRequest({
-    ...baseRequest,
-    body: {
-      input: "Use a tool.",
-      tools: [{ type: "function", name: "lookup" }],
-      tool_choice: "auto",
-    },
-  });
-  const requiredToolResult = findUnsupportedHostBridgeRequest({
-    ...baseRequest,
-    body: {
-      input: "Use a tool.",
-      tools: [{ type: "function", name: "lookup" }],
-      tool_choice: "required",
-    },
-  });
-  const disabledToolResult = findUnsupportedHostBridgeRequest({
-    ...baseRequest,
-    body: {
-      input: "Do not use a tool.",
-      tools: [{ type: "function", name: "lookup" }],
-      tool_choice: "none",
-    },
-  });
-
-  assert.equal(unsupportedImageResult?.statusCode, 400);
-  assert.match(JSON.stringify(unsupportedImageResult), /host_bridge_image_unsupported/u);
-  assert.equal(codexImageResult, undefined);
   assert.deepEqual(requestTurnInput(imageRequest).input, [
     { type: "image", url: "data:image/png;base64,test" },
   ]);
-  assert.equal(optionalToolResult, undefined);
-  assert.equal(requiredToolResult, undefined);
-  assert.equal(disabledToolResult, undefined);
+  assert.deepEqual(await requestCursorPromptContent(imageRequest), [
+    {
+      type: "text",
+      text: requestPrompt(imageRequest),
+    },
+    { type: "image", mimeType: "image/png", data: "test" },
+  ]);
+  assert.deepEqual(
+    (
+      await requestCursorPromptContent({
+        ...baseRequest,
+        body: {
+          input: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_image",
+                  image_url: "data:image/avif;base64,dGVzdA==",
+                },
+              ],
+            },
+          ],
+        },
+      })
+    )[1],
+    { type: "image", mimeType: "image/avif", data: "dGVzdA==" },
+  );
+});
+
+test("preserves phased Responses history when a user steers the same turn", () => {
+  const turn = requestTurnInput({
+    protocol: "responses",
+    virtualModelId: "ai-tidu9-config",
+    body: {
+      input: [
+        {
+          type: "message",
+          id: "user-original",
+          role: "user",
+          content: [{ type: "input_text", text: "original request" }],
+        },
+        {
+          type: "message",
+          id: "commentary-1",
+          status: "completed",
+          role: "assistant",
+          phase: "commentary",
+          content: [{ type: "output_text", text: "existing progress" }],
+        },
+        {
+          type: "message",
+          id: "user-steer",
+          role: "user",
+          content: [{ type: "input_text", text: "keep the earlier content" }],
+        },
+      ],
+    },
+  });
+
+  assert.deepEqual(turn.input, [
+    { type: "text", text: "keep the earlier content", text_elements: [] },
+  ]);
+  assert.equal(turn.historyItems.length, 2);
+  assert.deepEqual(turn.historyItems[1], {
+    type: "message",
+    id: "commentary-1",
+    status: "completed",
+    role: "assistant",
+    phase: "commentary",
+    content: [{ type: "output_text", text: "existing progress" }],
+  });
+});
+
+test("does not replay an old user message when Responses continuation items follow it", () => {
+  const conversation = [
+    {
+      type: "message",
+      id: "user-original",
+      role: "user",
+      content: [{ type: "input_text", text: "original request" }],
+    },
+    {
+      type: "message",
+      id: "commentary-1",
+      role: "assistant",
+      phase: "commentary",
+      content: [{ type: "output_text", text: "existing progress" }],
+    },
+    { type: "function_call", id: "call-1", call_id: "call-1", name: "inspect", arguments: "{}" },
+    { type: "function_call_output", call_id: "call-1", output: "tool result" },
+  ];
+  const turn = requestTurnInput({
+    protocol: "responses",
+    virtualModelId: "ai-tidu9-config",
+    body: { input: conversation },
+  });
+
+  assert.deepEqual(turn.input, [
+    {
+      type: "text",
+      text: "Continue from the supplied conversation.",
+      text_elements: [],
+    },
+  ]);
+  assert.equal(turn.historyItems.length, conversation.length);
+  assert.equal(turn.historyItems[1]?.phase, "commentary");
+  assert.equal(turn.historyItems.at(-1)?.type, "function_call_output");
+});
+
+test("executes text-only Cursor requests through headless streaming with real usage", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "tidu-cursor-provider-"));
+  const processLog = join(temporaryDirectory, "cursor-provider.log");
+  try {
+    const provider = await createCursorHostModelProvider({
+      command: createFakeCursorProviderCommand(temporaryDirectory),
+      environment: { ...process.env, TIDU_CURSOR_PROVIDER_TEST_LOG: processLog },
+    });
+    assert.notEqual(provider, undefined);
+    assert.deepEqual(await provider?.listModels?.(), [
+      {
+        id: "cursor-text-model",
+        name: "Cursor Text",
+        capabilities: ["text", "vision"],
+        capabilitySource: "effective-route",
+      },
+    ]);
+    const receipts: unknown[] = [];
+    const streamConfirmedModels: string[] = [];
+    const result = await provider?.execute({
+      protocol: "responses",
+      body: { model: "ai-tidu9-config", input: "解释数据库部署", stream: true },
+      virtualModelId: "ai-tidu9-config",
+      routing: {
+        host: "cursor",
+        role: "specialist",
+        targetModel: "cursor-text-model",
+        requiredCapabilities: ["text"],
+        availableCapabilities: ["text"],
+      },
+      onModelConfirmed: (model) => streamConfirmedModels.push(model),
+      onExecutionReceipt: (receipt) => receipts.push(receipt),
+    });
+    assert.equal(result?.kind, "stream");
+    if (result?.kind !== "stream") throw new Error("Expected a Cursor response stream.");
+    assert.deepEqual(streamConfirmedModels, []);
+    const events = await readStreamText(result.stream);
+    assert.deepEqual(streamConfirmedModels, ["cursor-text-model"]);
+    assert.match(events, /分析普通文本请求/u);
+    assert.match(events, /Cursor 正在调用 searchToolCall：公开资料/u);
+    assert.match(events, /Cursor 中文回答/u);
+    assert.match(events, /"input_tokens":21/u);
+    assert.match(events, /"cached_tokens":8/u);
+    assert.match(events, /"cache_write_tokens":2/u);
+    assert.deepEqual(receipts, [
+      {
+        host: "cursor",
+        model: "cursor-text-model",
+        role: "specialist",
+        capabilities: ["text"],
+        usage: {
+          inputTokens: 21,
+          outputTokens: 5,
+          totalTokens: 26,
+          cachedInputTokens: 8,
+          cacheWriteInputTokens: 2,
+        },
+      },
+    ]);
+    const processDeltas: string[] = [];
+    const nonStreamingConfirmedModels: string[] = [];
+    const nonStreamingResult = await provider?.execute({
+      protocol: "responses",
+      body: { model: "ai-tidu9-config", input: "继续解释数据库部署" },
+      virtualModelId: "ai-tidu9-config",
+      routing: {
+        host: "cursor",
+        role: "specialist",
+        targetModel: "cursor-text-model",
+        requiredCapabilities: ["text"],
+        availableCapabilities: ["text"],
+      },
+      onModelConfirmed: (model) => nonStreamingConfirmedModels.push(model),
+      onProcessDelta: (delta) => processDeltas.push(delta),
+    });
+    assert.equal(nonStreamingResult?.kind, "json");
+    assert.match(processDeltas.join(""), /分析普通文本请求/u);
+    assert.match(processDeltas.join(""), /Cursor 正在调用 searchToolCall：公开资料/u);
+    assert.deepEqual(nonStreamingConfirmedModels, ["cursor-text-model"]);
+    assert.equal(readFileSync(processLog, "utf8"), "acpProcess\n");
+  } finally {
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
 });
 
 test("reuses one Codex model session while forwarding effort and live deltas per turn", async () => {
@@ -292,6 +570,7 @@ test("reuses one Codex model session while forwarding effort and live deltas per
   try {
     assert.notEqual(provider, undefined);
     if (provider === undefined) throw new Error("Expected a Codex host provider.");
+    const lowProcessDeltas: string[] = [];
     const lowResult = await provider.execute({
       protocol: "responses",
       body: {
@@ -300,10 +579,13 @@ test("reuses one Codex model session while forwarding effort and live deltas per
         reasoning: { effort: "low" },
       },
       virtualModelId: "ai-tidu9-config",
+      onProcessDelta: (delta) => lowProcessDeltas.push(delta),
     });
     assert.equal(lowResult.kind, "json");
     assert.equal(lowResult.upstreamModel, "gpt-test");
     assert.match(JSON.stringify(lowResult), /low-result/u);
+    assert.match(lowProcessDeltas.join(""), /reasoning-/u);
+    assert.match(lowProcessDeltas.join(""), /working-/u);
 
     const highResult = await provider.execute({
       protocol: "responses",
@@ -331,7 +613,10 @@ test("reuses one Codex model session while forwarding effort and live deltas per
     assert.match(streamBody, /"created_at":\d+/u);
     assert.match(streamBody, /"completed_at":\d+/u);
     assert.match(streamBody, /"input_tokens":11/u);
+    assert.match(streamBody, /"cached_tokens":3/u);
+    assert.match(streamBody, /"cache_write_tokens":2/u);
     assert.match(streamBody, /"output_tokens":4/u);
+    assert.match(streamBody, /"reasoning_tokens":1/u);
     assert.match(streamBody, /"total_tokens":15/u);
     assert.match(streamBody, /data: \[DONE\]/u);
 
@@ -378,14 +663,93 @@ test("reuses one Codex model session while forwarding effort and live deltas per
     const processLogText = readFileSync(processLog, "utf8");
     assert.match(processLogText, /effort:low/u);
     assert.match(processLogText, /effort:high/u);
+    assert.match(processLogText, /summary:auto/u);
     assert.match(processLogText, /"type":"image","url":"data:image\/png;base64,test"/u);
     assert.match(processLogText, /"role":"developer"/u);
     assert.match(processLogText, /Preserve official input\./u);
     assert.match(processLogText, /previous question/u);
     assert.match(processLogText, /previous answer/u);
     assert.match(processLogText, /outputSchema:\{"type":"object"/u);
+    assert.match(processLogText, /threadModel:null/u);
+    assert.match(processLogText, /threadModel:"gpt-test"/u);
     assert.doesNotMatch(processLogText, /Caller instructions:/u);
     assert.doesNotMatch(processLogText, /Conversation:/u);
+  } finally {
+    await provider?.close?.();
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("keeps the shared Codex connection usable after one turn is cancelled", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "tidu-codex-cancel-"));
+  const codexHomeDirectory = join(temporaryDirectory, "codex-home");
+  const processLog = join(temporaryDirectory, "provider.log");
+  mkdirSync(codexHomeDirectory, { recursive: true });
+  const provider = await createCodexHostModelProvider(undefined, {
+    codexHomeDirectory,
+    command: createFakeCodexProviderCommand(temporaryDirectory),
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_DELAY_FIRST_TURN: "true",
+    },
+  });
+  try {
+    assert.notEqual(provider, undefined);
+    if (provider === undefined) throw new Error("Expected a Codex host provider.");
+    const controller = new AbortController();
+    const firstResult = await provider.execute({
+      protocol: "responses",
+      body: { model: "ai-tidu9-config", input: "wait", stream: true },
+      virtualModelId: "ai-tidu9-config",
+      signal: controller.signal,
+    });
+    assert.equal(firstResult.kind, "stream");
+    if (firstResult.kind !== "stream") throw new Error("Expected a streaming result.");
+    setTimeout(() => controller.abort(), 50).unref();
+    assert.match(await readStreamText(firstResult.stream), /Codex turn cancelled/u);
+
+    const secondResult = await provider.execute({
+      protocol: "responses",
+      body: { model: "ai-tidu9-config", input: "continue" },
+      virtualModelId: "ai-tidu9-config",
+    });
+    assert.equal(secondResult.kind, "json");
+    assert.match(JSON.stringify(secondResult), /medium-result/u);
+    assert.equal(readFileSync(processLog, "utf8").match(/^start$/gmu)?.length, 1);
+  } finally {
+    await provider?.close?.();
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("recreates a closed Codex connection before any visible output", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "tidu-codex-reconnect-"));
+  const codexHomeDirectory = join(temporaryDirectory, "codex-home");
+  const processLog = join(temporaryDirectory, "provider.log");
+  const exitOnceMarker = join(temporaryDirectory, "exit-once.marker");
+  mkdirSync(codexHomeDirectory, { recursive: true });
+  const provider = await createCodexHostModelProvider(undefined, {
+    codexHomeDirectory,
+    command: createFakeCodexProviderCommand(temporaryDirectory),
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_EXIT_ONCE_MARKER: exitOnceMarker,
+    },
+  });
+  try {
+    assert.notEqual(provider, undefined);
+    if (provider === undefined) throw new Error("Expected a Codex host provider.");
+    const result = await provider.execute({
+      protocol: "responses",
+      body: { model: "ai-tidu9-config", input: "recover", stream: true },
+      virtualModelId: "ai-tidu9-config",
+    });
+    assert.equal(result.kind, "stream");
+    if (result.kind !== "stream") throw new Error("Expected a streaming result.");
+    const events = await readStreamText(result.stream);
+    assert.match(events, /response\.completed/u);
+    assert.match(events, /medium-result/u);
+    assert.equal(readFileSync(processLog, "utf8").match(/^start$/gmu)?.length, 2);
   } finally {
     await provider?.close?.();
     rmSync(temporaryDirectory, { recursive: true, force: true });
@@ -402,7 +766,10 @@ test("rejects a Codex provider when the host does not confirm the configured mod
     const provider = await createCodexHostModelProvider("configured-model", {
       codexHomeDirectory,
       command,
-      environment: { TIDU_CODEX_PROVIDER_TEST_LOG: processLog },
+      environment: {
+        TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+        TIDU_CODEX_PROVIDER_IGNORE_REQUESTED_MODEL: "true",
+      },
     });
     assert.equal(provider, undefined);
   } finally {
@@ -419,7 +786,10 @@ test("rejects a later Codex target when the host confirms a different model", as
   const provider = await createCodexHostModelProvider(undefined, {
     codexHomeDirectory,
     command,
-    environment: { TIDU_CODEX_PROVIDER_TEST_LOG: processLog },
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_IGNORE_REQUESTED_MODEL: "true",
+    },
   });
   try {
     assert.notEqual(provider, undefined);
@@ -485,6 +855,31 @@ test("terminates failed host streams with response.failed and DONE", async () =>
   assert.match(body, /host_model_failed/u);
   assert.match(body, /data: \[DONE\]/u);
   assert.doesNotMatch(body, /event: response\.completed/u);
+});
+
+test("includes provider-reported usage in streamed host chat completions", async () => {
+  const stream = createLiveJsonStream(
+    {
+      protocol: "chat-completions",
+      body: {
+        model: "ai-tidu9-config",
+        messages: [{ role: "user", content: "hello" }],
+        stream: true,
+      },
+      virtualModelId: "ai-tidu9-config",
+    },
+    async (onTextDelta) => {
+      onTextDelta("hello");
+      return {
+        text: "hello",
+        usage: { inputTokens: 9, outputTokens: 2, totalTokens: 11 },
+      };
+    },
+  );
+  const body = await readStreamText(stream);
+
+  assert.match(body, /"usage":\{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11\}/u);
+  assert.match(body, /data: \[DONE\]/u);
 });
 
 test("ignores late host deltas and failures after the consumer cancels the stream", async () => {
@@ -1018,7 +1413,7 @@ test("discovers installed models from a running Ollama service", async () => {
   }
 });
 
-test("publishes only Ollama capabilities that the adapter forwards", async () => {
+test("publishes only Ollama capabilities routable through the adapter", async () => {
   const server = await startTestServer((request, response) => {
     if (request.url === "/api/tags") {
       response.writeHead(200, { "content-type": "application/json" });
@@ -1053,13 +1448,13 @@ test("publishes only Ollama capabilities that the adapter forwards", async () =>
         id: "qwen-vision",
         name: "qwen-vision",
         capabilities: ["text", "vision"],
-        capabilitySource: "provider-catalog",
+        capabilitySource: "effective-route",
       },
       {
         id: "qwen-tools",
         name: "qwen-tools",
         capabilities: ["text", "tool-use"],
-        capabilitySource: "provider-catalog",
+        capabilitySource: "effective-route",
       },
     ]);
   } finally {

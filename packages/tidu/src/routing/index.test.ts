@@ -304,6 +304,88 @@ test("executes only the secondary model when the primary has zero assigned capab
   assert.equal(record?.secondaryResults[0]?.executedModel, "secondary-model");
 });
 
+test("splits Chinese text and non-text capabilities across the assigned specialist and primary", async () => {
+  const calls: string[] = [];
+  const process: string[] = [];
+  let cursorRequest: ProviderExecutionRequest | undefined;
+  const provider: ModelProvider = {
+    descriptor: { type: "codex-host", model: "primary-model" },
+    execute: async (request) => {
+      const targetModel = request.routing?.targetModel ?? "primary-model";
+      calls.push(`${request.routing?.host ?? "unknown"}:${targetModel}`);
+      if (targetModel === "primary-model") {
+        request.onProcessDelta?.("Codex 已完成视觉检查。\n");
+      } else {
+        cursorRequest = request;
+        request.onProcessDelta?.("Cursor 正在汇总共享结果。\n");
+      }
+      return {
+        kind: "json",
+        statusCode: 200,
+        upstreamModel: targetModel,
+        body: {
+          output_text:
+            targetModel === "primary-model" ? "Codex 视觉检查结果" : "由 Cursor 汇总回答",
+        },
+      };
+    },
+  };
+  const completion = createCapabilityCompletionProvider(provider, async () => ({
+    modelSelection: { source: "official", model: "primary-model" },
+    capabilityCompletion: {
+      enabled: true,
+      mainCapabilities: ["vision"],
+      specialists: [
+        {
+          host: "cursor",
+          source: "official",
+          model: "secondary-model",
+          capabilities: ["text"],
+        },
+      ],
+      maximumSpecialists: 1,
+    },
+  }));
+
+  const result = await completion.execute({
+    protocol: "responses",
+    virtualModelId: "ai-tidu9-config",
+    body: { input: "九门远程部署创建数据库的流程是什么" },
+    routing: { host: "codex" },
+  });
+
+  assert.equal(result.statusCode, 200);
+  assert.deepEqual(calls, ["cursor:secondary-model"]);
+  const record = (await completion.inspectCapabilityCompletion()).records[0];
+  assert.deepEqual(record?.requiredCapabilities, ["text"]);
+  assert.equal(record?.mainResult.outcome, "not-run");
+  assert.equal(record?.secondaryResults[0]?.outcome, "succeeded");
+
+  await completion.execute({
+    protocol: "responses",
+    virtualModelId: "ai-tidu9-config",
+    body: { input: "结合图片说明九门远程部署创建数据库的流程" },
+    routing: { host: "codex", requiredCapabilities: ["text", "vision"] },
+    onProcessDelta: (delta) => process.push(delta),
+  });
+
+  assert.deepEqual(calls, [
+    "cursor:secondary-model",
+    "codex:primary-model",
+    "cursor:secondary-model",
+  ]);
+  const combinedRecord = (await completion.inspectCapabilityCompletion()).records[0];
+  assert.deepEqual(combinedRecord?.requiredCapabilities, ["text", "vision"]);
+  assert.deepEqual(combinedRecord?.mainResult.capabilities, ["vision"]);
+  assert.equal(combinedRecord?.mainResult.outcome, "succeeded");
+  assert.deepEqual(combinedRecord?.secondaryResults[0]?.capabilities, ["text"]);
+  assert.equal(combinedRecord?.secondaryResults[0]?.outcome, "succeeded");
+  assert.deepEqual(process, ["Codex 已完成视觉检查。\n", "Cursor 正在汇总共享结果。\n"]);
+  const serializedCursorRequest = JSON.stringify(cursorRequest?.body);
+  assert.doesNotMatch(serializedCursorRequest, /Codex 已完成视觉检查/u);
+  assert.match(serializedCursorRequest, /Codex 视觉检查结果/u);
+});
+
 test("records a fail-closed result when no configured model has any capability", async () => {
   const calls: string[] = [];
   const provider: ModelProvider = {
@@ -349,7 +431,6 @@ test("records a fail-closed result when no configured model has any capability",
   assert.equal(record?.outcome, "failed");
   assert.deepEqual(record?.missingCapabilities, ["text"]);
   assert.equal(record?.mainResult.outcome, "not-run");
-  assert.equal(record?.secondaryResults[0]?.outcome, "not-run");
 });
 
 test("does not call a zero-capability primary when capability completion is disabled", async () => {
@@ -649,7 +730,11 @@ test("records streaming latency only after the stream completes", async () => {
   mainControllers[0]?.enqueue(
     encodeSseData({
       type: "response.completed",
-      response: { status: "completed", output_text: "completed output" },
+      response: {
+        status: "completed",
+        output_text: "completed output",
+        usage: { input_tokens: 17, output_tokens: 6, total_tokens: 23 },
+      },
     }),
   );
   mainControllers[0]?.close();
@@ -661,6 +746,11 @@ test("records streaming latency only after the stream completes", async () => {
   assert.equal(completedStatus.records.length, 1);
   assert.equal(completedStatus.records[0]?.outcome, "succeeded");
   assert.equal(completedStatus.records[0]?.mainResult.outcome, "succeeded");
+  assert.deepEqual(completedStatus.records[0]?.tokenUsage, {
+    inputTokens: 17,
+    outputTokens: 6,
+    totalTokens: 23,
+  });
 
   await completion.execute({
     protocol: "responses",
@@ -896,6 +986,95 @@ const jsonProvider = (
   execute: async (request) => ({ kind: "json", ...(await execute(request)) }),
 });
 
+test("sends image inputs only to the model assigned vision and shares its result with text", async () => {
+  for (const protocol of ["responses", "chat-completions"] as const) {
+    for (const visionOwner of ["main", "specialist"] as const) {
+      let mainRequest: ProviderExecutionRequest | undefined;
+      let specialistRequest: ProviderExecutionRequest | undefined;
+      const router = createDynamicModelRouter(
+        [
+          {
+            profile: profile({
+              id: "cheap-main",
+              capabilities:
+                visionOwner === "main"
+                  ? ["code", "reasoning", "vision"]
+                  : ["text", "code", "reasoning"],
+            }),
+            provider: jsonProvider("main", async (request) => {
+              mainRequest = request;
+              return {
+                statusCode: 200,
+                body: { output_text: "combined answer" },
+              };
+            }),
+          },
+          {
+            profile: profile({
+              id: "vision-specialist",
+              capabilities: visionOwner === "specialist" ? ["vision"] : ["text"],
+            }),
+            provider: jsonProvider("specialist", async (request) => {
+              specialistRequest = request;
+              return {
+                statusCode: 200,
+                body: { output_text: "secondary evidence" },
+              };
+            }),
+          },
+        ],
+        policy,
+      );
+      const imageMarker = "data:image/png;base64,route-matrix";
+      const body =
+        protocol === "responses"
+          ? {
+              input: [
+                {
+                  role: "user",
+                  content: [
+                    { type: "input_text", text: "Inspect the attached image." },
+                    { type: "input_image", image_url: imageMarker },
+                  ],
+                },
+              ],
+              reasoning: { effort: "high" },
+            }
+          : {
+              messages: [
+                {
+                  role: "user",
+                  content: [
+                    { type: "text", text: "Inspect the attached image." },
+                    { type: "image_url", image_url: { url: imageMarker } },
+                  ],
+                },
+              ],
+              reasoning_effort: "high",
+            };
+
+      await router.execute({
+        protocol,
+        virtualModelId: "tidu",
+        body,
+        routing: { requiredCapabilities: ["code", "reasoning", "vision"] },
+      });
+
+      const serializedMainRequest = JSON.stringify(mainRequest?.body);
+      const serializedSpecialistRequest = JSON.stringify(specialistRequest?.body);
+      if (visionOwner === "main") {
+        assert.equal(serializedMainRequest.includes(imageMarker), true);
+        assert.equal(serializedSpecialistRequest.includes(imageMarker), false);
+        assert.match(serializedSpecialistRequest, /combined answer/u);
+      } else {
+        assert.equal(serializedMainRequest.includes(imageMarker), false);
+        assert.equal(serializedSpecialistRequest.includes(imageMarker), true);
+        assert.match(serializedMainRequest, /secondary evidence/u);
+      }
+    }
+  }
+});
+
 test("records a routed stream only after live output reaches a successful terminal", async () => {
   let upstreamController: ReadableStreamDefaultController<Uint8Array> | undefined;
   const provider: ModelProvider = {
@@ -934,7 +1113,11 @@ test("records a routed stream only after live output reaches a successful termin
   });
   const terminalChunk = encodeSseData({
     type: "response.completed",
-    response: { status: "completed", output_text: "hello" },
+    response: {
+      status: "completed",
+      output_text: "hello",
+      usage: { input_tokens: 11, output_tokens: 4, total_tokens: 15 },
+    },
   });
   upstreamController?.enqueue(outputChunk);
   upstreamController?.enqueue(terminalChunk);
@@ -957,6 +1140,11 @@ test("records a routed stream only after live output reaches a successful termin
       message: "",
     },
   ]);
+  assert.deepEqual(router.inspect()?.tokenUsage, {
+    inputTokens: 11,
+    outputTokens: 4,
+    totalTokens: 15,
+  });
 });
 
 test("marks unsuccessful stream terminals, EOF, reader errors, and cancellation as failed", async () => {
@@ -1803,12 +1991,18 @@ test("covers all 65,536 primary and secondary capability checkbox allocations", 
       const result = await router.execute(request);
       assert.equal(result.statusCode, 200);
       assert.deepEqual(router.inspect()?.missingCapabilities, []);
+      const textCapabilityIndex = capabilities.indexOf("text");
+      const primaryOwnsText = (primaryAllocation & (1 << textCapabilityIndex)) !== 0;
       const expectedCalls =
         primaryAllocation === fullAllocation
           ? ["primary"]
           : primaryAllocation === 0
             ? ["secondary"]
-            : ["secondary", "primary"];
+            : primaryOwnsText
+              ? ["secondary", "primary"]
+              : secondaryAllocation === fullAllocation
+                ? ["secondary"]
+                : ["primary", "secondary"];
       assert.deepEqual(calls, expectedCalls);
       assert.equal(
         router

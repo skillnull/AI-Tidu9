@@ -25,6 +25,8 @@ export interface CursorAcpModel {
   id: string;
   /** Provider-published model name intended for user interfaces. */
   name: string;
+  /** Capability identifiers published verbatim by Cursor ACP, when present. */
+  capabilities?: readonly string[];
 }
 
 export interface CursorAcpOptions extends CursorHostInspectionOptions {
@@ -62,17 +64,32 @@ export interface CursorAcpPromptResult {
   stopReason: string;
   /** Concatenated Agent message chunks. */
   text: string;
+  /** Provider-authoritative token usage when Cursor ACP publishes it. */
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  } | null;
 }
+
+export interface CursorAcpCapabilities {
+  /** ACP explicitly advertises image content blocks for session prompts. */
+  imageInput: boolean;
+}
+
+export type CursorAcpPromptContent =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string; uri?: string };
 
 export interface CursorAcpClient {
   /** Negotiates ACP capabilities and authenticates with Cursor-owned login. */
-  initialize: (signal?: AbortSignal) => Promise<void>;
+  initialize: (signal?: AbortSignal) => Promise<CursorAcpCapabilities>;
   /** Creates a new Cursor Agent session. */
   createSession: (signal?: AbortSignal) => Promise<CursorAcpSession>;
   /** Sends a prompt and waits for the ACP terminal response. */
   prompt: (
     sessionId: string,
-    text: string,
+    content: string | readonly CursorAcpPromptContent[],
     signal?: AbortSignal,
     onTextDelta?: (delta: string) => void,
   ) => Promise<CursorAcpPromptResult>;
@@ -87,6 +104,36 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const readString = (value: unknown, key: string): string | undefined =>
   isRecord(value) && typeof value[key] === "string" ? value[key] : undefined;
+
+const readStringArray = (value: unknown, key: string): readonly string[] | undefined => {
+  if (!isRecord(value) || !Array.isArray(value[key])) return undefined;
+  const entries = value[key];
+  return entries.every((entry) => typeof entry === "string") ? entries : undefined;
+};
+
+const readTokenCount = (value: unknown, ...keys: string[]): number | undefined => {
+  if (!isRecord(value)) return undefined;
+  for (const key of keys) {
+    const candidate = value[key];
+    if (typeof candidate === "number" && Number.isSafeInteger(candidate) && candidate >= 0) {
+      return candidate;
+    }
+  }
+  return undefined;
+};
+
+const readPromptUsage = (value: unknown): CursorAcpPromptResult["usage"] => {
+  if (!isRecord(value) || !isRecord(value.usage)) return null;
+  const inputTokens = readTokenCount(value.usage, "inputTokens", "input_tokens");
+  const outputTokens = readTokenCount(value.usage, "outputTokens", "output_tokens");
+  if (inputTokens === undefined || outputTokens === undefined) return null;
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens:
+      readTokenCount(value.usage, "totalTokens", "total_tokens") ?? inputTokens + outputTokens,
+  };
+};
 
 const readCurrentModel = (value: unknown): string | undefined => {
   if (!isRecord(value)) return undefined;
@@ -141,10 +188,12 @@ const readModelConfigOption = (
             readString(candidate, "id");
           if (id === undefined) return [];
           const publishedName = readString(candidate, "name")?.trim();
+          const capabilities = readStringArray(candidate, "capabilities");
           return [
             {
               id,
               name: publishedName === "" || publishedName === undefined ? id : publishedName,
+              ...(capabilities === undefined ? {} : { capabilities }),
             },
           ];
         })
@@ -164,6 +213,7 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
   const textDeltaListeners = new Map<string, (delta: string) => void>();
   let initialized = false;
   let initializedModel: string | undefined;
+  let capabilities: CursorAcpCapabilities = { imageInput: false };
   const launch = createCursorAcpLaunch(options);
 
   const handleRequest = async (request: JsonRpcServerRequest): Promise<unknown> => {
@@ -225,9 +275,9 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
   };
 
   return {
-    initialize: async (signal?: AbortSignal): Promise<void> => {
+    initialize: async (signal?: AbortSignal): Promise<CursorAcpCapabilities> => {
       if (initialized) {
-        return;
+        return capabilities;
       }
       const initializeResponse = await client.request<unknown>(
         "initialize",
@@ -242,8 +292,18 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
         signal,
       );
       initializedModel = readCurrentModel(initializeResponse);
+      const agentCapabilities = isRecord(initializeResponse)
+        ? initializeResponse.agentCapabilities
+        : undefined;
+      const promptCapabilities = isRecord(agentCapabilities)
+        ? agentCapabilities.promptCapabilities
+        : undefined;
+      capabilities = {
+        imageInput: isRecord(promptCapabilities) && promptCapabilities.image === true,
+      };
       await client.request("authenticate", { methodId: "cursor_login" }, signal);
       initialized = true;
+      return capabilities;
     },
     createSession: async (signal?: AbortSignal): Promise<CursorAcpSession> => {
       requireInitialized();
@@ -271,19 +331,6 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
           throw new TiduError(
             "CONFIGURATION_INVALID",
             "Cursor ACP did not expose a model selection option for this session.",
-          );
-        }
-        if (
-          modelOption.models.length > 0 &&
-          !modelOption.models.some((candidate) => candidate.id === options.requestedModel)
-        ) {
-          const availableModels = modelOption.models
-            .slice(0, 12)
-            .map((candidate) => candidate.id)
-            .join(", ");
-          throw new TiduError(
-            "CONFIGURATION_INVALID",
-            `Cursor ACP does not offer the configured model ${options.requestedModel}. Session options: ${availableModels}.`,
           );
         }
         const updateResponse = await client.request<unknown>(
@@ -325,12 +372,17 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
     },
     prompt: async (
       sessionId: string,
-      text: string,
+      content: string | readonly CursorAcpPromptContent[],
       signal?: AbortSignal,
       onTextDelta?: (delta: string) => void,
     ): Promise<CursorAcpPromptResult> => {
       requireInitialized();
-      if (text.trim() === "") {
+      const prompt =
+        typeof content === "string" ? [{ type: "text" as const, text: content }] : [...content];
+      if (
+        prompt.length === 0 ||
+        !prompt.some((part) => part.type === "image" || part.text.trim() !== "")
+      ) {
         throw new TiduError("CONFIGURATION_INVALID", "Cursor prompt cannot be empty.");
       }
       messageChunks.set(sessionId, "");
@@ -338,13 +390,14 @@ export const createCursorAcpClient = (options: CursorAcpOptions): CursorAcpClien
       try {
         const response = await client.request<Record<string, unknown>>(
           "session/prompt",
-          { sessionId, prompt: [{ type: "text", text }] },
+          { sessionId, prompt },
           signal,
         );
         return {
           sessionId,
           stopReason: readString(response, "stopReason") ?? "unknown",
           text: messageChunks.get(sessionId) ?? "",
+          usage: readPromptUsage(response),
         };
       } finally {
         textDeltaListeners.delete(sessionId);

@@ -132,7 +132,11 @@ export interface ModelProvider {
       /** Capabilities explicitly published by the provider, when available. */
       capabilities?: readonly string[];
       /** Evidence source for the capability declaration. */
-      capabilitySource?: "company-published" | "provider-catalog";
+      capabilitySource?:
+        | "company-published"
+        | "effective-route"
+        | "host-catalog"
+        | "provider-catalog";
       /** Published input price per million tokens, or null when not published. */
       inputCostPerMillionTokens?: number | null;
       /** Published output price per million tokens, or null when not published. */
@@ -608,7 +612,7 @@ export const createOllamaProvider = (options: ProviderAdapterOptions): ModelProv
             id: modelId,
             name: modelId,
             ...(capabilities.length > 0
-              ? { capabilities, capabilitySource: "provider-catalog" as const }
+              ? { capabilities, capabilitySource: "effective-route" as const }
               : {}),
           };
         }),

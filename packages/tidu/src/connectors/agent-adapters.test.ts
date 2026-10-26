@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { createCodexAgentClient } from "./codex-app-server.js";
 import { createCursorAcpClient } from "./cursor-acp.js";
+import { runCursorHeadless } from "./cursor-headless.js";
 
 const createFakeAgent = (
   root: string,
@@ -24,7 +25,7 @@ const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 readline.on("line", (line) => {
   const request = JSON.parse(line);
   if (request.id === undefined) return;
-  if (request.method === "initialize") send({ jsonrpc: "2.0", id: request.id, result: {} });
+  if (request.method === "initialize") send({ jsonrpc: "2.0", id: request.id, result: { agentCapabilities: { promptCapabilities: { image: true, audio: false, embeddedContext: false } } } });
   else if (request.method === "authenticate") send({ jsonrpc: "2.0", id: request.id, result: {} });
   else if (request.method === "thread/start") send({ jsonrpc: "2.0", id: request.id, result: { thread: { id: "thread-1" }, model: "gpt-test" } });
   else if (request.method === "turn/start") {
@@ -58,12 +59,38 @@ readline.on("line", (line) => {
     send({ jsonrpc: "2.0", id: request.id, result });
   }
   else if (request.method === "session/prompt") {
+    const promptHasImage = request.params.prompt.some((part) => part.type === "image");
     send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "session-1", update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "thinking" } } } });
     send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "session-1", update: { sessionUpdate: "future_answer_chunk", content: { type: "text", text: "future-" } } } });
-    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "cursor-result" } } } });
-    send({ jsonrpc: "2.0", id: request.id, result: { stopReason: "end_turn" } });
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "session-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: promptHasImage ? "cursor-image-result" : "cursor-result" } } } });
+    send({ jsonrpc: "2.0", id: request.id, result: { stopReason: "end_turn", usage: { inputTokens: 13, outputTokens: 5, totalTokens: 18 } } });
   }
   else send({ jsonrpc: "2.0", id: request.id, result: {} });
+});
+`;
+  writeFileSync(executable, source);
+  chmodSync(executable, 0o700);
+  return executable;
+};
+
+const createFakeCursorHeadlessAgent = (root: string): string => {
+  const executable = join(root, "fake-cursor-headless");
+  const source = `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (!args.includes("--print") || !args.includes("--trust") || args[args.indexOf("--mode") + 1] !== "ask" || args[args.indexOf("--output-format") + 1] !== "stream-json" || args[args.indexOf("--model") + 1] !== "cursor-test-model") {
+  console.error("unexpected Cursor headless arguments");
+  process.exit(2);
+}
+let prompt = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { prompt += chunk; });
+process.stdin.on("end", () => {
+  const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+  send({ type: "thinking", subtype: "delta", text: "分析" });
+  send({ type: "thinking", subtype: "delta", text: "请求" });
+  send({ type: "tool_call", subtype: "started", call_id: "call-1", tool_call: { readToolCall: { args: { path: "README.md" } } } });
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: prompt.trim() + "：完成" }] } });
+  send({ type: "result", subtype: "success", is_error: false, result: prompt.trim() + "：完成", usage: { inputTokens: 21, outputTokens: 5, cacheReadTokens: 8, cacheWriteTokens: 2 } });
 });
 `;
   writeFileSync(executable, source);
@@ -165,7 +192,7 @@ test("Cursor ACP adapter reuses official login and preserves Agent output", asyn
       workingDirectory: root,
       onProcessDelta: (delta) => processDeltas.push(delta),
     });
-    await client.initialize();
+    assert.deepEqual(await client.initialize(), { imageInput: true });
     const session = await client.createSession();
     const deltas: string[] = [];
     const result = await client.prompt(session.id, "test", undefined, (delta) =>
@@ -175,10 +202,71 @@ test("Cursor ACP adapter reuses official login and preserves Agent output", asyn
       sessionId: "session-1",
       stopReason: "end_turn",
       text: "future-cursor-result",
+      usage: { inputTokens: 13, outputTokens: 5, totalTokens: 18 },
     });
     assert.deepEqual(deltas, ["future-", "cursor-result"]);
     assert.deepEqual(processDeltas, ["thinking"]);
+    const imageResult = await client.prompt(session.id, [
+      { type: "text", text: "inspect" },
+      { type: "image", mimeType: "image/png", data: "dGVzdA==" },
+    ]);
+    assert.equal(imageResult.text, "future-cursor-image-result");
     await client.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Cursor headless adapter preserves process boundaries and terminal token usage", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tidu-cursor-headless-"));
+  try {
+    const processDeltas: string[] = [];
+    const textDeltas: string[] = [];
+    const result = await runCursorHeadless({
+      command: createFakeCursorHeadlessAgent(root),
+      environment: process.env,
+      workingDirectory: root,
+      model: "cursor-test-model",
+      prompt: "测试请求",
+      onProcessDelta: (delta) => processDeltas.push(delta),
+      onTextDelta: (delta) => textDeltas.push(delta),
+    });
+
+    assert.deepEqual(processDeltas, [
+      "分析",
+      "请求",
+      "\n\n",
+      "Cursor 正在调用 readToolCall：README.md",
+    ]);
+    assert.deepEqual(textDeltas, ["测试请求：完成"]);
+    assert.deepEqual(result, {
+      text: "测试请求：完成",
+      usage: {
+        inputTokens: 21,
+        outputTokens: 5,
+        totalTokens: 26,
+        cachedInputTokens: 8,
+        cacheWriteInputTokens: 2,
+      },
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Cursor headless adapter reports spawn failures without crashing the process", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tidu-cursor-headless-missing-"));
+  try {
+    await assert.rejects(
+      runCursorHeadless({
+        command: join(root, "missing-cursor-agent"),
+        environment: process.env,
+        workingDirectory: root,
+        model: "cursor-test-model",
+        prompt: "测试请求",
+      }),
+      /ENOENT|no such file/iu,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -220,6 +308,28 @@ test("Cursor ACP adapter applies the configured session model", async () => {
     await client.initialize();
     const session = await client.createSession();
     assert.equal(session.model, "cursor-fast");
+    await client.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Cursor ACP asks the host to resolve a configured model even when discovery is stale", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tidu-cursor-dynamic-model-"));
+  try {
+    const command = createFakeAgent(root);
+    const client = createCursorAcpClient({
+      command,
+      workingDirectory: root,
+      requestedModel: "newly-published-model",
+    });
+    await client.initialize();
+    const session = await client.createSession();
+    assert.equal(session.model, "newly-published-model");
+    assert.equal(
+      session.availableModels.some((candidate) => candidate.id === "newly-published-model"),
+      false,
+    );
     await client.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

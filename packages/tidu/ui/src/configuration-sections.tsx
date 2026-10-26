@@ -165,6 +165,19 @@ interface CapabilityCompletionUsageRecordView {
   mainResult: CapabilityCompletionModelResultView;
   /** Secondary-model execution results. */
   secondaryResults: readonly CapabilityCompletionModelResultView[];
+  /** Combined provider-authoritative token usage. */
+  tokenUsage: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  } | null;
+  /** Provider-authoritative token usage grouped by routed model. */
+  modelTokenUsage: readonly {
+    modelId: string;
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  }[];
 }
 
 interface CapabilityCompletionStatusResponse {
@@ -257,10 +270,7 @@ export const selectableModelCapabilityIds: readonly string[] = [...MODEL_ROUTING
 
 export const capabilityIdsForPicker = (
   publishedCapabilities: readonly string[],
-): readonly string[] => {
-  const published = new Set(publishedCapabilities);
-  return selectableModelCapabilityIds.filter((capability) => published.has(capability));
-};
+): readonly string[] => [...publishedCapabilities];
 
 export const defaultModelCapabilities = (
   publishedCapabilities: readonly string[],
@@ -270,10 +280,8 @@ export const selectedModelCapabilities = (
   selectedCapabilities: readonly string[],
   publishedCapabilities: readonly string[],
 ): readonly string[] => {
-  const selected = new Set(selectedCapabilities);
-  return capabilityIdsForPicker(publishedCapabilities).filter((capability) =>
-    selected.has(capability),
-  );
+  const published = new Set(publishedCapabilities);
+  return selectedCapabilities.filter((capability) => published.has(capability));
 };
 
 export const updateCapabilityCompletionEnabled = (
@@ -316,12 +324,14 @@ const capabilityLabel = (capability: string, english: boolean): string => {
 
 const CapabilityPicker = ({
   available,
+  evidenceLabel,
   selected,
   english,
   disabled,
   onChange,
 }: {
   available: readonly string[];
+  evidenceLabel?: string;
   selected: readonly string[];
   english: boolean;
   disabled: boolean;
@@ -333,38 +343,43 @@ const CapabilityPicker = ({
         id: capability,
         zh: capability,
         en: capability,
-        detail: "自定义能力声明",
+        detail: "宿主返回的原始能力",
       },
   );
   return (
-    <div className="capability-picker">
-      {options.map((capability) => {
-        const checked = selected.includes(capability.id);
-        return (
-          <label
-            className={`${checked ? "selected" : ""} ${disabled ? "disabled" : ""}`.trim()}
-            key={capability.id}
-          >
-            <input
-              type="checkbox"
-              checked={checked}
-              disabled={disabled}
-              onChange={() =>
-                onChange(
-                  checked
-                    ? selected.filter((item) => item !== capability.id)
-                    : [...selected, capability.id],
-                )
-              }
-            />
-            <span className="capability-check" aria-hidden="true" />
-            <span className="capability-copy">
-              <strong>{english ? capability.en : capability.zh}</strong>
-              <small>{english ? capability.id : capability.detail}</small>
-            </span>
-          </label>
-        );
-      })}
+    <div className="capability-picker-block">
+      {evidenceLabel === undefined ? null : (
+        <p className="capability-picker-note">{evidenceLabel}</p>
+      )}
+      <div className="capability-picker">
+        {options.map((capability) => {
+          const checked = selected.includes(capability.id);
+          return (
+            <label
+              className={`${checked ? "selected" : ""} ${disabled ? "disabled" : ""}`.trim()}
+              key={capability.id}
+            >
+              <input
+                type="checkbox"
+                checked={checked}
+                disabled={disabled}
+                onChange={() =>
+                  onChange(
+                    checked
+                      ? selected.filter((item) => item !== capability.id)
+                      : [...selected, capability.id],
+                  )
+                }
+              />
+              <span className="capability-check" aria-hidden="true" />
+              <span className="capability-copy">
+                <strong>{english ? capability.en : capability.zh}</strong>
+                <small>{english ? capability.id : `${capability.detail} · ${capability.id}`}</small>
+              </span>
+            </label>
+          );
+        })}
+      </div>
     </div>
   );
 };
@@ -780,21 +795,17 @@ export const CapabilityCompletionPanel = ({
                                   </small>
                                 </div>
                                 <p>
-                                  {english ? "Configured" : "配置模型"}：
+                                  {modelResult.host}：
                                   {displayModel(modelResult.host, {
                                     source: modelResult.modelId.endsWith(":custom")
                                       ? "custom"
                                       : modelSourceForHost(modelResult.host),
                                     model: modelResult.model,
                                   })}
-                                  {` · ${english ? "Host-confirmed" : "宿主回执"}：${
-                                    modelResult.executedModel ??
-                                    (english ? "No execution receipt" : "未获得执行回执")
-                                  }`}
                                 </p>
                                 <div className="capability-model-result-meta">
                                   <span>
-                                    {modelResult.host} · {english ? "Capabilities" : "能力"}：
+                                    {english ? "Capabilities" : "能力"}：
                                     {modelResult.capabilities.length > 0
                                       ? modelResult.capabilities
                                           .map((capability) => capabilityLabel(capability, english))
@@ -809,6 +820,18 @@ export const CapabilityCompletionPanel = ({
                                       ? ""
                                       : ` · HTTP ${modelResult.statusCode}`}
                                   </span>
+                                  {record.modelTokenUsage.find(
+                                    (usage) => usage.modelId === modelResult.modelId,
+                                  ) === undefined ? null : (
+                                    <span>
+                                      Token：
+                                      {
+                                        record.modelTokenUsage.find(
+                                          (usage) => usage.modelId === modelResult.modelId,
+                                        )?.totalTokens
+                                      }
+                                    </span>
+                                  )}
                                 </div>
                                 {modelResult.outcome === "succeeded" ||
                                 modelResult.message === "" ? null : (
@@ -819,6 +842,14 @@ export const CapabilityCompletionPanel = ({
                               </div>
                             ))}
                           </div>
+                          {record.tokenUsage === null ? null : (
+                            <p className="capability-record-token-usage">
+                              {english ? "Tokens" : "Token 统计"}：{english ? "input" : "输入"}{" "}
+                              {record.tokenUsage.inputTokens} · {english ? "output" : "输出"}{" "}
+                              {record.tokenUsage.outputTokens} · {english ? "total" : "合计"}{" "}
+                              {record.tokenUsage.totalTokens}
+                            </p>
+                          )}
                         </article>
                       ))
                   )}
@@ -2083,6 +2114,7 @@ export const QuickStartWizard = ({
   const [upstreamCatalogStatus, setUpstreamCatalogStatus] = useState<"error" | "loading" | "ready">(
     "loading",
   );
+  const [upstreamCatalogReload, setUpstreamCatalogReload] = useState(0);
   const stepLabels = english
     ? ["Deployment", "Entry", "Model", "Activate", "Clients (optional)"]
     : ["部署", "入口", "模型", "启用", "客户端（可选）"];
@@ -2154,6 +2186,8 @@ export const QuickStartWizard = ({
     specialists: form.capabilityCompletion.specialists,
     maximumSpecialists: form.capabilityCompletion.maximumSpecialists,
   };
+  const activeSpecialistsRef = useRef(activeHostPolicy.specialists);
+  activeSpecialistsRef.current = activeHostPolicy.specialists;
   const customModel = modelChoiceMode === "custom" ? activeHostPolicy.mainModel.model : "";
   const updateActiveHostPolicy = useCallback(
     (policy: typeof activeHostPolicy, nextModelSelection = policy.mainModel): void => {
@@ -2221,6 +2255,10 @@ export const QuickStartWizard = ({
   const primaryModelCapabilities = defaultModelCapabilities(
     selectedPrimaryCatalogModel?.capabilities ?? [],
   );
+  const capabilityEvidenceLabel = (host: AgentHostId): string =>
+    english
+      ? `Capabilities routable through the current ${hostLabel(host)} model path.`
+      : `当前 ${hostLabel(host)} 宿主、模型与适配器链路可实际调度的能力。`;
   const selectMainModel = (selection: ModelSelection): void => {
     const selectedModel = catalogModelForSelection(
       upstreamCatalog,
@@ -2350,7 +2388,7 @@ export const QuickStartWizard = ({
     void (async () => {
       try {
         let catalog = await readCatalog();
-        if (catalogNeedsConfiguredSpecialistRecovery(catalog, activeHostPolicy.specialists)) {
+        if (catalogNeedsConfiguredSpecialistRecovery(catalog, activeSpecialistsRef.current)) {
           catalog = await readCatalog();
         }
         if (!current) return;
@@ -2358,29 +2396,23 @@ export const QuickStartWizard = ({
         setUpstreamCatalogStatus("ready");
       } catch {
         if (!current) return;
-        setUpstreamCatalog({
-          companyConfigured: false,
-          companyProviderType: null,
-          company: [],
-          official: [],
-          hosts: createEmptyHostCatalog(),
-        });
         setUpstreamCatalogStatus("error");
       }
     })();
     return () => {
       current = false;
     };
-  }, [activeHostPolicy.specialists, step]);
+  }, [step, upstreamCatalogReload]);
   useEffect(() => {
     if (step !== 2 || upstreamCatalogStatus !== "ready") return;
-    const mainCapabilities = selectedModelCapabilities(
-      activeHostPolicy.mainCapabilities,
-      primaryModelCapabilities,
-    );
+    const mainCapabilities =
+      selectedPrimaryCatalogModel?.capabilities === undefined
+        ? activeHostPolicy.mainCapabilities
+        : selectedModelCapabilities(activeHostPolicy.mainCapabilities, primaryModelCapabilities);
     const specialists = activeHostPolicy.specialists.map((specialist) => {
       const selectedModel = catalogModelForSelection(upstreamCatalog, specialist.host, specialist);
-      const publishedCapabilities = defaultModelCapabilities(selectedModel?.capabilities ?? []);
+      if (selectedModel?.capabilities === undefined) return specialist;
+      const publishedCapabilities = defaultModelCapabilities(selectedModel.capabilities);
       return {
         ...specialist,
         capabilities: selectedModelCapabilities(specialist.capabilities, publishedCapabilities),
@@ -2407,6 +2439,7 @@ export const QuickStartWizard = ({
   }, [
     activeHostPolicy,
     primaryModelCapabilities,
+    selectedPrimaryCatalogModel,
     step,
     upstreamCatalog,
     upstreamCatalogStatus,
@@ -2468,11 +2501,12 @@ export const QuickStartWizard = ({
     };
   }, [step, activeProviderChoice]);
   const primaryCapabilitiesAreValid =
-    primaryModelCapabilities.length > 0 &&
-    equalCapabilities(
-      activeHostPolicy.mainCapabilities,
-      selectedModelCapabilities(activeHostPolicy.mainCapabilities, primaryModelCapabilities),
-    );
+    selectedPrimaryCatalogModel?.capabilities === undefined
+      ? true
+      : equalCapabilities(
+          activeHostPolicy.mainCapabilities,
+          selectedModelCapabilities(activeHostPolicy.mainCapabilities, primaryModelCapabilities),
+        );
   const modelConfigurationIsValid =
     isValidModelIdentifier(activeHostPolicy.mainModel.model) &&
     primaryCapabilitiesAreValid &&
@@ -2481,13 +2515,15 @@ export const QuickStartWizard = ({
       const publishedCapabilities = defaultModelCapabilities(selectedModel?.capabilities ?? []);
       return (
         selectedModel !== undefined &&
-        publishedCapabilities.length > 0 &&
         specialist.host !== activeHostId &&
         isValidModelIdentifier(specialist.model) &&
-        equalCapabilities(
-          specialist.capabilities,
-          selectedModelCapabilities(specialist.capabilities, publishedCapabilities),
-        )
+        (selectedModel.capabilities === undefined
+          ? specialist.capabilities.length > 0
+          : publishedCapabilities.length > 0 &&
+            equalCapabilities(
+              specialist.capabilities,
+              selectedModelCapabilities(specialist.capabilities, publishedCapabilities),
+            ))
       );
     });
   const canAdvance =
@@ -2948,8 +2984,8 @@ export const QuickStartWizard = ({
               </div>
               {modelChoiceMode === "custom" ? (
                 <label className="upstream-custom-model">
-                  {english ? "Custom model ID" : "自定义模型 ID"}
                   <input
+                    aria-label={english ? "Custom model ID" : "自定义模型 ID"}
                     value={customModel}
                     onChange={(event) => {
                       const customModel = event.target.value;
@@ -3012,11 +3048,15 @@ export const QuickStartWizard = ({
                     <section className="capability-primary-card">
                       <div className="capability-section-heading">
                         <div>
-                          <h4>{english ? "1. Primary model capabilities" : "1. 主模型可用能力"}</h4>
+                          <h4>
+                            {english
+                              ? "1. Routable primary-model capabilities"
+                              : "1. 主模型可调度能力"}
+                          </h4>
                           <p>
                             {english
-                              ? "Only capabilities returned by the selected model catalog are shown and selected by default."
-                              : "仅展示所选模型接口返回的可用能力，并默认全选。"}
+                              ? "Only capabilities that the selected host, model configuration, and adapter can carry end to end are shown."
+                              : "只展示所选宿主、模型配置与适配器当前能够端到端传输并参与调度的能力。"}
                           </p>
                         </div>
                       </div>
@@ -3034,6 +3074,7 @@ export const QuickStartWizard = ({
                       ) : primaryModelCapabilities.length > 0 ? (
                         <CapabilityPicker
                           available={primaryModelCapabilities}
+                          evidenceLabel={capabilityEvidenceLabel(activeHostId)}
                           selected={activeHostPolicy.mainCapabilities}
                           english={english}
                           disabled={isPending || readOnly}
@@ -3047,8 +3088,8 @@ export const QuickStartWizard = ({
                       ) : (
                         <p className="capability-evidence warning">
                           {english
-                            ? "The selected model did not return supported capability metadata and cannot be used for capability completion."
-                            : "所选模型接口未返回九门支持的能力，不能用于能力互补。"}
+                            ? `${hostLabel(activeHostId)} currently exposes no capability that this route can schedule.`
+                            : `${hostLabel(activeHostId)} 当前没有通过这条链路确认可调度的能力。`}
                         </p>
                       )}
                     </section>
@@ -3058,8 +3099,8 @@ export const QuickStartWizard = ({
                           <h4>{english ? "2. Select secondary models" : "2. 选择副模型"}</h4>
                           <p>
                             {english
-                              ? "Each model shows only capabilities returned by its host catalog, selected by default. Selecting at most two usually minimizes cost."
-                              : "每个模型仅展示宿主接口返回的可用能力，并默认全选；建议最多选择 2 个。"}
+                              ? "Each secondary model shows only capabilities routable through its own host and adapter path. Selecting at most two usually minimizes cost."
+                              : "每个副模型只展示其所属宿主、模型与适配器链路可调度的能力；建议最多选择 2 个。"}
                           </p>
                         </div>
                       </div>
@@ -3068,13 +3109,15 @@ export const QuickStartWizard = ({
                           <span aria-hidden="true" />
                           {english ? "Loading secondary models…" : "正在读取副模型…"}
                         </div>
-                      ) : upstreamCatalogStatus === "error" ? (
+                      ) : null}
+                      {upstreamCatalogStatus === "error" ? (
                         <p className="capability-loading-error" role="alert">
                           {english
                             ? "Secondary models could not be loaded. Refresh and try again."
                             : "副模型读取失败，请刷新后重试。"}
                         </p>
-                      ) : (
+                      ) : null}
+                      {upstreamCatalogStatus !== "loading" ? (
                         <>
                           {activeHostPolicy.specialists.map((specialist, index) => {
                             const hostAvailable = availableSpecialistHosts.includes(
@@ -3258,6 +3301,7 @@ export const QuickStartWizard = ({
                                 {selectedCatalogCapabilities.length > 0 ? (
                                   <CapabilityPicker
                                     available={selectedCatalogCapabilities}
+                                    evidenceLabel={capabilityEvidenceLabel(specialist.host)}
                                     selected={specialist.capabilities}
                                     english={english}
                                     disabled={isPending || readOnly}
@@ -3273,8 +3317,8 @@ export const QuickStartWizard = ({
                                 ) : (
                                   <p className="capability-evidence warning">
                                     {english
-                                      ? "This model did not publish capability metadata and cannot be used for capability completion."
-                                      : "该模型未发布能力信息，不能用于能力互补。"}
+                                      ? `${hostLabel(specialist.host)} currently exposes no capability that this model path can schedule.`
+                                      : `${hostLabel(specialist.host)} 当前没有通过该模型链路确认可调度的能力。`}
                                   </p>
                                 )}
                                 {specialist.host === "ollama" ||
@@ -3333,7 +3377,10 @@ export const QuickStartWizard = ({
                             type="button"
                             onClick={() => {
                               const choice = availableNewSpecialistModels[0];
-                              if (choice === undefined) return;
+                              if (choice === undefined) {
+                                setUpstreamCatalogReload((revision) => revision + 1);
+                                return;
+                              }
                               updateSpecialists([
                                 ...activeHostPolicy.specialists,
                                 {
@@ -3351,19 +3398,26 @@ export const QuickStartWizard = ({
                               ]);
                             }}
                             disabled={
-                              isPending || readOnly || availableNewSpecialistModels.length === 0
+                              isPending ||
+                              readOnly ||
+                              (availableNewSpecialistModels.length === 0 &&
+                                availableSpecialistHosts.length > 0)
                             }
                           >
                             {availableNewSpecialistModels.length === 0
-                              ? english
-                                ? "Every available specialist model is already configured"
-                                : "全部可用副模型均已配置"
+                              ? availableSpecialistHosts.length === 0
+                                ? english
+                                  ? "Reload secondary model list"
+                                  : "重新读取副模型列表"
+                                : english
+                                  ? "Every available specialist model is already configured"
+                                  : "全部可用副模型均已配置"
                               : english
                                 ? "Add specialist model"
                                 : "添加副模型"}
                           </button>
                         </>
-                      )}
+                      ) : null}
                     </div>
                   </>
                 ) : null}

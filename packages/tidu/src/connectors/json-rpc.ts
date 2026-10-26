@@ -45,6 +45,8 @@ export interface JsonRpcClientOptions {
   onNotification?: (notification: JsonRpcNotification) => void;
   /** Optional stderr observer; output is never persisted by the transport. */
   onStandardError?: (message: string) => void;
+  /** Receives the terminal transport error exactly once. */
+  onClose?: (error: Error) => void;
 }
 
 export interface JsonRpcClient {
@@ -109,7 +111,14 @@ export const createStdioJsonRpcClient = (
   const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
   let nextRequestId = 1;
   let closed = false;
+  let closeNotified = false;
   let closePromise: Promise<void> | undefined;
+
+  const notifyClose = (error: Error): void => {
+    if (closeNotified) return;
+    closeNotified = true;
+    options.onClose?.(error);
+  };
 
   const writeMessage = (message: Record<string, unknown>): void => {
     if (closed || child.stdin.destroyed || child.stdin.writableEnded || !child.stdin.writable) {
@@ -146,6 +155,7 @@ export const createStdioJsonRpcClient = (
       return closePromise;
     }
     closed = true;
+    notifyClose(reason);
     lines.close();
     rejectAllPending(reason);
     if (!child.stdin.destroyed && !child.stdin.writableEnded) {
@@ -256,14 +266,14 @@ export const createStdioJsonRpcClient = (
   child.once("exit", (exitCode, signal) => {
     lines.close();
     closed = true;
-    rejectAllPending(
-      new TiduError(
-        "INTERNAL_ERROR",
-        signal === null
-          ? `Agent protocol process exited with code ${String(exitCode)}.`
-          : `Agent protocol process exited after signal ${signal}.`,
-      ),
+    const error = new TiduError(
+      "INTERNAL_ERROR",
+      signal === null
+        ? `Agent protocol process exited with code ${String(exitCode)}.`
+        : `Agent protocol process exited after signal ${signal}.`,
     );
+    notifyClose(error);
+    rejectAllPending(error);
   });
 
   const client: JsonRpcClient = {

@@ -1237,12 +1237,12 @@ export const switchCodexClientConfiguration = async (
     const request = options.request ?? fetch;
     try {
       await verifyEndpoint(state.endpoint, request);
+      activateDefaultCodexConfiguration(paths, state.endpoint, state.model);
       await verifyInference(
         state.endpoint,
         state.model,
         options.request ?? requestInferenceWithoutDeadline,
       );
-      activateDefaultCodexConfiguration(paths, state.endpoint, state.model);
       const verified = await verifyEndpoint(state.endpoint, request);
       writePrivateFileAtomically(
         paths.modelCatalog,

@@ -190,6 +190,7 @@ test("writes an isolated Codex profile and switches back to the official configu
         const url = String(input);
         if (url.endsWith("/v1/hosts/codex/responses") && init?.method === "POST") {
           assert.equal(init.signal, undefined);
+          assert.match(readFileSync(defaultConfiguration, "utf8"), /model_provider = "ai_tidu9"/u);
           return Response.json({
             id: "verified",
             object: "response",
@@ -710,6 +711,7 @@ test("keeps the official configuration active when inference verification fails"
           data: [{ id: "ai-tidu9-config", owned_by: "AI-Tidu9" }],
         });
       }
+      assert.match(readFileSync(defaultConfiguration, "utf8"), /model_provider = "ai_tidu9"/u);
       return Response.json(
         {
           error: {
@@ -768,6 +770,7 @@ test("attributes an official Codex inference failure and keeps official mode act
           data: [{ id: "ai-tidu9-config", owned_by: "AI-Tidu9" }],
         });
       }
+      assert.match(readFileSync(defaultConfiguration, "utf8"), /model_provider = "ai_tidu9"/u);
       return Response.json(
         {
           error: {

@@ -95,24 +95,27 @@ test("offers only capabilities implemented by the model-routing contract", () =>
   assert.equal(capabilityIds.includes("local-private"), false);
 });
 
-test("offers only interface-published capabilities supported by the routing contract", () => {
-  assert.deepEqual(capabilityIdsForPicker(["code", "text", "vision"]), ["text", "code", "vision"]);
+test("shows every host-published capability verbatim and in provider order", () => {
+  assert.deepEqual(capabilityIdsForPicker(["code", "text", "vision"]), ["code", "text", "vision"]);
   assert.deepEqual(capabilityIdsForPicker([]), []);
-  assert.deepEqual(capabilityIdsForPicker(["document-analysis", "local-private"]), []);
+  assert.deepEqual(
+    capabilityIdsForPicker(["document-analysis", "local-private", "document-analysis"]),
+    ["document-analysis", "local-private", "document-analysis"],
+  );
 });
 
-test("defaults a model to all and only its interface-published capabilities", () => {
+test("defaults a model to the host-published capability order without pruning", () => {
   assert.deepEqual(defaultModelCapabilities(["code", "text", "vision"]), [
-    "text",
     "code",
+    "text",
     "vision",
   ]);
   assert.deepEqual(
     selectedModelCapabilities(
-      ["text", "reasoning", "vision", "web-research"],
+      ["vision", "reasoning", "text", "web-research"],
       ["text", "code", "vision"],
     ),
-    ["text", "vision"],
+    ["vision", "text"],
   );
   assert.deepEqual(selectedModelCapabilities([], ["text", "code", "vision"]), []);
 });
@@ -231,6 +234,14 @@ test("changing a configured model replaces capabilities with the selected model 
   });
 
   assert.deepEqual(nextPolicy.mainCapabilities, ["text", "vision"]);
+  assert.deepEqual(
+    updatePrimaryModelSelection(
+      policy,
+      { source: "custom", model: "custom-primary-with-no-assignment" },
+      [],
+    ).mainCapabilities,
+    [],
+  );
   assert.deepEqual(nextSpecialist.capabilities, ["text", "structured-output"]);
 });
 

@@ -213,6 +213,7 @@ const PRIVACY_RANK: Readonly<Record<ProviderPrivacy, number>> = {
 const DEFAULT_REQUIRED_CAPABILITY = "text";
 const LONG_CONTEXT_INPUT_CHARACTER_THRESHOLD = 100_000;
 const WEB_RESEARCH_TOOL_TYPES = new Set(["search", "web_search", "web_search_preview"]);
+const IMAGE_INPUT_TYPES = new Set(["image", "image_url", "input_image", "localImage"]);
 const CODE_EXECUTION_TOOL_NAMES = new Set([
   "apply_patch",
   "code_interpreter",
@@ -239,7 +240,6 @@ const HOST_BRIDGE_CAPABILITY_UNSUPPORTED_CODES = new Set([
   "host_bridge_web_unsupported",
   "host_bridge_web_research_unsupported",
 ]);
-
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
@@ -345,7 +345,7 @@ export const inferModelRequestCapabilities = (
     inferred.add("reasoning");
   }
   const serialized = JSON.stringify(request.body);
-  if (/"type"\s*:\s*"(?:image|image_url|input_image)"/u.test(serialized)) {
+  if (/"type"\s*:\s*"(?:image|image_url|input_image|localImage)"/u.test(serialized)) {
     inferred.add("vision");
   }
   const requestInput =
@@ -357,6 +357,38 @@ export const inferModelRequestCapabilities = (
 };
 
 const inferCapabilities = inferModelRequestCapabilities;
+
+const removeImageInputs = (value: unknown): unknown => {
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => {
+      const projected = removeImageInputs(item);
+      return projected === undefined ? [] : [projected];
+    });
+  }
+  if (!isRecord(value)) return value;
+  if (typeof value.type === "string" && IMAGE_INPUT_TYPES.has(value.type)) return undefined;
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([key, item]) => {
+      const projected = removeImageInputs(item);
+      return projected === undefined ? [] : [[key, projected]];
+    }),
+  );
+};
+
+const projectRequestForCapabilities = (
+  request: ProviderExecutionRequest,
+  capabilities: readonly string[],
+): ProviderExecutionRequest => {
+  if (capabilities.includes("vision")) return request;
+  const conversationKey = request.protocol === "responses" ? "input" : "messages";
+  return {
+    ...request,
+    body: {
+      ...request.body,
+      [conversationKey]: removeImageInputs(request.body[conversationKey]),
+    },
+  };
+};
 
 const validateProfile = (profile: ModelRouteProfile): ModelRouteProfile => {
   if (!ID_PATTERN.test(profile.id)) {
@@ -524,17 +556,15 @@ const scoreProfile = (
   );
 };
 
-const extractTokenUsage = (
-  result: ProviderExecutionResult,
-): {
+type RoutingTokenUsage = {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
-} | null => {
-  if (result.kind !== "json" || !isRecord(result.body) || !isRecord(result.body.usage)) {
-    return null;
-  }
-  const usage = result.body.usage;
+};
+
+const extractTokenUsageRecord = (body: Record<string, unknown>): RoutingTokenUsage | null => {
+  if (!isRecord(body.usage)) return null;
+  const usage = body.usage;
   const inputTokens = usage.input_tokens ?? usage.prompt_tokens;
   const outputTokens = usage.output_tokens ?? usage.completion_tokens;
   if (
@@ -551,6 +581,9 @@ const extractTokenUsage = (
     totalTokens: (inputTokens as number) + (outputTokens as number),
   };
 };
+
+const extractTokenUsage = (result: ProviderExecutionResult): RoutingTokenUsage | null =>
+  result.kind === "json" && isRecord(result.body) ? extractTokenUsageRecord(result.body) : null;
 
 const combineTokenUsage = (
   usages: readonly ({
@@ -604,6 +637,13 @@ const extractModelText = (result: ProviderExecutionResult): string => {
   throw new Error("Capability-completion secondary model returned no text result.");
 };
 
+const MAX_SHARED_PROCESS_CHARACTERS = 16_384;
+
+const appendSharedProcess = (current: string, delta: string): string => {
+  if (current.length >= MAX_SHARED_PROCESS_CHARACTERS || delta === "") return current;
+  return `${current}${delta.slice(0, MAX_SHARED_PROCESS_CHARACTERS - current.length)}`;
+};
+
 const providerErrorMessage = (result: ProviderExecutionResult, fallback: string): string => {
   if (result.kind !== "json" || !isRecord(result.body) || !isRecord(result.body.error)) {
     return fallback;
@@ -638,12 +678,15 @@ interface ProviderStreamObservation {
   succeeded: boolean;
   /** Bounded terminal diagnostic used by local routing history. */
   message: string;
+  /** Provider-reported usage parsed from the successful or failed stream terminal. */
+  tokenUsage: RoutingTokenUsage | null;
 }
 
 interface ProviderStreamObservationState {
   sawOutput: boolean;
   sawSuccessfulTerminal: boolean;
   failureMessage?: string;
+  tokenUsage?: RoutingTokenUsage;
 }
 
 const boundedStreamMessage = (message: string): string => message.slice(0, 500);
@@ -688,6 +731,9 @@ const observeProviderStreamEvent = (
     return;
   }
   if (!isRecord(body)) return;
+  const usageBody =
+    body.type === "response.completed" && isRecord(body.response) ? body.response : body;
+  state.tokenUsage = extractTokenUsageRecord(usageBody) ?? state.tokenUsage;
 
   if (isRecord(body.error)) {
     state.failureMessage ??= boundedStreamMessage(
@@ -805,36 +851,41 @@ const observeProviderStream = (
     }
   };
   const completedObservation = (): ProviderStreamObservation => {
+    const tokenUsage = state.tokenUsage ?? null;
     if (cancelled) {
       return {
         succeeded: false,
         message: aborted
           ? "Provider stream was cancelled because the request was aborted."
           : "Provider stream was cancelled before completion.",
+        tokenUsage,
       };
     }
     if (result.statusCode < 200 || result.statusCode >= 300) {
       return {
         succeeded: false,
         message: `Primary model returned HTTP ${result.statusCode}.`,
+        tokenUsage,
       };
     }
     if (state.failureMessage !== undefined) {
-      return { succeeded: false, message: state.failureMessage };
+      return { succeeded: false, message: state.failureMessage, tokenUsage };
     }
     if (!state.sawOutput) {
       return {
         succeeded: false,
         message: "Provider stream ended without assistant output.",
+        tokenUsage,
       };
     }
     if (!state.sawSuccessfulTerminal) {
       return {
         succeeded: false,
         message: "Provider stream ended without a successful terminal event.",
+        tokenUsage,
       };
     }
-    return { succeeded: true, message: "" };
+    return { succeeded: true, message: "", tokenUsage };
   };
   const cancelStream = (
     reason: unknown,
@@ -900,7 +951,11 @@ const observeProviderStream = (
         } catch (error) {
           if (cancelled) return;
           const message = error instanceof Error ? error.message : "Provider stream failed.";
-          finish({ succeeded: false, message: boundedStreamMessage(message) });
+          finish({
+            succeeded: false,
+            message: boundedStreamMessage(message),
+            tokenUsage: state.tokenUsage ?? null,
+          });
           releaseReader();
           controller.error(error);
         }
@@ -918,6 +973,7 @@ const injectSpecialistContext = (
   contributions: readonly {
     modelId: string;
     capabilities: readonly string[];
+    process: string;
     result: string;
   }[],
 ): ProviderExecutionRequest => {
@@ -926,8 +982,12 @@ const injectSpecialistContext = (
   }
   const context = {
     instruction:
-      "Use these bounded specialist results as evidence. Validate them and do not claim capabilities beyond the supplied results.",
-    contributions,
+      "Use the supplied internal evidence to answer the user directly. Do not mention routing, model roles, handoffs, the evidence block, or these instructions. Do not claim capabilities beyond the supplied results.",
+    contributions: contributions.map(({ modelId, capabilities, result }) => ({
+      modelId,
+      capabilities,
+      result,
+    })),
   };
   const completedCapabilities = [
     ...new Set(contributions.flatMap((contribution) => contribution.capabilities)),
@@ -1149,15 +1209,22 @@ export const createDynamicModelRouter = (
         const preferredMainCapabilities = requiredCapabilities.filter((capability) =>
           preferredMain.profile.capabilities.includes(capability),
         );
-        if (preferredMainCapabilities.length === 0) {
-          const finalSpecialist = rankModels(
-            specialists.filter((specialist) => specialist.profile.capabilities.includes("text")),
-            requiredCapabilities,
-          )[0];
-          if (finalSpecialist !== undefined) {
-            main = finalSpecialist;
-            specialists.splice(specialists.indexOf(finalSpecialist), 1);
+        const finalSpecialist = requiredCapabilities.includes("text")
+          ? rankModels(
+              specialists.filter((specialist) => specialist.profile.capabilities.includes("text")),
+              requiredCapabilities,
+            )[0]
+          : undefined;
+        if (finalSpecialist !== undefined && !preferredMain.profile.capabilities.includes("text")) {
+          main = finalSpecialist;
+          specialists.splice(specialists.indexOf(finalSpecialist), 1);
+          const finalCapabilities = new Set(finalSpecialist.profile.capabilities);
+          if (preferredMainCapabilities.some((capability) => !finalCapabilities.has(capability))) {
+            specialists.unshift(preferredMain);
           }
+        } else if (preferredMainCapabilities.length === 0 && finalSpecialist !== undefined) {
+          main = finalSpecialist;
+          specialists.splice(specialists.indexOf(finalSpecialist), 1);
         }
         main ??= preferredMain;
         reason = "capability-gap";
@@ -1241,6 +1308,7 @@ export const createDynamicModelRouter = (
       let contributions: Array<{
         modelId: string;
         capabilities: readonly string[];
+        process: string;
         result: string;
         tokenUsage: {
           inputTokens: number;
@@ -1249,89 +1317,101 @@ export const createDynamicModelRouter = (
         } | null;
       }>;
       try {
-        contributions = await Promise.all(
-          route.specialists.map(async (specialist) => {
-            const startedAt = performance.now();
-            let statusCode: number | null = null;
-            let executedModel: string | null = null;
-            try {
-              const assignedCapabilities = route.decision.requiredCapabilities.filter(
-                (capability) => specialist.profile.capabilities.includes(capability),
-              );
-              const cancellationBeforeSpecialist = requestCancellationError(request);
-              if (cancellationBeforeSpecialist !== undefined) {
-                throw cancellationBeforeSpecialist;
-              }
-              const specialistResult = await specialist.provider.execute({
-                ...request,
-                onModelConfirmed: (model) => {
-                  executedModel = model;
-                },
-                body: { ...request.body, stream: false },
-                routing: {
-                  ...request.routing,
-                  host: specialist.profile.host ?? request.routing?.host,
-                  role: "specialist",
-                  requiredCapabilities: assignedCapabilities,
-                  availableCapabilities: assignedCapabilities,
-                },
-              });
-              statusCode = specialistResult.statusCode;
-              if (specialistResult.statusCode === 429) {
-                throw new Error(`Secondary model quota exhausted (HTTP 429).`);
-              }
-              if (specialistResult.statusCode < 200 || specialistResult.statusCode >= 300) {
-                throw new Error(
-                  providerErrorMessage(
-                    specialistResult,
-                    `Secondary model failed with HTTP ${specialistResult.statusCode}.`,
-                  ),
-                );
-              }
-              const result = extractModelText(specialistResult);
-              const tokenUsage = extractTokenUsage(specialistResult);
-              requestAttempts.push({
-                modelId: specialist.profile.id,
-                role: "secondary",
-                outcome: "succeeded",
-                executedModel: specialistResult.upstreamModel ?? executedModel,
-                statusCode,
-                durationMilliseconds: Math.round(performance.now() - startedAt),
-                message: "",
-              });
-              const confirmedSpecialistModel = specialistResult.upstreamModel ?? executedModel;
-              if (confirmedSpecialistModel !== null) {
-                request.onExecutionReceipt?.({
-                  host: specialist.profile.host ?? request.routing?.host ?? "openai-compatible",
-                  model: confirmedSpecialistModel,
-                  role: "specialist",
-                  capabilities: assignedCapabilities,
-                  usage: tokenUsage,
-                });
-              }
-              return {
-                modelId: specialist.profile.id,
-                capabilities: specialist.profile.capabilities.filter((capability) =>
-                  route.decision.requiredCapabilities.includes(capability),
-                ),
-                result,
-                tokenUsage,
-              };
-            } catch (error) {
-              const message = error instanceof Error ? error.message : "Secondary model failed.";
-              requestAttempts.push({
-                modelId: specialist.profile.id,
-                role: "secondary",
-                outcome: "failed",
-                executedModel,
-                statusCode,
-                durationMilliseconds: Math.round(performance.now() - startedAt),
-                message: message.slice(0, 500),
-              });
-              throw error;
+        contributions = [];
+        for (const specialist of route.specialists) {
+          const startedAt = performance.now();
+          let statusCode: number | null = null;
+          let executedModel: string | null = null;
+          let process = "";
+          try {
+            const assignedCapabilities = route.decision.requiredCapabilities.filter((capability) =>
+              specialist.profile.capabilities.includes(capability),
+            );
+            const cancellationBeforeSpecialist = requestCancellationError(request);
+            if (cancellationBeforeSpecialist !== undefined) {
+              throw cancellationBeforeSpecialist;
             }
-          }),
-        );
+            const projectedRequest = projectRequestForCapabilities(request, assignedCapabilities);
+            const specialistRequest = injectSpecialistContext(
+              {
+                ...projectedRequest,
+                body: { ...projectedRequest.body, stream: false },
+                onProcessDelta: (delta) => {
+                  process = appendSharedProcess(process, delta);
+                  request.onProcessDelta?.(delta);
+                },
+              },
+              contributions,
+            );
+            const specialistResult = await specialist.provider.execute({
+              ...specialistRequest,
+              onModelConfirmed: (model) => {
+                executedModel = model;
+              },
+              routing: {
+                ...specialistRequest.routing,
+                host: specialist.profile.host ?? specialistRequest.routing?.host,
+                role: "specialist",
+                requiredCapabilities: assignedCapabilities,
+                availableCapabilities: assignedCapabilities,
+              },
+            });
+            statusCode = specialistResult.statusCode;
+            if (specialistResult.statusCode === 429) {
+              throw new Error(`Secondary model quota exhausted (HTTP 429).`);
+            }
+            if (specialistResult.statusCode < 200 || specialistResult.statusCode >= 300) {
+              throw new Error(
+                providerErrorMessage(
+                  specialistResult,
+                  `Secondary model failed with HTTP ${specialistResult.statusCode}.`,
+                ),
+              );
+            }
+            const result = extractModelText(specialistResult);
+            const tokenUsage = extractTokenUsage(specialistResult);
+            requestAttempts.push({
+              modelId: specialist.profile.id,
+              role: "secondary",
+              outcome: "succeeded",
+              executedModel: specialistResult.upstreamModel ?? executedModel,
+              statusCode,
+              durationMilliseconds: Math.round(performance.now() - startedAt),
+              message: "",
+            });
+            const confirmedSpecialistModel = specialistResult.upstreamModel ?? executedModel;
+            if (confirmedSpecialistModel !== null) {
+              request.onExecutionReceipt?.({
+                host: specialist.profile.host ?? request.routing?.host ?? "openai-compatible",
+                model: confirmedSpecialistModel,
+                role: "specialist",
+                capabilities: assignedCapabilities,
+                usage: tokenUsage,
+              });
+            }
+            contributions.push({
+              modelId: specialist.profile.id,
+              capabilities: specialist.profile.capabilities.filter((capability) =>
+                route.decision.requiredCapabilities.includes(capability),
+              ),
+              process,
+              result,
+              tokenUsage,
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "Secondary model failed.";
+            requestAttempts.push({
+              modelId: specialist.profile.id,
+              role: "secondary",
+              outcome: "failed",
+              executedModel,
+              statusCode,
+              durationMilliseconds: Math.round(performance.now() - startedAt),
+              message: message.slice(0, 500),
+            });
+            throw error;
+          }
+        }
       } catch (error) {
         const cancellation = requestCancellationError(request, error);
         if (cancellation !== undefined) throw cancellation;
@@ -1348,7 +1428,10 @@ export const createDynamicModelRouter = (
         const mainCapabilities = route.decision.requiredCapabilities.filter((capability) =>
           route.main.profile.capabilities.includes(capability),
         );
-        const complementedRequest = injectSpecialistContext(request, contributions);
+        const complementedRequest = injectSpecialistContext(
+          projectRequestForCapabilities(request, mainCapabilities),
+          contributions,
+        );
         const routedRequest = injectMissingCapabilityContext(
           complementedRequest,
           route.decision.missingCapabilities,
@@ -1425,33 +1508,36 @@ export const createDynamicModelRouter = (
       }
       if (result.statusCode !== 429 && result.statusCode < 500) {
         const resultTokenUsage = extractTokenUsage(result);
-        latestDecision = {
-          ...route.decision,
-          tokenUsage: combineTokenUsage([
-            ...contributions.map((contribution) => contribution.tokenUsage),
-            resultTokenUsage,
-          ]),
-          modelTokenUsage: [
-            ...contributions.flatMap((contribution) =>
-              contribution.tokenUsage === null
+        const updateDecisionTokenUsage = (mainTokenUsage: RoutingTokenUsage | null): void => {
+          latestDecision = {
+            ...route.decision,
+            tokenUsage: combineTokenUsage([
+              ...contributions.map((contribution) => contribution.tokenUsage),
+              mainTokenUsage,
+            ]),
+            modelTokenUsage: [
+              ...contributions.flatMap((contribution) =>
+                contribution.tokenUsage === null
+                  ? []
+                  : [
+                      {
+                        modelId: contribution.modelId,
+                        ...contribution.tokenUsage,
+                      },
+                    ],
+              ),
+              ...(mainTokenUsage === null
                 ? []
                 : [
                     {
-                      modelId: contribution.modelId,
-                      ...contribution.tokenUsage,
+                      modelId: route.main.profile.id,
+                      ...mainTokenUsage,
                     },
-                  ],
-            ),
-            ...(resultTokenUsage === null
-              ? []
-              : [
-                  {
-                    modelId: route.main.profile.id,
-                    ...resultTokenUsage,
-                  },
-                ]),
-          ],
+                  ]),
+            ],
+          };
         };
+        updateDecisionTokenUsage(resultTokenUsage);
         if (result.kind === "stream") {
           const confirmedMainModel = result.upstreamModel ?? mainExecutedModel;
           if (confirmedMainModel !== null) {
@@ -1468,6 +1554,7 @@ export const createDynamicModelRouter = (
           return observeProviderStream(
             result,
             (observation) => {
+              updateDecisionTokenUsage(observation.tokenUsage);
               requestAttempts.push({
                 modelId: route.main.profile.id,
                 role: "main",
@@ -1931,7 +2018,7 @@ export const createCapabilityCompletionProvider = (
                   durationMilliseconds: Math.round(performance.now() - startedAt),
                   message: observation.message,
                 },
-                null,
+                observation.tokenUsage,
               );
             },
             request.protocol,
@@ -2060,7 +2147,10 @@ export const createCapabilityCompletionProvider = (
             return observeProviderStream(
               result,
               (observation) => {
-                recordRoutingResult(decision, observation.succeeded ? "succeeded" : "failed");
+                recordRoutingResult(
+                  router.inspect() ?? decision,
+                  observation.succeeded ? "succeeded" : "failed",
+                );
               },
               request.protocol,
               request.signal,

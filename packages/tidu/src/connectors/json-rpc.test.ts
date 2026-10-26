@@ -22,6 +22,10 @@ process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "ready", params: {
 setTimeout(() => undefined, 10_000);
 `;
 
+const EXITING_CHILD_SOURCE = `
+process.exit(7);
+`;
+
 test("stdio JSON-RPC correlates requests and notifications", async () => {
   const notifications: string[] = [];
   const client = createStdioJsonRpcClient(
@@ -75,4 +79,29 @@ test("stdio JSON-RPC rejects writes after the child closes its input", async () 
     await client.close();
   }
   assert.equal(client.process.exitCode !== null || client.process.signalCode !== null, true);
+});
+
+test("stdio JSON-RPC reports a terminal child exit exactly once", async () => {
+  const closeErrors: Error[] = [];
+  let observeClose = (): void => undefined;
+  const closed = new Promise<void>((resolve) => {
+    observeClose = resolve;
+  });
+  const client = createStdioJsonRpcClient(
+    {
+      command: process.execPath,
+      arguments: ["-e", EXITING_CHILD_SOURCE],
+      environment: process.env,
+    },
+    {
+      onClose: (error) => {
+        closeErrors.push(error);
+        observeClose();
+      },
+    },
+  );
+  await closed;
+  await client.close();
+  assert.equal(closeErrors.length, 1);
+  assert.match(closeErrors[0]?.message ?? "", /exited with code 7/u);
 });

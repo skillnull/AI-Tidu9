@@ -2345,10 +2345,29 @@ h2 {
     }
   }
 
+  .capability-picker-block {
+    min-width: 0;
+
+    .capability-picker-note {
+      display: inline-block;
+      box-sizing: border-box;
+      max-width: calc(100% - 4px);
+      margin: 7px 2px 0;
+      padding: 3px 8px;
+      border: 1px solid rgb(101 202 188 / 28%);
+      border-radius: 999px;
+      background: rgb(22 64 60 / 42%);
+      color: #79bdb4;
+      font-size: 10px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+  }
+
   .capability-picker {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
-    margin: 6px -2px -2px;
+    margin: 4px 0 0;
 
     label {
       display: flex;
@@ -2645,10 +2664,15 @@ h2 {
   }
 
   .capability-record-detail,
-  .capability-record-specialists {
+  .capability-record-specialists,
+  .capability-record-token-usage {
     margin: 5px 0 0;
     color: #8794a5;
     font-size: 12px;
+  }
+
+  .capability-record-token-usage {
+    color: #69c8ba;
   }
 
   .capability-model-results {

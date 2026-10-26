@@ -10,7 +10,7 @@ export interface CatalogModel {
   /** Capabilities published for this model. */
   capabilities?: readonly string[];
   /** Evidence source for the capability declaration. */
-  capabilitySource?: "company-published" | "host-catalog" | "provider-catalog";
+  capabilitySource?: "company-published" | "effective-route" | "host-catalog" | "provider-catalog";
   /** Published input price per million tokens. */
   inputCostPerMillionTokens?: number | null;
   /** Published output price per million tokens. */
