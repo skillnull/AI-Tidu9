@@ -2371,6 +2371,20 @@ test("validates OpenAI-compatible inference requests before provider routing", a
       "invalid_messages",
     );
 
+    const gitResponse = await fetch(`${runtime.origin}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        input: "git status",
+        stream: true,
+      }),
+    });
+    assert.equal(gitResponse.status, 200);
+    const gitStream = await gitResponse.text();
+    assert.match(gitStream, /response\.completed/u);
+    assert.match(gitStream, /total_tokens":0/u);
+
     const chatResponse = await fetch(`${runtime.origin}/v1/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json" },

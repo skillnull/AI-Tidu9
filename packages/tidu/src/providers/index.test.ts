@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +28,7 @@ import {
   requireValidHostModelText,
   resolveCursorHeadlessModel,
 } from "./codex-host.js";
+import { createLocalGitProvider } from "./git-local.js";
 import {
   createCatalogModelRouter,
   createOllamaProvider,
@@ -26,10 +36,131 @@ import {
   createProviderFromEnvironment,
   discoverOllamaModels,
   type ModelProvider,
+  type ProviderExecutionRequest,
 } from "./index.js";
 
 const readStreamText = async (stream: ReadableStream<Uint8Array>): Promise<string> =>
   new Response(stream).text();
+
+const createCommitRequest = (text: string): ProviderExecutionRequest => ({
+  protocol: "responses",
+  body: { model: "ai-tidu9", input: text },
+  virtualModelId: "ai-tidu9",
+});
+
+test("executes Git requests locally without invoking the model provider", async () => {
+  const repository = mkdtempSync(join(tmpdir(), "tidu-clean-commit-"));
+  try {
+    const runGit = (...argumentsList: string[]): void => {
+      execFileSync("git", argumentsList, { cwd: repository, stdio: "ignore" });
+    };
+    runGit("init", "--quiet");
+    runGit("config", "user.name", "AI-Tidu9 Test");
+    runGit("config", "user.email", "test@example.invalid");
+    const checkMarker = join(repository, ".git", "check-ran");
+    writeFileSync(
+      join(repository, "package.json"),
+      JSON.stringify({
+        scripts: {
+          check: "node -e \"require('node:fs').writeFileSync('.git/check-ran', 'passed')\"",
+        },
+      }),
+    );
+    writeFileSync(join(repository, "tracked.txt"), "initial\n");
+    runGit("add", "package.json", "tracked.txt");
+    runGit("commit", "--quiet", "-m", "test: initialize");
+
+    let modelCalls = 0;
+    const modelProvider: ModelProvider = {
+      descriptor: { type: "openai-compatible", model: "model-test" },
+      execute: async () => {
+        modelCalls += 1;
+        return { kind: "json", statusCode: 200, body: { delegated: true } };
+      },
+    };
+    const provider = createLocalGitProvider(modelProvider, repository);
+    const cleanResult = await provider.execute(createCommitRequest("提交"));
+    assert.match(JSON.stringify(cleanResult), /没有更新要提交/u);
+    assert.equal(modelCalls, 0);
+
+    writeFileSync(join(repository, "tracked.txt"), "changed\n");
+    const commitResult = await provider.execute(
+      createCommitRequest("提交代码\nfix: update tracked file"),
+    );
+    assert.match(JSON.stringify(commitResult), /已提交/u);
+    assert.equal(
+      execFileSync("git", ["log", "-1", "--pretty=%s"], {
+        cwd: repository,
+        encoding: "utf8",
+      }).trim(),
+      "fix: update tracked file",
+    );
+    assert.equal(
+      execFileSync("git", ["status", "--porcelain"], { cwd: repository, encoding: "utf8" }),
+      "",
+    );
+    assert.equal(readFileSync(checkMarker, "utf8"), "passed");
+    assert.equal(modelCalls, 0);
+
+    rmSync(checkMarker, { force: true });
+    const repeatedCommitResult = await provider.execute(createCommitRequest("提交代码"));
+    assert.match(JSON.stringify(repeatedCommitResult), /没有更新要提交/u);
+    assert.equal(existsSync(checkMarker), false);
+    assert.equal(modelCalls, 0);
+
+    const committedHead = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(
+      join(repository, "package.json"),
+      JSON.stringify({ scripts: { check: 'node -e "process.exit(1)"' } }),
+    );
+    writeFileSync(join(repository, "tracked.txt"), "blocked\n");
+    const blockedCommitResult = await provider.execute(
+      createCommitRequest("提交代码\nfix: must not commit"),
+    );
+    assert.match(JSON.stringify(blockedCommitResult), /Git 命令执行失败/u);
+    assert.equal(
+      execFileSync("git", ["rev-parse", "HEAD"], { cwd: repository, encoding: "utf8" }).trim(),
+      committedHead,
+    );
+    assert.equal(modelCalls, 0);
+
+    const statusRequest = createCommitRequest("git status");
+    const statusResult = await provider.execute({
+      ...statusRequest,
+      body: { ...statusRequest.body, stream: true },
+    });
+    assert.equal(statusResult.kind, "stream");
+    if (statusResult.kind === "stream") {
+      assert.match(await readStreamText(statusResult.stream), /response\.completed/u);
+    }
+    assert.equal(modelCalls, 0);
+
+    const unsupportedResult = await provider.execute(createCommitRequest("请提交并推送"));
+    assert.match(JSON.stringify(unsupportedResult), /未识别 Git 操作/u);
+    assert.equal(modelCalls, 0);
+
+    await provider.execute(createCommitRequest("解释这段代码"));
+    assert.equal(modelCalls, 1);
+
+    await provider.execute({
+      protocol: "responses",
+      body: {
+        model: "ai-tidu9",
+        input: [
+          { role: "user", content: "git status" },
+          { role: "assistant", content: "already completed" },
+        ],
+      },
+      virtualModelId: "ai-tidu9",
+    });
+    assert.equal(modelCalls, 2);
+  } finally {
+    rmSync(repository, { recursive: true, force: true });
+  }
+});
 
 const createFakeCodexProviderCommand = (directory: string): string => {
   const executable = join(directory, "fake-codex-provider");

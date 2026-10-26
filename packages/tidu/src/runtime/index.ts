@@ -59,6 +59,7 @@ import {
   inspectCodexHostAccountReport,
   inspectCodexHostConfiguration,
 } from "../providers/codex-host.js";
+import { executeLocalGitRequest } from "../providers/git-local.js";
 import {
   createCatalogModelRouter,
   createOllamaProvider,
@@ -1271,6 +1272,26 @@ const handleOpenAiInference = async (
   }
   const requestBody = body as Record<string, unknown>;
   const probe = isRecord(requestBody.metadata) && requestBody.metadata.ai_tidu9_probe === true;
+  if (!probe) {
+    const localGitResult = await executeLocalGitRequest({
+      protocol,
+      body: requestBody,
+      virtualModelId: activeModelId,
+    });
+    if (localGitResult !== undefined) {
+      if (localGitResult.kind === "stream") {
+        await sendOpenAiStream(
+          response,
+          localGitResult.statusCode,
+          localGitResult.stream,
+          requestId,
+        );
+      } else {
+        sendOpenAiJson(response, localGitResult.statusCode, localGitResult.body, requestId);
+      }
+      return;
+    }
+  }
   const modelSelection = workspace.active.configuration.modelSelection ?? {
     source: "official" as const,
     model: "current",
