@@ -69,7 +69,7 @@ const executableExists = (path: string): boolean => {
   }
 };
 
-const resolveCodexCommand = (options: CodexHostInspectionOptions): string => {
+export const resolveCodexCommand = (options: CodexHostInspectionOptions): string => {
   if (options.command !== undefined) return options.command;
   const environment = { ...process.env, ...options.environment };
   const pathCandidates = (environment.PATH ?? "")

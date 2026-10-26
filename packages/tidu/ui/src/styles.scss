@@ -2654,6 +2654,14 @@ h2 {
       &.record-failed {
         color: #ef8490;
       }
+
+      &.record-cancelled {
+        color: #9aa6b4;
+      }
+
+      &.record-waiting {
+        color: #d8b56b;
+      }
     }
 
     span {
@@ -2710,19 +2718,35 @@ h2 {
       }
 
       .capability-model-result-meta {
-        display: flex;
-        flex-wrap: wrap;
-        margin: 3px -5px 0;
+        display: grid;
+        margin-top: 3px;
 
         span {
-          margin: 0 5px;
           color: #7f8c9b;
           font-size: 10px;
+        }
+
+        .capability-model-result-timing,
+        .capability-model-result-tokens {
+          margin-top: 2px;
         }
       }
 
       .capability-model-result-error {
         color: #bd8790;
+      }
+
+      &.cancelled .capability-model-result-error {
+        color: #9aa6b4;
+      }
+
+      &.waiting {
+        border-color: #d8b56b;
+
+        small,
+        .capability-model-result-error {
+          color: #d8b56b;
+        }
       }
 
       &.succeeded {

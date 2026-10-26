@@ -1013,6 +1013,22 @@ test("includes provider-reported usage in streamed host chat completions", async
   assert.match(body, /data: \[DONE\]/u);
 });
 
+test("keeps reported usage when either host stream protocol fails", async () => {
+  for (const protocol of ["responses", "chat-completions"] as const) {
+    const stream = createLiveJsonStream(
+      { protocol, virtualModelId: "tidu", body: { stream: true } },
+      async () => {
+        throw new Error("Fixture failed");
+      },
+      () => ({ inputTokens: 12, outputTokens: 3, totalTokens: 15 }),
+    );
+    const body = await readStreamText(stream);
+    assert.match(body, /Fixture failed/u);
+    assert.match(body, /"total_tokens":15/u);
+    assert.match(body, /data: \[DONE\]/u);
+  }
+});
+
 test("ignores late host deltas and failures after the consumer cancels the stream", async () => {
   let emitDelta: (delta: string) => void = () => undefined;
   let rejectRun: (reason: Error) => void = () => undefined;

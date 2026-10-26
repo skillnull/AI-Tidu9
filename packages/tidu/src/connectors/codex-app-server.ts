@@ -97,6 +97,10 @@ export interface CodexTurnResult {
   status: "completed" | "failed" | "interrupted";
   /** Concatenated assistant message deltas. */
   text: string;
+  /** Caller-owned tools yielded without execution by the delegated host. */
+  toolCalls?: readonly CodexCallerToolCall[];
+  /** Completed native reasoning and commentary items from delegated model rounds. */
+  progressItems?: readonly Record<string, unknown>[];
   /** Per-turn token usage reported by the official app-server. */
   usage: {
     inputTokens: number;
@@ -106,6 +110,17 @@ export interface CodexTurnResult {
     cacheWriteInputTokens?: number;
     reasoningTokens?: number;
   } | null;
+}
+
+export interface CodexCallerToolCall {
+  /** Stable call identifier returned by the model. */
+  callId: string;
+  /** Caller tool namespace, when declared. */
+  namespace: string | null;
+  /** Caller tool name. */
+  tool: string;
+  /** Model-generated arguments; execution remains with the caller. */
+  arguments: unknown;
 }
 
 export type CodexTurnInput =
@@ -137,7 +152,11 @@ export interface CodexAgentClient {
   /** Negotiates protocol capabilities and sends the initialized notification. */
   initialize: () => Promise<void>;
   /** Starts a persistent Codex thread under the configured workspace. */
-  startThread: (model?: string) => Promise<CodexThread>;
+  startThread: (
+    model?: string,
+    callerTools?: readonly Record<string, unknown>[],
+    webSearchMode?: "disabled" | "cached" | "live",
+  ) => Promise<CodexThread>;
   /** Reads non-secret account metadata through the official app-server. */
   readAccount: () => Promise<CodexAccountSummary | null>;
   /** Reads account quota and token totals without running a model turn. */
@@ -154,6 +173,7 @@ export interface CodexAgentClient {
     outputSchema?: Record<string, unknown>,
     onUsageUpdate?: (usage: NonNullable<CodexTurnResult["usage"]>) => void,
     reasoningSummary?: CodexReasoningSummary,
+    onNativeItem?: (item: Record<string, unknown>) => void,
   ) => Promise<CodexTurnResult>;
   /** Interrupts one active turn. */
   cancel: (threadId: string, turnId: string) => Promise<void>;
@@ -162,6 +182,18 @@ export interface CodexAgentClient {
 }
 
 interface TurnState {
+  /** Whether the current model response reached its official completion boundary. */
+  modelResponseCompleted: boolean;
+  /** Dynamic requests waiting for the complete model response and its usage. */
+  responseWaiters: Array<() => void>;
+  /** One shared interruption after all model-emitted calls have been collected. */
+  toolInterruption?: Promise<unknown>;
+  /** Streams completed native progress before subsequent text or tool requests. */
+  onNativeItem?: (item: Record<string, unknown>) => void;
+  /** Completed model items that can be durably forwarded without flattening their phase. */
+  progressItems: Record<string, unknown>[];
+  /** Caller-owned tool requests captured before interrupting delegated execution. */
+  toolCalls: CodexCallerToolCall[];
   /** Assistant text accumulated from streaming notifications. */
   text: string;
   /** Completes the public prompt promise. */
@@ -178,11 +210,21 @@ interface TurnState {
   processItemKey?: string;
   /** Latest per-turn token usage reported by the official app-server. */
   usage: CodexTurnResult["usage"];
+  /** Whether usage came from the turn-aggregate notification instead of one raw model response. */
+  hasTurnAggregateUsage: boolean;
   /** Receives provider-authoritative usage before the turn reaches a terminal state. */
   onUsageUpdate?: (usage: NonNullable<CodexTurnResult["usage"]>) => void;
+  /** Successful completion held briefly while an adjacent exact-usage notification arrives. */
+  pendingCompletion?: Omit<CodexTurnResult, "text" | "usage">;
+  /** Bounded timer that prevents a missing usage event from delaying completion indefinitely. */
+  usageWaitTimer?: NodeJS.Timeout;
 }
 
 interface BufferedTurnNotifications {
+  /** A model response boundary received before local turn registration. */
+  modelResponseCompleted?: boolean;
+  /** Native progress completed before the turn-start response was registered. */
+  nativeItems?: Record<string, unknown>[];
   /** Text deltas received before the turn was registered locally. */
   deltas: string[];
   /** Public process deltas received before the turn was registered locally. */
@@ -191,6 +233,8 @@ interface BufferedTurnNotifications {
   completion?: Omit<CodexTurnResult, "text" | "usage">;
   /** Token usage received before the turn was registered locally. */
   usage?: NonNullable<CodexTurnResult["usage"]>;
+  /** Whether buffered usage is the authoritative turn aggregate. */
+  hasTurnAggregateUsage?: boolean;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -209,6 +253,36 @@ const readNumber = (value: unknown, key: string): number | null => {
   }
   return null;
 };
+
+const readTurnTokenUsage = (value: unknown): NonNullable<CodexTurnResult["usage"]> | null => {
+  const inputTokens = readNumber(value, "inputTokens");
+  const outputTokens = readNumber(value, "outputTokens");
+  const totalTokens = readNumber(value, "totalTokens");
+  if (inputTokens === null || outputTokens === null || totalTokens === null) return null;
+  const cachedInputTokens = readNumber(value, "cachedInputTokens");
+  const cacheWriteInputTokens = readNumber(value, "cacheWriteInputTokens");
+  const reasoningTokens = readNumber(value, "reasoningOutputTokens");
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    ...(cachedInputTokens === null ? {} : { cachedInputTokens }),
+    ...(cacheWriteInputTokens === null ? {} : { cacheWriteInputTokens }),
+    ...(reasoningTokens === null ? {} : { reasoningTokens }),
+  };
+};
+
+const tokenUsageMatches = (
+  left: CodexTurnResult["usage"],
+  right: NonNullable<CodexTurnResult["usage"]>,
+): boolean =>
+  left !== null &&
+  left.inputTokens === right.inputTokens &&
+  left.outputTokens === right.outputTokens &&
+  left.totalTokens === right.totalTokens &&
+  left.cachedInputTokens === right.cachedInputTokens &&
+  left.cacheWriteInputTokens === right.cacheWriteInputTokens &&
+  left.reasoningTokens === right.reasoningTokens;
 
 const markdownCode = (value: string): string => `\`${value.replaceAll("`", "\\`")}\``;
 
@@ -345,6 +419,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
   const activeTurns = new Map<string, TurnState>();
   const bufferedTurnNotifications = new Map<string, BufferedTurnNotifications>();
   const messagePhases = new Map<string, CodexMessagePhase>();
+  const forwardedMessageText = new Map<string, string>();
   const forwardedProcessItems = new Set<string>();
   let initialized = false;
 
@@ -373,7 +448,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     if (state.processItemKey !== undefined && state.processItemKey !== itemKey) {
       state.onProcessDelta?.("\n\n");
     }
-    state.processItemKey = itemKey;
+    state.processItemKey = delta === "\n\n" ? undefined : itemKey;
     state.onProcessDelta?.(delta);
   };
 
@@ -388,6 +463,10 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     descriptions.forEach((description, index) => {
       forwardProcessDelta(turnId, `activity:${itemId}:${String(index)}`, description);
     });
+    // An observed activity is already a complete public record, even while its command runs.
+    forwardProcessDelta(turnId, `activity:${itemId}:${String(descriptions.length - 1)}`, "\n\n");
+    const state = activeTurns.get(turnId);
+    if (state !== undefined) state.processItemKey = undefined;
   };
 
   const clearTurnProcessItems = (turnId: string): void => {
@@ -395,21 +474,123 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     for (const processItemKey of forwardedProcessItems) {
       if (processItemKey.startsWith(prefix)) forwardedProcessItems.delete(processItemKey);
     }
+    for (const messageKey of forwardedMessageText.keys()) {
+      if (messageKey.startsWith(prefix)) forwardedMessageText.delete(messageKey);
+    }
   };
 
   const completeTurn = (
     completion: Omit<CodexTurnResult, "text" | "usage">,
     state: TurnState,
   ): void => {
+    if (state.usageWaitTimer !== undefined) clearTimeout(state.usageWaitTimer);
+    state.pendingCompletion = undefined;
+    state.usageWaitTimer = undefined;
     activeTurns.delete(completion.turnId);
     clearTurnProcessItems(completion.turnId);
     state.cleanup();
-    state.resolve({ ...completion, text: state.text, usage: state.usage });
+    state.resolve({
+      ...completion,
+      text: state.text,
+      usage: state.usage,
+      ...(state.toolCalls.length === 0 ? {} : { toolCalls: state.toolCalls }),
+      ...(state.progressItems.length === 0 ? {} : { progressItems: state.progressItems }),
+    });
+  };
+
+  const scheduleTurnCompletion = (
+    completion: Omit<CodexTurnResult, "text" | "usage">,
+    state: TurnState,
+  ): void => {
+    if (state.hasTurnAggregateUsage) {
+      completeTurn(completion, state);
+      return;
+    }
+    state.pendingCompletion = completion;
+    state.usageWaitTimer = setTimeout(() => {
+      if (activeTurns.get(completion.turnId) === state) completeTurn(completion, state);
+    }, 25);
+  };
+
+  const updateTurnUsage = (
+    turnId: string,
+    usage: NonNullable<CodexTurnResult["usage"]>,
+    turnAggregate: boolean,
+  ): void => {
+    const state = activeTurns.get(turnId);
+    if (state === undefined) {
+      bufferTurnNotification(turnId, (buffer) => {
+        if (buffer.hasTurnAggregateUsage === true && !turnAggregate) return;
+        buffer.usage = usage;
+        buffer.hasTurnAggregateUsage = turnAggregate;
+        if (turnAggregate) buffer.modelResponseCompleted = true;
+      });
+      return;
+    }
+    if (!state.hasTurnAggregateUsage || turnAggregate) {
+      const usageChanged = !tokenUsageMatches(state.usage, usage);
+      state.usage = usage;
+      if (usageChanged) state.onUsageUpdate?.(usage);
+    }
+    if (turnAggregate) state.hasTurnAggregateUsage = true;
+    if (turnAggregate) {
+      state.modelResponseCompleted = true;
+      state.responseWaiters.splice(0).forEach((resolve) => {
+        resolve();
+      });
+    }
+    if (state.pendingCompletion !== undefined && state.hasTurnAggregateUsage) {
+      completeTurn(state.pendingCompletion, state);
+    }
   };
 
   const onNotification = (notification: JsonRpcNotification): void => {
     options.onEvent?.(notification);
     const turnId = readString(notification.params, "turnId");
+    if (
+      notification.method === "rawResponseItem/completed" &&
+      turnId !== undefined &&
+      isRecord(notification.params) &&
+      isRecord(notification.params.item)
+    ) {
+      const item = notification.params.item;
+      if (
+        item.type === "function_call" &&
+        typeof item.call_id === "string" &&
+        typeof item.name === "string" &&
+        typeof item.arguments === "string"
+      ) {
+        const state = activeTurns.get(turnId);
+        if (state !== undefined && !state.toolCalls.some((call) => call.callId === item.call_id)) {
+          try {
+            state.toolCalls.push({
+              callId: item.call_id,
+              tool: item.name,
+              namespace: readString(item, "namespace") ?? null,
+              arguments: JSON.parse(item.arguments) as unknown,
+            });
+          } catch {
+            /* The official tool handler reports malformed arguments as a failure. */
+          }
+        }
+      }
+      if (
+        item.type === "reasoning" ||
+        item.type === "web_search_call" ||
+        (item.type === "message" && item.phase === "commentary")
+      ) {
+        const state = activeTurns.get(turnId);
+        if (state !== undefined) {
+          state.progressItems.push(item);
+          state.onNativeItem?.(item);
+        } else
+          bufferTurnNotification(turnId, (buffer) => {
+            buffer.nativeItems ??= [];
+            buffer.nativeItems.push(item);
+          });
+      }
+      return;
+    }
     if (
       notification.method === "item/started" &&
       turnId !== undefined &&
@@ -429,6 +610,25 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       return;
     }
     if (
+      notification.method === "rawResponse/completed" &&
+      turnId !== undefined &&
+      isRecord(notification.params)
+    ) {
+      const usage = readTurnTokenUsage(notification.params.usage);
+      if (usage !== null) updateTurnUsage(turnId, usage, false);
+      const state = activeTurns.get(turnId);
+      if (state !== undefined) {
+        state.modelResponseCompleted = true;
+        state.responseWaiters.splice(0).forEach((resolve) => {
+          resolve();
+        });
+      } else
+        bufferTurnNotification(turnId, (buffer) => {
+          buffer.modelResponseCompleted = true;
+        });
+      return;
+    }
+    if (
       notification.method === "thread/tokenUsage/updated" &&
       turnId !== undefined &&
       isRecord(notification.params) &&
@@ -436,31 +636,8 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     ) {
       const tokenUsage = notification.params.tokenUsage;
       const last = isRecord(tokenUsage.last) ? tokenUsage.last : tokenUsage.total;
-      const inputTokens = readNumber(last, "inputTokens");
-      const outputTokens = readNumber(last, "outputTokens");
-      const totalTokens = readNumber(last, "totalTokens");
-      if (inputTokens !== null && outputTokens !== null && totalTokens !== null) {
-        const cachedInputTokens = readNumber(last, "cachedInputTokens");
-        const cacheWriteInputTokens = readNumber(last, "cacheWriteInputTokens");
-        const reasoningTokens = readNumber(last, "reasoningOutputTokens");
-        const usage = {
-          inputTokens,
-          outputTokens,
-          totalTokens,
-          ...(cachedInputTokens === null ? {} : { cachedInputTokens }),
-          ...(cacheWriteInputTokens === null ? {} : { cacheWriteInputTokens }),
-          ...(reasoningTokens === null ? {} : { reasoningTokens }),
-        };
-        const state = activeTurns.get(turnId);
-        if (state === undefined) {
-          bufferTurnNotification(turnId, (buffer) => {
-            buffer.usage = usage;
-          });
-        } else {
-          state.usage = usage;
-          state.onUsageUpdate?.(usage);
-        }
-      }
+      const usage = readTurnTokenUsage(last);
+      if (usage !== null) updateTurnUsage(turnId, usage, true);
       return;
     }
     if (notification.method === "item/agentMessage/delta" && turnId !== undefined) {
@@ -468,6 +645,13 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       const delta = readString(notification.params, "delta");
       const itemId = readString(notification.params, "itemId");
       const phase = itemId === undefined ? undefined : messagePhases.get(itemId);
+      if (itemId !== undefined && delta !== undefined) {
+        const messageKey = `${turnId}\u0000${itemId}`;
+        forwardedMessageText.set(
+          messageKey,
+          `${forwardedMessageText.get(messageKey) ?? ""}${delta}`,
+        );
+      }
       if (delta !== undefined && phase === "commentary") {
         forwardProcessDelta(turnId, `commentary:${itemId ?? "unknown"}`, delta);
       } else if (state !== undefined && delta !== undefined) {
@@ -495,6 +679,33 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     ) {
       const item = notification.params.item;
       const itemId = readString(item, "id");
+      const state = activeTurns.get(turnId);
+      if (item.type === "agentMessage" && itemId !== undefined) {
+        const messageKey = `${turnId}\u0000${itemId}`;
+        const forwarded = forwardedMessageText.get(messageKey) ?? "";
+        const text = readString(item, "text") ?? "";
+        const trailing = text.startsWith(forwarded) ? text.slice(forwarded.length) : "";
+        if (trailing !== "") {
+          if (readString(item, "phase") === "commentary")
+            forwardProcessDelta(turnId, `commentary:${itemId}`, trailing);
+          else if (state !== undefined) {
+            state.text += trailing;
+            state.onTextDelta?.(trailing);
+          } else
+            bufferTurnNotification(turnId, (buffer) => {
+              buffer.deltas.push(trailing);
+            });
+        }
+        forwardedMessageText.delete(messageKey);
+      }
+      if (
+        itemId !== undefined &&
+        (state?.processItemKey?.startsWith(`reasoning:${itemId}:`) ||
+          state?.processItemKey === `commentary:${itemId}`)
+      ) {
+        state.onProcessDelta?.("\n\n");
+        state.processItemKey = undefined;
+      }
       if (itemId !== undefined) messagePhases.delete(itemId);
       forwardProcessItem(turnId, item);
       return;
@@ -522,25 +733,63 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       });
       return;
     }
-    completeTurn({ threadId, turnId: completedTurnId, status }, state);
+    scheduleTurnCompletion({ threadId, turnId: completedTurnId, status }, state);
   };
 
   const launch = createCodexAppServerLaunch(options);
   const failActiveTurns = (error: Error): void => {
     for (const state of activeTurns.values()) {
+      if (state.usageWaitTimer !== undefined) clearTimeout(state.usageWaitTimer);
       state.cleanup();
       state.reject(error);
     }
     activeTurns.clear();
     bufferedTurnNotifications.clear();
     messagePhases.clear();
+    forwardedMessageText.clear();
     forwardedProcessItems.clear();
   };
   const client: JsonRpcClient = createStdioJsonRpcClient(
     { ...launch, workingDirectory: options.workingDirectory },
     {
       onNotification,
-      onRequest: (request) => defaultServerRequest(request, options.onApproval),
+      onRequest: async (request) => {
+        if (request.method !== "item/tool/call")
+          return defaultServerRequest(request, options.onApproval);
+        await Promise.resolve();
+        const params = request.params;
+        const turnId = readString(params, "turnId");
+        const threadId = readString(params, "threadId");
+        const callId = readString(params, "callId");
+        const tool = readString(params, "tool");
+        const state = turnId === undefined ? undefined : activeTurns.get(turnId);
+        if (
+          state === undefined ||
+          threadId === undefined ||
+          callId === undefined ||
+          tool === undefined ||
+          !isRecord(params)
+        ) {
+          throw new TiduError("INTERNAL_ERROR", "Invalid caller tool request from Codex.");
+        }
+        if (!state.toolCalls.some((call) => call.callId === callId))
+          state.toolCalls.push({
+            callId,
+            tool,
+            namespace: readString(params, "namespace") ?? null,
+            arguments: params.arguments,
+          });
+        // Yield the request to the caller. Never acknowledge it as executed or run it here.
+        if (!state.modelResponseCompleted)
+          await new Promise<void>((resolve) => {
+            state.responseWaiters.push(resolve);
+          });
+        if (activeTurns.get(turnId as string) !== state)
+          return { contentItems: [], success: false };
+        state.toolInterruption ??= client.request("turn/interrupt", { threadId, turnId });
+        await state.toolInterruption;
+        return { contentItems: [], success: false };
+      },
       onClose: failActiveTurns,
     },
   );
@@ -563,7 +812,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           version: "0.2.0-alpha.1",
         },
         capabilities: {
-          experimentalApi: false,
+          experimentalApi: true,
           requestAttestation: false,
           mcpServerOpenaiFormElicitation: false,
         },
@@ -571,7 +820,11 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       client.notify("initialized");
       initialized = true;
     },
-    startThread: async (modelOverride?: string): Promise<CodexThread> => {
+    startThread: async (
+      modelOverride?: string,
+      callerTools?: readonly Record<string, unknown>[],
+      webSearchMode: "disabled" | "cached" | "live" = "disabled",
+    ): Promise<CodexThread> => {
       requireInitialized();
       const requestedModel = modelOverride ?? options.model;
       const response = await client.request<Record<string, unknown>>("thread/start", {
@@ -580,6 +833,25 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
         approvalPolicy: "on-request",
         sandbox: options.sandbox ?? "workspace-write",
         ephemeral: options.ephemeral ?? false,
+        ...(callerTools === undefined
+          ? {}
+          : {
+              dynamicTools: callerTools,
+              experimentalRawEvents: true,
+              developerInstructions:
+                "Tools belong to the calling client. Use only the registered tidu_caller_tool_* names; their descriptions identify the original caller tools. The client executes them under its own permissions and returns real results. Do not invoke the original tool names or execute commands or edit files in this delegated thread.",
+              config: {
+                "features.shell_tool": false,
+                "features.apply_patch_freeform": false,
+                "features.view_image": false,
+                "features.multi_agent": false,
+                "features.multi_agent_v2": false,
+                "features.goals": false,
+                "features.apps": false,
+                "agents.enabled": false,
+                web_search: webSearchMode,
+              },
+            }),
       });
       const thread = response.thread;
       const id = readString(thread, "id");
@@ -658,6 +930,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       outputSchema?: Record<string, unknown>,
       onUsageUpdate?: (usage: NonNullable<CodexTurnResult["usage"]>) => void,
       reasoningSummary: CodexReasoningSummary = "auto",
+      onNativeItem?: (item: Record<string, unknown>) => void,
     ): Promise<CodexTurnResult> => {
       requireInitialized();
       if (
@@ -692,41 +965,59 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           if (active === undefined) return;
           activeTurns.delete(turnId);
           clearTurnProcessItems(turnId);
+          if (active.usageWaitTimer !== undefined) clearTimeout(active.usageWaitTimer);
           active.cleanup();
           void client.request("turn/interrupt", { threadId, turnId }).catch(() => undefined);
-          active.reject(new TiduError("INTERNAL_ERROR", "Codex turn cancelled."));
+          active.reject(new DOMException("Codex turn cancelled.", "AbortError"));
         };
         signal?.addEventListener("abort", abort, { once: true });
         const state: TurnState = {
+          modelResponseCompleted: false,
+          responseWaiters: [],
+          progressItems: [],
+          onNativeItem,
+          toolCalls: [],
           text: "",
           resolve,
           reject,
-          cleanup: () => signal?.removeEventListener("abort", abort),
+          cleanup: () => {
+            signal?.removeEventListener("abort", abort);
+            state.responseWaiters.splice(0).forEach((resolve) => {
+              resolve();
+            });
+          },
           onTextDelta,
           onProcessDelta,
           usage: null,
+          hasTurnAggregateUsage: false,
           onUsageUpdate,
         };
         activeTurns.set(turnId, state);
+        if (signal?.aborted) {
+          abort();
+          return;
+        }
         const buffered = bufferedTurnNotifications.get(turnId);
         if (buffered === undefined) return;
         bufferedTurnNotifications.delete(turnId);
+        state.modelResponseCompleted = buffered.modelResponseCompleted === true;
+        for (const item of buffered.nativeItems ?? []) {
+          state.progressItems.push(item);
+          state.onNativeItem?.(item);
+        }
         for (const delta of buffered.deltas) {
           state.text += delta;
           state.onTextDelta?.(delta);
         }
         for (const processDelta of buffered.processDeltas) {
-          if (state.processItemKey !== undefined && state.processItemKey !== processDelta.itemKey) {
-            state.onProcessDelta?.("\n\n");
-          }
-          state.processItemKey = processDelta.itemKey;
-          state.onProcessDelta?.(processDelta.delta);
+          forwardProcessDelta(turnId, processDelta.itemKey, processDelta.delta);
         }
         if (buffered.usage !== undefined) {
           state.usage = buffered.usage;
+          state.hasTurnAggregateUsage = buffered.hasTurnAggregateUsage === true;
           state.onUsageUpdate?.(buffered.usage);
         }
-        if (buffered.completion !== undefined) completeTurn(buffered.completion, state);
+        if (buffered.completion !== undefined) scheduleTurnCompletion(buffered.completion, state);
       });
     },
     cancel: async (threadId: string, turnId: string): Promise<void> => {

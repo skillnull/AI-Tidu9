@@ -761,7 +761,7 @@ test("records streaming latency only after the stream completes", async () => {
   if (secondResult.kind === "stream") await secondResult.stream.cancel("test cleanup");
 });
 
-test("records failed and cancelled streams as unavailable observations", async () => {
+test("records failures without penalizing availability for user cancellation", async () => {
   for (const terminalState of ["failed", "cancelled"] as const) {
     const calls: string[] = [];
     const provider: ModelProvider = {
@@ -819,15 +819,19 @@ test("records failed and cancelled streams as unavailable observations", async (
       }
     }
     const failedStatus = await completion.inspectCapabilityCompletion();
-    assert.equal(failedStatus.records[0]?.outcome, "failed");
-    assert.equal(failedStatus.records[0]?.mainResult.outcome, "failed");
+    assert.equal(failedStatus.records[0]?.outcome, terminalState);
+    assert.equal(failedStatus.records[0]?.mainResult.outcome, terminalState);
 
     await completion.execute({
       protocol: "responses",
       virtualModelId: "tidu",
       body: { input: "retry" },
     });
-    assert.deepEqual(calls, ["secondary", "main", "secondary"]);
+    assert.deepEqual(calls, [
+      "secondary",
+      "main",
+      terminalState === "cancelled" ? "main" : "secondary",
+    ]);
   }
 });
 
@@ -984,6 +988,62 @@ const jsonProvider = (
 ): ModelProvider => ({
   descriptor: { type: "openai-compatible", model },
   execute: async (request) => ({ kind: "json", ...(await execute(request)) }),
+});
+
+test("returns specialist native tool requests before asking the text model for a final answer", async () => {
+  const calls: string[] = [];
+  const completion = createCapabilityCompletionProvider(
+    {
+      descriptor: { type: "codex-host", model: "main" },
+      execute: async (request) => {
+        calls.push(request.routing?.targetModel ?? "main");
+        assert.equal(request.routing?.role, "specialist");
+        assert.equal(request.body.stream, false);
+        return {
+          kind: "json",
+          statusCode: 200,
+          upstreamModel: "code",
+          body: {
+            output: [
+              {
+                type: "function_call",
+                call_id: "native-read",
+                name: "exec_command",
+                arguments: '{"cmd":"cat fixture.ts"}',
+              },
+            ],
+            usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15 },
+          },
+        };
+      },
+    },
+    async () => ({
+      modelSelection: { source: "official", model: "main" },
+      capabilityCompletion: {
+        enabled: true,
+        mainCapabilities: ["text"],
+        specialists: [
+          { host: "cursor", source: "official", model: "code", capabilities: ["code"] },
+        ],
+        maximumSpecialists: 1,
+      },
+    }),
+  );
+  const result = await completion.execute({
+    protocol: "responses",
+    virtualModelId: "tidu",
+    body: { input: "Read the code file", stream: true },
+    routing: { requiredCapabilities: ["code", "text"] },
+  });
+  assert.deepEqual(calls, ["code"]);
+  assert.equal(result.kind, "json");
+  if (result.kind === "json") assert.match(JSON.stringify(result.body), /native-read/u);
+  const status = await completion.inspectCapabilityCompletion();
+  assert.equal(status.records[0]?.outcome, "succeeded");
+  assert.equal(status.records[0]?.mainResult.outcome, "not-run");
+  assert.equal(status.records[0]?.mainResult.skipReason, "awaiting-tool-results");
+  assert.equal(status.records[0]?.secondaryResults[0]?.outcome, "succeeded");
+  assert.equal(status.records[0]?.tokenUsage?.totalTokens, 15);
 });
 
 test("sends image inputs only to the model assigned vision and shares its result with text", async () => {
@@ -1147,7 +1207,7 @@ test("records a routed stream only after live output reaches a successful termin
   });
 });
 
-test("marks unsuccessful stream terminals, EOF, reader errors, and cancellation as failed", async () => {
+test("distinguishes cancellation from unsuccessful terminals, EOF, and reader errors", async () => {
   const failureCases = [
     {
       name: "responses failure",
@@ -1314,7 +1374,10 @@ test("marks unsuccessful stream terminals, EOF, reader errors, and cancellation 
     });
     assert.equal(result.kind, "stream");
     if (result.kind === "stream") await failureCase.consume(result.stream);
-    assert.equal(router.inspectAttempts()[0]?.outcome, "failed");
+    assert.equal(
+      router.inspectAttempts()[0]?.outcome,
+      failureCase.name === "cancelled" ? "cancelled" : "failed",
+    );
     assert.match(router.inspectAttempts()[0]?.message ?? "", failureCase.message);
   }
 });
@@ -1369,7 +1432,7 @@ test("aborting a routed stream cancels upstream without trying a fallback", asyn
   assert.equal(upstreamCancelled, true);
   assert.deepEqual(calls, ["cheap-main"]);
   assert.equal(router.inspectAttempts().length, 1);
-  assert.equal(router.inspectAttempts()[0]?.outcome, "failed");
+  assert.equal(router.inspectAttempts()[0]?.outcome, "cancelled");
   assert.match(router.inspectAttempts()[0]?.message ?? "", /aborted/u);
 });
 
@@ -1408,7 +1471,7 @@ test("does not try a fallback after a provider throws AbortError", async () => {
   );
 
   assert.deepEqual(calls, ["cheap-main"]);
-  assert.equal(router.inspectAttempts()[0]?.outcome, "failed");
+  assert.equal(router.inspectAttempts()[0]?.outcome, "cancelled");
 });
 
 test("records an aborted routed stream in capability-completion history", async () => {
@@ -1471,9 +1534,100 @@ test("records an aborted routed stream in capability-completion history", async 
   assert.equal(upstreamCancelCount, 1);
   assert.deepEqual(calls, ["main"]);
   assert.equal(status.records.length, 1);
-  assert.equal(status.records[0]?.outcome, "failed");
-  assert.equal(status.records[0]?.mainResult.outcome, "failed");
+  assert.equal(status.records[0]?.outcome, "cancelled");
+  assert.equal(status.records[0]?.mainResult.outcome, "cancelled");
   assert.match(status.records[0]?.mainResult.message ?? "", /aborted/u);
+});
+
+test("keeps reported usage when cancellation skips another selected model", async () => {
+  const completion = createCapabilityCompletionProvider(
+    {
+      descriptor: { type: "codex-host", model: "fixture" },
+      execute: async (request) => {
+        request.onExecutionReceipt?.({
+          host: "cursor",
+          model: "vision",
+          role: "specialist",
+          capabilities: ["vision"],
+          usage: { inputTokens: 12, outputTokens: 3, totalTokens: 15 },
+        });
+        throw new DOMException("Fixture cancelled", "AbortError");
+      },
+    },
+    async () => ({
+      modelSelection: { source: "official", model: "main" },
+      capabilityCompletion: {
+        enabled: true,
+        mainCapabilities: ["text"],
+        maximumSpecialists: 1,
+        specialists: [
+          { host: "cursor", source: "official", model: "vision", capabilities: ["vision"] },
+        ],
+      },
+    }),
+  );
+  await assert.rejects(
+    completion.execute({
+      protocol: "responses",
+      virtualModelId: "tidu",
+      body: { input: "fixture" },
+      routing: { requiredCapabilities: ["text", "vision"] },
+    }),
+    { name: "AbortError" },
+  );
+  const record = (await completion.inspectCapabilityCompletion()).records[0];
+  assert.equal(record?.outcome, "cancelled");
+  assert.equal(record?.mainResult.outcome, "not-run");
+  assert.equal(record?.mainResult.skipReason, "blocked-by-cancellation");
+  assert.equal(record?.secondaryResults[0]?.outcome, "cancelled");
+  assert.equal(record?.tokenUsage?.totalTokens, 15);
+});
+
+test("retains usage on failed and incomplete stream terminal events", async () => {
+  for (const terminalType of ["response.failed", "response.incomplete"] as const) {
+    const completion = createCapabilityCompletionProvider(
+      {
+        descriptor: { type: "openai-compatible", model: "fixture" },
+        execute: async () => ({
+          kind: "stream",
+          statusCode: 200,
+          stream: new ReadableStream<Uint8Array>({
+            start: (controller) => {
+              controller.enqueue(
+                encodeSseData({
+                  type: terminalType,
+                  response: {
+                    error: { message: "fixture failure" },
+                    usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15 },
+                  },
+                }),
+              );
+              controller.close();
+            },
+          }),
+        }),
+      },
+      async () => ({
+        modelSelection: { source: "official", model: "main" },
+        capabilityCompletion: {
+          enabled: false,
+          mainCapabilities: ["text"],
+          maximumSpecialists: 0,
+          specialists: [],
+        },
+      }),
+    );
+    const result = await completion.execute({
+      protocol: "responses",
+      virtualModelId: "tidu",
+      body: { input: "fixture" },
+    });
+    assert.equal(result.kind, "stream");
+    if (result.kind === "stream") await consumeStream(result.stream);
+    const record = (await completion.inspectCapabilityCompletion()).records[0];
+    assert.equal(record?.outcome, "failed");
+    assert.equal(record?.tokenUsage?.totalTokens, 15);
+  }
 });
 
 test("uses an opt-in specialist to complete a cheap main model capability", async () => {

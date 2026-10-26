@@ -90,9 +90,15 @@ tidu clients
 tidu clients connect codex [--yes] [--endpoint <url>]
 tidu clients switch codex <official|ai-tidu9> [--yes] [--endpoint <url>]
 tidu clients rollback codex [--yes]
+tidu-codex --install-desktop
+tidu-codex --uninstall-desktop
 ```
 
 The default setup action is `install` and does not require a prestarted runtime. It prepares a mutually exclusive native AI-Tidu9 Agent mode for Codex, installs the required transports for other hosts, and automatically starts every service in the installed edition while leaving direct Official mode active. `clients switch codex ai-tidu9` makes Codex show only “九门赛博提督”; tasks enter the same Agent kernel for planning, capability completion, execution, and independent verification. Official, company, and custom upstreams are mutually exclusive configuration choices and never become separate Codex entries. `clients switch codex official` restores the exact original official configuration and model list. Official Codex remains the authority for account identity, plan, and quota data. AI-Tidu9 keeps only its original installation baseline and latest rollback point.
+
+On macOS, default-home setup prepares the native recovery relay and AI-Tidu9 mode registers it through `CODEX_CLI_PATH`; restart Codex to load it. `tidu-codex --install-desktop` also installs it explicitly. Official mode restores the previous executable override and uninstall removes only the owned launcher. The official CLI still executes commands and handles approvals. Recovery reads official session history without creating a separate conversation store.
+
+Desktop startup organization-settings reads, daemon management, help, and protocol-generation commands run directly through the official CLI, preserving output and exit status. Only persistent stdio app-server sessions enter the recovery relay.
 
 Codex uses a native Provider integration and does not register an AI-Tidu9 MCP server. Restart Codex after a mode switch so it reloads the Provider and model catalog. Cursor may use a stdio connector as its transport, but `route_tidu_task` still enters the same Agent kernel used by Codex, CLI, and OpenAI-compatible endpoints; the transport never bypasses planning, capability completion, or verification.
 

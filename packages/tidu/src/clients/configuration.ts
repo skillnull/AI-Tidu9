@@ -15,10 +15,41 @@ import { request as requestHttp } from "node:http";
 import { request as requestHttps } from "node:https";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { resolveCodexCommand } from "../accounts/codex-host.js";
 import { DEFAULT_VIRTUAL_MODEL_ID } from "../config/index.js";
 import { PRODUCT, TiduError } from "../core/index.js";
+import {
+  installCodexDesktopProxy,
+  removeCodexDesktopProxy,
+  switchCodexDesktopProxy,
+} from "./codex-desktop.js";
 
 const CODEX_PROFILE_NAME = "ai-tidu9";
+const prepareDesktopRecovery = (home: string, customHome?: string): void => {
+  // A custom home may be an embedded/headless client and must not change the desktop environment.
+  if (
+    process.platform !== "darwin" ||
+    customHome !== undefined ||
+    home !== join(homedir(), ".codex")
+  )
+    return;
+  const bundled = [
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "/Applications/Codex.app/Contents/Resources/codex",
+  ].find((path) => existsSync(path));
+  const source = import.meta.url.endsWith(".ts");
+  installCodexDesktopProxy({
+    realCommand: bundled ?? resolveCodexCommand({}),
+    nodeCommand: process.execPath,
+    entryPath: fileURLToPath(
+      new URL(`../connectors/codex-client-cli.${source ? "ts" : "js"}`, import.meta.url),
+    ),
+    nodeArguments: source ? ["--import", import.meta.resolve("tsx")] : [],
+    codexHomeDirectory: home,
+    activate: false,
+  });
+};
 const CODEX_PROFILE_FILE = `${CODEX_PROFILE_NAME}.config.toml`;
 const CODEX_MODEL_CATALOG_FILE = ".ai-tidu9-model-catalog.json";
 const STATE_FILE = ".ai-tidu9-profile-state.json";
@@ -1090,6 +1121,7 @@ export const configureCodexClient = async (
       : await verifyEndpoint(options.endpoint, request);
   const paths = resolveCodexPaths(options.codexHomeDirectory);
   let existingState = readManagedState(paths.state);
+  switchCodexDesktopProxy(false, paths.home);
   if (existingState !== undefined && hasManagedDefaultConfiguration(paths)) {
     restoreDefaultConfigurationValues(paths, existingState.originalBackupId);
     existingState = {
@@ -1118,6 +1150,7 @@ export const configureCodexClient = async (
       configuredAt: new Date().toISOString(),
     });
     pruneManagedSnapshots(paths, [existingState.originalBackupId, existingState.backupId]);
+    prepareDesktopRecovery(paths.home, options.codexHomeDirectory);
     return {
       status: "configured",
       client: "codex",
@@ -1157,6 +1190,7 @@ export const configureCodexClient = async (
       }
     }
     pruneManagedSnapshots(paths, [state.originalBackupId, state.backupId]);
+    prepareDesktopRecovery(paths.home, options.codexHomeDirectory);
   } catch (error) {
     restoreSnapshot(paths, backupId, true);
     throw error;
@@ -1231,11 +1265,13 @@ export const switchCodexClientConfiguration = async (
   const managedDefaultActive = hasManagedDefaultConfiguration(paths);
   const activeMode = managedDefaultActive ? "ai-tidu9" : "official";
   if (activeMode === options.mode && options.mode === "official") {
+    switchCodexDesktopProxy(false, paths.home);
     return inspectCodexClientConfiguration(options);
   }
   if (options.mode === "ai-tidu9") {
     const request = options.request ?? fetch;
     try {
+      prepareDesktopRecovery(paths.home, options.codexHomeDirectory);
       await verifyEndpoint(state.endpoint, request);
       activateDefaultCodexConfiguration(paths, state.endpoint, state.model);
       await verifyInference(
@@ -1248,6 +1284,7 @@ export const switchCodexClientConfiguration = async (
         paths.modelCatalog,
         createCodexModelCatalog(state.model, verified.reasoningEffortSupported),
       );
+      switchCodexDesktopProxy(true, paths.home);
     } catch (error) {
       restoreDefaultConfigurationValues(paths, state.originalBackupId);
       writeManagedState(paths.state, {
@@ -1259,6 +1296,7 @@ export const switchCodexClientConfiguration = async (
     }
   } else {
     restoreDefaultConfigurationValues(paths, state.originalBackupId);
+    switchCodexDesktopProxy(false, paths.home);
   }
   writeManagedState(paths.state, {
     ...state,
@@ -1293,6 +1331,10 @@ export const rollbackCodexClientConfiguration = (
     };
   }
   restoreSnapshot(paths, backupId, true);
+  switchCodexDesktopProxy(
+    inspectCodexClientConfiguration(options).activeMode === "ai-tidu9",
+    paths.home,
+  );
   return {
     status: "restored",
     client: "codex",
@@ -1336,6 +1378,7 @@ export const removeCodexClientConfiguration = (
   }
 
   let removedArtifactCount = 0;
+  if (removeCodexDesktopProxy(paths.home)) removedArtifactCount += 1;
   if (profileExists) {
     rmSync(paths.profile);
     rmSync(paths.state);

@@ -34,6 +34,7 @@ import {
 } from "../connectors/cursor-acp.js";
 import { runCursorHeadless } from "../connectors/cursor-headless.js";
 import { TiduError } from "../core/index.js";
+import { createCallerToolCatalog } from "./caller-tools.js";
 import type { ModelProvider, ProviderExecutionRequest, ProviderExecutionResult } from "./index.js";
 
 const CURSOR_DISCOVERY_TIMEOUT_MILLISECONDS = 30_000;
@@ -451,7 +452,8 @@ const createResponse = (
   responseId = `tidu_${randomUUID()}`,
   usage?: HostTokenUsage | null,
   createdAt = Math.floor(Date.now() / 1_000),
-): unknown => {
+  outputItems?: readonly Record<string, unknown>[],
+): Record<string, unknown> => {
   if (request.protocol === "chat-completions") {
     return {
       id: responseId,
@@ -485,7 +487,7 @@ const createResponse = (
     error: null,
     incomplete_details: null,
     model: responseModel(request),
-    output: [
+    output: outputItems ?? [
       {
         id: `${responseId}_message`,
         type: "message",
@@ -516,6 +518,7 @@ export const createLiveJsonStream = (
   run: (
     onTextDelta: (delta: string) => void,
     onProcessDelta: (delta: string) => void,
+    onNativeItem: (item: Record<string, unknown>) => void,
   ) => Promise<
     | string
     | {
@@ -523,8 +526,13 @@ export const createLiveJsonStream = (
         text: string;
         /** Provider-authoritative token usage, when available. */
         usage: HostTokenUsage | null;
+        /** Native caller-owned tool requests yielded without delegated execution. */
+        outputItems?: readonly Record<string, unknown>[];
+        /** Completed native progress with original reasoning or message phase. */
+        progressItems?: readonly Record<string, unknown>[];
       }
   >,
+  readUsage: () => HostTokenUsage | null = () => null,
 ): ReadableStream<Uint8Array> => {
   const responseId = `tidu_${randomUUID()}`;
   const createdAt = Math.floor(Date.now() / 1_000);
@@ -533,6 +541,8 @@ export const createLiveJsonStream = (
   return new ReadableStream<Uint8Array>({
     start(controller) {
       let firstChatDelta = true;
+      const nativeItemIds = new Set<string>();
+      let nativeOutputIndex = 0;
       const write = (event: string): boolean => {
         if (!streamOpen) return false;
         controller.enqueue(encoder.encode(event));
@@ -580,11 +590,25 @@ export const createLiveJsonStream = (
           `event: response.reasoning_summary_text.delta\ndata: ${JSON.stringify({ type: "response.reasoning_summary_text.delta", delta })}\n\n`,
         );
       };
-      void run(emitTextDelta, emitProcessDelta)
+      const emitNativeItem = (item: Record<string, unknown>): void => {
+        if (!streamOpen || (typeof item.id === "string" && nativeItemIds.has(item.id))) return;
+        if (typeof item.id === "string") nativeItemIds.add(item.id);
+        const outputIndex = nativeOutputIndex;
+        nativeOutputIndex += 1;
+        write(
+          `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", output_index: outputIndex, item })}\n\n`,
+        );
+        write(
+          `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: outputIndex, item })}\n\n`,
+        );
+      };
+      void run(emitTextDelta, emitProcessDelta, emitNativeItem)
         .then((result) => {
           if (!streamOpen) return;
           const text = typeof result === "string" ? result : result.text;
           const usage = typeof result === "string" ? null : result.usage;
+          const outputItems = typeof result === "string" ? undefined : result.outputItems;
+          const progressItems = typeof result === "string" ? [] : (result.progressItems ?? []);
           if (request.protocol === "chat-completions") {
             write(
               `data: ${JSON.stringify({
@@ -605,10 +629,23 @@ export const createLiveJsonStream = (
               })}\n\n`,
             );
           } else {
+            const responseBody = createResponse(
+              request,
+              text,
+              responseId,
+              usage,
+              createdAt,
+              outputItems,
+            );
+            const terminalItems = [
+              ...progressItems,
+              ...(responseBody.output as Record<string, unknown>[]),
+            ];
+            terminalItems.forEach(emitNativeItem);
             write(
               `event: response.completed\ndata: ${JSON.stringify({
                 type: "response.completed",
-                response: createResponse(request, text, responseId, usage, createdAt),
+                response: { ...responseBody, output: terminalItems },
               })}\n\n`,
             );
           }
@@ -618,13 +655,14 @@ export const createLiveJsonStream = (
         .catch((error: unknown) => {
           if (!streamOpen) return;
           const message = error instanceof Error ? error.message : "The host model failed.";
+          const usage = readUsage();
           if (request.protocol === "chat-completions") {
             write(
-              `data: ${JSON.stringify({ error: { code: "host_model_failed", message: message.slice(0, 240), type: "server_error" } })}\n\n`,
+              `data: ${JSON.stringify({ error: { code: "host_model_failed", message: message.slice(0, 240), type: "server_error" }, ...(usage === null ? {} : { usage: { prompt_tokens: usage.inputTokens, completion_tokens: usage.outputTokens, total_tokens: usage.totalTokens } }) })}\n\n`,
             );
           } else {
             write(
-              `event: response.failed\ndata: ${JSON.stringify({ type: "response.failed", response: { id: responseId, object: "response", status: "failed", model: responseModel(request), output: [], error: { code: "host_model_failed", message: message.slice(0, 240) } } })}\n\n`,
+              `event: response.failed\ndata: ${JSON.stringify({ type: "response.failed", response: { ...(createResponse(request, "", responseId, usage, createdAt) as Record<string, unknown>), status: "failed", output: [], error: { code: "host_model_failed", message: message.slice(0, 240) } } })}\n\n`,
             );
           }
           if (!write("data: [DONE]\n\n")) return;
@@ -832,8 +870,17 @@ const runCodexTurn = async (
   request: ProviderExecutionRequest,
   onTextDelta?: (delta: string) => void,
   onProcessDelta?: (delta: string) => void,
-): Promise<CodexTurnResult> => {
-  const thread = session.initialThread ?? (await session.client.startThread(session.model));
+  onNativeItem?: (item: Record<string, unknown>) => void,
+): Promise<CodexTurnResult & { outputItems?: readonly Record<string, unknown>[] }> => {
+  const callerTools = createCallerToolCatalog(request);
+  const thread =
+    callerTools === undefined
+      ? (session.initialThread ?? (await session.client.startThread(session.model)))
+      : await session.client.startThread(
+          session.model,
+          callerTools.definitions,
+          callerTools.webSearchMode,
+        );
   session.initialThread = undefined;
   if (thread.model !== session.model) {
     throw new TiduError(
@@ -855,12 +902,22 @@ const runCodexTurn = async (
     request.signal,
     onTextDelta,
     requestReasoningEffort(request),
-    onProcessDelta,
-    turnPayload.historyItems,
+    callerTools === undefined ? onProcessDelta : undefined,
+    callerTools === undefined
+      ? turnPayload.historyItems
+      : callerTools.historyItems(turnPayload.historyItems),
     outputSchema,
     (usage) => reportCodexExecution(request, session.model, usage),
     requestReasoningSummary(request),
+    callerTools === undefined ? undefined : onNativeItem,
   );
+  if (
+    callerTools !== undefined &&
+    (result.toolCalls?.length ?? 0) > 0 &&
+    !request.signal?.aborted
+  ) {
+    return { ...result, outputItems: result.toolCalls?.map(callerTools.outputItem) };
+  }
   if (result.status !== "completed") {
     throw new Error("The current host model did not complete the request.");
   }
@@ -1034,62 +1091,108 @@ export const createCodexHostModelProvider = async (
       request.onModelConfirmed?.(upstreamModel);
       try {
         if (request.body.stream === true) {
+          let reportedUsage: HostTokenUsage | null = null;
+          const streamingRequest: ProviderExecutionRequest = {
+            ...request,
+            onExecutionReceipt: (receipt) => {
+              if (receipt.usage !== null) reportedUsage = receipt.usage;
+              request.onExecutionReceipt?.(receipt);
+            },
+          };
           return {
             kind: "stream",
             statusCode: 200,
             upstreamModel,
-            stream: createLiveJsonStream(request, async (onTextDelta, onProcessDelta) => {
-              let emittedVisibleOutput = false;
-              const forwardTextDelta = (delta: string): void => {
-                if (delta !== "") emittedVisibleOutput = true;
-                onTextDelta(delta);
-              };
-              const forwardProcessDelta = (delta: string): void => {
-                if (delta.replace(/\s/gu, "") !== "") emittedVisibleOutput = true;
-                onProcessDelta(delta);
-              };
-              try {
-                const result = await runCodexTurn(
-                  session,
-                  request,
-                  forwardTextDelta,
-                  forwardProcessDelta,
-                );
-                reportCodexExecution(request, upstreamModel, result.usage);
-                return { text: result.text, usage: result.usage };
-              } catch (error) {
-                if (!isCodexConnectionFailure(error)) throw error;
-                await discardSession(requestedModel, sessionPromise, session);
-                if (request.signal?.aborted || emittedVisibleOutput) throw error;
-                const retrySessionPromise = resolveSession(requestedModel);
-                const retrySession = await retrySessionPromise;
-                const retryModel = requireCodexSessionModel(retrySession, requestedModel);
+            stream: createLiveJsonStream(
+              request,
+              async (onTextDelta, onProcessDelta, onNativeItem) => {
+                let emittedVisibleOutput = false;
+                const forwardTextDelta = (delta: string): void => {
+                  if (delta !== "") emittedVisibleOutput = true;
+                  onTextDelta(delta);
+                };
+                const forwardProcessDelta = (delta: string): void => {
+                  if (delta.replace(/\s/gu, "") !== "") emittedVisibleOutput = true;
+                  onProcessDelta(delta);
+                };
+                const forwardNativeItem = (item: Record<string, unknown>): void => {
+                  emittedVisibleOutput = true;
+                  onNativeItem(item);
+                };
                 try {
                   const result = await runCodexTurn(
-                    retrySession,
-                    request,
+                    session,
+                    streamingRequest,
                     forwardTextDelta,
                     forwardProcessDelta,
+                    forwardNativeItem,
                   );
-                  reportCodexExecution(request, retryModel, result.usage);
-                  return { text: result.text, usage: result.usage };
-                } catch (retryError) {
-                  if (isCodexConnectionFailure(retryError)) {
-                    await discardSession(requestedModel, retrySessionPromise, retrySession);
+                  reportCodexExecution(request, upstreamModel, result.usage);
+                  return {
+                    text: result.text,
+                    usage: result.usage,
+                    ...(result.progressItems === undefined
+                      ? {}
+                      : { progressItems: result.progressItems }),
+                    ...(result.outputItems === undefined
+                      ? {}
+                      : { outputItems: result.outputItems }),
+                  };
+                } catch (error) {
+                  if (!isCodexConnectionFailure(error)) throw error;
+                  await discardSession(requestedModel, sessionPromise, session);
+                  if (request.signal?.aborted || emittedVisibleOutput) throw error;
+                  const retrySessionPromise = resolveSession(requestedModel);
+                  const retrySession = await retrySessionPromise;
+                  const retryModel = requireCodexSessionModel(retrySession, requestedModel);
+                  try {
+                    const result = await runCodexTurn(
+                      retrySession,
+                      streamingRequest,
+                      forwardTextDelta,
+                      forwardProcessDelta,
+                      forwardNativeItem,
+                    );
+                    reportCodexExecution(request, retryModel, result.usage);
+                    return {
+                      text: result.text,
+                      usage: result.usage,
+                      ...(result.progressItems === undefined
+                        ? {}
+                        : { progressItems: result.progressItems }),
+                      ...(result.outputItems === undefined
+                        ? {}
+                        : { outputItems: result.outputItems }),
+                    };
+                  } catch (retryError) {
+                    if (isCodexConnectionFailure(retryError)) {
+                      await discardSession(requestedModel, retrySessionPromise, retrySession);
+                    }
+                    throw retryError;
                   }
-                  throw retryError;
                 }
-              }
-            }),
+              },
+              () => reportedUsage,
+            ),
           };
         }
         const result = await runCodexTurn(session, request, undefined, request.onProcessDelta);
         reportCodexExecution(request, upstreamModel, result.usage);
+        const body = createResponse(
+          request,
+          result.text,
+          undefined,
+          result.usage,
+          undefined,
+          result.outputItems,
+        );
+        if (request.protocol === "responses" && result.progressItems !== undefined)
+          body.output = [...result.progressItems, ...(body.output as Record<string, unknown>[])];
         return {
           kind: "json",
           statusCode: 200,
           upstreamModel,
-          body: createResponse(request, result.text, undefined, result.usage),
+          body,
         };
       } catch (error) {
         if (isCodexConnectionFailure(error)) {
@@ -1153,6 +1256,19 @@ export const createCursorHostModelProvider = async (
           ? request.body.model
           : model);
       const promptContent = await requestCursorPromptContent(request);
+      let reportedUsage: HostTokenUsage | null = null;
+      const reportUsage = (usage: HostTokenUsage | null): void => {
+        if (usage === null || usage === reportedUsage) return;
+        reportedUsage = usage;
+        request.onExecutionReceipt?.({
+          host: request.routing?.host ?? "cursor",
+          model: requestedModel,
+          role: request.routing?.role ?? "main",
+          capabilities:
+            request.routing?.availableCapabilities ?? request.routing?.requiredCapabilities ?? [],
+          usage,
+        });
+      };
       const hasImageInput = promptContent.some((part) => part.type === "image");
       const workingDirectory = await mkdtemp(join(tmpdir(), "tidu-model-"));
       const removeWorkingDirectory = async (): Promise<void> => {
@@ -1177,6 +1293,7 @@ export const createCursorHostModelProvider = async (
             workingDirectory,
             model: headlessModel,
             prompt: requestPrompt(request),
+            onUsageUpdate: reportUsage,
             ...(request.signal === undefined ? {} : { signal: request.signal }),
             ...(onTextDelta === undefined ? {} : { onTextDelta }),
             ...(onProcessDelta === undefined ? {} : { onProcessDelta }),
@@ -1186,38 +1303,26 @@ export const createCursorHostModelProvider = async (
             kind: "stream",
             statusCode: 200,
             upstreamModel: requestedModel,
-            stream: createLiveJsonStream(request, async (onTextDelta, onProcessDelta) => {
-              try {
-                const result = await executeHeadless(onTextDelta, onProcessDelta);
-                request.onModelConfirmed?.(requestedModel);
-                request.onExecutionReceipt?.({
-                  host: request.routing?.host ?? "cursor",
-                  model: requestedModel,
-                  role: request.routing?.role ?? "main",
-                  capabilities:
-                    request.routing?.availableCapabilities ??
-                    request.routing?.requiredCapabilities ??
-                    [],
-                  usage: result.usage,
-                });
-                return result;
-              } finally {
-                await removeWorkingDirectory();
-              }
-            }),
+            stream: createLiveJsonStream(
+              request,
+              async (onTextDelta, onProcessDelta) => {
+                try {
+                  const result = await executeHeadless(onTextDelta, onProcessDelta);
+                  request.onModelConfirmed?.(requestedModel);
+                  reportUsage(result.usage);
+                  return result;
+                } finally {
+                  await removeWorkingDirectory();
+                }
+              },
+              () => reportedUsage,
+            ),
           };
         }
         try {
           const result = await executeHeadless(undefined, request.onProcessDelta);
           request.onModelConfirmed?.(requestedModel);
-          request.onExecutionReceipt?.({
-            host: request.routing?.host ?? "cursor",
-            model: requestedModel,
-            role: request.routing?.role ?? "main",
-            capabilities:
-              request.routing?.availableCapabilities ?? request.routing?.requiredCapabilities ?? [],
-            usage: result.usage,
-          });
+          reportUsage(result.usage);
           return {
             kind: "json",
             statusCode: 200,
@@ -1261,6 +1366,7 @@ export const createCursorHostModelProvider = async (
         usage: Awaited<ReturnType<typeof client.prompt>>["usage"];
       }> => {
         const result = await client.prompt(session.id, promptContent, request.signal, onTextDelta);
+        reportUsage(result.usage);
         return {
           text: requireValidHostModelText(
             request,
@@ -1282,36 +1388,24 @@ export const createCursorHostModelProvider = async (
           kind: "stream",
           statusCode: 200,
           upstreamModel: session.model,
-          stream: createLiveJsonStream(request, async (onTextDelta) => {
-            try {
-              const result = await run(session, onTextDelta);
-              request.onExecutionReceipt?.({
-                host: request.routing?.host ?? "cursor",
-                model: session.model,
-                role: request.routing?.role ?? "main",
-                capabilities:
-                  request.routing?.availableCapabilities ??
-                  request.routing?.requiredCapabilities ??
-                  [],
-                usage: result.usage,
-              });
-              return result;
-            } finally {
-              await closeClient();
-            }
-          }),
+          stream: createLiveJsonStream(
+            request,
+            async (onTextDelta) => {
+              try {
+                const result = await run(session, onTextDelta);
+                reportUsage(result.usage);
+                return result;
+              } finally {
+                await closeClient();
+              }
+            },
+            () => reportedUsage,
+          ),
         };
       }
       try {
         const result = await run(session);
-        request.onExecutionReceipt?.({
-          host: request.routing?.host ?? "cursor",
-          model: session.model,
-          role: request.routing?.role ?? "main",
-          capabilities:
-            request.routing?.availableCapabilities ?? request.routing?.requiredCapabilities ?? [],
-          usage: result.usage,
-        });
+        reportUsage(result.usage);
         return {
           kind: "json",
           statusCode: 200,

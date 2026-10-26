@@ -59,6 +59,8 @@ export interface AgentModelRequest {
   onOutputDelta?: (delta: string) => void;
   /** Public model process output forwarded only to the active streaming caller. */
   onProcessDelta?: (delta: string) => void;
+  /** Caller-owned tool requests returned without execution by the Agent worker. */
+  onOutputItem?: (item: Record<string, unknown>) => void;
   /** Actual per-model execution receipts retained only for the active caller. */
   onExecutionReceipt?: (receipt: {
     /** Host that executed this model call. */
@@ -451,7 +453,7 @@ export interface AgentKernel {
   /** Creates, understands, plans, and durably checkpoints a task. */
   createTask: (input: CreateAgentTaskInput) => Promise<TaskCapsule>;
   /** Runs or continues a planned task within all configured bounds. */
-  runTask: (taskId: string) => Promise<TaskCapsule>;
+  runTask: (taskId: string, signal?: AbortSignal) => Promise<TaskCapsule>;
   /** Requests a safe pause at the current execution boundary. */
   pauseTask: (taskId: string) => Promise<TaskCapsule>;
   /** Resumes a paused, failed, or approved task from its checkpoint. */
@@ -973,7 +975,7 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
     return { capsule: nextCapsule, approved: true };
   };
 
-  const runTask = async (taskId: string): Promise<TaskCapsule> => {
+  const runTask = async (taskId: string, signal?: AbortSignal): Promise<TaskCapsule> => {
     if (activeExecutions.has(taskId)) {
       throw new Error(`Task ${taskId} is already running.`);
     }
@@ -988,6 +990,12 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
       requested: undefined as "cancel" | "pause" | undefined,
     };
     activeExecutions.set(taskId, execution);
+    const cancelFromCaller = (): void => {
+      execution.requested = "cancel";
+      controller.abort(signal?.reason);
+    };
+    signal?.addEventListener("abort", cancelFromCaller, { once: true });
+    if (signal?.aborted) cancelFromCaller();
     capsule = transition(
       capsule,
       "running",
@@ -997,6 +1005,10 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
     capsule = await persist(capsule);
 
     try {
+      if (controller.signal.aborted) {
+        capsule = transition(capsule, "cancelled", "task.cancelled", { source: "caller" });
+        return persistAndRemoveDisposableTask(capsule);
+      }
       while ((capsule.plan?.steps.length ?? 0) > capsule.checkpoint.nextStepIndex) {
         ensureRunnable(capsule);
         const plan = capsule.plan as AgentPlan;
@@ -1317,6 +1329,7 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
       }
       throw error;
     } finally {
+      signal?.removeEventListener("abort", cancelFromCaller);
       activeExecutions.delete(taskId);
       activeModelRequests.delete(taskId);
     }

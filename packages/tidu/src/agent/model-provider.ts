@@ -171,7 +171,7 @@ const extractProviderUsage = (value: unknown): ProviderTokenUsage | null => {
 
 const extractStreamUsage = (body: unknown): ProviderTokenUsage | null => {
   if (!isRecord(body)) return null;
-  if (body.type === "response.completed" && isRecord(body.response)) {
+  if (isRecord(body.response)) {
     return extractProviderUsage(body.response.usage);
   }
   return extractProviderUsage(body.usage);
@@ -239,6 +239,7 @@ const consumeProviderTextStream = async (
   onOutputDelta: (delta: string) => void,
   onProcessDelta?: (delta: string) => void,
   onTerminalUsage?: (usage: ProviderTokenUsage) => void,
+  onOutputItem?: (item: Record<string, unknown>) => void,
 ): Promise<string> => {
   const reader = source.getReader();
   const decoder = new TextDecoder();
@@ -248,6 +249,39 @@ const consumeProviderTextStream = async (
   let sawSuccessfulTerminal = false;
   const messagePhases = new Map<string, string>();
   const publicProcessItemIds = new Set<string>();
+  const forwardedToolCalls = new Set<string>();
+  const forwardedProgressItems = new Set<string>();
+  const streamedProgressItems = new Set<string>();
+  const forwardProgressItem = (item: unknown): void => {
+    if (
+      onOutputItem === undefined ||
+      !isRecord(item) ||
+      typeof item.id !== "string" ||
+      (item.type !== "reasoning" &&
+        item.type !== "web_search_call" &&
+        !(item.type === "message" && item.phase === "commentary")) ||
+      forwardedProgressItems.has(item.id) ||
+      streamedProgressItems.has(item.id)
+    )
+      return;
+    forwardedProgressItems.add(item.id);
+    onOutputItem(item);
+  };
+  const forwardToolItem = (item: unknown): void => {
+    if (
+      !isRecord(item) ||
+      (item.type !== "function_call" &&
+        item.type !== "custom_tool_call" &&
+        item.type !== "tool_search_call") ||
+      typeof item.call_id !== "string" ||
+      forwardedToolCalls.has(item.call_id)
+    )
+      return;
+    if (onOutputItem === undefined)
+      throw new Error("The caller cannot receive native tool requests.");
+    forwardedToolCalls.add(item.call_id);
+    onOutputItem(item);
+  };
 
   const consumeEvent = (event: string): void => {
     const data = event
@@ -262,6 +296,22 @@ const consumeProviderTextStream = async (
       return;
     }
     const body = JSON.parse(data) as unknown;
+    if (isRecord(body) && body.type === "response.output_item.done") {
+      forwardToolItem(body.item);
+      forwardProgressItem(body.item);
+    }
+    if (
+      isRecord(body) &&
+      body.type === "response.completed" &&
+      isRecord(body.response) &&
+      Array.isArray(body.response.output)
+    ) {
+      body.response.output.forEach(forwardToolItem);
+      body.response.output.forEach(forwardProgressItem);
+    }
+    // A failed terminal can still contain authoritative usage; publish it before throwing.
+    const usage = extractStreamUsage(body);
+    if (usage !== null) onTerminalUsage?.(usage);
     if (
       isRecord(body) &&
       body.type === "response.output_item.added" &&
@@ -362,6 +412,8 @@ const consumeProviderTextStream = async (
       onOutputDelta(delta);
     }
     const processDelta = extractStreamProcessDelta(body, messagePhases);
+    if (processDelta !== "" && isRecord(body) && typeof body.item_id === "string")
+      streamedProgressItems.add(body.item_id);
     if (processDelta !== "") onProcessDelta?.(processDelta);
     if (
       isRecord(body) &&
@@ -372,8 +424,6 @@ const consumeProviderTextStream = async (
     ) {
       onProcessDelta?.("\n\n");
     }
-    const usage = extractStreamUsage(body);
-    if (usage !== null) onTerminalUsage?.(usage);
     const terminalText = extractCompletedStreamText(body);
     if (terminalText !== "") completedText = terminalText;
   };
@@ -406,6 +456,7 @@ const consumeProviderTextStream = async (
     );
   }
   if (streamedText !== "") return streamedText;
+  if (forwardedToolCalls.size > 0) return "Tool requests forwarded to the calling client.";
   if (completedText !== "") {
     onOutputDelta(completedText);
     return completedText;
@@ -610,25 +661,24 @@ export const createModelProviderAgentAdapters = (
           if (input.modelRequest.onOutputDelta === undefined) {
             throw new Error("Agent execution model unexpectedly returned a stream.");
           }
-          let terminalUsage: ProviderTokenUsage | null = null;
           const summary = await consumeProviderTextStream(
             directResult.stream,
             input.modelRequest.protocol,
             input.modelRequest.onOutputDelta,
             forwardProcessDelta,
             (usage) => {
-              terminalUsage = usage;
+              if (!providerReportedWorkerUsage) {
+                input.modelRequest?.onExecutionReceipt?.({
+                  host: executionHost,
+                  model: directResult.upstreamModel ?? provider.descriptor.model,
+                  role: "worker",
+                  capabilities: executionCapabilities,
+                  usage,
+                });
+              }
             },
+            input.modelRequest.onOutputItem,
           );
-          if (!providerReportedWorkerUsage && terminalUsage !== null) {
-            forwardExecutionReceipt({
-              host: executionHost,
-              model: directResult.upstreamModel ?? provider.descriptor.model,
-              role: "worker",
-              capabilities: executionCapabilities,
-              usage: terminalUsage,
-            });
-          }
           return { summary };
         }
         if (directResult.kind !== "json") {
@@ -638,7 +688,36 @@ export const createModelProviderAgentAdapters = (
             "Agent execution model did not return a successful JSON response.",
           );
         }
-        const summary = extractTextContent(directResult.body);
+        const body = directResult.body;
+        const toolItems =
+          isRecord(body) && Array.isArray(body.output)
+            ? body.output.filter(
+                (item) =>
+                  isRecord(item) &&
+                  (item.type === "function_call" ||
+                    item.type === "custom_tool_call" ||
+                    item.type === "tool_search_call"),
+              )
+            : [];
+        if (isRecord(body) && Array.isArray(body.output)) {
+          for (const item of body.output) {
+            if (
+              isRecord(item) &&
+              (item.type === "reasoning" ||
+                (item.type === "message" && item.phase === "commentary"))
+            )
+              input.modelRequest.onOutputItem?.(item);
+          }
+        }
+        if (toolItems.length > 0 && input.modelRequest.onOutputItem === undefined)
+          throw new Error("The caller cannot receive native tool requests.");
+        toolItems.forEach((item) => {
+          input.modelRequest?.onOutputItem?.(item);
+        });
+        const summary =
+          toolItems.length > 0
+            ? "Tool requests forwarded to the calling client."
+            : extractTextContent(body);
         const responseUsage =
           isRecord(directResult.body) && !providerReportedWorkerUsage
             ? extractProviderUsage(directResult.body.usage)
@@ -652,7 +731,7 @@ export const createModelProviderAgentAdapters = (
             usage: responseUsage,
           });
         }
-        input.modelRequest.onOutputDelta?.(summary);
+        if (toolItems.length === 0) input.modelRequest.onOutputDelta?.(summary);
         return { summary };
       }
       return executeJson<AgentStepOutput>(

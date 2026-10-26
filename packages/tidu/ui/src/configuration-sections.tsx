@@ -121,9 +121,13 @@ interface CapabilityCompletionModelResultView {
   /** Required capabilities assigned to this model. */
   capabilities: readonly string[];
   /** Result of this individual model call. */
-  outcome: "failed" | "not-run" | "succeeded";
+  outcome: "cancelled" | "failed" | "not-run" | "succeeded";
   /** Why a configured model was not called. */
-  skipReason?: "blocked-by-failure" | "not-selected";
+  skipReason?:
+    | "awaiting-tool-results"
+    | "blocked-by-cancellation"
+    | "blocked-by-failure"
+    | "not-selected";
   /** Upstream HTTP status, or null when unavailable. */
   statusCode: number | null;
   /** Individual model duration, or null when not called. */
@@ -142,7 +146,7 @@ interface CapabilityCompletionUsageRecordView {
   /** Whether a secondary model was selected. */
   complemented: boolean;
   /** Final combined routing outcome. */
-  outcome: "failed" | "succeeded";
+  outcome: "cancelled" | "failed" | "succeeded";
   /** Primary model used for the request. */
   mainModelId: string;
   /** Secondary models selected for the request. */
@@ -179,6 +183,67 @@ interface CapabilityCompletionUsageRecordView {
     totalTokens: number;
   }[];
 }
+
+export const capabilityCompletionOutcomeLabel = (
+  outcome: CapabilityCompletionModelResultView["outcome"],
+  english: boolean,
+): string =>
+  (english
+    ? { cancelled: "Cancelled", failed: "Failed", "not-run": "Not called", succeeded: "Succeeded" }
+    : { cancelled: "已取消", failed: "失败", "not-run": "未调用", succeeded: "成功" })[outcome];
+
+export const capabilityCompletionModelOutcomeLabel = (
+  result: Pick<CapabilityCompletionModelResultView, "outcome" | "skipReason">,
+  english: boolean,
+): string =>
+  result.skipReason === "awaiting-tool-results"
+    ? english
+      ? "Waiting for tool results"
+      : "等待工具结果"
+    : capabilityCompletionOutcomeLabel(result.outcome, english);
+
+export const capabilityCompletionRecordOutcomeLabel = (
+  record: Pick<CapabilityCompletionUsageRecordView, "mainResult" | "outcome" | "secondaryResults">,
+  english: boolean,
+): string =>
+  [record.mainResult, ...record.secondaryResults].some(
+    (result) => result.skipReason === "awaiting-tool-results",
+  )
+    ? english
+      ? "Waiting for tool results"
+      : "等待工具结果"
+    : capabilityCompletionOutcomeLabel(record.outcome, english);
+
+export const normalizeCapabilityCompletionCancellation = (
+  record: CapabilityCompletionUsageRecordView,
+): CapabilityCompletionUsageRecordView => {
+  // These exact diagnostics were emitted by older runtimes for explicit cancellation.
+  const cancellationMessages = [
+    "Codex turn cancelled.",
+    "Cursor request cancelled.",
+    "Provider stream was cancelled because the request was aborted.",
+    "Provider stream was cancelled before completion.",
+  ];
+  const models = [record.mainResult, ...record.secondaryResults].map((result) =>
+    result.outcome === "failed" && cancellationMessages.includes(result.message)
+      ? { ...result, outcome: "cancelled" as const }
+      : result,
+  );
+  const cancelled =
+    models.some((result) => result.outcome === "cancelled") &&
+    models.every((result) => result.outcome !== "failed");
+  const normalized = models.map((result) =>
+    cancelled && result.skipReason === "blocked-by-failure"
+      ? { ...result, skipReason: "blocked-by-cancellation" as const }
+      : result,
+  );
+  return {
+    ...record,
+    outcome: cancelled ? "cancelled" : record.outcome,
+    mainResult: normalized[0] ?? record.mainResult,
+    secondaryResults: normalized.slice(1),
+  };
+};
 
 interface CapabilityCompletionStatusResponse {
   /** Host currently backing the active primary model, when identifiable. */
@@ -429,7 +494,11 @@ export const CapabilityCompletionPanel = ({
         cache: "no-store",
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      setStatus((await response.json()) as CapabilityCompletionStatusResponse);
+      const result = (await response.json()) as CapabilityCompletionStatusResponse;
+      setStatus({
+        ...result,
+        records: result.records.map(normalizeCapabilityCompletionCancellation),
+      });
       setMessage("");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : english ? "Unavailable" : "读取失败");
@@ -444,6 +513,9 @@ export const CapabilityCompletionPanel = ({
     });
   const displayResultMessage = (result: CapabilityCompletionModelResultView): string => {
     if (english) return result.message;
+    if (result.outcome === "cancelled") return "请求已取消。";
+    if (result.skipReason === "awaiting-tool-results") return "等待客户端执行工具并回传结果。";
+    if (result.skipReason === "blocked-by-cancellation") return "请求已取消，该模型未执行。";
     if (result.skipReason === "not-selected")
       return "本次请求按动态路由规则由其他模型执行，当前模型未被选中。";
     if (result.skipReason === "blocked-by-failure")
@@ -744,18 +816,14 @@ export const CapabilityCompletionPanel = ({
                             <strong>{english ? "Combined result" : "组合结果"}</strong>
                             <small
                               className={
-                                record.outcome === "succeeded"
-                                  ? "record-succeeded"
-                                  : "record-failed"
+                                [record.mainResult, ...record.secondaryResults].some(
+                                  (result) => result.skipReason === "awaiting-tool-results",
+                                )
+                                  ? "record-waiting"
+                                  : `record-${record.outcome}`
                               }
                             >
-                              {record.outcome === "succeeded"
-                                ? english
-                                  ? "Succeeded"
-                                  : "成功"
-                                : english
-                                  ? "Failed"
-                                  : "失败"}
+                              {capabilityCompletionRecordOutcomeLabel(record, english)}
                             </small>
                             <span>{new Date(record.occurredAt).toLocaleString()}</span>
                           </div>
@@ -765,89 +833,103 @@ export const CapabilityCompletionPanel = ({
                             {` · ${english ? "Route" : "路由原因"}：${routingReasonLabel(record.reason)}`}
                           </p>
                           <div className="capability-model-results">
-                            {[record.mainResult, ...record.secondaryResults].map((modelResult) => (
-                              <div
-                                className={`capability-model-result ${modelResult.outcome}`}
-                                key={modelResult.modelId}
-                              >
-                                <div>
-                                  <strong>
-                                    {modelResult.role === "main"
-                                      ? english
-                                        ? "Primary model"
-                                        : "主模型"
-                                      : english
-                                        ? "Secondary model"
-                                        : "副模型"}
-                                  </strong>
-                                  <small>
-                                    {modelResult.outcome === "succeeded"
-                                      ? english
-                                        ? "Succeeded"
-                                        : "成功"
-                                      : modelResult.outcome === "failed"
+                            {[record.mainResult, ...record.secondaryResults].map((modelResult) => {
+                              const modelUsage = record.modelTokenUsage.find(
+                                (usage) => usage.modelId === modelResult.modelId,
+                              );
+                              const zeroUsage =
+                                modelUsage !== undefined &&
+                                modelUsage.inputTokens === 0 &&
+                                modelUsage.outputTokens === 0 &&
+                                modelUsage.totalTokens === 0;
+                              return (
+                                <div
+                                  className={`capability-model-result ${
+                                    modelResult.skipReason === "awaiting-tool-results"
+                                      ? "waiting"
+                                      : modelResult.outcome
+                                  }`}
+                                  key={modelResult.modelId}
+                                >
+                                  <div>
+                                    <strong>
+                                      {modelResult.role === "main"
                                         ? english
-                                          ? "Failed"
-                                          : "失败"
+                                          ? "Primary model"
+                                          : "主模型"
                                         : english
-                                          ? "Not called"
-                                          : "未调用"}
-                                  </small>
-                                </div>
-                                <p>
-                                  {modelResult.host}：
-                                  {displayModel(modelResult.host, {
-                                    source: modelResult.modelId.endsWith(":custom")
-                                      ? "custom"
-                                      : modelSourceForHost(modelResult.host),
-                                    model: modelResult.model,
-                                  })}
-                                </p>
-                                <div className="capability-model-result-meta">
-                                  <span>
-                                    {english ? "Capabilities" : "能力"}：
-                                    {modelResult.capabilities.length > 0
-                                      ? modelResult.capabilities
-                                          .map((capability) => capabilityLabel(capability, english))
-                                          .join(" / ")
-                                      : "—"}
-                                  </span>
-                                  <span>
-                                    {modelResult.durationMilliseconds === null
-                                      ? "—"
-                                      : `${modelResult.durationMilliseconds} ms`}
-                                    {modelResult.statusCode === null
-                                      ? ""
-                                      : ` · HTTP ${modelResult.statusCode}`}
-                                  </span>
-                                  {record.modelTokenUsage.find(
-                                    (usage) => usage.modelId === modelResult.modelId,
-                                  ) === undefined ? null : (
+                                          ? "Secondary model"
+                                          : "副模型"}
+                                    </strong>
+                                    <small>
+                                      {capabilityCompletionModelOutcomeLabel(modelResult, english)}
+                                    </small>
+                                  </div>
+                                  <p>
+                                    {modelResult.host}：
+                                    {displayModel(modelResult.host, {
+                                      source: modelResult.modelId.endsWith(":custom")
+                                        ? "custom"
+                                        : modelSourceForHost(modelResult.host),
+                                      model: modelResult.model,
+                                    })}
+                                  </p>
+                                  <div className="capability-model-result-meta">
                                     <span>
-                                      Token：
-                                      {
-                                        record.modelTokenUsage.find(
-                                          (usage) => usage.modelId === modelResult.modelId,
-                                        )?.totalTokens
-                                      }
+                                      {english ? "Capabilities" : "能力"}：
+                                      {modelResult.capabilities.length > 0
+                                        ? modelResult.capabilities
+                                            .map((capability) =>
+                                              capabilityLabel(capability, english),
+                                            )
+                                            .join(" / ")
+                                        : "—"}
                                     </span>
+                                    <span className="capability-model-result-timing">
+                                      {modelResult.durationMilliseconds === null
+                                        ? "—"
+                                        : `${modelResult.durationMilliseconds} ms`}
+                                      {modelResult.statusCode === null
+                                        ? ""
+                                        : ` · HTTP ${modelResult.statusCode}`}
+                                    </span>
+                                    {modelResult.outcome === "not-run" || zeroUsage ? null : (
+                                      <span className="capability-model-result-tokens">
+                                        Token：
+                                        {modelUsage?.totalTokens ??
+                                          (english ? "Not retrieved" : "未获取到")}
+                                      </span>
+                                    )}
+                                  </div>
+                                  {modelResult.outcome === "succeeded" ||
+                                  modelResult.message === "" ? null : (
+                                    <p className="capability-model-result-error">
+                                      {displayResultMessage(modelResult)}
+                                    </p>
                                   )}
                                 </div>
-                                {modelResult.outcome === "succeeded" ||
-                                modelResult.message === "" ? null : (
-                                  <p className="capability-model-result-error">
-                                    {displayResultMessage(modelResult)}
-                                  </p>
-                                )}
-                              </div>
-                            ))}
+                              );
+                            })}
                           </div>
-                          {record.tokenUsage === null ? null : (
+                          {record.tokenUsage !== null &&
+                          record.tokenUsage.inputTokens === 0 &&
+                          record.tokenUsage.outputTokens === 0 &&
+                          record.tokenUsage.totalTokens === 0 ? null : (
                             <p className="capability-record-token-usage">
-                              {english ? "Tokens" : "Token 统计"}：{english ? "input" : "输入"}{" "}
-                              {record.tokenUsage.inputTokens} · {english ? "output" : "输出"}{" "}
-                              {record.tokenUsage.outputTokens} · {english ? "total" : "合计"}{" "}
-                              {record.tokenUsage.totalTokens}
+                              {record.tokenUsage === null ? (
+                                english ? (
+                                  "Tokens: Not retrieved"
+                                ) : (
+                                  "Token 统计：未获取到"
+                                )
+                              ) : (
+                                <>
+                                  {english ? "Tokens" : "Token 统计"}：{english ? "input" : "输入"}{" "}
+                                  {record.tokenUsage.inputTokens} · {english ? "output" : "输出"}{" "}
+                                  {record.tokenUsage.outputTokens} · {english ? "total" : "合计"}{" "}
+                                  {record.tokenUsage.totalTokens}
+                                </>
+                              )}
                             </p>
                           )}
                         </article>

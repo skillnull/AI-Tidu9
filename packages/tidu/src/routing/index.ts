@@ -132,7 +132,7 @@ export interface RoutingModelAttempt {
   /** Whether this attempt ran as the primary or a secondary model. */
   role: "main" | "secondary";
   /** Result of this individual model call. */
-  outcome: "failed" | "succeeded";
+  outcome: "cancelled" | "failed" | "succeeded";
   /** Upstream model explicitly confirmed by the provider or host, or null without a receipt. */
   executedModel: string | null;
   /** Upstream HTTP status, or null when the provider threw before returning one. */
@@ -157,9 +157,13 @@ export interface CapabilityCompletionModelResult {
   /** Required capabilities assigned to this model for the request. */
   capabilities: readonly string[];
   /** Individual call result, including models skipped after an earlier failure. */
-  outcome: "failed" | "not-run" | "succeeded";
+  outcome: "cancelled" | "failed" | "not-run" | "succeeded";
   /** Why a configured model was not called for this request. */
-  skipReason?: "blocked-by-failure" | "not-selected";
+  skipReason?:
+    | "awaiting-tool-results"
+    | "blocked-by-cancellation"
+    | "blocked-by-failure"
+    | "not-selected";
   /** Upstream HTTP status, or null when unavailable. */
   statusCode: number | null;
   /** Wall-clock duration, or null when the model was not called. */
@@ -178,7 +182,7 @@ export interface CapabilityCompletionUsageRecord extends RoutingDecision {
   /** Whether at least one specialist actually contributed. */
   complemented: boolean;
   /** Upstream request outcome after routing. */
-  outcome: "failed" | "succeeded";
+  outcome: "cancelled" | "failed" | "succeeded";
   /** Primary-model execution result. */
   mainResult: CapabilityCompletionModelResult;
   /** Secondary-model execution results in configured order. */
@@ -674,6 +678,8 @@ const requestCancellationError = (
 };
 
 interface ProviderStreamObservation {
+  /** Whether the consumer or its request signal stopped execution. */
+  cancelled?: boolean;
   /** Whether the stream produced assistant output and reached a successful terminal event. */
   succeeded: boolean;
   /** Bounded terminal diagnostic used by local routing history. */
@@ -695,7 +701,14 @@ const responseOutputHasContent = (response: Record<string, unknown>): boolean =>
   if (typeof response.output_text === "string" && response.output_text !== "") return true;
   if (!Array.isArray(response.output)) return false;
   return response.output.some((item) => {
-    if (!isRecord(item) || !Array.isArray(item.content)) return false;
+    if (!isRecord(item)) return false;
+    if (
+      item.type === "function_call" ||
+      item.type === "custom_tool_call" ||
+      item.type === "tool_search_call"
+    )
+      return true;
+    if (!Array.isArray(item.content)) return false;
     return item.content.some(
       (content) =>
         isRecord(content) &&
@@ -731,8 +744,7 @@ const observeProviderStreamEvent = (
     return;
   }
   if (!isRecord(body)) return;
-  const usageBody =
-    body.type === "response.completed" && isRecord(body.response) ? body.response : body;
+  const usageBody = isRecord(body.response) ? body.response : body;
   state.tokenUsage = extractTokenUsageRecord(usageBody) ?? state.tokenUsage;
 
   if (isRecord(body.error)) {
@@ -854,6 +866,7 @@ const observeProviderStream = (
     const tokenUsage = state.tokenUsage ?? null;
     if (cancelled) {
       return {
+        cancelled: true,
         succeeded: false,
         message: aborted
           ? "Provider stream was cancelled because the request was aborted."
@@ -1281,6 +1294,19 @@ export const createDynamicModelRouter = (
 
   const execute = async (request: ProviderExecutionRequest): Promise<ProviderExecutionResult> => {
     const requestAttempts: RoutingModelAttempt[] = [];
+    const usageByModel = new Map<string, RoutingTokenUsage>();
+    const recordUsage = (modelId: string, usage: RoutingTokenUsage | null): void => {
+      if (usage !== null) usageByModel.set(modelId, usage);
+      if (latestDecision === undefined) return;
+      latestDecision = {
+        ...latestDecision,
+        tokenUsage: combineTokenUsage([...usageByModel.values()]),
+        modelTokenUsage: [...usageByModel].map(([usedModelId, modelUsage]) => ({
+          modelId: usedModelId,
+          ...modelUsage,
+        })),
+      };
+    };
     latestAttempts = requestAttempts;
     const attemptedMainIds = new Set<string>();
     let lastFailure: Error | undefined;
@@ -1345,6 +1371,10 @@ export const createDynamicModelRouter = (
             );
             const specialistResult = await specialist.provider.execute({
               ...specialistRequest,
+              onExecutionReceipt: (receipt) => {
+                recordUsage(specialist.profile.id, receipt.usage);
+                request.onExecutionReceipt?.(receipt);
+              },
               onModelConfirmed: (model) => {
                 executedModel = model;
               },
@@ -1368,8 +1398,20 @@ export const createDynamicModelRouter = (
                 ),
               );
             }
-            const result = extractModelText(specialistResult);
+            const callerToolRequest =
+              specialistResult.kind === "json" &&
+              isRecord(specialistResult.body) &&
+              Array.isArray(specialistResult.body.output) &&
+              specialistResult.body.output.some(
+                (item) =>
+                  isRecord(item) &&
+                  (item.type === "function_call" ||
+                    item.type === "custom_tool_call" ||
+                    item.type === "tool_search_call"),
+              );
+            const result = callerToolRequest ? "" : extractModelText(specialistResult);
             const tokenUsage = extractTokenUsage(specialistResult);
+            recordUsage(specialist.profile.id, tokenUsage);
             requestAttempts.push({
               modelId: specialist.profile.id,
               role: "secondary",
@@ -1398,12 +1440,14 @@ export const createDynamicModelRouter = (
               result,
               tokenUsage,
             });
+            if (callerToolRequest) return specialistResult;
           } catch (error) {
             const message = error instanceof Error ? error.message : "Secondary model failed.";
             requestAttempts.push({
               modelId: specialist.profile.id,
               role: "secondary",
-              outcome: "failed",
+              outcome:
+                requestCancellationError(request, error) === undefined ? "failed" : "cancelled",
               executedModel,
               statusCode,
               durationMilliseconds: Math.round(performance.now() - startedAt),
@@ -1438,6 +1482,10 @@ export const createDynamicModelRouter = (
         );
         result = await route.main.provider.execute({
           ...routedRequest,
+          onExecutionReceipt: (receipt) => {
+            recordUsage(route.main.profile.id, receipt.usage);
+            request.onExecutionReceipt?.(receipt);
+          },
           onModelConfirmed: (model) => {
             mainExecutedModel = model;
           },
@@ -1456,7 +1504,7 @@ export const createDynamicModelRouter = (
         requestAttempts.push({
           modelId: route.main.profile.id,
           role: "main",
-          outcome: "failed",
+          outcome: cancellation === undefined ? "failed" : "cancelled",
           executedModel: mainExecutedModel,
           statusCode: null,
           durationMilliseconds: Math.round(performance.now() - mainStartedAt),
@@ -1477,7 +1525,7 @@ export const createDynamicModelRouter = (
         requestAttempts.push({
           modelId: route.main.profile.id,
           role: "main",
-          outcome: "failed",
+          outcome: "cancelled",
           executedModel: result.upstreamModel ?? mainExecutedModel,
           statusCode: result.statusCode,
           durationMilliseconds: Math.round(performance.now() - mainStartedAt),
@@ -1508,36 +1556,7 @@ export const createDynamicModelRouter = (
       }
       if (result.statusCode !== 429 && result.statusCode < 500) {
         const resultTokenUsage = extractTokenUsage(result);
-        const updateDecisionTokenUsage = (mainTokenUsage: RoutingTokenUsage | null): void => {
-          latestDecision = {
-            ...route.decision,
-            tokenUsage: combineTokenUsage([
-              ...contributions.map((contribution) => contribution.tokenUsage),
-              mainTokenUsage,
-            ]),
-            modelTokenUsage: [
-              ...contributions.flatMap((contribution) =>
-                contribution.tokenUsage === null
-                  ? []
-                  : [
-                      {
-                        modelId: contribution.modelId,
-                        ...contribution.tokenUsage,
-                      },
-                    ],
-              ),
-              ...(mainTokenUsage === null
-                ? []
-                : [
-                    {
-                      modelId: route.main.profile.id,
-                      ...mainTokenUsage,
-                    },
-                  ]),
-            ],
-          };
-        };
-        updateDecisionTokenUsage(resultTokenUsage);
+        recordUsage(route.main.profile.id, resultTokenUsage);
         if (result.kind === "stream") {
           const confirmedMainModel = result.upstreamModel ?? mainExecutedModel;
           if (confirmedMainModel !== null) {
@@ -1554,11 +1573,15 @@ export const createDynamicModelRouter = (
           return observeProviderStream(
             result,
             (observation) => {
-              updateDecisionTokenUsage(observation.tokenUsage);
+              recordUsage(route.main.profile.id, observation.tokenUsage);
               requestAttempts.push({
                 modelId: route.main.profile.id,
                 role: "main",
-                outcome: observation.succeeded ? "succeeded" : "failed",
+                outcome: observation.cancelled
+                  ? "cancelled"
+                  : observation.succeeded
+                    ? "succeeded"
+                    : "failed",
                 executedModel: result.upstreamModel ?? mainExecutedModel,
                 statusCode: result.statusCode,
                 durationMilliseconds: Math.round(performance.now() - mainStartedAt),
@@ -1748,7 +1771,7 @@ export const createCapabilityCompletionProvider = (
               return observeProviderStream(
                 result,
                 (observation) => {
-                  recordPerformance(startedAt, observation.succeeded);
+                  if (!observation.cancelled) recordPerformance(startedAt, observation.succeeded);
                 },
                 request.protocol,
               );
@@ -1756,7 +1779,8 @@ export const createCapabilityCompletionProvider = (
             recordPerformance(startedAt, result.statusCode >= 200 && result.statusCode < 300);
             return result;
           } catch (error) {
-            recordPerformance(startedAt, false);
+            if (requestCancellationError(request, error) === undefined)
+              recordPerformance(startedAt, false);
             throw error;
           }
         },
@@ -1795,7 +1819,13 @@ export const createCapabilityCompletionProvider = (
     selectedModelIds: ReadonlySet<string>,
   ): CapabilityCompletionModelResult => {
     const attempt = [...attempts].reverse().find((item) => item.modelId === modelId);
-    const skipReason = selectedModelIds.has(modelId) ? "blocked-by-failure" : "not-selected";
+    const skipReason = selectedModelIds.has(modelId)
+      ? attempts.some((item) => item.outcome === "cancelled")
+        ? "blocked-by-cancellation"
+        : attempts.length > 0 && attempts.every((item) => item.outcome === "succeeded")
+          ? "awaiting-tool-results"
+          : "blocked-by-failure"
+      : "not-selected";
     return attempt === undefined
       ? {
           modelId,
@@ -1809,9 +1839,13 @@ export const createCapabilityCompletionProvider = (
           statusCode: null,
           durationMilliseconds: null,
           message:
-            skipReason === "blocked-by-failure"
-              ? "Selected but not called because another selected model failed first."
-              : "Not selected by the active routing rules for this request.",
+            skipReason === "awaiting-tool-results"
+              ? "Waiting for the caller to execute the requested tools and return their results."
+              : skipReason === "blocked-by-cancellation"
+                ? "Selected but not called because the request was cancelled."
+                : skipReason === "blocked-by-failure"
+                  ? "Selected but not called because another selected model failed first."
+                  : "Not selected by the active routing rules for this request.",
         }
       : {
           modelId,
@@ -1925,6 +1959,7 @@ export const createCapabilityCompletionProvider = (
           );
         }
         const startedAt = performance.now();
+        let reportedUsage: RoutingTokenUsage | null = null;
         const recordMainResult = (
           mainAttempt: RoutingModelAttempt,
           tokenUsage: ReturnType<typeof extractTokenUsage>,
@@ -1972,6 +2007,10 @@ export const createCapabilityCompletionProvider = (
             mainId,
           ).provider.execute({
             ...routedRequest,
+            onExecutionReceipt: (receipt) => {
+              if (receipt.usage !== null) reportedUsage = receipt.usage;
+              request.onExecutionReceipt?.(receipt);
+            },
             routing: {
               ...routedRequest.routing,
               host: requestHost,
@@ -1983,7 +2022,8 @@ export const createCapabilityCompletionProvider = (
           const mainAttempt: RoutingModelAttempt = {
             modelId: mainId,
             role: "main",
-            outcome: "failed",
+            outcome:
+              requestCancellationError(request, error) === undefined ? "failed" : "cancelled",
             executedModel: null,
             statusCode: null,
             durationMilliseconds: Math.round(performance.now() - startedAt),
@@ -1992,7 +2032,7 @@ export const createCapabilityCompletionProvider = (
               500,
             ),
           };
-          recordMainResult(mainAttempt, null);
+          recordMainResult(mainAttempt, reportedUsage);
           throw error;
         }
         if (result.kind === "stream") {
@@ -2012,13 +2052,17 @@ export const createCapabilityCompletionProvider = (
                 {
                   modelId: mainId,
                   role: "main",
-                  outcome: observation.succeeded ? "succeeded" : "failed",
+                  outcome: observation.cancelled
+                    ? "cancelled"
+                    : observation.succeeded
+                      ? "succeeded"
+                      : "failed",
                   executedModel: result.upstreamModel ?? null,
                   statusCode: result.statusCode,
                   durationMilliseconds: Math.round(performance.now() - startedAt),
                   message: observation.message,
                 },
-                observation.tokenUsage,
+                observation.tokenUsage ?? reportedUsage,
               );
             },
             request.protocol,
@@ -2087,7 +2131,7 @@ export const createCapabilityCompletionProvider = (
       ]);
       const recordRoutingResult = (
         decision: RoutingDecision,
-        outcome: "failed" | "succeeded",
+        outcome: CapabilityCompletionUsageRecord["outcome"],
       ): void => {
         for (const usage of decision.modelTokenUsage) {
           const capabilities = capabilitiesByModel.get(usage.modelId) ?? [];
@@ -2149,7 +2193,11 @@ export const createCapabilityCompletionProvider = (
               (observation) => {
                 recordRoutingResult(
                   router.inspect() ?? decision,
-                  observation.succeeded ? "succeeded" : "failed",
+                  observation.cancelled
+                    ? "cancelled"
+                    : observation.succeeded
+                      ? "succeeded"
+                      : "failed",
                 );
               },
               request.protocol,
@@ -2165,7 +2213,10 @@ export const createCapabilityCompletionProvider = (
       } catch (error) {
         const decision = router.inspect();
         if (decision !== undefined) {
-          recordRoutingResult(decision, "failed");
+          recordRoutingResult(
+            decision,
+            requestCancellationError(request, error) === undefined ? "failed" : "cancelled",
+          );
         }
         throw error;
       }

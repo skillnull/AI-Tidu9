@@ -225,11 +225,7 @@ const validateTools = (
 ): OpenAiRequestValidation => {
   if (body.tools !== undefined) {
     const toolIsValid = protocol === "chat-completions" ? isChatFunctionTool : isResponsesTool;
-    if (
-      !Array.isArray(body.tools) ||
-      body.tools.length === 0 ||
-      !body.tools.every((tool) => toolIsValid(tool))
-    ) {
+    if (!Array.isArray(body.tools) || !body.tools.every((tool) => toolIsValid(tool))) {
       const unsupportedTypes = Array.isArray(body.tools)
         ? [
             ...new Set(
@@ -296,8 +292,9 @@ const validateTools = (
           return typeof name === "string" ? [name] : [];
         })
       : [];
+    const requiresConfiguredTool = choice === "required" || typeof selectedName === "string";
     if (
-      (choice !== "none" && configuredNames.length === 0) ||
+      (requiresConfiguredTool && configuredNames.length === 0) ||
       (typeof selectedName === "string" && !configuredNames.includes(selectedName))
     ) {
       return {

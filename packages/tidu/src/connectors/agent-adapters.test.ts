@@ -46,8 +46,9 @@ readline.on("line", (line) => {
     send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "future-1", delta: "future-" } });
     send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", startedAtMs: Date.now(), item: { type: "agentMessage", id: "final-1", text: "", phase: "final_answer", memoryCitation: null, delivery: null, questions: null } } });
     send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "final-1", delta: request.params.effort + "-codex-result" } });
-    send({ jsonrpc: "2.0", method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: "turn-1", tokenUsage: { last: { inputTokens: 11, cachedInputTokens: 3, cacheWriteInputTokens: 2, outputTokens: 4, reasoningOutputTokens: 1, totalTokens: 15 } } } });
     send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
+    setTimeout(() => send({ jsonrpc: "2.0", method: "rawResponse/completed", params: { threadId: "thread-1", turnId: "turn-1", responseId: "response-1", usage: { inputTokens: 7, cachedInputTokens: 2, cacheWriteInputTokens: 1, outputTokens: 2, reasoningOutputTokens: 1, totalTokens: 9 }, usageMetadata: null } }), 5);
+    setTimeout(() => send({ jsonrpc: "2.0", method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: "turn-1", tokenUsage: { last: { inputTokens: 11, cachedInputTokens: 3, cacheWriteInputTokens: 2, outputTokens: 4, reasoningOutputTokens: 1, totalTokens: 15 } } } }), 10);
   }
   else if (request.method === "session/new") send({ jsonrpc: "2.0", id: request.id, result: { sessionId: "session-1", configOptions: [{ configId: "model", category: "model", type: "select", currentValue: selectedModel, options: [{ value: "auto-smart", name: "Auto Balance" }, { value: "cursor-fast", name: "Cursor Fast" }, { value: "claude-opus-5[thinking=true,context=300k,effort=high,fast=false]", name: "claude-opus-5" }] }] } });
   else if (request.method === "session/set_config_option") {
@@ -73,7 +74,10 @@ readline.on("line", (line) => {
   return executable;
 };
 
-const createFakeCursorHeadlessAgent = (root: string): string => {
+const createFakeCursorHeadlessAgent = (
+  root: string,
+  resultState: "success" | "error" = "success",
+): string => {
   const executable = join(root, "fake-cursor-headless");
   const source = `#!/usr/bin/env node
 const args = process.argv.slice(2);
@@ -90,7 +94,7 @@ process.stdin.on("end", () => {
   send({ type: "thinking", subtype: "delta", text: "请求" });
   send({ type: "tool_call", subtype: "started", call_id: "call-1", tool_call: { readToolCall: { args: { path: "README.md" } } } });
   send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: prompt.trim() + "：完成" }] } });
-  send({ type: "result", subtype: "success", is_error: false, result: prompt.trim() + "：完成", usage: { inputTokens: 21, outputTokens: 5, cacheReadTokens: 8, cacheWriteTokens: 2 } });
+  send({ type: "result", subtype: ${JSON.stringify(resultState)}, is_error: ${resultState === "error"}, result: prompt.trim() + "：完成", usage: { inputTokens: 21, outputTokens: 5, cacheReadTokens: 8, cacheWriteTokens: 2 } });
 });
 `;
   writeFileSync(executable, source);
@@ -155,8 +159,17 @@ test("Codex app-server adapter negotiates, streams, and completes a turn", async
       "搜索网页 `Responses API events`",
       "\n\n",
       "上下文已自动压缩",
+      "\n\n",
     ]);
     assert.deepEqual(usageUpdates, [
+      {
+        inputTokens: 7,
+        outputTokens: 2,
+        totalTokens: 9,
+        cachedInputTokens: 2,
+        cacheWriteInputTokens: 1,
+        reasoningTokens: 1,
+      },
       {
         inputTokens: 11,
         outputTokens: 4,
@@ -217,6 +230,34 @@ test("Cursor ACP adapter reuses official login and preserves Agent output", asyn
   }
 });
 
+test("Cursor headless reports usage before rejecting a failed terminal", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tidu-cursor-failed-usage-"));
+  try {
+    const usageUpdates: unknown[] = [];
+    await assert.rejects(
+      runCursorHeadless({
+        command: createFakeCursorHeadlessAgent(root, "error"),
+        environment: process.env,
+        workingDirectory: root,
+        model: "cursor-test-model",
+        prompt: "fixture",
+        onUsageUpdate: (usage) => usageUpdates.push(usage),
+      }),
+    );
+    assert.deepEqual(usageUpdates, [
+      {
+        inputTokens: 21,
+        outputTokens: 5,
+        totalTokens: 26,
+        cachedInputTokens: 8,
+        cacheWriteInputTokens: 2,
+      },
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Cursor headless adapter preserves process boundaries and terminal token usage", async () => {
   const root = mkdtempSync(join(tmpdir(), "tidu-cursor-headless-"));
   try {
@@ -237,6 +278,7 @@ test("Cursor headless adapter preserves process boundaries and terminal token us
       "请求",
       "\n\n",
       "Cursor 正在调用 readToolCall：README.md",
+      "\n\n",
     ]);
     assert.deepEqual(textDeltas, ["测试请求：完成"]);
     assert.deepEqual(result, {

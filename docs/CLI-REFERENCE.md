@@ -90,9 +90,15 @@ tidu clients
 tidu clients connect codex [--yes] [--endpoint <url>]
 tidu clients switch codex <official|ai-tidu9> [--yes] [--endpoint <url>]
 tidu clients rollback codex [--yes]
+tidu-codex --install-desktop
+tidu-codex --uninstall-desktop
 ```
 
 `setup` 默认动作是 `install`，不要求预先启动运行时。它会为 Codex 准备互斥的九门原生 Agent 模式、为其他宿主安装所需连接器，并自动启动当前版型的全部服务，但保持官方直连生效。`clients switch codex ai-tidu9` 使 Codex 只显示“九门赛博提督”，任务进入规划、能力补位、执行和独立验收的同一 Agent 内核；官方、公司或自定义上游只在九门配置页三选一，不会成为独立 Codex 模型项。`clients switch codex official` 精确恢复原始官方配置和官方模型列表。官方账号、套餐和额度始终由官方 Codex 管理。九门自有备份只保留首次安装基线与最新回滚点。
+
+macOS 默认目录安装会准备客户端恢复接入，切到九门时通过 `CODEX_CLI_PATH` 注册；重启 Codex 后加载。也可使用 `tidu-codex --install-desktop` 显式安装。官方模式恢复之前的可执行文件设置，卸载只删除九门自有启动器。命令执行与审批仍交给官方 CLI；恢复只读官方会话，不新增会话存储。
+
+桌面启动时的组织设置读取、守护进程管理及帮助和协议生成命令直接交给官方 CLI，原样保留输出与退出状态；只有持续的 stdio app-server 会话进入恢复接入。
 
 Codex 使用原生 Provider 接入，不注册九门 MCP；切换模式后需要重启 Codex 才会重新载入 Provider 和模型目录。Cursor 可使用 stdio 连接器作为传输层，但 `route_tidu_task` 仍进入与 Codex、CLI 和 OpenAI 兼容入口相同的 Agent 内核，传输协议不会绕过九门的规划、能力补位和验收。
 

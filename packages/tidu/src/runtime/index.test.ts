@@ -861,6 +861,28 @@ test("routes ordinary inference through one Agent model call and preserves reaso
       output_tokens_details: { reasoning_tokens: 0 },
       total_tokens: 28,
     });
+    const imageOnlyResponse = await fetch(`${runtime.origin}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_image",
+                image_url:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+              },
+            ],
+          },
+        ],
+        tools: [],
+        tool_choice: "none",
+      }),
+    });
+    assert.equal(imageOnlyResponse.status, 200);
     const streamedChatResponse = await fetch(`${runtime.origin}/v1/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -901,6 +923,16 @@ test("routes ordinary inference through one Agent model call and preserves reaso
             parameters: { type: "object" },
           },
         ],
+      },
+      {
+        protocol: "responses",
+        model: "ai-tidu9-config",
+        virtualModelId: "ai-tidu9-config",
+        reasoning: undefined,
+        reasoningEffort: undefined,
+        role: "worker",
+        toolChoice: "none",
+        tools: [],
       },
       {
         protocol: "chat-completions",
@@ -1041,7 +1073,7 @@ test("streams real upstream output deltas through the Agent Responses lifecycle"
       events += decoder.decode(chunk?.value, { stream: true });
     }
     assert.doesNotMatch(events, /event: response\.completed/u);
-    assert.match(events, /"phase":"commentary"/u);
+    assert.match(events, /"type":"reasoning"/u);
     assert.match(events, /checking source/u);
     assert.match(events, /verifying config/u);
     assert.match(events, /future summary/u);
@@ -1080,21 +1112,17 @@ test("streams real upstream output deltas through the Agent Responses lifecycle"
         if (dataLine === undefined || dataLine === "data: [DONE]") return [];
         return [JSON.parse(dataLine.slice("data: ".length)) as Record<string, unknown>];
       });
-    const commentaryItems = responseEvents.filter((event) => {
+    const reasoningItems = responseEvents.filter((event) => {
       if (event.type !== "response.output_item.added") return false;
       const item = event.item;
       return (
-        typeof item === "object" &&
-        item !== null &&
-        "type" in item &&
-        item.type === "message" &&
-        "phase" in item &&
-        item.phase === "commentary"
+        typeof item === "object" && item !== null && "type" in item && item.type === "reasoning"
       );
     });
+    assert.ok(reasoningItems.length >= 3);
     assert.deepEqual(
-      commentaryItems.map((event) => event.output_index),
-      [0, 1, 2],
+      reasoningItems.map((event) => event.output_index),
+      reasoningItems.map((_, index) => index),
     );
     const finalMessageItems = responseEvents.filter((event) => {
       if (event.type !== "response.output_item.added") return false;
@@ -1110,7 +1138,7 @@ test("streams real upstream output deltas through the Agent Responses lifecycle"
     });
     assert.deepEqual(
       finalMessageItems.map((event) => event.output_index),
-      [3],
+      [reasoningItems.length],
     );
     const createdEvent = responseEvents.find((event) => event.type === "response.created");
     const completedEvent = responseEvents.find((event) => event.type === "response.completed");
@@ -1129,18 +1157,10 @@ test("streams real upstream output deltas through the Agent Responses lifecycle"
       total_tokens: 42,
     });
     const terminalOutput = completedResponse?.output as Record<string, unknown>[] | undefined;
-    assert.deepEqual(
-      terminalOutput?.map((item) => item.type),
-      ["message", "message", "message", "message"],
-    );
-    assert.deepEqual(
-      terminalOutput?.map((item) => item.phase),
-      ["commentary", "commentary", "commentary", "final_answer"],
-    );
-    assert.deepEqual(
-      terminalOutput?.map((item) => item.status),
-      ["completed", "completed", "completed", "completed"],
-    );
+    assert.equal(terminalOutput?.at(-1)?.type, "message");
+    assert.equal(terminalOutput?.at(-1)?.phase, "final_answer");
+    assert.equal(terminalOutput?.at(-1)?.status, "completed");
+    assert.ok(terminalOutput?.slice(0, -1).every((item) => item.type === "reasoning"));
   } finally {
     await runtime.close();
   }
@@ -1197,9 +1217,8 @@ test("preserves the Codex process lifecycle when the host turn only emits a fina
     assert.notEqual(processStartedAt, -1);
     assert.ok(processStartedAt < finalMessageStartedAt);
     assert.doesNotMatch(events, /Starting the task execution environment/u);
-    assert.doesNotMatch(events, /response\.reasoning_summary/u);
-    assert.match(events, /Working on the request/u);
-    assert.match(events, /"phase":"commentary"/u);
+    assert.doesNotMatch(events, /Working on the request|正在处理请求/u);
+    assert.match(events, /"type":"reasoning","summary":\[\],"encrypted_content":null/u);
     assert.match(events, /response\.content_part\.added/u);
     assert.match(events, /response\.content_part\.done/u);
     assert.match(events, /"output_index":1/u);
@@ -1289,6 +1308,125 @@ test("fails the public stream when Agent execution fails without hiding it behin
     assert.match(events, /data: \[DONE\]/u);
   } finally {
     await runtime.close();
+  }
+});
+
+test("Codex success and failure always include a token footer for streamed and JSON responses", async () => {
+  for (const failed of [false, true]) {
+    for (const reported of [false, true]) {
+      const provider: ModelProvider = {
+        descriptor: { type: "codex-host", model: "fixture" },
+        execute: async (request) => {
+          const response = {
+            status: failed ? "failed" : "completed",
+            ...(failed
+              ? { error: { code: "fixture_failed", message: "Fixture failed" } }
+              : {
+                  output: [
+                    {
+                      type: "message",
+                      content: [{ type: "output_text", text: "Fixture answer" }],
+                    },
+                  ],
+                }),
+            ...(reported
+              ? { usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15 } }
+              : {}),
+          };
+          request.onExecutionReceipt?.({
+            host: "codex",
+            model: "fixture",
+            role: "worker",
+            capabilities: ["text"],
+            usage: reported ? { inputTokens: 12, outputTokens: 3, totalTokens: 15 } : null,
+          });
+          if (request.body.stream !== true)
+            return { kind: "json", statusCode: failed ? 502 : 200, body: response };
+          return {
+            kind: "stream",
+            statusCode: 200,
+            stream: new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(
+                  new TextEncoder().encode(
+                    `data: ${JSON.stringify({ type: failed ? "response.failed" : "response.completed", response })}\n\ndata: [DONE]\n\n`,
+                  ),
+                );
+                controller.close();
+              },
+            }),
+          };
+        },
+      };
+      const runtime = await startLocalRuntime({
+        databasePath: IN_MEMORY_DATABASE_PATH,
+        port: 0,
+        discoverHostProvider: false,
+        provider,
+      });
+      try {
+        for (const stream of [false, true]) {
+          const response = await fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ model: "ai-tidu9-config", input: "检查结果", stream }),
+          });
+          const body = await response.text();
+          assert.equal(response.status, failed && !stream ? 502 : 200, body);
+          assert.match(body, reported ? /Token：输入 12 · 输出 3 · 合计 15/u : /Token：未获取到/u);
+          if (stream)
+            assert.match(body, failed ? /event: response.failed/u : /event: response.completed/u);
+        }
+      } finally {
+        await runtime.close();
+      }
+    }
+  }
+});
+
+test("hides confirmed zero token consumption in streamed and JSON Codex success and failure results", async () => {
+  for (const failed of [false, true]) {
+    const provider: ModelProvider = {
+      descriptor: { type: "codex-host", model: "fixture" },
+      execute: async (request) => {
+        request.onExecutionReceipt?.({
+          host: "codex",
+          model: "fixture",
+          role: "worker",
+          capabilities: ["text"],
+          usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        });
+        return {
+          kind: "json",
+          statusCode: failed ? 502 : 200,
+          body: failed
+            ? { error: { code: "zero_fixture", message: "Zero fixture failure" } }
+            : {
+                output_text: "Fixture answer",
+                usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+              },
+        };
+      },
+    };
+    const runtime = await startLocalRuntime({
+      databasePath: IN_MEMORY_DATABASE_PATH,
+      port: 0,
+      discoverHostProvider: false,
+      provider,
+    });
+    try {
+      for (const stream of [false, true]) {
+        const response = await fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "ai-tidu9-config", input: "检查结果", stream }),
+        });
+        assert.equal(response.status, failed && !stream ? 502 : 200);
+        assert.doesNotMatch(await response.text(), /Tokens?[:：]|未获取到|待确认|待补齐/u);
+      }
+    } finally {
+      await runtime.close();
+    }
   }
 });
 
@@ -1416,8 +1554,9 @@ test("completes the Agent Responses stream with explicit lifecycle events", asyn
     assert.match(events, /event: response\.created/u);
     assert.match(events, /event: response\.output_item\.added/u);
     assert.match(events, /event: response\.content_part\.added/u);
-    assert.match(events, /"phase":"commentary"/u);
+    assert.match(events, /"type":"reasoning","summary":\[\],"encrypted_content":null/u);
     assert.doesNotMatch(events, /event: response\.reasoning_summary/u);
+    assert.doesNotMatch(events, /Working on the request|正在处理请求/u);
     assert.doesNotMatch(events, /Request: Codex|Execution task:/u);
     assert.doesNotMatch(events, /configured model route/u);
     assert.doesNotMatch(events, /执行路径已确认/u);
@@ -1439,7 +1578,7 @@ test("completes the Agent Responses stream with explicit lifecycle events", asyn
   }
 });
 
-test("opens a native process item before the assistant message", async () => {
+test("opens a native reasoning lifecycle before work without injecting placeholder text", async () => {
   let releaseWorker: (() => void) | undefined;
   const workerGate = new Promise<void>((resolveWorker) => {
     releaseWorker = resolveWorker;
@@ -1487,22 +1626,15 @@ test("opens a native process item before the assistant message", async () => {
     assert.notEqual(reader, undefined);
     const decoder = new TextDecoder();
     let initialEvents = "";
-    while (!initialEvents.includes("event: response.output_item.done")) {
+    while (!initialEvents.includes("event: response.output_item.added")) {
       const chunk = await reader?.read();
       assert.equal(chunk?.done, false);
       initialEvents += decoder.decode(chunk?.value, { stream: true });
     }
-    assert.match(initialEvents, /response\.content_part\.added/u);
-    assert.match(
-      initialEvents,
-      /"type":"message","status":"in_progress","role":"assistant","phase":"commentary","content":\[\]/u,
-    );
-    assert.match(initialEvents, /"delta":"Working on the request…"/u);
-    assert.match(initialEvents, /response\.output_text\.done/u);
-    assert.match(
-      initialEvents,
-      /"type":"message","status":"completed","role":"assistant","phase":"commentary","content":\[\{"type":"output_text","text":"Working on the request…","annotations":\[\]\}\]/u,
-    );
+    assert.match(initialEvents, /"type":"reasoning","summary":\[\],"encrypted_content":null/u);
+    assert.doesNotMatch(initialEvents, /Working on the request|正在处理请求/u);
+    assert.doesNotMatch(initialEvents, /response\.output_item\.done/u);
+    assert.doesNotMatch(initialEvents, /"phase":"final_answer"/u);
     assert.doesNotMatch(initialEvents, /Request: Codex|Execution task:/u);
 
     releaseWorker?.();
@@ -1514,6 +1646,7 @@ test("opens a native process item before the assistant message", async () => {
     }
     completedEvents += decoder.decode();
     assert.match(completedEvents, /event: response\.content_part\.added/u);
+    assert.match(completedEvents, /event: response\.output_item\.done/u);
     assert.match(completedEvents, /event: response\.output_text\.delta/u);
     assert.match(completedEvents, /event: response\.completed/u);
   } finally {
@@ -1579,6 +1712,51 @@ test("reports Agent stream failures as terminal events instead of disconnecting"
       /"usage":\{"input_tokens":19,"input_tokens_details":\{"cached_tokens":0,"cache_write_tokens":0\},"output_tokens":3,"output_tokens_details":\{"reasoning_tokens":0\},"total_tokens":22\}/u,
     );
     assert.match(events, /data: \[DONE\]/u);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("forwards failed upstream terminal usage through the Agent stream", async () => {
+  const encoder = new TextEncoder();
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    port: 0,
+    provider: {
+      descriptor: { type: "openai-compatible", model: "fixture" },
+      execute: async () => ({
+        kind: "stream",
+        statusCode: 200,
+        stream: new ReadableStream<Uint8Array>({
+          start: (controller) => {
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({
+                  type: "response.failed",
+                  response: {
+                    status: "failed",
+                    error: { code: "fixture_failure", message: "Fixture failed" },
+                    usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15 },
+                  },
+                })}\n\n`,
+              ),
+            );
+            controller.close();
+          },
+        }),
+      }),
+    },
+  });
+  try {
+    const response = await fetch(`${runtime.origin}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "ai-tidu9-config", input: "fixture", stream: true }),
+    });
+    const events = await response.text();
+    assert.match(events, /event: response\.failed/u);
+    assert.match(events, /"total_tokens":15/u);
+    assert.match(events, /Fixture failed/u);
   } finally {
     await runtime.close();
   }

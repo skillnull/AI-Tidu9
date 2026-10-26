@@ -77,6 +77,8 @@ export interface CursorHeadlessOptions {
   onProcessDelta?: (delta: string) => void;
   /** Receives assistant text deltas. */
   onTextDelta?: (delta: string) => void;
+  /** Receives reported usage before success or failure is validated. */
+  onUsageUpdate?: (usage: CursorHeadlessUsage) => void;
 }
 
 export const runCursorHeadless = async (
@@ -165,9 +167,15 @@ export const runCursorHeadless = async (
           `tool:${readString(event, "call_id") ?? "unknown"}`,
           toolDescription(event),
         );
+        options.onProcessDelta?.("\n\n");
+        activeProcessKey = undefined;
         continue;
       }
       if (type === "assistant") {
+        if (activeProcessKey !== undefined) {
+          options.onProcessDelta?.("\n\n");
+          activeProcessKey = undefined;
+        }
         const delta = assistantText(event);
         if (delta !== "") {
           assistantOutput += delta;
@@ -176,6 +184,18 @@ export const runCursorHeadless = async (
         continue;
       }
       if (type !== "result") continue;
+      const inputTokens = readTokenCount(event.usage, "inputTokens");
+      const outputTokens = readTokenCount(event.usage, "outputTokens");
+      if (inputTokens !== undefined && outputTokens !== undefined) {
+        usage = {
+          inputTokens,
+          outputTokens,
+          totalTokens: inputTokens + outputTokens,
+          cachedInputTokens: readTokenCount(event.usage, "cacheReadTokens") ?? 0,
+          cacheWriteInputTokens: readTokenCount(event.usage, "cacheWriteTokens") ?? 0,
+        };
+        options.onUsageUpdate?.(usage);
+      }
       if (subtype !== "success" || event.is_error === true) {
         throw new TiduError(
           "INTERNAL_ERROR",
@@ -183,25 +203,16 @@ export const runCursorHeadless = async (
         );
       }
       resultText = readString(event, "result");
-      const inputTokens = readTokenCount(event.usage, "inputTokens");
-      const outputTokens = readTokenCount(event.usage, "outputTokens");
-      if (inputTokens === undefined || outputTokens === undefined) {
+      if (usage === undefined) {
         throw new TiduError(
           "INTERNAL_ERROR",
           "Cursor completed without provider-authoritative token usage.",
         );
       }
-      usage = {
-        inputTokens,
-        outputTokens,
-        totalTokens: inputTokens + outputTokens,
-        cachedInputTokens: readTokenCount(event.usage, "cacheReadTokens") ?? 0,
-        cacheWriteInputTokens: readTokenCount(event.usage, "cacheWriteTokens") ?? 0,
-      };
     }
     const exit = await exitPromise;
     if (options.signal?.aborted) {
-      throw new TiduError("INTERNAL_ERROR", "Cursor request cancelled.");
+      throw new DOMException("Cursor request cancelled.", "AbortError");
     }
     if (exit.kind === "error") {
       throw new TiduError("INTERNAL_ERROR", exit.error.message);

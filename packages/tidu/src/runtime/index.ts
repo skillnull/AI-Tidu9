@@ -83,11 +83,20 @@ import {
   resolveDefaultDatabasePath,
   type StorageAdapter,
 } from "../storage/index.js";
+import {
+  createResponseUsageLedger,
+  formatResponseTokenFooter,
+  type ResponseUsageSnapshot,
+} from "./response-usage.js";
 
 export const DEFAULT_RUNTIME_HOST = "127.0.0.1";
 export const DEFAULT_RUNTIME_PORT = 9639;
 
 const CONFIG_CENTER_DIRECTORY = fileURLToPath(new URL("../ui/", import.meta.url));
+const responseUsageLedgers = new WeakMap<
+  StorageAdapter,
+  ReturnType<typeof createResponseUsageLedger>
+>();
 const STATIC_CONTENT_TYPES = Object.freeze<Record<string, string>>({
   ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
@@ -718,9 +727,15 @@ const createAgentChatBody = (
       }),
 });
 
-const resolveAgentFailure = (error: unknown): { code: string; message: string } => ({
+const resolveAgentFailure = (
+  error: unknown,
+  reservedCharacters = 0,
+): { code: string; message: string } => ({
   code: error instanceof AgentExecutionError ? error.code : "agent_task_failed",
-  message: (error instanceof Error ? error.message : "The Agent task failed.").slice(0, 240),
+  message: (error instanceof Error ? error.message : "The Agent task failed.").slice(
+    0,
+    Math.max(0, 240 - reservedCharacters),
+  ),
 });
 
 const createAgentResponsesStream = (
@@ -729,10 +744,17 @@ const createAgentResponsesStream = (
     signal: AbortSignal,
     onProcessDelta: (delta: string) => void,
     onOutputDelta: (delta: string) => void,
+    onOutputItem?: (item: Record<string, unknown>) => void,
   ) => Promise<string>,
   chineseRequest: boolean,
   preserveProcessLifecycle: boolean,
   readUsage: () => AgentTokenUsage | null,
+  usageDisplay?: {
+    /** Reads user-turn totals without changing per-response wire usage. */
+    snapshot: () => ResponseUsageSnapshot;
+    /** Correlates yielded tool requests or releases a finished user turn. */
+    finish: (items: readonly Record<string, unknown>[]) => void;
+  },
 ): ReadableStream<Uint8Array> => {
   const responseId = `resp_${randomUUID()}`;
   const messageId = `${responseId}_message`;
@@ -790,23 +812,27 @@ const createAgentResponsesStream = (
       }, 10_000);
       keepAlive.unref();
       const completedOutputItems = new Map<number, Record<string, unknown>>();
-      let activeProcess: { id: string; outputIndex: number; text: string } | undefined;
+      let activeProcess:
+        | { id: string; outputIndex: number; summaryStarted: boolean; text: string }
+        | undefined;
       let nextOutputIndex = 0;
       let processCount = 0;
       let messageStarted = false;
       let messageOutputIndex = 0;
       let outputText = "";
+      let toolCallCount = 0;
       const startProcessLifecycle = (): void => {
         if (activeProcess !== undefined) return;
         const stepIndex = processCount;
         const processItemId =
           stepIndex === 0
-            ? `${responseId}_commentary`
-            : `${responseId}_commentary_${String(stepIndex + 1)}`;
+            ? `${responseId}_reasoning`
+            : `${responseId}_reasoning_${String(stepIndex + 1)}`;
         processCount += 1;
         activeProcess = {
           id: processItemId,
           outputIndex: nextOutputIndex,
+          summaryStarted: false,
           text: "",
         };
         nextOutputIndex += 1;
@@ -814,44 +840,35 @@ const createAgentResponsesStream = (
           output_index: activeProcess.outputIndex,
           item: {
             id: processItemId,
-            type: "message",
-            status: "in_progress",
-            role: "assistant",
-            phase: "commentary",
-            content: [],
+            type: "reasoning",
+            summary: [],
+            encrypted_content: null,
           },
-        });
-        write("response.content_part.added", {
-          item_id: processItemId,
-          output_index: activeProcess.outputIndex,
-          content_index: 0,
-          part: { type: "output_text", text: "", annotations: [] },
         });
       };
       const finishProcessLifecycle = (): void => {
         const process = activeProcess;
         if (process === undefined) return;
         activeProcess = undefined;
-        if (process.text === "") return;
-        write("response.output_text.done", {
-          item_id: process.id,
-          output_index: process.outputIndex,
-          content_index: 0,
-          text: process.text,
-        });
-        write("response.content_part.done", {
-          item_id: process.id,
-          output_index: process.outputIndex,
-          content_index: 0,
-          part: { type: "output_text", text: process.text, annotations: [] },
-        });
+        if (process.summaryStarted) {
+          write("response.reasoning_summary_text.done", {
+            item_id: process.id,
+            output_index: process.outputIndex,
+            summary_index: 0,
+            text: process.text,
+          });
+          write("response.reasoning_summary_part.done", {
+            item_id: process.id,
+            output_index: process.outputIndex,
+            summary_index: 0,
+            part: { type: "summary_text", text: process.text },
+          });
+        }
         const completedItem = {
           id: process.id,
-          type: "message",
-          status: "completed",
-          role: "assistant",
-          phase: "commentary",
-          content: [{ type: "output_text", text: process.text, annotations: [] }],
+          type: "reasoning",
+          summary: process.summaryStarted ? [{ type: "summary_text", text: process.text }] : [],
+          encrypted_content: null,
         };
         completedOutputItems.set(process.outputIndex, completedItem);
         write("response.output_item.done", {
@@ -893,11 +910,20 @@ const createAgentResponsesStream = (
           }
           startProcessLifecycle();
           if (activeProcess === undefined) continue;
+          if (!activeProcess.summaryStarted) {
+            activeProcess.summaryStarted = true;
+            write("response.reasoning_summary_part.added", {
+              item_id: activeProcess.id,
+              output_index: activeProcess.outputIndex,
+              summary_index: 0,
+              part: { type: "summary_text", text: "" },
+            });
+          }
           activeProcess.text += chunk;
-          write("response.output_text.delta", {
+          write("response.reasoning_summary_text.delta", {
             item_id: activeProcess.id,
             output_index: activeProcess.outputIndex,
-            content_index: 0,
+            summary_index: 0,
             delta: chunk,
           });
         }
@@ -913,44 +939,69 @@ const createAgentResponsesStream = (
           delta,
         });
       };
-      if (preserveProcessLifecycle) {
-        emitProcessDelta(chineseRequest ? "正在处理请求…" : "Working on the request…");
+      const emitOutputItem = (item: Record<string, unknown>): void => {
+        if (closed) return;
         finishProcessLifecycle();
+        const outputIndex = nextOutputIndex;
+        nextOutputIndex += 1;
+        if (
+          item.type === "function_call" ||
+          item.type === "custom_tool_call" ||
+          item.type === "tool_search_call"
+        )
+          toolCallCount += 1;
+        completedOutputItems.set(outputIndex, item);
+        write("response.output_item.added", { output_index: outputIndex, item });
+        write("response.output_item.done", { output_index: outputIndex, item });
+      };
+      if (preserveProcessLifecycle) {
+        startProcessLifecycle();
       }
-      void run(abortController.signal, emitProcessDelta, emitOutputDelta)
+      void run(abortController.signal, emitProcessDelta, emitOutputDelta, emitOutputItem)
         .then((text) => {
-          if (outputText === "") {
+          if (outputText === "" && toolCallCount === 0) {
             emitOutputDelta(text);
-          } else if (text.startsWith(outputText) && text.length > outputText.length) {
+          } else if (
+            outputText !== "" &&
+            text.startsWith(outputText) &&
+            text.length > outputText.length
+          ) {
             emitOutputDelta(text.slice(outputText.length));
           }
           finishProcessLifecycle();
-          startMessage();
-          write("response.output_text.done", {
-            item_id: messageId,
-            output_index: messageOutputIndex,
-            content_index: 0,
-            text: outputText,
-          });
-          write("response.content_part.done", {
-            item_id: messageId,
-            output_index: messageOutputIndex,
-            content_index: 0,
-            part: { type: "output_text", text: outputText, annotations: [] },
-          });
-          const completedMessage = {
-            id: messageId,
-            type: "message",
-            status: "completed",
-            role: "assistant",
-            phase: "final_answer",
-            content: [{ type: "output_text", text: outputText, annotations: [] }],
-          };
-          completedOutputItems.set(messageOutputIndex, completedMessage);
-          write("response.output_item.done", {
-            output_index: messageOutputIndex,
-            item: completedMessage,
-          });
+          if (toolCallCount === 0 && usageDisplay !== undefined) {
+            const footer = formatResponseTokenFooter(usageDisplay.snapshot(), chineseRequest);
+            if (footer !== "") emitOutputDelta(`${outputText === "" ? "" : "\n\n"}${footer}`);
+          }
+          if (toolCallCount === 0 || messageStarted) {
+            startMessage();
+            write("response.output_text.done", {
+              item_id: messageId,
+              output_index: messageOutputIndex,
+              content_index: 0,
+              text: outputText,
+            });
+            write("response.content_part.done", {
+              item_id: messageId,
+              output_index: messageOutputIndex,
+              content_index: 0,
+              part: { type: "output_text", text: outputText, annotations: [] },
+            });
+            const completedMessage = {
+              id: messageId,
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              phase: "final_answer",
+              content: [{ type: "output_text", text: outputText, annotations: [] }],
+            };
+            completedOutputItems.set(messageOutputIndex, completedMessage);
+            write("response.output_item.done", {
+              output_index: messageOutputIndex,
+              item: completedMessage,
+            });
+          }
+          usageDisplay?.finish([...completedOutputItems.values()]);
           write("response.completed", {
             response: createAgentResponsesBody(
               model,
@@ -972,6 +1023,10 @@ const createAgentResponsesStream = (
           finishProcessLifecycle();
           const failureText = `${chineseRequest ? "请求失败" : "Request failed"}: ${failure.message}`;
           emitOutputDelta(`${outputText === "" ? "" : "\n\n"}${failureText}`);
+          if (usageDisplay !== undefined) {
+            const footer = formatResponseTokenFooter(usageDisplay.snapshot(), chineseRequest);
+            if (footer !== "") emitOutputDelta(`\n\n${footer}`);
+          }
           if (messageStarted) {
             write("response.output_text.done", {
               item_id: messageId,
@@ -999,13 +1054,14 @@ const createAgentResponsesStream = (
               item: incompleteMessage,
             });
           }
+          usageDisplay?.finish([]);
           write("response.failed", {
             response: {
               id: responseId,
               object: "response",
               created_at: createdAt,
               status: "failed",
-              completed_at: null,
+              completed_at: Math.floor(Date.now() / 1_000),
               incomplete_details: null,
               model,
               output: [...completedOutputItems.entries()]
@@ -1122,8 +1178,20 @@ const runAgentResponsesTask = async (
   onProcessDelta?: (delta: string) => void,
   onOutputDelta?: (delta: string) => void,
   onExecutionReceipt?: (receipt: ProviderExecutionReceipt) => void,
+  onOutputItem?: (item: Record<string, unknown>) => void,
 ): Promise<string> => {
-  const objective = createAgentObjective(body);
+  const model = typeof body.model === "string" ? body.model : "ai-tidu9-config";
+  const requiredCapabilities = inferModelRequestCapabilities({
+    protocol,
+    body,
+    virtualModelId: model,
+    routing: { host: originHost },
+  });
+  const textObjective = createAgentObjective(body);
+  const objective =
+    textObjective !== "" || !requiredCapabilities.includes("vision")
+      ? textObjective
+      : "Analyze the attached image input and provide a direct response.";
   if (objective === "") throw new Error("The Agent request does not contain a usable goal.");
   const reasoning = isRecord(body.reasoning) ? body.reasoning.effort : undefined;
   const requestedReasoningEffort = reasoning ?? body.reasoning_effort;
@@ -1142,13 +1210,6 @@ const runAgentResponsesTask = async (
     allowedReasoningEfforts.has(requestedReasoningEffort as AgentReasoningEffort)
       ? (requestedReasoningEffort as AgentReasoningEffort)
       : undefined;
-  const model = typeof body.model === "string" ? body.model : "ai-tidu9-config";
-  const requiredCapabilities = inferModelRequestCapabilities({
-    protocol,
-    body,
-    virtualModelId: model,
-    routing: { host: originHost },
-  });
   const created = await agentKernel.createTask({
     goal: {
       objective,
@@ -1166,16 +1227,10 @@ const runAgentResponsesTask = async (
       ...(onOutputDelta === undefined ? {} : { onOutputDelta }),
       ...(onProcessDelta === undefined ? {} : { onProcessDelta }),
       ...(onExecutionReceipt === undefined ? {} : { onExecutionReceipt }),
+      ...(onOutputItem === undefined ? {} : { onOutputItem }),
     },
   });
-  const cancel = (): void => {
-    void agentKernel.cancelTask(created.task.taskId).catch(() => undefined);
-  };
-  if (signal?.aborted) cancel();
-  signal?.addEventListener("abort", cancel, { once: true });
-  const completed = await agentKernel.runTask(created.task.taskId).finally(() => {
-    signal?.removeEventListener("abort", cancel);
-  });
+  const completed = await agentKernel.runTask(created.task.taskId, signal);
   if (completed.task.status !== "completed" || completed.result?.accepted !== true) {
     const failureEvent = [...completed.events]
       .reverse()
@@ -1331,10 +1386,24 @@ const handleOpenAiInference = async (
     }
     const model = typeof requestBody.model === "string" ? requestBody.model : "ai-tidu9-config";
     const usageCollector = createAgentUsageCollector();
+    let usageDisplay: Parameters<typeof createAgentResponsesStream>[5];
+    if (protocol === "responses" && originHost === "codex") {
+      let ledger = responseUsageLedgers.get(storage);
+      if (ledger === undefined) {
+        ledger = createResponseUsageLedger();
+        responseUsageLedgers.set(storage, ledger);
+      }
+      const usageTurn = ledger.begin(requestBody.input);
+      usageDisplay = {
+        snapshot: () => usageTurn.snapshot(usageCollector.read()),
+        finish: (items) => usageTurn.finish(items, usageCollector.read()),
+      };
+    }
     const run = async (
       signal?: AbortSignal,
       onProcessDelta?: (delta: string) => void,
       onOutputDelta?: (delta: string) => void,
+      onOutputItem?: (item: Record<string, unknown>) => void,
     ): Promise<string> =>
       runAgentResponsesTask(
         agentKernel,
@@ -1345,6 +1414,7 @@ const handleOpenAiInference = async (
         onProcessDelta,
         onOutputDelta,
         usageCollector.record,
+        onOutputItem,
       );
     try {
       if (requestBody.stream === true) {
@@ -1356,33 +1426,68 @@ const handleOpenAiInference = async (
                 /\p{Script=Han}/u.test(createAgentObjective(requestBody)),
                 originHost === "codex",
                 usageCollector.read,
+                usageDisplay,
               )
             : createAgentChatStream(model, run, usageCollector.read);
         await sendOpenAiStream(response, 200, stream, requestId);
       } else {
-        const text = await run();
+        const outputItems: Record<string, unknown>[] = [];
+        const text = await run(undefined, undefined, undefined, (item) => {
+          outputItems.push(item);
+        });
+        const requestedTools = outputItems.some(
+          (item) =>
+            item.type === "function_call" ||
+            item.type === "custom_tool_call" ||
+            item.type === "tool_search_call",
+        );
+        const footer =
+          !requestedTools && usageDisplay !== undefined
+            ? formatResponseTokenFooter(
+                usageDisplay.snapshot(),
+                /\p{Script=Han}/u.test(createAgentObjective(requestBody)),
+              )
+            : "";
+        const finalText = footer === "" ? text : `${text}\n\n${footer}`;
+        const responseBody = createAgentResponsesBody(
+          model,
+          finalText,
+          undefined,
+          requestedTools ? outputItems : undefined,
+          undefined,
+          usageCollector.read(),
+        );
+        if (!requestedTools && outputItems.length > 0)
+          responseBody.output = [
+            ...outputItems,
+            ...(responseBody.output as Record<string, unknown>[]),
+          ];
+        usageDisplay?.finish(outputItems);
         sendOpenAiJson(
           response,
           200,
           protocol === "responses"
-            ? createAgentResponsesBody(
-                model,
-                text,
-                undefined,
-                undefined,
-                undefined,
-                usageCollector.read(),
-              )
+            ? responseBody
             : createAgentChatBody(model, text, undefined, usageCollector.read()),
           requestId,
         );
       }
     } catch (error) {
-      const failure = resolveAgentFailure(error);
+      const footer =
+        usageDisplay === undefined
+          ? undefined
+          : formatResponseTokenFooter(
+              usageDisplay.snapshot(),
+              /\p{Script=Han}/u.test(createAgentObjective(requestBody)),
+            ) || undefined;
+      const failure = resolveAgentFailure(error, footer === undefined ? 0 : footer.length + 2);
+      const failureMessage =
+        footer === undefined ? failure.message : `${failure.message}\n\n${footer}`;
+      usageDisplay?.finish([]);
       sendOpenAiJson(
         response,
         502,
-        createOpenAiError(failure.code, failure.message, "server_error"),
+        createOpenAiError(failure.code, failureMessage, "server_error"),
         requestId,
       );
     }

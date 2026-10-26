@@ -3,9 +3,13 @@ import test from "node:test";
 import { MODEL_ROUTING_CAPABILITIES } from "../../src/config/index.js";
 
 import {
+  capabilityCompletionModelOutcomeLabel,
+  capabilityCompletionOutcomeLabel,
+  capabilityCompletionRecordOutcomeLabel,
   capabilityIdsForPicker,
   catalogNeedsConfiguredSpecialistRecovery,
   defaultModelCapabilities,
+  normalizeCapabilityCompletionCancellation,
   resolveWizardAdvance,
   resolveWizardEntryState,
   selectableModelCapabilityIds,
@@ -15,6 +19,92 @@ import {
   updateSpecialistModelSelection,
 } from "./configuration-sections.js";
 import { catalogModelName, modelDisplayName } from "./model-display.js";
+
+test("distinguishes cancellation from failure in both usage-history languages", () => {
+  assert.equal(capabilityCompletionOutcomeLabel("cancelled", false), "已取消");
+  assert.equal(capabilityCompletionOutcomeLabel("cancelled", true), "Cancelled");
+  assert.equal(capabilityCompletionOutcomeLabel("failed", false), "失败");
+  assert.equal(capabilityCompletionOutcomeLabel("not-run", true), "Not called");
+});
+
+test("shows tool continuations as waiting instead of permanently not called", () => {
+  const waitingResult = {
+    modelId: "secondary",
+    host: "cursor" as const,
+    model: "fixture",
+    executedModel: null,
+    role: "secondary" as const,
+    capabilities: [],
+    outcome: "not-run" as const,
+    skipReason: "awaiting-tool-results" as const,
+    statusCode: null,
+    durationMilliseconds: null,
+    message: "Waiting for the client to execute a tool and return its result.",
+  };
+  assert.equal(capabilityCompletionModelOutcomeLabel(waitingResult, false), "等待工具结果");
+  assert.equal(
+    capabilityCompletionModelOutcomeLabel(waitingResult, true),
+    "Waiting for tool results",
+  );
+  assert.equal(
+    capabilityCompletionRecordOutcomeLabel(
+      { outcome: "succeeded", mainResult: waitingResult, secondaryResults: [] },
+      false,
+    ),
+    "等待工具结果",
+  );
+});
+
+test("corrects older cancellation records while retaining genuine model failures", () => {
+  const modelResult = {
+    modelId: "main",
+    host: "codex" as const,
+    model: "fixture",
+    executedModel: null,
+    role: "main" as const,
+    capabilities: [],
+    outcome: "failed" as const,
+    statusCode: null,
+    durationMilliseconds: 150_974,
+    message: "Codex turn cancelled.",
+  };
+  const record = {
+    host: "codex" as const,
+    occurredAt: "2026-01-01T00:00:00Z",
+    role: "worker",
+    complemented: true,
+    outcome: "failed" as const,
+    mainModelId: "main",
+    specialistModelIds: ["secondary"],
+    requiredCapabilities: ["text"],
+    missingCapabilities: [],
+    reason: "capability-gap" as const,
+    mainResult: modelResult,
+    secondaryResults: [
+      {
+        ...modelResult,
+        modelId: "secondary",
+        outcome: "not-run" as const,
+        skipReason: "blocked-by-failure" as const,
+        message: "Selected but not called",
+      },
+    ],
+    tokenUsage: null,
+    modelTokenUsage: [],
+  };
+  const normalized = normalizeCapabilityCompletionCancellation(record);
+  assert.equal(normalized.outcome, "cancelled");
+  assert.equal(normalized.mainResult.outcome, "cancelled");
+  assert.equal(normalized.mainResult.durationMilliseconds, 150_974);
+  assert.equal(normalized.secondaryResults[0]?.skipReason, "blocked-by-cancellation");
+  assert.equal(record.mainResult.outcome, "failed");
+  const failed = normalizeCapabilityCompletionCancellation({
+    ...record,
+    secondaryResults: [{ ...modelResult, modelId: "secondary", message: "Upstream failed." }],
+  });
+  assert.equal(failed.outcome, "failed");
+  assert.equal(failed.secondaryResults[0]?.outcome, "failed");
+});
 
 test("shows the provider model name instead of its parameterized execution identifier", () => {
   const models = [

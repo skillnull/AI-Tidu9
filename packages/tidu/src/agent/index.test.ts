@@ -187,6 +187,28 @@ test("removes an active task after cancellation reaches its terminal result", as
   assert.deepEqual(await kernel.listTasks(), []);
 });
 
+test("cancels a caller-aborted task before the worker starts", async () => {
+  const kernel = createAgentKernel({
+    store: createInMemoryTaskCapsuleStore(),
+    planner: createPlanner({
+      revision: 1,
+      steps: [{ id: "deliver", title: "Deliver", kind: "reason" }],
+    }),
+    worker: {
+      execute: async () => {
+        throw new Error("Cancelled work must not start");
+      },
+    },
+  });
+  const created = await kernel.createTask({ goal: "Cancel before execution" });
+  const controller = new AbortController();
+  const running = kernel.runTask(created.task.taskId, controller.signal);
+  controller.abort();
+  const cancelled = await running;
+  assert.equal(cancelled.task.status, "cancelled");
+  assert.equal(await kernel.getTask(created.task.taskId), undefined);
+});
+
 test("forwards response capabilities and reasoning strength in one model call", async () => {
   const requests: ProviderExecutionRequest[] = [];
   const deliveredText = "x".repeat(4_096);

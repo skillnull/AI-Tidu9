@@ -20,7 +20,8 @@
     "./storage/migrations/*.sql": "./storage/migrations/*.sql"
   },
   "bin": {
-    "tidu": "dist/cli/launcher.js"
+    "tidu": "dist/cli/launcher.js",
+    "tidu-codex": "dist/connectors/codex-client-cli.js"
   },
   "files": [
     "connectors",
@@ -43,7 +44,7 @@
     "build": "sh -c '. \"$(git rev-parse --show-toplevel)/scripts/use-project-node.sh\" && node -e \"require(\\\"node:fs\\\").rmSync(\\\"dist\\\", { recursive: true, force: true })\" && tsc -p tsconfig.build.json && tsc -p tsconfig.json && vite build'",
     "prepack": "sh -c '. \"$(git rev-parse --show-toplevel)/scripts/use-project-node.sh\" && npm run build && node ../../scripts/npm-package-assets.mjs prepare'",
     "postpack": "sh -c '. \"$(git rev-parse --show-toplevel)/scripts/use-project-node.sh\" && node ../../scripts/npm-package-assets.mjs clean'",
-    "test": "sh -c '. \"$(git rev-parse --show-toplevel)/scripts/use-project-node.sh\" && npm run build && node --import tsx --test ui/src/configuration-sections.test.tsx && node --test --test-reporter=dot dist/accounts/chatgpt.test.js dist/accounts/codex-host.test.js dist/accounts/cursor-host.test.js dist/accounts/index.test.js dist/agent/index.test.js dist/capabilities/index.test.js dist/channels/index.test.js dist/ecosystem/index.test.js dist/index.test.js dist/cli/index.test.js dist/clients/configuration.test.js dist/clients/index.test.js dist/config-center/index.test.js dist/config/index.test.js dist/connectors/*.test.js dist/core/index.test.js dist/enterprise/index.test.js dist/lifecycle/index.test.js dist/openai/index.test.js dist/personal/index.test.js dist/protocol/index.test.js dist/providers/codex-history.test.js dist/providers/index.test.js dist/routing/index.test.js dist/runtime/index.test.js dist/scaling/index.test.js dist/security/index.test.js dist/storage/index.test.js dist/usage/index.test.js'"
+    "test": "sh -c '. \"$(git rev-parse --show-toplevel)/scripts/use-project-node.sh\" && npm run build && node --import tsx --test ui/src/configuration-sections.test.tsx && node --test --test-reporter=dot dist/accounts/chatgpt.test.js dist/accounts/codex-host.test.js dist/accounts/cursor-host.test.js dist/accounts/index.test.js dist/agent/index.test.js dist/capabilities/index.test.js dist/channels/index.test.js dist/ecosystem/index.test.js dist/index.test.js dist/cli/index.test.js dist/clients/codex-desktop.test.js dist/clients/codex-recovery.test.js dist/clients/configuration.test.js dist/clients/index.test.js dist/config-center/index.test.js dist/config/index.test.js dist/connectors/*.test.js dist/core/index.test.js dist/enterprise/index.test.js dist/lifecycle/index.test.js dist/openai/index.test.js dist/personal/index.test.js dist/protocol/index.test.js dist/providers/caller-tools.test.js dist/providers/codex-history.test.js dist/providers/index.test.js dist/routing/index.test.js dist/runtime/index.test.js dist/runtime/response-usage.test.js dist/scaling/index.test.js dist/security/index.test.js dist/storage/index.test.js dist/usage/index.test.js'"
   },
   "engines": {
     "node": ">=22.14.0"

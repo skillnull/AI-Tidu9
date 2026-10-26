@@ -190,3 +190,30 @@ test("accepts Responses custom tools used by coding-agent clients", () => {
     true,
   );
 });
+
+test("accepts Codex compaction requests with an empty tool inventory", () => {
+  assert.equal(
+    validateResponsesRequest(
+      {
+        model: "ai-tidu9-config",
+        input: [{ role: "user", content: "Compact the current context." }],
+        tools: [],
+        tool_choice: "auto",
+      },
+      "ai-tidu9-config",
+    ).valid,
+    true,
+  );
+  assert.equal(
+    validateResponsesRequest(
+      {
+        model: "ai-tidu9-config",
+        input: "Compact the current context.",
+        tools: [],
+        tool_choice: "required",
+      },
+      "ai-tidu9-config",
+    ).error?.error.code,
+    "invalid_tool_choice",
+  );
+});
