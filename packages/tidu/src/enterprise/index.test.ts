@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -24,7 +24,12 @@ const createPilotState = (): EnterpriseState => ({
     { id: "tenant-acme", name: "Acme", type: "tenant", parentId: null },
     { id: "org-ai", name: "AI", type: "organization", parentId: "tenant-acme" },
     { id: "team-platform", name: "Platform", type: "team", parentId: "org-ai" },
-    { id: "user-alice", name: "Alice", type: "user", parentId: "team-platform" },
+    {
+      id: "user-alice",
+      name: "Alice",
+      type: "user",
+      parentId: "team-platform",
+    },
   ],
   identities: [
     {
@@ -157,7 +162,12 @@ test("reserves, settles, releases, and shares hierarchical quota atomically", as
   await controlPlane.settleQuota("request-1", 80);
   await controlPlane.releaseQuota("request-2");
   await assert.rejects(
-    controlPlane.shareAllocation("allocation-platform", "allocation-other", 50),
+    controlPlane.shareAllocation(
+      "allocation-platform",
+      "allocation-other",
+      50,
+      new Date("2026-10-30T23:59:59.000Z"),
+    ),
     /not active/u,
   );
   await controlPlane.shareAllocation(
@@ -185,14 +195,74 @@ test("shows an administrator key once and revokes sessions on rotation", async (
   const persistedState = await controlPlane.snapshot();
   assert.equal(JSON.stringify(persistedState).includes(firstKey.key), false);
   const session = await controlPlane.authenticateAdministrator(firstKey.key);
-  assert.equal(controlPlane.validateAdministratorSession(session.id), true);
+  assert.equal(await controlPlane.validateAdministratorSession(session.id), true);
   await controlPlane.rotateAdministratorKey();
-  assert.equal(controlPlane.validateAdministratorSession(session.id), false);
+  assert.equal(await controlPlane.validateAdministratorSession(session.id), false);
   await assert.rejects(controlPlane.authenticateAdministrator(firstKey.key), /failed/u);
   await controlPlane.recoverAdministratorKey(true, "Approved host recovery");
   assert.equal(
     (await controlPlane.snapshot()).securityAudit.at(-1)?.action,
     "administrator-key-host-recovery",
+  );
+});
+
+test("validates administrator sessions across stateless control-plane instances", async () => {
+  const repository = createInMemoryEnterpriseStateRepository(createPilotState());
+  const firstGateway = createEnterpriseControlPlane(repository);
+  const secondGateway = createEnterpriseControlPlane(repository);
+  const administratorKey = await firstGateway.initializeAdministratorKey();
+  const session = await firstGateway.authenticateAdministrator(administratorKey.key);
+
+  assert.equal(await secondGateway.validateAdministratorSession(session.id), true);
+  await secondGateway.revokeAdministratorSessions();
+  assert.equal(await firstGateway.validateAdministratorSession(session.id), false);
+});
+
+test("rejects invalid quota allocations and reservation aggregates before publishing", async () => {
+  const controlPlane = createEnterpriseControlPlane(
+    createInMemoryEnterpriseStateRepository(createPilotState()),
+  );
+  const pilotState = createPilotState();
+  const invalidAllocation = {
+    ...pilotState,
+    quotaAllocations: [
+      ...pilotState.quotaAllocations,
+      {
+        id: "allocation-invalid",
+        poolId: "pool-missing",
+        scopeId: "scope-missing",
+        limit: -1,
+        reserved: 0,
+        settled: 0,
+      },
+    ],
+  };
+  const {
+    contractVersion: _contractVersion,
+    revision: _revision,
+    ...invalidUpdate
+  } = invalidAllocation;
+  await assert.rejects(controlPlane.publish(invalidUpdate), /allocation-invalid is invalid/u);
+
+  const inconsistentReservations = {
+    ...pilotState,
+    quotaAllocations: pilotState.quotaAllocations.map((allocation, index) =>
+      index === 0 ? { ...allocation, reserved: 10 } : allocation,
+    ),
+    quotaPools: pilotState.quotaPools.map((pool) => ({
+      ...pool,
+      remaining: pool.remaining - 10,
+      reserved: 10,
+    })),
+  };
+  const {
+    contractVersion: _reservationContractVersion,
+    revision: _reservationRevision,
+    ...inconsistentUpdate
+  } = inconsistentReservations;
+  await assert.rejects(
+    controlPlane.publish(inconsistentUpdate),
+    /does not match its reservations/u,
   );
 });
 
@@ -217,6 +287,25 @@ test("isolates bounded private artifacts by scope", async () => {
     assert.equal(await store.delete("team-platform", "result.bin"), true);
   } finally {
     await rm(rootDirectory, { recursive: true, force: true });
+  }
+});
+
+test("rejects linked private-artifact scopes without touching the linked directory", async () => {
+  const rootDirectory = await mkdtemp(join(tmpdir(), "tidu-enterprise-artifact-root-"));
+  const outsideDirectory = await mkdtemp(join(tmpdir(), "tidu-enterprise-artifact-outside-"));
+  try {
+    await mkdir(join(rootDirectory, "private"));
+    await symlink(outsideDirectory, join(rootDirectory, "private", "team-platform"), "dir");
+    const store = createPrivateFileArtifactStore(join(rootDirectory, "private"));
+
+    await assert.rejects(
+      store.put("team-platform", "result.bin", new Uint8Array([1, 2, 3])),
+      /real directory/u,
+    );
+    await assert.rejects(access(join(outsideDirectory, "result.bin")), /ENOENT/u);
+  } finally {
+    await rm(rootDirectory, { recursive: true, force: true });
+    await rm(outsideDirectory, { recursive: true, force: true });
   }
 });
 

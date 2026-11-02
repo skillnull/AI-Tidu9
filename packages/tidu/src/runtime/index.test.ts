@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { request as requestHttp } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -111,6 +112,90 @@ test("exposes bounded Agent task creation and control through the local API", as
       `${runtime.origin}/api/tasks/${cancellable.task.taskId}`,
     );
     assert.equal(cancelledTaskResponse.status, 404);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("rejects non-loopback browser origins on a loopback runtime", async () => {
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    port: 0,
+  });
+  try {
+    const response = await new Promise<{ body: unknown; status: number }>((resolve, reject) => {
+      const outgoing = requestHttp(
+        `${runtime.origin}/api/enterprise/admin/initialize`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            host: "untrusted.example",
+            origin: "http://untrusted.example",
+          },
+        },
+        (incoming) => {
+          const chunks: Buffer[] = [];
+          incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
+          incoming.once("end", () => {
+            resolve({
+              body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown,
+              status: incoming.statusCode ?? 0,
+            });
+          });
+        },
+      );
+      outgoing.once("error", reject);
+      outgoing.end("{}");
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(response.body, {
+      error: "CONFIGURATION_INVALID",
+      message: "Local configuration writes require the runtime loopback origin.",
+    });
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("accepts matching external origins for an enterprise runtime behind its gateway", async () => {
+  const enterpriseControlPlane = createEnterpriseControlPlane(
+    createInMemoryEnterpriseStateRepository(),
+  );
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    deployment: "enterprise",
+    enterpriseControlPlane,
+    port: 0,
+  });
+  try {
+    const response = await new Promise<{ body: unknown; status: number }>((resolve, reject) => {
+      const outgoing = requestHttp(
+        `${runtime.origin}/api/enterprise/admin/initialize`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            host: "gateway.example",
+            origin: "https://gateway.example",
+          },
+        },
+        (incoming) => {
+          const chunks: Buffer[] = [];
+          incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
+          incoming.once("end", () => {
+            resolve({
+              body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown,
+              status: incoming.statusCode ?? 0,
+            });
+          });
+        },
+      );
+      outgoing.once("error", reject);
+      outgoing.end("{}");
+    });
+    assert.equal(response.status, 201);
+    assert.equal(typeof (response.body as { key?: unknown }).key, "string");
   } finally {
     await runtime.close();
   }
@@ -543,10 +628,10 @@ test("configures the complete Codex dual-channel entry from the local API", asyn
       body: JSON.stringify({ mode: "official" }),
     });
     assert.equal(officialModeResponse.status, 200);
-    assert.equal(
-      readFileSync(join(codexHomeDirectory, "config.toml"), "utf8"),
-      'model = "official-test"\n',
-    );
+    const officialConfiguration = readFileSync(join(codexHomeDirectory, "config.toml"), "utf8");
+    assert.match(officialConfiguration, /^model = "official-test"/u);
+    assert.match(officialConfiguration, /\[model_providers\.ai_tidu9\]/u);
+    assert.doesNotMatch(officialConfiguration, /AI-Tidu9 managed default:start/u);
     providerFailure = new Error("official session expired");
     const failedSwitchResponse = await fetch(`${runtime.origin}/api/clients/codex/configuration`, {
       method: "POST",
@@ -567,10 +652,10 @@ test("configures the complete Codex dual-channel entry from the local API", asyn
       failedSwitch.nextSteps.some((step) => step.includes("codex login status")),
       true,
     );
-    assert.equal(
-      readFileSync(join(codexHomeDirectory, "config.toml"), "utf8"),
-      'model = "official-test"\n',
-    );
+    const retainedConfiguration = readFileSync(join(codexHomeDirectory, "config.toml"), "utf8");
+    assert.match(retainedConfiguration, /^model = "official-test"/u);
+    assert.match(retainedConfiguration, /\[model_providers\.ai_tidu9\]/u);
+    assert.doesNotMatch(retainedConfiguration, /AI-Tidu9 managed default:start/u);
   } finally {
     await runtime.close();
     if (originalEnvironment.codexHome === undefined) {
@@ -1301,8 +1386,8 @@ test("fails the public stream when Agent execution fails without hiding it behin
     assert.doesNotMatch(events, /fallback OK/u);
     assert.doesNotMatch(events, /event: response\.completed/u);
     assert.doesNotMatch(events, /reasoning_summary/u);
-    assert.match(events, /event: response\.output_text\.delta/u);
-    assert.match(events, /Request failed: Agent orchestration failed before delivery\./u);
+    assert.doesNotMatch(events, /event: response\.output_text\.delta/u);
+    assert.doesNotMatch(events, /Request failed:/u);
     assert.match(events, /event: response\.failed/u);
     assert.match(events, /Agent orchestration failed before delivery/u);
     assert.match(events, /data: \[DONE\]/u);
@@ -1311,7 +1396,7 @@ test("fails the public stream when Agent execution fails without hiding it behin
   }
 });
 
-test("Codex success and failure always include a token footer for streamed and JSON responses", async () => {
+test("Codex success shows host usage while failures stay concise", async () => {
   for (const failed of [false, true]) {
     for (const reported of [false, true]) {
       const provider: ModelProvider = {
@@ -1330,7 +1415,13 @@ test("Codex success and failure always include a token footer for streamed and J
                   ],
                 }),
             ...(reported
-              ? { usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15 } }
+              ? {
+                  usage: {
+                    input_tokens: 12,
+                    output_tokens: 3,
+                    total_tokens: 15,
+                  },
+                }
               : {}),
           };
           request.onExecutionReceipt?.({
@@ -1341,7 +1432,11 @@ test("Codex success and failure always include a token footer for streamed and J
             usage: reported ? { inputTokens: 12, outputTokens: 3, totalTokens: 15 } : null,
           });
           if (request.body.stream !== true)
-            return { kind: "json", statusCode: failed ? 502 : 200, body: response };
+            return {
+              kind: "json",
+              statusCode: failed ? 502 : 200,
+              body: response,
+            };
           return {
             kind: "stream",
             statusCode: 200,
@@ -1369,11 +1464,27 @@ test("Codex success and failure always include a token footer for streamed and J
           const response = await fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ model: "ai-tidu9-config", input: "检查结果", stream }),
+            body: JSON.stringify({
+              model: "ai-tidu9-config",
+              input: "检查结果",
+              stream,
+            }),
           });
           const body = await response.text();
           assert.equal(response.status, failed && !stream ? 502 : 200, body);
-          assert.match(body, reported ? /Token：输入 12 · 输出 3 · 合计 15/u : /Token：未获取到/u);
+          if (failed) {
+            assert.match(body, /Codex：Fixture failed/u);
+            assert.doesNotMatch(body, /Token：|未获取到/u);
+          } else {
+            assert.match(
+              body,
+              reported ? /Token：输入 12 · 输出 3 · 合计 15/u : /Token：未获取到/u,
+            );
+            assert.match(
+              body,
+              reported ? /Codex：输入 12 · 输出 3 · 合计 15/u : /Codex：未获取到/u,
+            );
+          }
           if (stream)
             assert.match(body, failed ? /event: response.failed/u : /event: response.completed/u);
         }
@@ -1400,7 +1511,12 @@ test("hides confirmed zero token consumption in streamed and JSON Codex success 
           kind: "json",
           statusCode: failed ? 502 : 200,
           body: failed
-            ? { error: { code: "zero_fixture", message: "Zero fixture failure" } }
+            ? {
+                error: {
+                  code: "zero_fixture",
+                  message: "Zero fixture failure",
+                },
+              }
             : {
                 output_text: "Fixture answer",
                 usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
@@ -1419,7 +1535,11 @@ test("hides confirmed zero token consumption in streamed and JSON Codex success 
         const response = await fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ model: "ai-tidu9-config", input: "检查结果", stream }),
+          body: JSON.stringify({
+            model: "ai-tidu9-config",
+            input: "检查结果",
+            stream,
+          }),
         });
         assert.equal(response.status, failed && !stream ? 502 : 200);
         assert.doesNotMatch(await response.text(), /Tokens?[:：]|未获取到|待确认|待补齐/u);
@@ -1717,6 +1837,94 @@ test("reports Agent stream failures as terminal events instead of disconnecting"
   }
 });
 
+test("forwards public progress without provider-private encrypted state", async () => {
+  const provider: ModelProvider = {
+    descriptor: { type: "codex-host", model: "fixture" },
+    execute: async () => {
+      const reasoningItem = {
+        id: "rs_fixture_private",
+        type: "reasoning",
+        summary: [{ type: "summary_text", text: "Checked the visible process." }],
+        content: [{ type: "reasoning_text", text: "private reasoning text" }],
+        encrypted_content: "provider-private-ciphertext",
+        internal_chat_message_metadata_passthrough: { private: true },
+      };
+      const messageItem = {
+        id: "msg_fixture_answer",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        phase: "final_answer",
+        content: [{ type: "output_text", text: "Visible answer" }],
+      };
+      const encoder = new TextEncoder();
+      return {
+        kind: "stream" as const,
+        statusCode: 200,
+        stream: new ReadableStream<Uint8Array>({
+          start(controller) {
+            const events = [
+              {
+                type: "response.output_item.added",
+                output_index: 0,
+                item: reasoningItem,
+              },
+              {
+                type: "response.output_item.done",
+                output_index: 0,
+                item: reasoningItem,
+              },
+              {
+                type: "response.completed",
+                response: {
+                  status: "completed",
+                  output: [reasoningItem, messageItem],
+                },
+              },
+            ];
+            for (const event of events) {
+              controller.enqueue(
+                encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`),
+              );
+            }
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        }),
+      };
+    },
+  };
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
+    port: 0,
+    provider,
+  });
+
+  try {
+    const response = await fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        input: "检查过程",
+        stream: true,
+      }),
+    });
+    const events = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(events, /Checked the visible process\./u);
+    assert.match(events, /Visible answer/u);
+    assert.doesNotMatch(
+      events,
+      /provider-private-ciphertext|private reasoning text|metadata_passthrough/u,
+    );
+    assert.match(events, /"encrypted_content":null/u);
+  } finally {
+    await runtime.close();
+  }
+});
+
 test("forwards failed upstream terminal usage through the Agent stream", async () => {
   const encoder = new TextEncoder();
   const runtime = await startLocalRuntime({
@@ -1735,8 +1943,15 @@ test("forwards failed upstream terminal usage through the Agent stream", async (
                   type: "response.failed",
                   response: {
                     status: "failed",
-                    error: { code: "fixture_failure", message: "Fixture failed" },
-                    usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15 },
+                    error: {
+                      code: "fixture_failure",
+                      message: "Fixture failed",
+                    },
+                    usage: {
+                      input_tokens: 12,
+                      output_tokens: 3,
+                      total_tokens: 15,
+                    },
                   },
                 })}\n\n`,
               ),
@@ -1751,7 +1966,11 @@ test("forwards failed upstream terminal usage through the Agent stream", async (
     const response = await fetch(`${runtime.origin}/v1/responses`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "ai-tidu9-config", input: "fixture", stream: true }),
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        input: "fixture",
+        stream: true,
+      }),
     });
     const events = await response.text();
     assert.match(events, /event: response\.failed/u);
@@ -1893,7 +2112,7 @@ test("preserves bounded provider error details across Agent response formats", a
       const errorMessage = request.stream
         ? /"message":"([^"]*)"/u.exec(responseText)?.[1]
         : ((JSON.parse(responseText) as { error: { message: string } }).error.message ?? "");
-      assert.ok((errorMessage?.length ?? 0) <= 240);
+      assert.ok((errorMessage?.split("\n\nToken")[0]?.length ?? 0) <= 240);
     }
     assert.equal(providerCalls, requests.length);
   } finally {
@@ -2597,6 +2816,92 @@ test("validates OpenAI-compatible inference requests before provider routing", a
     assert.equal(responseFailure.error.code, "model_provider_not_configured");
     assert.equal(responseFailure.error.failure_source, "ai-tidu9");
     assert.equal(responseFailure.error.next_steps.length, 3);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("normalizes historical model aliases only on Codex host-scoped inference routes", async () => {
+  const providerBodies: Record<string, unknown>[] = [];
+  const provider: ModelProvider = {
+    descriptor: { type: "codex-host", model: "gpt-6.1-sol" },
+    execute: async (request) => {
+      providerBodies.push(request.body);
+      return {
+        kind: "json",
+        statusCode: 200,
+        body: {
+          id: "response-host-alias",
+          object: "response",
+          status: "completed",
+          model: request.virtualModelId,
+          output: [],
+        },
+      };
+    },
+  };
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
+    port: 0,
+    provider,
+  });
+
+  try {
+    const hostRequests = [
+      {
+        path: "/v1/hosts/codex/responses",
+        body: {
+          model: "gpt-6.1-sol",
+          input: "native compaction fixture",
+          metadata: { ai_tidu9_probe: true },
+        },
+      },
+      {
+        path: "/v1/hosts/codex/chat/completions",
+        body: {
+          model: "gpt-6.1-sol",
+          messages: [{ role: "user", content: "native chat fixture" }],
+          metadata: { ai_tidu9_probe: true },
+        },
+      },
+    ] as const;
+    for (const hostRequest of hostRequests) {
+      const hostResponse = await fetch(`${runtime.origin}${hostRequest.path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(hostRequest.body),
+      });
+      assert.equal(hostResponse.status, 200);
+    }
+    assert.equal(providerBodies.length, 2);
+    assert.equal(providerBodies[0]?.model, "ai-tidu9-config");
+    assert.equal(providerBodies[1]?.model, "ai-tidu9-config");
+
+    const publicResponse = await fetch(`${runtime.origin}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-6.1-sol", input: "public fixture" }),
+    });
+    assert.equal(publicResponse.status, 404);
+    assert.equal(
+      ((await publicResponse.json()) as { error: { code: string } }).error.code,
+      "model_not_found",
+    );
+    const otherHostResponse = await fetch(`${runtime.origin}/v1/hosts/cursor/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-6.1-sol",
+        input: "other host fixture",
+      }),
+    });
+    assert.equal(otherHostResponse.status, 404);
+    assert.equal(
+      ((await otherHostResponse.json()) as { error: { code: string } }).error.code,
+      "model_not_found",
+    );
+    assert.equal(providerBodies.length, 2);
   } finally {
     await runtime.close();
   }

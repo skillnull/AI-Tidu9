@@ -278,7 +278,9 @@ const App = () => {
   }, [locale]);
   const refreshUpstreamModelCatalog = useCallback(async () => {
     try {
-      const response = await fetch("/api/models/upstreams", { cache: "no-store" });
+      const response = await fetch("/api/models/upstreams", {
+        cache: "no-store",
+      });
       if (!response.ok) return;
       setUpstreamModelCatalog((await response.json()) as UpstreamModelCatalog);
     } catch {
@@ -326,8 +328,8 @@ const App = () => {
         status: "success",
         message:
           locale === "zh-CN"
-            ? "九门配置已准备，当前保持纯官方直连；九门模型与 MCP 不会在确认切换前启用。"
-            : "AI-Tidu9 is prepared while pure Official direct mode remains active. Its model and MCP stay disabled until you confirm the switch.",
+            ? "九门配置已准备，当前仍是官方模式。首次安装后重启 Codex 一次；之后同一对话可在两种模式间续聊，下一轮按当前模式执行。"
+            : "AI-Tidu9 is prepared while Official mode remains active. Restart Codex once after initial installation; afterward, the same chat can continue across both modes and each new turn uses the current mode.",
       });
       await refreshCodexConfiguration();
     } catch (error) {
@@ -364,11 +366,11 @@ const App = () => {
           message:
             mode === "official"
               ? locale === "zh-CN"
-                ? "已恢复纯官方 Codex 直连。重启 Codex 后，宿主将重新加载官方模型与官方账号配置。"
-                : "Pure Official Codex direct mode is restored. Restart Codex to reload the official models and account configuration."
+                ? "已切到官方模式。同一对话的下一轮使用官方模型，不显示九门 Token 统计；已完成轮次保持不变。"
+                : "Switched to Official mode. The next turn in the same chat uses the official model without AI-Tidu9 token statistics; completed turns stay unchanged."
               : locale === "zh-CN"
-                ? "九门 Agent 内核与路由链路诊断通过。重启 Codex 后，宿主只显示“九门赛博提督”；切回官方模式会完整恢复官方直连。"
-                : "The AI-Tidu9 Agent kernel and routing-path diagnostic passed. Restart Codex to show only AI-Tidu9; switching back fully restores Official direct mode.",
+                ? "已切到九门模式。同一对话的下一轮使用九门 Agent 并恢复九门 Token 统计；已完成轮次保持不变。"
+                : "Switched to AI-Tidu9 mode. The next turn in the same chat uses the AI-Tidu9 Agent and restores AI-Tidu9 token statistics; completed turns stay unchanged.",
         });
       } catch (error) {
         await refreshCodexConfiguration().catch(() => undefined);
@@ -1081,8 +1083,8 @@ const App = () => {
                 <p className="client-limitation">
                   {group.id === "openai"
                     ? locale === "zh-CN"
-                      ? "Codex 使用原生双模式：九门模式只显示九门 Agent，官方模式只显示官方模型。两套提供方与模型目录严格隔离，上游能力在配置页选择。"
-                      : "Codex uses two native modes: AI-Tidu9 mode exposes only the AI-Tidu9 Agent, while Official mode exposes only official models. Providers and catalogs remain isolated; configure upstream capabilities in Configuration."
+                      ? "Codex 使用原生双模式：九门模式只显示九门 Agent，官方模式只显示官方模型。同一对话可无缝续聊，下一轮按当前模式执行；历史轮次不改写，原生重试和自动压缩也兼容双向切换。"
+                      : "Codex uses two native modes: AI-Tidu9 mode exposes only the AI-Tidu9 Agent, while Official mode exposes only official models. One chat can continue seamlessly; each new turn uses the current mode, prior turns remain unchanged, and native retry and automatic compaction survive switches in either direction."
                     : group.id === "ollama"
                       ? locale === "zh-CN"
                         ? "Ollama 客户端负责本地模型安装与运行；九门通过本地 API 发现模型，并把它作为主模型或副模型调度。"
@@ -1215,8 +1217,8 @@ const App = () => {
                         </strong>
                         <span>
                           {locale === "zh-CN"
-                            ? "准备九门配置档和完整模型目录，供本机新启动的 Codex 会话使用；不会切换当前接入模式。"
-                            : "Prepare the AI-Tidu9 profile and complete model catalog for newly started Codex sessions on this device. This does not switch the active mode."}
+                            ? "准备九门配置档、模型目录和同一对话的双模式续聊能力；首次安装需重启 Codex 一次，不会切换当前接入模式。"
+                            : "Prepare the AI-Tidu9 profile, model catalog, and same-chat dual-mode continuation. Initial installation requires one Codex restart and does not switch the active mode."}
                         </span>
                       </div>
                       <button

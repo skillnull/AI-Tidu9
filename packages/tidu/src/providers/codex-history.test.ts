@@ -236,6 +236,69 @@ test("keeps the completed answer when a later turn asks a follow-up question", (
   });
 });
 
+test("converts provider-private reasoning into reusable public history", () => {
+  const turn = requestTurnInput({
+    protocol: "responses",
+    virtualModelId: "ai-tidu9-config",
+    body: {
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "first question" }],
+        },
+        {
+          type: "reasoning",
+          id: "rs-private",
+          summary: [{ type: "summary_text", text: "Checked the reusable context." }],
+          encrypted_content: "provider-private-ciphertext",
+        },
+        {
+          type: "compaction",
+          encrypted_content: "provider-private-compaction",
+        },
+        {
+          type: "message",
+          role: "assistant",
+          phase: "final_answer",
+          encrypted_content: "provider-private-message",
+          content: [{ type: "output_text", text: "first answer" }],
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "follow-up question" }],
+        },
+      ],
+    },
+  });
+
+  assert.deepEqual(turn.input, [{ type: "text", text: "follow-up question", text_elements: [] }]);
+  assert.deepEqual(turn.historyItems, [
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "first question" }],
+    },
+    {
+      type: "message",
+      role: "assistant",
+      phase: "commentary",
+      content: [{ type: "output_text", text: "Checked the reusable context." }],
+    },
+    {
+      type: "message",
+      role: "assistant",
+      phase: "final_answer",
+      content: [{ type: "output_text", text: "first answer" }],
+    },
+  ]);
+  assert.doesNotMatch(
+    JSON.stringify(turn.historyItems),
+    /encrypted_content|ciphertext|compaction/u,
+  );
+});
+
 test("does not replay an old user message when Responses continuation items follow it", () => {
   const conversation = [
     {

@@ -86,6 +86,7 @@ import {
 import {
   createResponseUsageLedger,
   formatResponseTokenFooter,
+  type ResponseModelUsage,
   type ResponseUsageSnapshot,
 } from "./response-usage.js";
 
@@ -614,27 +615,32 @@ const createAgentObjective = (body: Record<string, unknown>): string => {
 
 type AgentTokenUsage = NonNullable<ProviderExecutionReceipt["usage"]>;
 
-const createAgentUsageCollector = (): {
+const createAgentUsageCollector = (
+  originHost: AgentHostId,
+): {
   /** Records the most authoritative usage for one concrete host/model/role execution. */
   record: (receipt: ProviderExecutionReceipt) => void;
   /** Returns combined provider-reported usage for the active user turn. */
   read: () => AgentTokenUsage | null;
+  /** Returns model identities and independently reported consumption for the active response. */
+  readModels: () => readonly ResponseModelUsage[];
 } => {
-  const usageByExecution = new Map<string, AgentTokenUsage>();
+  const usageByExecution = new Map<string, ProviderExecutionReceipt>();
   return {
     record: (receipt) => {
-      if (receipt.usage === null) return;
-      const executionKey = JSON.stringify([
-        receipt.host,
-        receipt.model,
-        receipt.role,
-        [...receipt.capabilities].sort(),
-      ]);
-      usageByExecution.set(executionKey, receipt.usage);
+      const executionKey = JSON.stringify([receipt.host, receipt.model]);
+      const previous = usageByExecution.get(executionKey);
+      usageByExecution.set(executionKey, {
+        ...receipt,
+        usage: receipt.usage ?? previous?.usage ?? null,
+      });
     },
     read: () => {
-      if (usageByExecution.size === 0) return null;
-      return [...usageByExecution.values()].reduce<AgentTokenUsage>(
+      const reported = [...usageByExecution.values()]
+        .map((receipt) => receipt.usage)
+        .filter((usage): usage is AgentTokenUsage => usage !== null);
+      if (reported.length === 0) return null;
+      return reported.reduce<AgentTokenUsage>(
         (total, usage) => ({
           inputTokens: total.inputTokens + usage.inputTokens,
           outputTokens: total.outputTokens + usage.outputTokens,
@@ -654,6 +660,14 @@ const createAgentUsageCollector = (): {
         },
       );
     },
+    readModels: () =>
+      [...usageByExecution.values()].map((receipt) => ({
+        host: receipt.host,
+        model: receipt.model,
+        role: receipt.host === originHost ? "main" : "secondary",
+        usage: receipt.usage,
+        complete: receipt.usage !== null,
+      })),
   };
 };
 
@@ -693,7 +707,9 @@ const createAgentResponsesBody = (
             cache_write_tokens: usage.cacheWriteInputTokens ?? 0,
           },
           output_tokens: usage.outputTokens,
-          output_tokens_details: { reasoning_tokens: usage.reasoningTokens ?? 0 },
+          output_tokens_details: {
+            reasoning_tokens: usage.reasoningTokens ?? 0,
+          },
           total_tokens: usage.totalTokens,
         },
       }),
@@ -727,15 +743,9 @@ const createAgentChatBody = (
       }),
 });
 
-const resolveAgentFailure = (
-  error: unknown,
-  reservedCharacters = 0,
-): { code: string; message: string } => ({
+const resolveAgentFailure = (error: unknown): { code: string; message: string } => ({
   code: error instanceof AgentExecutionError ? error.code : "agent_task_failed",
-  message: (error instanceof Error ? error.message : "The Agent task failed.").slice(
-    0,
-    Math.max(0, 240 - reservedCharacters),
-  ),
+  message: (error instanceof Error ? error.message : "The Agent task failed.").slice(0, 240),
 });
 
 const createAgentResponsesStream = (
@@ -813,7 +823,12 @@ const createAgentResponsesStream = (
       keepAlive.unref();
       const completedOutputItems = new Map<number, Record<string, unknown>>();
       let activeProcess:
-        | { id: string; outputIndex: number; summaryStarted: boolean; text: string }
+        | {
+            id: string;
+            outputIndex: number;
+            summaryStarted: boolean;
+            text: string;
+          }
         | undefined;
       let nextOutputIndex = 0;
       let processCount = 0;
@@ -951,7 +966,10 @@ const createAgentResponsesStream = (
         )
           toolCallCount += 1;
         completedOutputItems.set(outputIndex, item);
-        write("response.output_item.added", { output_index: outputIndex, item });
+        write("response.output_item.added", {
+          output_index: outputIndex,
+          item,
+        });
         write("response.output_item.done", { output_index: outputIndex, item });
       };
       if (preserveProcessLifecycle) {
@@ -1021,12 +1039,6 @@ const createAgentResponsesStream = (
           const failure = resolveAgentFailure(error);
           const failureUsage = readUsage();
           finishProcessLifecycle();
-          const failureText = `${chineseRequest ? "请求失败" : "Request failed"}: ${failure.message}`;
-          emitOutputDelta(`${outputText === "" ? "" : "\n\n"}${failureText}`);
-          if (usageDisplay !== undefined) {
-            const footer = formatResponseTokenFooter(usageDisplay.snapshot(), chineseRequest);
-            if (footer !== "") emitOutputDelta(`\n\n${footer}`);
-          }
           if (messageStarted) {
             write("response.output_text.done", {
               item_id: messageId,
@@ -1318,14 +1330,21 @@ const handleOpenAiInference = async (
   const workspace = await storage.configurationStore.loadWorkspace();
   const originHost = resolveInferenceHost(workspace.active.configuration, provider, requestedHost);
   const activeModelId = workspace.active.configuration.activeProfileId;
+  const normalizedBody =
+    requestedHost === "codex" &&
+    isRecord(body) &&
+    typeof body.model === "string" &&
+    body.model.trim() !== ""
+      ? { ...body, model: activeModelId }
+      : body;
   const validation =
     protocol === "chat-completions"
-      ? validateChatCompletionRequest(body, activeModelId)
-      : validateResponsesRequest(body, activeModelId);
+      ? validateChatCompletionRequest(normalizedBody, activeModelId)
+      : validateResponsesRequest(normalizedBody, activeModelId);
   if (sendOpenAiValidation(response, validation, requestId)) {
     return;
   }
-  const requestBody = body as Record<string, unknown>;
+  const requestBody = normalizedBody as Record<string, unknown>;
   const probe = isRecord(requestBody.metadata) && requestBody.metadata.ai_tidu9_probe === true;
   if (!probe) {
     const localGitResult = await executeLocalGitRequest({
@@ -1385,7 +1404,7 @@ const handleOpenAiInference = async (
       return;
     }
     const model = typeof requestBody.model === "string" ? requestBody.model : "ai-tidu9-config";
-    const usageCollector = createAgentUsageCollector();
+    const usageCollector = createAgentUsageCollector(originHost);
     let usageDisplay: Parameters<typeof createAgentResponsesStream>[5];
     if (protocol === "responses" && originHost === "codex") {
       let ledger = responseUsageLedgers.get(storage);
@@ -1395,8 +1414,9 @@ const handleOpenAiInference = async (
       }
       const usageTurn = ledger.begin(requestBody.input);
       usageDisplay = {
-        snapshot: () => usageTurn.snapshot(usageCollector.read()),
-        finish: (items) => usageTurn.finish(items, usageCollector.read()),
+        snapshot: () => usageTurn.snapshot(usageCollector.read(), usageCollector.readModels()),
+        finish: (items) =>
+          usageTurn.finish(items, usageCollector.read(), usageCollector.readModels()),
       };
     }
     const run = async (
@@ -1473,21 +1493,12 @@ const handleOpenAiInference = async (
         );
       }
     } catch (error) {
-      const footer =
-        usageDisplay === undefined
-          ? undefined
-          : formatResponseTokenFooter(
-              usageDisplay.snapshot(),
-              /\p{Script=Han}/u.test(createAgentObjective(requestBody)),
-            ) || undefined;
-      const failure = resolveAgentFailure(error, footer === undefined ? 0 : footer.length + 2);
-      const failureMessage =
-        footer === undefined ? failure.message : `${failure.message}\n\n${footer}`;
+      const failure = resolveAgentFailure(error);
       usageDisplay?.finish([]);
       sendOpenAiJson(
         response,
         502,
-        createOpenAiError(failure.code, failureMessage, "server_error"),
+        createOpenAiError(failure.code, failure.message, "server_error"),
         requestId,
       );
     }
@@ -1870,21 +1881,49 @@ const isExpertServiceEnabled = async (
   return configuration.activeMode !== "expert" || configuration.expertServices?.[service] !== false;
 };
 
-const validateMutationRequest = (request: import("node:http").IncomingMessage): void => {
+const validateMutationRequestOrigin = (
+  request: import("node:http").IncomingMessage,
+  deployment: "personal" | "enterprise",
+): void => {
   if (!request.headers["content-type"]?.toLowerCase().startsWith("application/json")) {
     throw new TiduError("CONFIGURATION_INVALID", "Content-Type must be application/json.");
   }
 
   const origin = request.headers.origin;
   if (origin !== undefined) {
-    let originHost: string;
+    let originUrl: URL;
     try {
-      originHost = new URL(origin).host;
+      originUrl = new URL(origin);
     } catch (error) {
       throw new TiduError("CONFIGURATION_INVALID", "Request origin is invalid.", { cause: error });
     }
-    if (originHost !== request.headers.host) {
+    if (originUrl.host !== request.headers.host) {
       throw new TiduError("CONFIGURATION_INVALID", "Cross-origin configuration writes are denied.");
+    }
+    const localAddress = request.socket.localAddress?.replace(/^::ffff:/u, "").toLowerCase();
+    const loopbackAddresses = new Set(["127.0.0.1", "::1"]);
+    if (
+      deployment === "personal" &&
+      localAddress !== undefined &&
+      loopbackAddresses.has(localAddress)
+    ) {
+      const loopbackOriginHosts = new Set(["127.0.0.1", "[::1]", "localhost"]);
+      const originPort =
+        originUrl.port === ""
+          ? originUrl.protocol === "https:"
+            ? 443
+            : 80
+          : Number(originUrl.port);
+      if (
+        originUrl.protocol !== "http:" ||
+        !loopbackOriginHosts.has(originUrl.hostname.toLowerCase()) ||
+        originPort !== request.socket.localPort
+      ) {
+        throw new TiduError(
+          "CONFIGURATION_INVALID",
+          "Local configuration writes require the runtime loopback origin.",
+        );
+      }
     }
   }
 };
@@ -2025,6 +2064,8 @@ const handleRequest = async (
   },
 ): Promise<void> => {
   const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+  const validateMutationRequest = (incomingRequest: import("node:http").IncomingMessage): void =>
+    validateMutationRequestOrigin(incomingRequest, deployment);
 
   if (request.method === "GET" && pathname === "/health") {
     const scalingHealth = await scaling?.health();
@@ -2779,7 +2820,10 @@ const handleRequest = async (
       return;
     }
     const sessionId = request.headers["x-tidu-admin-session"];
-    if (typeof sessionId !== "string" || !enterprise.validateAdministratorSession(sessionId)) {
+    if (
+      typeof sessionId !== "string" ||
+      !(await enterprise.validateAdministratorSession(sessionId))
+    ) {
       sendJson(response, 401, { error: "ADMINISTRATOR_SESSION_REQUIRED" });
       return;
     }
@@ -2904,7 +2948,10 @@ const handleRequest = async (
       return;
     }
     const sessionId = request.headers["x-tidu-admin-session"];
-    if (typeof sessionId !== "string" || !enterprise.validateAdministratorSession(sessionId)) {
+    if (
+      typeof sessionId !== "string" ||
+      !(await enterprise.validateAdministratorSession(sessionId))
+    ) {
       sendJson(response, 401, { error: "ADMINISTRATOR_SESSION_REQUIRED" });
       return;
     }
@@ -3575,9 +3622,16 @@ export const startLocalRuntime = async (
       runtimeNetwork,
       refreshCodexModelCatalog,
       runtimePaths,
-    ).catch(() => {
+    ).catch((error: unknown) => {
       if (!response.headersSent) {
-        sendJson(response, 500, { error: "INTERNAL_ERROR" });
+        if (error instanceof TiduError && error.code === "CONFIGURATION_INVALID") {
+          sendJson(response, 400, {
+            error: error.code,
+            message: error.message,
+          });
+        } else {
+          sendJson(response, 500, { error: "INTERNAL_ERROR" });
+        }
       } else {
         response.end();
       }

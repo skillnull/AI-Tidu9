@@ -95,6 +95,11 @@ export interface CodexTurnResult {
   turnId: string;
   /** Terminal turn status. */
   status: "completed" | "failed" | "interrupted";
+  /** Host-reported failure, when the turn failed with an explanation. */
+  error?: {
+    /** Original upstream failure message. */
+    message: string;
+  };
   /** Concatenated assistant message deltas. */
   text: string;
   /** Caller-owned tools yielded without execution by the delegated host. */
@@ -422,6 +427,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
   const forwardedMessageText = new Map<string, string>();
   const forwardedProcessItems = new Set<string>();
   let initialized = false;
+  const messagePhaseKey = (turnId: string, itemId: string): string => `${turnId}\u0000${itemId}`;
 
   const bufferTurnNotification = (
     turnId: string,
@@ -476,6 +482,9 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     }
     for (const messageKey of forwardedMessageText.keys()) {
       if (messageKey.startsWith(prefix)) forwardedMessageText.delete(messageKey);
+    }
+    for (const phaseKey of messagePhases.keys()) {
+      if (phaseKey.startsWith(prefix)) messagePhases.delete(phaseKey);
     }
   };
 
@@ -602,7 +611,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
         const itemId = readString(item, "id");
         const phase = readString(item, "phase");
         if (itemId !== undefined && phase !== undefined && phase !== "") {
-          messagePhases.set(itemId, phase);
+          messagePhases.set(messagePhaseKey(turnId, itemId), phase);
         }
       } else {
         forwardProcessItem(turnId, item);
@@ -644,7 +653,8 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       const state = activeTurns.get(turnId);
       const delta = readString(notification.params, "delta");
       const itemId = readString(notification.params, "itemId");
-      const phase = itemId === undefined ? undefined : messagePhases.get(itemId);
+      const phase =
+        itemId === undefined ? undefined : messagePhases.get(messagePhaseKey(turnId, itemId));
       if (itemId !== undefined && delta !== undefined) {
         const messageKey = `${turnId}\u0000${itemId}`;
         forwardedMessageText.set(
@@ -706,7 +716,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
         state.onProcessDelta?.("\n\n");
         state.processItemKey = undefined;
       }
-      if (itemId !== undefined) messagePhases.delete(itemId);
+      if (itemId !== undefined) messagePhases.delete(messagePhaseKey(turnId, itemId));
       forwardProcessItem(turnId, item);
       return;
     }
@@ -726,14 +736,21 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     ) {
       return;
     }
+    const message = readString(turn.error, "message");
+    const completion = {
+      threadId,
+      turnId: completedTurnId,
+      status,
+      ...(message === undefined ? {} : { error: { message } }),
+    } satisfies Omit<CodexTurnResult, "text" | "usage">;
     const state = activeTurns.get(completedTurnId);
     if (state === undefined) {
       bufferTurnNotification(completedTurnId, (buffer) => {
-        buffer.completion = { threadId, turnId: completedTurnId, status };
+        buffer.completion = completion;
       });
       return;
     }
-    scheduleTurnCompletion({ threadId, turnId: completedTurnId, status }, state);
+    scheduleTurnCompletion(completion, state);
   };
 
   const launch = createCodexAppServerLaunch(options);
@@ -786,7 +803,10 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           });
         if (activeTurns.get(turnId as string) !== state)
           return { contentItems: [], success: false };
-        state.toolInterruption ??= client.request("turn/interrupt", { threadId, turnId });
+        state.toolInterruption ??= client.request("turn/interrupt", {
+          threadId,
+          turnId,
+        });
         await state.toolInterruption;
         return { contentItems: [], success: false };
       },

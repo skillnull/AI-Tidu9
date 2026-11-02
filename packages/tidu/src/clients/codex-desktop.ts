@@ -121,7 +121,7 @@ export const installCodexDesktopProxy = (
   return { launcher, requiresAppRestart: true };
 };
 
-/** Switches an installed connector with the product mode, preserving the original environment. */
+/** Activates or deactivates the installed dual-mode relay, preserving the original environment. */
 export const switchCodexDesktopProxy = (
   enabled: boolean,
   codexHomeDirectory = process.env.CODEX_HOME ?? join(homedir(), ".codex"),

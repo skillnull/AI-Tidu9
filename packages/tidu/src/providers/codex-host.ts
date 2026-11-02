@@ -339,6 +339,24 @@ export const requestTurnInput = (
     collectActiveInput(value.content);
   };
   collectActiveInput(activeContent);
+  const sanitizeHistoryValue = (value: unknown): unknown => {
+    if (Array.isArray(value)) {
+      return value.flatMap((item) => {
+        const sanitized = sanitizeHistoryValue(item);
+        return sanitized === undefined ? [] : [sanitized];
+      });
+    }
+    if (!isRecord(value)) return value;
+    if (value.type === "encrypted_content") return undefined;
+    return Object.fromEntries(
+      Object.entries(value).flatMap(([field, child]) => {
+        if (field === "encrypted_content" || field === "internal_chat_message_metadata_passthrough")
+          return [];
+        const sanitized = sanitizeHistoryValue(child);
+        return sanitized === undefined ? [] : [[field, sanitized]];
+      }),
+    );
+  };
   const normalizeHistoryMessage = (message: Record<string, unknown>): Record<string, unknown> => {
     const role = typeof message.role === "string" ? message.role : "user";
     const content = Array.isArray(message.content) ? message.content : [message.content];
@@ -352,6 +370,8 @@ export const requestTurnInput = (
         ];
       }
       if (!isRecord(part)) return [];
+      const sanitizedPart = sanitizeHistoryValue(part);
+      if (!isRecord(sanitizedPart)) return [];
       if (typeof part.type === "string" && imageTypes.has(part.type)) {
         const imageInput = readImageTurnInput(part);
         if (imageInput?.type === "image") {
@@ -364,15 +384,45 @@ export const requestTurnInput = (
       if (typeof part.text === "string") {
         return [
           {
-            ...part,
+            ...sanitizedPart,
             type: role === "assistant" ? "output_text" : "input_text",
             text: part.text,
           },
         ];
       }
-      return [part];
+      return [sanitizedPart];
     });
-    return { ...message, type: "message", role, content: normalizedContent };
+    const sanitizedMessage = sanitizeHistoryValue(message);
+    return {
+      ...(isRecord(sanitizedMessage) ? sanitizedMessage : {}),
+      type: "message",
+      role,
+      content: normalizedContent,
+    };
+  };
+  const normalizeHistoryItem = (item: Record<string, unknown>): Record<string, unknown>[] => {
+    if (item.type === "reasoning") {
+      const summary = Array.isArray(item.summary)
+        ? item.summary.flatMap((part): string[] =>
+            isRecord(part) && part.type === "summary_text" && typeof part.text === "string"
+              ? [part.text]
+              : [],
+          )
+        : [];
+      return summary.length === 0
+        ? []
+        : [
+            {
+              type: "message",
+              role: "assistant",
+              phase: "commentary",
+              content: [{ type: "output_text", text: summary.join("\n") }],
+            },
+          ];
+    }
+    if (item.type === "compaction" || item.type === "context_compaction") return [];
+    const sanitized = sanitizeHistoryValue(item);
+    return isRecord(sanitized) ? [sanitized] : [];
   };
   const historyItems: Record<string, unknown>[] = [];
   if (typeof request.body.instructions === "string" && request.body.instructions !== "") {
@@ -391,7 +441,11 @@ export const requestTurnInput = (
     historyItems.push(
       ...conversationItems
         .slice(0, historyEndIndex)
-        .map((item) => (typeof item.role === "string" ? normalizeHistoryMessage(item) : item)),
+        .flatMap((item) =>
+          typeof item.role === "string"
+            ? [normalizeHistoryMessage(item)]
+            : normalizeHistoryItem(item),
+        ),
     );
   }
   if (input.length === 0) {
@@ -889,6 +943,7 @@ const runCodexTurn = async (
     );
   }
   const turnPayload = requestTurnInput(request);
+  reportCodexExecution(request, session.model, null);
   const outputFormat = structuredOutputFormat(request);
   const outputSchema =
     outputFormat?.type === "json_schema" && isRecord(outputFormat.schema)
@@ -919,7 +974,11 @@ const runCodexTurn = async (
     return { ...result, outputItems: result.toolCalls?.map(callerTools.outputItem) };
   }
   if (result.status !== "completed") {
-    throw new Error("The current host model did not complete the request.");
+    if (result.status === "interrupted")
+      throw new DOMException("Codex turn cancelled.", "AbortError");
+    throw new Error(
+      result.error?.message ?? "The current host model did not complete the request.",
+    );
   }
   return { ...result, text: requireValidHostModelText(request, result.text) };
 };

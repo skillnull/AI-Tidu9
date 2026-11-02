@@ -10,7 +10,11 @@ import type {
   ProviderExecutionReceipt,
   ProviderExecutionRequest,
 } from "../providers/index.js";
-import { createDynamicModelRouter, type RoutableModel } from "../routing/index.js";
+import {
+  createCapabilityCompletionProvider,
+  createDynamicModelRouter,
+  type RoutableModel,
+} from "../routing/index.js";
 import { createSecretGate } from "../security/index.js";
 import { openNodeSqliteStorage } from "../storage/index.js";
 import {
@@ -49,6 +53,113 @@ const agentStreamEncoder = new TextEncoder();
 
 const encodeAgentSseData = (body: unknown): Uint8Array =>
   agentStreamEncoder.encode(`data: ${typeof body === "string" ? body : JSON.stringify(body)}\n\n`);
+
+test("attributes model failures and terminal usage to the configured primary or secondary", async () => {
+  for (const secondary of [false, true]) {
+    for (const failureMode of ["json", "stream", "throw", "usage"]) {
+      const streamed = failureMode === "stream" || failureMode === "usage";
+      for (const chinese of [false, true]) {
+        const receipts: ProviderExecutionReceipt[] = [];
+        const upstream: ModelProvider = {
+          descriptor: { type: "codex-host", model: "primary-fixture" },
+          execute: async (request) => {
+            request.onModelConfirmed?.(secondary ? "secondary-fixture" : "primary-fixture");
+            if (failureMode === "throw") throw new Error("Fixture upstream failure");
+            const body =
+              failureMode === "usage"
+                ? {
+                    status: "completed",
+                    output_text: "Fixture answer",
+                    output: [
+                      {
+                        type: "message",
+                        role: "assistant",
+                        content: [{ type: "output_text", text: "Fixture answer" }],
+                      },
+                    ],
+                    usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15 },
+                  }
+                : {
+                    error: { code: "fixture_failure", message: "Fixture upstream failure" },
+                  };
+            return request.body.stream === true
+              ? {
+                  kind: "stream",
+                  statusCode: 200,
+                  upstreamModel: secondary ? "secondary-fixture" : "primary-fixture",
+                  stream: new ReadableStream({
+                    start(controller) {
+                      controller.enqueue(
+                        encodeAgentSseData({
+                          type: failureMode === "usage" ? "response.completed" : "response.failed",
+                          response: body,
+                        }),
+                      );
+                      controller.close();
+                    },
+                  }),
+                }
+              : { kind: "json", statusCode: 502, body };
+          },
+        };
+        const provider = createCapabilityCompletionProvider(upstream, async () => ({
+          modelSelection: { source: "official", model: "primary-fixture" },
+          capabilityCompletion: {
+            enabled: secondary,
+            mainCapabilities: secondary ? [] : ["text"],
+            specialists: secondary
+              ? [
+                  {
+                    host: "cursor",
+                    source: "official",
+                    model: "secondary-fixture",
+                    capabilities: ["text"],
+                  },
+                ]
+              : [],
+            maximumSpecialists: 1,
+          },
+        }));
+        const kernel = createAgentKernel({
+          store: createInMemoryTaskCapsuleStore(),
+          ...createModelProviderAgentAdapters(provider, "tidu"),
+        });
+        const created = await kernel.createTask({
+          goal: chinese ? "检查错误" : "Check the failure",
+          originHost: "codex",
+          planningMode: "response",
+          verificationMode: "response",
+          requiredCapabilities: ["text"],
+          modelRequest: {
+            protocol: "responses",
+            virtualModelId: "tidu",
+            body: { input: chinese ? "检查错误" : "Check the failure" },
+            onExecutionReceipt: (receipt) => {
+              receipts.push(receipt);
+            },
+            ...(streamed ? { onOutputDelta: () => undefined } : {}),
+          },
+        });
+        const completed = await kernel.runTask(created.task.taskId);
+        if (failureMode === "usage") {
+          assert.equal(completed.task.status, "completed");
+          const reported = receipts.filter((receipt) => receipt.usage !== null);
+          assert.equal(reported.length, 1);
+          assert.equal(reported[0]?.role === "specialist", secondary);
+          assert.equal(reported[0]?.host, secondary ? "cursor" : "codex");
+          assert.equal(reported[0]?.usage?.totalTokens, 15);
+          continue;
+        }
+        const failure = completed.events.find((event) => event.type === "task.failed");
+        const reason = String((failure?.payload as { reason?: string } | undefined)?.reason);
+        const host = secondary ? "Cursor" : "Codex";
+        assert.ok(reason.startsWith(`${host}${chinese ? "：" : ": "}`), reason);
+        assert.match(reason, /Fixture upstream failure/u);
+        assert.doesNotMatch(reason, /主模型|副模型|Primary model|Secondary model/u);
+      }
+    }
+  }
+});
 
 const executeFastStream = async (
   stream: ReadableStream<Uint8Array>,

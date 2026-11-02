@@ -896,8 +896,19 @@ export const CapabilityCompletionPanel = ({
                                     {modelResult.outcome === "not-run" || zeroUsage ? null : (
                                       <span className="capability-model-result-tokens">
                                         Token：
-                                        {modelUsage?.totalTokens ??
-                                          (english ? "Not retrieved" : "未获取到")}
+                                        {modelUsage === undefined ? (
+                                          english ? (
+                                            "Not retrieved"
+                                          ) : (
+                                            "未获取到"
+                                          )
+                                        ) : (
+                                          <>
+                                            {english ? "input" : "输入"} {modelUsage.inputTokens} ·{" "}
+                                            {english ? "output" : "输出"} {modelUsage.outputTokens}{" "}
+                                            · {english ? "total" : "合计"} {modelUsage.totalTokens}
+                                          </>
+                                        )}
                                       </span>
                                     )}
                                   </div>

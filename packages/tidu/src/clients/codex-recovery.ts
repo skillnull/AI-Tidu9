@@ -8,42 +8,14 @@ const isRecord = (value: unknown): value is JsonObject =>
 const number = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 const MAXIMUM_HISTORY_BYTES = 8 * 1024 * 1024;
-const MAXIMUM_FAILURE_MESSAGE_CHARACTERS = 1_000;
 let cachedHistory:
-  | { path: string; size: number; modifiedAt: number; records: readonly unknown[] }
-  | undefined;
-
-const readFailureMessage = (value: unknown, depth = 0): string | undefined => {
-  if (depth > 6) return undefined;
-  if (typeof value === "string") {
-    const message = value.trim();
-    if (message === "") return undefined;
-    if (message.startsWith("{")) {
-      try {
-        const nested = readFailureMessage(JSON.parse(message) as unknown, depth + 1);
-        if (nested !== undefined) return nested;
-      } catch {
-        /* A plain provider error can begin with a brace without being JSON. */
-      }
+  | {
+      path: string;
+      size: number;
+      modifiedAt: number;
+      records: readonly unknown[];
     }
-    return [...message].slice(0, MAXIMUM_FAILURE_MESSAGE_CHARACTERS).join("");
-  }
-  if (!isRecord(value)) return undefined;
-  for (const field of [value.error, value.message, value.reason]) {
-    const message = readFailureMessage(field, depth + 1);
-    if (message !== undefined) return message;
-  }
-  return undefined;
-};
-
-const appendFailureBeforeFooter = (text: string, failure: string, footer: string): string => {
-  if (text.includes(failure)) return text;
-  if (footer !== "" && text === footer) return `${failure}\n\n${footer}`;
-  if (footer !== "" && text.endsWith(`\n\n${footer}`)) {
-    return `${text.slice(0, -(footer.length + 2))}\n\n${failure}\n\n${footer}`;
-  }
-  return text === "" ? failure : `${text}\n\n${failure}`;
-};
+  | undefined;
 
 export interface CodexRecoveredTurn {
   /** Official turn with missing cancelled commands, footer, and timing restored. */
@@ -80,7 +52,35 @@ export const recoverCodexTurn = (
   turn: JsonObject,
   records: readonly unknown[],
   cwd: string,
+  managedProvider?: string,
+  managedModel?: string,
+  managedTurnConfirmed = false,
 ): CodexRecoveredTurn => {
+  const recordedContext = records.find(
+    (record) => isRecord(record) && record.type === "turn_context" && isRecord(record.payload),
+  );
+  const recordedProvider =
+    isRecord(recordedContext) && isRecord(recordedContext.payload)
+      ? recordedContext.payload.model_provider
+      : undefined;
+  const recordedModel =
+    isRecord(recordedContext) && isRecord(recordedContext.payload)
+      ? recordedContext.payload.model
+      : undefined;
+  if (managedProvider !== undefined) {
+    if (typeof recordedProvider === "string") {
+      if (recordedProvider !== managedProvider) return { turn, completedItems: [] };
+    } else if (!managedTurnConfirmed) {
+      // A model name is not provider identity. Official and managed turns may use the same model.
+      return { turn, completedItems: [] };
+    }
+  } else if (
+    managedModel !== undefined &&
+    typeof recordedModel === "string" &&
+    recordedModel !== managedModel
+  ) {
+    return { turn, completedItems: [] };
+  }
   const items = Array.isArray(turn.items) ? turn.items.filter(isRecord) : [];
   const recovered = [...items];
   const completedItems: JsonObject[] = [];
@@ -88,8 +88,11 @@ export const recoverCodexTurn = (
   let startedAt: number | undefined;
   let completedAt: number | undefined;
   let durationMs = number(turn.durationMs);
-  let usage: { inputTokens: number; outputTokens: number; totalTokens: number } | null = null;
-  let failureMessage: string | undefined;
+  let usage: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  } | null = null;
   let currentTurnId: unknown;
   for (const record of records) {
     if (!isRecord(record) || !isRecord(record.payload)) continue;
@@ -114,9 +117,6 @@ export const recoverCodexTurn = (
     ) {
       if (Number.isFinite(timestamp)) completedAt = timestamp;
       if ((number(payload.duration_ms) ?? 0) > 0) durationMs = payload.duration_ms as number;
-      if (payload.type === "task_complete") {
-        failureMessage = readFailureMessage(payload.error) ?? failureMessage;
-      }
     }
     if (record.type === "token_usage_record" && isRecord(payload.turn_token_usage)) {
       const reported = payload.turn_token_usage;
@@ -178,14 +178,14 @@ export const recoverCodexTurn = (
     completedAt !== undefined
   )
     durationMs = Math.max(0, completedAt - startedAt);
-  if (turn.status === "interrupted" || turn.status === "failed") {
+  if (turn.status === "interrupted") {
     const footer = formatResponseTokenFooter({ usage, complete: usage !== null }, true);
     const footerId = `tidu_usage_${String(turn.id)}`;
     let finalIndex = -1;
     for (let index = recovered.length - 1; index >= 0; index -= 1) {
       const item = recovered[index];
       if (
-        (footer !== "" || failureMessage !== undefined) &&
+        footer !== "" &&
         item?.type === "agentMessage" &&
         item.phase === "final_answer" &&
         typeof item.text === "string" &&
@@ -197,28 +197,20 @@ export const recoverCodexTurn = (
     }
     const finalMessage = recovered[finalIndex];
     if (finalMessage !== undefined && typeof finalMessage.text === "string") {
-      const visibleText =
-        failureMessage === undefined
-          ? finalMessage.text
-          : appendFailureBeforeFooter(finalMessage.text, failureMessage, footer);
       const completedText =
-        footer === "" || visibleText.endsWith(footer) ? visibleText : `${visibleText}\n\n${footer}`;
+        footer === "" || finalMessage.text.endsWith(footer)
+          ? finalMessage.text
+          : `${finalMessage.text}\n\n${footer}`;
       if (completedText !== finalMessage.text) {
         const updated = { ...finalMessage, text: completedText };
         recovered[finalIndex] = updated;
         completedItems.push(updated);
       }
-    } else if (
-      (failureMessage !== undefined || footer !== "") &&
-      !recovered.some((item) => item.id === footerId)
-    ) {
-      const text = [failureMessage, footer]
-        .filter((part) => part !== undefined && part !== "")
-        .join("\n\n");
+    } else if (footer !== "" && !recovered.some((item) => item.id === footerId)) {
       const item = {
         type: "agentMessage",
-        id: failureMessage === undefined ? footerId : `tidu_failure_${String(turn.id)}`,
-        text,
+        id: footerId,
+        text: footer,
         phase: "final_answer",
         memoryCitation: null,
         delivery: null,
@@ -229,7 +221,11 @@ export const recoverCodexTurn = (
     }
   }
   return {
-    turn: { ...turn, ...(durationMs === undefined ? {} : { durationMs }), items: recovered },
+    turn: {
+      ...turn,
+      ...(durationMs === undefined ? {} : { durationMs }),
+      items: recovered,
+    },
     completedItems,
   };
 };
@@ -268,6 +264,8 @@ export const readCodexRecoveryRecords = async (
         const payload = record.payload;
         // Keep only recovery evidence, never user prompts, reasoning, or bulk command output.
         if (
+          (record.type === "turn_context" &&
+            (typeof payload.model_provider === "string" || typeof payload.model === "string")) ||
           record.type === "token_usage_record" ||
           (record.type === "event_msg" &&
             ["task_started", "turn_aborted", "task_complete"].includes(String(payload.type))) ||
@@ -276,14 +274,34 @@ export const readCodexRecoveryRecords = async (
               (payload.type === "function_call_output" &&
                 typeof payload.output === "string" &&
                 /^Wall time: [\d.]+ seconds\naborted by user$/u.test(payload.output.trim()))))
-        )
+        ) {
+          if (record.type === "turn_context")
+            return [
+              {
+                type: "turn_context",
+                ...(typeof record.timestamp === "string" ? { timestamp: record.timestamp } : {}),
+                payload: {
+                  ...(typeof payload.model_provider === "string"
+                    ? { model_provider: payload.model_provider }
+                    : {}),
+                  ...(typeof payload.model === "string" ? { model: payload.model } : {}),
+                  ...(typeof payload.turn_id === "string" ? { turn_id: payload.turn_id } : {}),
+                },
+              },
+            ];
           return [record];
+        }
         return [];
       } catch {
         return [];
       }
     });
-    cachedHistory = { path: sessionPath, size: stats.size, modifiedAt: stats.mtimeMs, records };
+    cachedHistory = {
+      path: sessionPath,
+      size: stats.size,
+      modifiedAt: stats.mtimeMs,
+      records,
+    };
     return records;
   } finally {
     await file.close();

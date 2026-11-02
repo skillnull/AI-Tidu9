@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveCodexCommand } from "../accounts/codex-host.js";
 import { DEFAULT_VIRTUAL_MODEL_ID } from "../config/index.js";
+import { readCodexActiveSelection } from "../connectors/codex-client-proxy.js";
 import { PRODUCT, TiduError } from "../core/index.js";
 import {
   installCodexDesktopProxy,
@@ -53,6 +54,7 @@ const prepareDesktopRecovery = (home: string, customHome?: string): void => {
 const CODEX_PROFILE_FILE = `${CODEX_PROFILE_NAME}.config.toml`;
 const CODEX_MODEL_CATALOG_FILE = ".ai-tidu9-model-catalog.json";
 const STATE_FILE = ".ai-tidu9-profile-state.json";
+const TURN_PROVIDER_HISTORY_FILE = ".ai-tidu9-turn-providers.jsonl";
 const BACKUP_DIRECTORY = ".ai-tidu9-backups";
 const SNAPSHOT_MANIFEST_FILE = "snapshot.json";
 const SNAPSHOT_PROFILE_FILE = "profile.config.toml";
@@ -109,7 +111,7 @@ export interface CodexClientConfigurationResult {
 export type CodexClientMode = "official" | "ai-tidu9";
 
 export interface CodexClientModeOptions extends CodexClientRollbackOptions {
-  /** Configuration to make active for newly started Codex sessions. */
+  /** Configuration to make active for new chats and subsequent turns in resumed chats. */
   mode: CodexClientMode;
   /** Optional fetch implementation for isolated tests. */
   request?: typeof fetch;
@@ -123,7 +125,7 @@ export interface CodexClientModelCatalogRefreshOptions extends CodexClientRollba
 export interface CodexClientStatus {
   /** Whether the managed AI-Tidu9 profile is installed. */
   installed: boolean;
-  /** Configuration currently selected for newly started Codex sessions. */
+  /** Configuration currently selected for new chats and subsequent resumed turns. */
   activeMode: CodexClientMode;
   /** Managed endpoint, or null when the profile is not installed. */
   endpoint: string | null;
@@ -162,6 +164,10 @@ interface CodexProfileState {
   endpoint: string;
   /** Active virtual-model identifier. */
   model: string;
+  /** Official model alias retained so either mode can compact the same chat. */
+  officialModel?: string;
+  /** Latest official top-level model selection restored after managed mode. */
+  officialDefaultLines?: readonly string[];
   /** Snapshot restored by the next explicit rollback. */
   backupId: string;
   /** First snapshot used to restore the pre-install Codex defaults on uninstall. */
@@ -224,6 +230,13 @@ interface CodexPaths {
   backups: string;
 }
 
+interface PrivateFileState {
+  /** Managed file path participating in one local transaction. */
+  path: string;
+  /** Complete file content, or undefined when the file must be absent. */
+  content: string | undefined;
+}
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
@@ -252,6 +265,20 @@ const hasManagedDefaultConfiguration = (paths: CodexPaths): boolean =>
   existsSync(paths.defaultConfiguration) &&
   readFileSync(paths.defaultConfiguration, "utf8").includes(MANAGED_DEFAULT_START);
 
+const OFFICIAL_DEFAULT_KEYS = new Set(["model", "model_provider", "model_catalog_json"]);
+
+const readOfficialDefaultLines = (configurationPath: string): readonly string[] => {
+  if (!existsSync(configurationPath)) return [];
+  assertSafeRegularFile(configurationPath);
+  const lines = readFileSync(configurationPath, "utf8").split("\n");
+  const firstTableIndex = lines.findIndex((line) => /^\s*\[/u.test(line));
+  const topLevelEnd = firstTableIndex === -1 ? lines.length : firstTableIndex;
+  return lines.slice(0, topLevelEnd).filter((line) => {
+    const key = line.match(/^\s*([a-z_]+)\s*=/u)?.[1];
+    return key !== undefined && OFFICIAL_DEFAULT_KEYS.has(key);
+  });
+};
+
 const removeManagedBlock = (content: string, start: string, end: string): string => {
   let remaining = content;
   while (true) {
@@ -268,6 +295,35 @@ const removeManagedBlock = (content: string, start: string, end: string): string
     }
     remaining = `${remaining.slice(0, startIndex)}${remaining.slice(endIndex + end.length)}`;
   }
+};
+
+const addManagedProviderBlock = (content: string, endpoint: string): string => {
+  const withoutManagedProvider = removeManagedBlock(
+    content,
+    MANAGED_PROVIDER_START,
+    MANAGED_PROVIDER_END,
+  );
+  if (/^\s*\[model_providers\.ai_tidu9\]\s*$/mu.test(withoutManagedProvider)) {
+    throw new TiduError(
+      "CONFIGURATION_CONFLICT",
+      "Codex already contains an unmanaged model_providers.ai_tidu9 definition.",
+    );
+  }
+  const normalized = withoutManagedProvider.replace(/^\n+|\n+$/gu, "");
+  return [
+    normalized,
+    MANAGED_PROVIDER_START,
+    "# Local Agent runtime only. Official Codex credentials are never sent to this endpoint.",
+    "[model_providers.ai_tidu9]",
+    'name = "AI-Tidu9 (local)"',
+    `base_url = ${JSON.stringify(`${endpoint}/v1/hosts/codex`)}`,
+    'wire_api = "responses"',
+    "requires_openai_auth = false",
+    "supports_websockets = false",
+    MANAGED_PROVIDER_END,
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
 };
 
 const activateDefaultCodexConfiguration = (
@@ -318,23 +374,9 @@ const activateDefaultCodexConfiguration = (
     `model_catalog_json = ${JSON.stringify(paths.modelCatalog)}`,
     MANAGED_DEFAULT_END,
   );
-  lines.push(
-    "",
-    MANAGED_PROVIDER_START,
-    "# Local Agent runtime only. Official Codex credentials are never sent to this endpoint.",
-    "[model_providers.ai_tidu9]",
-    'name = "AI-Tidu9 (local)"',
-    `base_url = ${JSON.stringify(`${endpoint}/v1/hosts/codex`)}`,
-    'wire_api = "responses"',
-    "requires_openai_auth = false",
-    "supports_websockets = false",
-    "request_max_retries = 0",
-    "stream_max_retries = 0",
-    MANAGED_PROVIDER_END,
-  );
   writePrivateFileAtomically(
     paths.defaultConfiguration,
-    `${lines.join("\n").replace(/^\n+|\n+$/gu, "")}\n`,
+    `${addManagedProviderBlock(lines.join("\n"), endpoint)}\n`,
   );
 };
 
@@ -376,6 +418,65 @@ const writePrivateFileAtomically = (targetPath: string, content: string): void =
     chmodSync(targetPath, 0o600);
   } finally {
     rmSync(temporaryPath, { force: true });
+  }
+};
+
+const applyPrivateFileStatesAtomically = (states: readonly PrivateFileState[]): void => {
+  const duplicatePaths = new Set<string>();
+  for (const state of states) {
+    if (duplicatePaths.has(state.path)) {
+      throw new TiduError("CONFIGURATION_CONFLICT", "Client file transaction is invalid.");
+    }
+    duplicatePaths.add(state.path);
+    assertSafeRegularFile(state.path);
+  }
+  const transactionId = randomUUID();
+  const entries = states.map((state) => ({
+    ...state,
+    previousPath: `${state.path}.${transactionId}.previous`,
+    stagedPath: `${state.path}.${transactionId}.staged`,
+    previousMoved: false,
+    nextInstalled: false,
+  }));
+  let committed = false;
+  try {
+    for (const entry of entries) {
+      if (entry.content === undefined) continue;
+      writeFileSync(entry.stagedPath, entry.content, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      });
+    }
+    for (const entry of entries) {
+      if (existsSync(entry.path)) {
+        renameSync(entry.path, entry.previousPath);
+        entry.previousMoved = true;
+      }
+      if (entry.content !== undefined) {
+        renameSync(entry.stagedPath, entry.path);
+        entry.nextInstalled = true;
+        chmodSync(entry.path, 0o600);
+      }
+    }
+    committed = true;
+  } catch (error) {
+    for (const entry of [...entries].reverse()) {
+      if (entry.nextInstalled) {
+        rmSync(entry.path, { force: true });
+        entry.nextInstalled = false;
+      }
+      if (entry.previousMoved && existsSync(entry.previousPath)) {
+        renameSync(entry.previousPath, entry.path);
+        entry.previousMoved = false;
+      }
+    }
+    throw error;
+  } finally {
+    for (const entry of entries) {
+      rmSync(entry.stagedPath, { force: true });
+      if (committed) rmSync(entry.previousPath, { force: true });
+    }
   }
 };
 
@@ -664,10 +765,25 @@ const createCodexProfile = (endpoint: string, model: string, modelCatalogPath: s
     'wire_api = "responses"',
     "requires_openai_auth = false",
     "supports_websockets = false",
-    "request_max_retries = 0",
-    "stream_max_retries = 0",
     "",
   ].join("\n");
+
+const restoreCodexNativeRetries = (filePath: string): void => {
+  if (!existsSync(filePath)) return;
+  assertSafeRegularFile(filePath);
+  const original = readFileSync(filePath, "utf8");
+  let managedProvider = false;
+  const updated = original
+    .split("\n")
+    .filter((line) => {
+      if (/^\s*\[/u.test(line))
+        managedProvider = /^\s*\[model_providers\.ai_tidu9\]\s*$/u.test(line);
+      if (line === MANAGED_PROVIDER_END) managedProvider = false;
+      return !(managedProvider && /^\s*(?:request|stream)_max_retries\s*=\s*0\s*$/u.test(line));
+    })
+    .join("\n");
+  if (updated !== original) writePrivateFileAtomically(filePath, updated);
+};
 
 const createCodexModelCatalog = (model: string, reasoningEffortSupported: boolean): string =>
   `${JSON.stringify(
@@ -680,17 +796,26 @@ const createCodexModelCatalog = (model: string, reasoningEffortSupported: boolea
           ...(reasoningEffortSupported ? { default_reasoning_level: "medium" } : {}),
           supported_reasoning_levels: reasoningEffortSupported
             ? [
-                { effort: "low", description: "Fast responses with lighter reasoning" },
+                {
+                  effort: "low",
+                  description: "Fast responses with lighter reasoning",
+                },
                 {
                   effort: "medium",
                   description: "Balances speed and reasoning depth for everyday tasks",
                 },
-                { effort: "high", description: "Greater reasoning depth for complex problems" },
+                {
+                  effort: "high",
+                  description: "Greater reasoning depth for complex problems",
+                },
                 {
                   effort: "xhigh",
                   description: "Extra high reasoning depth for complex problems",
                 },
-                { effort: "max", description: "Maximum reasoning depth for the hardest problems" },
+                {
+                  effort: "max",
+                  description: "Maximum reasoning depth for the hardest problems",
+                },
                 {
                   effort: "ultra",
                   description: "Maximum reasoning with automatic task delegation",
@@ -874,8 +999,19 @@ const readManagedState = (statePath: string): CodexProfileState | undefined => {
     state.profile !== CODEX_PROFILE_NAME ||
     typeof state.endpoint !== "string" ||
     typeof state.model !== "string" ||
+    (state.officialModel !== undefined && typeof state.officialModel !== "string") ||
+    (state.officialDefaultLines !== undefined &&
+      (!Array.isArray(state.officialDefaultLines) ||
+        !state.officialDefaultLines.every(
+          (line) =>
+            typeof line === "string" &&
+            OFFICIAL_DEFAULT_KEYS.has(line.match(/^\s*([a-z_]+)\s*=/u)?.[1] ?? ""),
+        ))) ||
     typeof state.backupId !== "string" ||
-    (state.originalBackupId !== undefined && typeof state.originalBackupId !== "string") ||
+    !MANAGED_SNAPSHOT_ID_PATTERN.test(state.backupId) ||
+    (state.originalBackupId !== undefined &&
+      (typeof state.originalBackupId !== "string" ||
+        !MANAGED_SNAPSHOT_ID_PATTERN.test(state.originalBackupId))) ||
     typeof state.configuredAt !== "string"
   ) {
     throw new TiduError("CONFIGURATION_CONFLICT", "AI-Tidu9 client state is invalid.");
@@ -956,6 +1092,9 @@ const createSnapshot = (paths: CodexPaths): string => {
 
 const readSnapshotManifest = (snapshotDirectory: string): SnapshotManifest => {
   const manifestPath = join(snapshotDirectory, SNAPSHOT_MANIFEST_FILE);
+  if (!existsSync(manifestPath)) {
+    throw new TiduError("CONFIGURATION_CONFLICT", "Client backup manifest is missing.");
+  }
   assertSafeRegularFile(manifestPath);
   let manifest: unknown;
   try {
@@ -980,55 +1119,95 @@ const readSnapshotManifest = (snapshotDirectory: string): SnapshotManifest => {
   return manifest as unknown as SnapshotManifest;
 };
 
-const restoreSnapshot = (paths: CodexPaths, backupId: string, removeSnapshot: boolean): void => {
-  const snapshotDirectory = join(paths.backups, backupId);
-  const manifest = readSnapshotManifest(snapshotDirectory);
-  if (manifest.profileExisted) {
-    const snapshotProfile = join(snapshotDirectory, SNAPSHOT_PROFILE_FILE);
-    assertSafeRegularFile(snapshotProfile);
-    writePrivateFileAtomically(paths.profile, readFileSync(snapshotProfile, "utf8"));
-  } else {
-    assertSafeRegularFile(paths.profile);
-    rmSync(paths.profile, { force: true });
+const resolveSnapshotDirectory = (paths: CodexPaths, backupId: string): string => {
+  if (!MANAGED_SNAPSHOT_ID_PATTERN.test(backupId)) {
+    throw new TiduError("CONFIGURATION_CONFLICT", "Client backup identifier is invalid.");
   }
-  if (manifest.stateExisted) {
-    const snapshotState = join(snapshotDirectory, SNAPSHOT_STATE_FILE);
-    assertSafeRegularFile(snapshotState);
-    writePrivateFileAtomically(paths.state, readFileSync(snapshotState, "utf8"));
-  } else {
-    assertSafeRegularFile(paths.state);
-    rmSync(paths.state, { force: true });
+  if (!existsSync(paths.backups)) {
+    throw new TiduError("CONFIGURATION_CONFLICT", "Client backup directory is missing.");
   }
-  if (manifest.modelCatalogExisted) {
-    const snapshotCatalog = join(snapshotDirectory, SNAPSHOT_MODEL_CATALOG_FILE);
-    assertSafeRegularFile(snapshotCatalog);
-    writePrivateFileAtomically(paths.modelCatalog, readFileSync(snapshotCatalog, "utf8"));
-  } else {
-    assertSafeRegularFile(paths.modelCatalog);
-    rmSync(paths.modelCatalog, { force: true });
-  }
-  if (manifest.defaultConfigurationExisted) {
-    const snapshotConfiguration = join(snapshotDirectory, SNAPSHOT_DEFAULT_CONFIGURATION_FILE);
-    assertSafeRegularFile(snapshotConfiguration);
-    writePrivateFileAtomically(
-      paths.defaultConfiguration,
-      readFileSync(snapshotConfiguration, "utf8"),
+  const backupStatus = lstatSync(paths.backups);
+  if (!backupStatus.isDirectory() || backupStatus.isSymbolicLink()) {
+    throw new TiduError(
+      "CONFIGURATION_CONFLICT",
+      "AI-Tidu9 Codex backups must be a real directory.",
     );
-  } else {
-    assertSafeRegularFile(paths.defaultConfiguration);
-    rmSync(paths.defaultConfiguration, { force: true });
   }
+  const snapshotDirectory = join(paths.backups, backupId);
+  if (!existsSync(snapshotDirectory)) {
+    throw new TiduError("CONFIGURATION_CONFLICT", "Client backup snapshot is missing.");
+  }
+  const snapshotStatus = lstatSync(snapshotDirectory);
+  if (!snapshotStatus.isDirectory() || snapshotStatus.isSymbolicLink()) {
+    throw new TiduError("CONFIGURATION_CONFLICT", "Client backup snapshot is invalid.");
+  }
+  return snapshotDirectory;
+};
+
+const readSnapshotFile = (snapshotDirectory: string, fileName: string): string => {
+  const snapshotPath = join(snapshotDirectory, fileName);
+  if (!existsSync(snapshotPath)) {
+    throw new TiduError("CONFIGURATION_CONFLICT", "Client backup snapshot is incomplete.");
+  }
+  assertSafeRegularFile(snapshotPath);
+  return readFileSync(snapshotPath, "utf8");
+};
+
+const readSnapshotRestoration = (
+  paths: CodexPaths,
+  backupId: string,
+): { snapshotDirectory: string; states: readonly PrivateFileState[] } => {
+  const snapshotDirectory = resolveSnapshotDirectory(paths, backupId);
+  const manifest = readSnapshotManifest(snapshotDirectory);
+  const states = [
+    {
+      path: paths.profile,
+      content: manifest.profileExisted
+        ? readSnapshotFile(snapshotDirectory, SNAPSHOT_PROFILE_FILE)
+        : undefined,
+    },
+    {
+      path: paths.state,
+      content: manifest.stateExisted
+        ? readSnapshotFile(snapshotDirectory, SNAPSHOT_STATE_FILE)
+        : undefined,
+    },
+    {
+      path: paths.modelCatalog,
+      content: manifest.modelCatalogExisted
+        ? readSnapshotFile(snapshotDirectory, SNAPSHOT_MODEL_CATALOG_FILE)
+        : undefined,
+    },
+    {
+      path: paths.defaultConfiguration,
+      content: manifest.defaultConfigurationExisted
+        ? readSnapshotFile(snapshotDirectory, SNAPSHOT_DEFAULT_CONFIGURATION_FILE)
+        : undefined,
+    },
+  ];
+  return { snapshotDirectory, states };
+};
+
+const restoreSnapshot = (paths: CodexPaths, backupId: string, removeSnapshot: boolean): void => {
+  const restoration = readSnapshotRestoration(paths, backupId);
+  applyPrivateFileStatesAtomically(restoration.states);
   if (removeSnapshot) {
-    rmSync(snapshotDirectory, { force: true, recursive: true });
+    rmSync(restoration.snapshotDirectory, { force: true, recursive: true });
   }
 };
 
-const restoreDefaultConfigurationValues = (paths: CodexPaths, backupId: string): void => {
-  const snapshotDirectory = join(paths.backups, backupId);
+const createRestoredDefaultConfiguration = (
+  paths: CodexPaths,
+  backupId: string,
+  retainedProviderEndpoint?: string,
+  retainedDefaultLines?: readonly string[],
+): string | undefined => {
+  const snapshotDirectory = resolveSnapshotDirectory(paths, backupId);
   const manifest = readSnapshotManifest(snapshotDirectory);
   const original = manifest.defaultConfigurationExisted
-    ? readFileSync(join(snapshotDirectory, SNAPSHOT_DEFAULT_CONFIGURATION_FILE), "utf8")
+    ? readSnapshotFile(snapshotDirectory, SNAPSHOT_DEFAULT_CONFIGURATION_FILE)
     : "";
+  assertSafeRegularFile(paths.defaultConfiguration);
   const current = existsSync(paths.defaultConfiguration)
     ? readFileSync(paths.defaultConfiguration, "utf8")
     : "";
@@ -1047,10 +1226,12 @@ const restoreDefaultConfigurationValues = (paths: CodexPaths, backupId: string):
   const originalTopLevelEnd =
     originalFirstTableIndex === -1 ? originalLines.length : originalFirstTableIndex;
   const managedKeys = new Set(["model", "model_provider", "model_catalog_json"]);
-  const originalManagedLines = originalLines.slice(0, originalTopLevelEnd).filter((line) => {
-    const key = line.match(/^\s*([a-z_]+)\s*=/u)?.[1];
-    return key !== undefined && managedKeys.has(key);
-  });
+  const originalManagedLines =
+    retainedDefaultLines ??
+    originalLines.slice(0, originalTopLevelEnd).filter((line) => {
+      const key = line.match(/^\s*([a-z_]+)\s*=/u)?.[1];
+      return key !== undefined && managedKeys.has(key);
+    });
   const remaining = withoutManagedBlocks.replace(/^\n+|\n+$/gu, "");
   const remainingLines = remaining === "" ? [] : remaining.split("\n");
   const firstTableIndex = remainingLines.findIndex((line) => /^\s*\[/u.test(line));
@@ -1066,11 +1247,33 @@ const restoreDefaultConfigurationValues = (paths: CodexPaths, backupId: string):
     updatedFirstTableIndex === -1 ? remainingLines.length : updatedFirstTableIndex;
   remainingLines.splice(insertIndex, 0, ...originalManagedLines);
   const restored = remainingLines.join("\n").replace(/^\n+|\n+$/gu, "");
-  if (restored === "" && !manifest.defaultConfigurationExisted) {
-    rmSync(paths.defaultConfiguration, { force: true });
-    return;
+  if (
+    restored === "" &&
+    !manifest.defaultConfigurationExisted &&
+    retainedProviderEndpoint === undefined
+  ) {
+    return undefined;
   }
-  writePrivateFileAtomically(paths.defaultConfiguration, `${restored}\n`);
+  const officialCompatibleConfiguration =
+    retainedProviderEndpoint === undefined
+      ? restored
+      : addManagedProviderBlock(restored, retainedProviderEndpoint);
+  return `${officialCompatibleConfiguration}\n`;
+};
+
+const restoreDefaultConfigurationValues = (
+  paths: CodexPaths,
+  backupId: string,
+  retainedProviderEndpoint?: string,
+  retainedDefaultLines?: readonly string[],
+): void => {
+  const content = createRestoredDefaultConfiguration(
+    paths,
+    backupId,
+    retainedProviderEndpoint,
+    retainedDefaultLines,
+  );
+  applyPrivateFileStatesAtomically([{ path: paths.defaultConfiguration, content }]);
 };
 
 const listSnapshotIds = (paths: CodexPaths): readonly string[] => {
@@ -1096,7 +1299,7 @@ const pruneManagedSnapshots = (paths: CodexPaths, retainedIds: readonly string[]
     if (retained.has(backupId)) {
       continue;
     }
-    const snapshotDirectory = join(paths.backups, backupId);
+    const snapshotDirectory = resolveSnapshotDirectory(paths, backupId);
     try {
       readSnapshotManifest(snapshotDirectory);
     } catch {
@@ -1121,9 +1324,13 @@ export const configureCodexClient = async (
       : await verifyEndpoint(options.endpoint, request);
   const paths = resolveCodexPaths(options.codexHomeDirectory);
   let existingState = readManagedState(paths.state);
-  switchCodexDesktopProxy(false, paths.home);
   if (existingState !== undefined && hasManagedDefaultConfiguration(paths)) {
-    restoreDefaultConfigurationValues(paths, existingState.originalBackupId);
+    restoreDefaultConfigurationValues(
+      paths,
+      existingState.originalBackupId,
+      existingState.endpoint,
+      existingState.officialDefaultLines,
+    );
     existingState = {
       ...existingState,
       activeMode: "official",
@@ -1144,13 +1351,24 @@ export const configureCodexClient = async (
     readFileSync(paths.profile, "utf8") === expectedProfile &&
     readFileSync(paths.modelCatalog, "utf8") === expectedCatalog
   ) {
+    const officialModel = readCodexActiveSelection(paths.home).model;
+    const officialDefaultLines = readOfficialDefaultLines(paths.defaultConfiguration);
+    restoreDefaultConfigurationValues(
+      paths,
+      existingState.originalBackupId,
+      existingState.endpoint,
+      officialDefaultLines,
+    );
     writeManagedState(paths.state, {
       ...existingState,
+      officialModel,
+      officialDefaultLines,
       activeMode: "official",
       configuredAt: new Date().toISOString(),
     });
     pruneManagedSnapshots(paths, [existingState.originalBackupId, existingState.backupId]);
     prepareDesktopRecovery(paths.home, options.codexHomeDirectory);
+    switchCodexDesktopProxy(true, paths.home);
     return {
       status: "configured",
       client: "codex",
@@ -1162,10 +1380,17 @@ export const configureCodexClient = async (
     };
   }
   if (existingState?.activeMode === "ai-tidu9") {
-    restoreDefaultConfigurationValues(paths, existingState.originalBackupId);
+    restoreDefaultConfigurationValues(
+      paths,
+      existingState.originalBackupId,
+      existingState.endpoint,
+      existingState.officialDefaultLines,
+    );
   }
   const backupId = createSnapshot(paths);
   try {
+    const officialModel = readCodexActiveSelection(paths.home).model;
+    const officialDefaultLines = readOfficialDefaultLines(paths.defaultConfiguration);
     writePrivateFileAtomically(paths.modelCatalog, expectedCatalog);
     writePrivateFileAtomically(paths.profile, expectedProfile);
     const state: CodexProfileState = {
@@ -1174,12 +1399,20 @@ export const configureCodexClient = async (
       profile: CODEX_PROFILE_NAME,
       endpoint: verified.endpoint,
       model: verified.model,
+      ...(officialModel === undefined ? {} : { officialModel }),
+      officialDefaultLines,
       backupId,
       originalBackupId: existingState?.originalBackupId ?? backupId,
       configuredAt: new Date().toISOString(),
       activeMode: "official",
     };
     writeManagedState(paths.state, state);
+    restoreDefaultConfigurationValues(
+      paths,
+      state.originalBackupId,
+      state.endpoint,
+      state.officialDefaultLines,
+    );
     if (options.verifyRuntime !== false) {
       const postWriteVerification = await verifyEndpoint(verified.endpoint, request);
       if (postWriteVerification.model !== verified.model) {
@@ -1191,6 +1424,7 @@ export const configureCodexClient = async (
     }
     pruneManagedSnapshots(paths, [state.originalBackupId, state.backupId]);
     prepareDesktopRecovery(paths.home, options.codexHomeDirectory);
+    switchCodexDesktopProxy(true, paths.home);
   } catch (error) {
     restoreSnapshot(paths, backupId, true);
     throw error;
@@ -1240,6 +1474,8 @@ export const refreshCodexClientModelCatalog = async (
     paths.modelCatalog,
     createCodexModelCatalog(state.model, verified.reasoningEffortSupported),
   );
+  restoreCodexNativeRetries(paths.profile);
+  restoreCodexNativeRetries(paths.defaultConfiguration);
   return inspectCodexClientConfiguration(options);
 };
 
@@ -1265,14 +1501,24 @@ export const switchCodexClientConfiguration = async (
   const managedDefaultActive = hasManagedDefaultConfiguration(paths);
   const activeMode = managedDefaultActive ? "ai-tidu9" : "official";
   if (activeMode === options.mode && options.mode === "official") {
-    switchCodexDesktopProxy(false, paths.home);
+    prepareDesktopRecovery(paths.home, options.codexHomeDirectory);
+    switchCodexDesktopProxy(true, paths.home);
     return inspectCodexClientConfiguration(options);
   }
+  let nextState = state;
   if (options.mode === "ai-tidu9") {
     const request = options.request ?? fetch;
+    const officialModel = readCodexActiveSelection(paths.home).model;
+    const officialDefaultLines = readOfficialDefaultLines(paths.defaultConfiguration);
+    nextState = {
+      ...state,
+      officialModel,
+      officialDefaultLines,
+    };
     try {
       prepareDesktopRecovery(paths.home, options.codexHomeDirectory);
       await verifyEndpoint(state.endpoint, request);
+      restoreCodexNativeRetries(paths.profile);
       activateDefaultCodexConfiguration(paths, state.endpoint, state.model);
       await verifyInference(
         state.endpoint,
@@ -1286,20 +1532,32 @@ export const switchCodexClientConfiguration = async (
       );
       switchCodexDesktopProxy(true, paths.home);
     } catch (error) {
-      restoreDefaultConfigurationValues(paths, state.originalBackupId);
+      restoreDefaultConfigurationValues(
+        paths,
+        state.originalBackupId,
+        state.endpoint,
+        nextState.officialDefaultLines,
+      );
       writeManagedState(paths.state, {
-        ...state,
+        ...nextState,
         activeMode: "official",
         configuredAt: new Date().toISOString(),
       });
+      switchCodexDesktopProxy(true, paths.home);
       throw error;
     }
   } else {
-    restoreDefaultConfigurationValues(paths, state.originalBackupId);
-    switchCodexDesktopProxy(false, paths.home);
+    restoreDefaultConfigurationValues(
+      paths,
+      state.originalBackupId,
+      state.endpoint,
+      state.officialDefaultLines,
+    );
+    prepareDesktopRecovery(paths.home, options.codexHomeDirectory);
+    switchCodexDesktopProxy(true, paths.home);
   }
   writeManagedState(paths.state, {
-    ...state,
+    ...nextState,
     activeMode: options.mode,
     configuredAt: new Date().toISOString(),
   });
@@ -1331,10 +1589,8 @@ export const rollbackCodexClientConfiguration = (
     };
   }
   restoreSnapshot(paths, backupId, true);
-  switchCodexDesktopProxy(
-    inspectCodexClientConfiguration(options).activeMode === "ai-tidu9",
-    paths.home,
-  );
+  if (inspectCodexClientConfiguration(options).installed) switchCodexDesktopProxy(true, paths.home);
+  else removeCodexDesktopProxy(paths.home);
   return {
     status: "restored",
     client: "codex",
@@ -1367,28 +1623,19 @@ export const removeCodexClientConfiguration = (
       "The AI-Tidu9 model catalog exists without managed ownership state.",
     );
   }
-  if (
-    managedState?.activeMode === "ai-tidu9" &&
-    !existsSync(join(paths.backups, managedState.originalBackupId))
-  ) {
+  if (managedState?.activeMode === "ai-tidu9" && !existsSync(paths.backups)) {
     throw new TiduError(
       "CONFIGURATION_CONFLICT",
       "The original Codex configuration snapshot is missing; restore the official configuration before uninstalling.",
     );
   }
 
-  let removedArtifactCount = 0;
-  if (removeCodexDesktopProxy(paths.home)) removedArtifactCount += 1;
-  if (profileExists) {
-    rmSync(paths.profile);
-    rmSync(paths.state);
-    removedArtifactCount += 2;
-  }
-  if (modelCatalogExists) {
-    rmSync(paths.modelCatalog);
-    removedArtifactCount += 1;
-  }
-  if (existsSync(paths.backups)) {
+  const turnProviderHistory = join(paths.home, TURN_PROVIDER_HISTORY_FILE);
+  assertSafeRegularFile(turnProviderHistory);
+  const turnProviderHistoryExists = existsSync(turnProviderHistory);
+  const backupsExist = existsSync(paths.backups);
+  let restoredDefaultConfiguration: string | undefined;
+  if (backupsExist) {
     const backupStatus = lstatSync(paths.backups);
     if (!backupStatus.isDirectory() || backupStatus.isSymbolicLink()) {
       throw new TiduError(
@@ -1397,8 +1644,42 @@ export const removeCodexClientConfiguration = (
       );
     }
     if (managedState !== undefined) {
-      restoreDefaultConfigurationValues(paths, managedState.originalBackupId);
+      const retainedDefaultLines = hasManagedDefaultConfiguration(paths)
+        ? managedState.officialDefaultLines
+        : readOfficialDefaultLines(paths.defaultConfiguration);
+      restoredDefaultConfiguration = createRestoredDefaultConfiguration(
+        paths,
+        managedState.originalBackupId,
+        undefined,
+        retainedDefaultLines,
+      );
     }
+  }
+
+  let removedArtifactCount = 0;
+  applyPrivateFileStatesAtomically([
+    ...(profileExists
+      ? [
+          { path: paths.profile, content: undefined },
+          { path: paths.state, content: undefined },
+        ]
+      : []),
+    ...(modelCatalogExists ? [{ path: paths.modelCatalog, content: undefined }] : []),
+    ...(turnProviderHistoryExists ? [{ path: turnProviderHistory, content: undefined }] : []),
+    ...(backupsExist && managedState !== undefined
+      ? [
+          {
+            path: paths.defaultConfiguration,
+            content: restoredDefaultConfiguration,
+          },
+        ]
+      : []),
+  ]);
+  if (profileExists) removedArtifactCount += 2;
+  if (modelCatalogExists) removedArtifactCount += 1;
+  if (turnProviderHistoryExists) removedArtifactCount += 1;
+  if (removeCodexDesktopProxy(paths.home)) removedArtifactCount += 1;
+  if (backupsExist) {
     rmSync(paths.backups, { recursive: true });
     removedArtifactCount += 1;
   }

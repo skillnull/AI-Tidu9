@@ -5,6 +5,7 @@ import type {
   ProviderExecutionRequest,
   ProviderExecutionResult,
 } from "../providers/index.js";
+import { formatModelFailureMessage } from "../providers/index.js";
 import {
   AgentExecutionError,
   type AgentModelPreferences,
@@ -233,6 +234,27 @@ const extractCompletedStreamText = (body: unknown): string => {
     .join("");
 };
 
+const createPublicProgressItem = (item: Record<string, unknown>): Record<string, unknown> => {
+  const publicItem = Object.fromEntries(
+    Object.entries(item).filter(
+      ([field]) =>
+        field !== "encrypted_content" &&
+        field !== "internal_chat_message_metadata_passthrough" &&
+        (item.type !== "reasoning" || field !== "content"),
+    ),
+  );
+  if (item.type !== "reasoning") return publicItem;
+  return {
+    ...publicItem,
+    summary: Array.isArray(item.summary)
+      ? item.summary.filter(
+          (part) => isRecord(part) && part.type === "summary_text" && typeof part.text === "string",
+        )
+      : [],
+    encrypted_content: null,
+  };
+};
+
 const consumeProviderTextStream = async (
   source: ReadableStream<Uint8Array>,
   protocol: ProviderExecutionRequest["protocol"],
@@ -265,7 +287,7 @@ const consumeProviderTextStream = async (
     )
       return;
     forwardedProgressItems.add(item.id);
-    onOutputItem(item);
+    onOutputItem(createPublicProgressItem(item));
   };
   const forwardToolItem = (item: unknown): void => {
     if (
@@ -603,11 +625,43 @@ export const createModelProviderAgentAdapters = (
               : provider.descriptor.type === "ollama"
                 ? "ollama"
                 : "openai-compatible");
-        let providerReportedWorkerUsage = false;
+        const reportedUsage = new Set<string>();
+        let executedModel = provider.descriptor.model;
+        let executionSource: Pick<
+          ProviderExecutionReceipt,
+          "host" | "model" | "role" | "capabilities"
+        > = {
+          host: executionHost,
+          model: executedModel,
+          role: "worker",
+          capabilities: executionCapabilities,
+        };
+        const hasReportedOutputUsage = (model: string): boolean =>
+          reportedUsage.has(
+            JSON.stringify([
+              executionSource.model === model ? executionSource.host : executionHost,
+              model,
+            ]),
+          );
+        const failureBody = input.modelRequest.body;
+        const failModel = (error: unknown): never => {
+          if (!(error instanceof Error) || error.name === "AbortError") throw error;
+          error.message = formatModelFailureMessage(
+            failureBody,
+            {
+              host: executionSource.host,
+              model: executedModel,
+              role: executionSource.role,
+            },
+            sanitizeProviderErrorMessage(error.message, "Model execution failed."),
+          );
+          throw error;
+        };
         const forwardExecutionReceipt = (receipt: ProviderExecutionReceipt): void => {
-          if (receipt.role === "worker" && receipt.usage !== null) {
-            providerReportedWorkerUsage = true;
-          }
+          executionSource = receipt;
+          executedModel = receipt.model;
+          if (receipt.usage !== null)
+            reportedUsage.add(JSON.stringify([receipt.host, receipt.model]));
           input.modelRequest?.onExecutionReceipt?.(receipt);
         };
         let providerProcessStarted = false;
@@ -621,40 +675,61 @@ export const createModelProviderAgentAdapters = (
                 }
                 input.modelRequest?.onProcessDelta?.(delta);
               };
-        const directResult = await provider.execute({
-          protocol: input.modelRequest.protocol,
-          virtualModelId: input.modelRequest.virtualModelId,
-          signal: input.signal,
-          onProcessDelta: forwardProcessDelta,
-          onExecutionReceipt: forwardExecutionReceipt,
-          routing: {
-            role: "worker",
-            securityScopeId: input.task.taskId,
-            requiredCapabilities: executionCapabilities,
-            host: input.task.originHost,
-          },
-          body: {
-            ...input.modelRequest.body,
-            stream: shouldStream,
-            ...(input.modelPreferences?.reasoningEffort === undefined
-              ? {}
-              : input.modelRequest.protocol === "responses"
-                ? {
-                    reasoning: {
-                      ...(isRecord(input.modelRequest.body.reasoning)
-                        ? input.modelRequest.body.reasoning
-                        : {}),
-                      effort: input.modelPreferences.reasoningEffort,
-                    },
-                  }
-                : { reasoning_effort: input.modelPreferences.reasoningEffort }),
-          },
-        });
+        const directResult = await provider
+          .execute({
+            protocol: input.modelRequest.protocol,
+            virtualModelId: input.modelRequest.virtualModelId,
+            signal: input.signal,
+            onProcessDelta: forwardProcessDelta,
+            onExecutionReceipt: forwardExecutionReceipt,
+            onModelConfirmed: (model) => {
+              executedModel = model;
+            },
+            routing: {
+              role: "worker",
+              securityScopeId: input.task.taskId,
+              requiredCapabilities: executionCapabilities,
+              host: input.task.originHost,
+            },
+            body: {
+              ...input.modelRequest.body,
+              stream: shouldStream,
+              ...(input.modelPreferences?.reasoningEffort === undefined
+                ? {}
+                : input.modelRequest.protocol === "responses"
+                  ? {
+                      reasoning: {
+                        ...(isRecord(input.modelRequest.body.reasoning)
+                          ? input.modelRequest.body.reasoning
+                          : {}),
+                        effort: input.modelPreferences.reasoningEffort,
+                      },
+                    }
+                  : { reasoning_effort: input.modelPreferences.reasoningEffort }),
+            },
+          })
+          .catch(failModel);
+        executedModel = directResult.upstreamModel ?? executedModel;
+        const recordOutputUsage = (usage: ProviderTokenUsage): void => {
+          const model = directResult.upstreamModel ?? provider.descriptor.model;
+          const source =
+            executionSource.model === model
+              ? executionSource
+              : {
+                  host: executionHost,
+                  model,
+                  role: "worker" as const,
+                  capabilities: executionCapabilities,
+                };
+          forwardExecutionReceipt({ ...source, usage });
+        };
         if (directResult.statusCode < 200 || directResult.statusCode >= 300) {
-          throw createProviderResultError(
-            directResult,
-            "agent_model_request_failed",
-            "Agent execution model did not return a successful response.",
+          failModel(
+            createProviderResultError(
+              directResult,
+              "agent_model_request_failed",
+              "Agent execution model did not return a successful response.",
+            ),
           );
         }
         if (directResult.kind === "stream") {
@@ -667,18 +742,14 @@ export const createModelProviderAgentAdapters = (
             input.modelRequest.onOutputDelta,
             forwardProcessDelta,
             (usage) => {
-              if (!providerReportedWorkerUsage) {
-                input.modelRequest?.onExecutionReceipt?.({
-                  host: executionHost,
-                  model: directResult.upstreamModel ?? provider.descriptor.model,
-                  role: "worker",
-                  capabilities: executionCapabilities,
-                  usage,
-                });
+              if (
+                !hasReportedOutputUsage(directResult.upstreamModel ?? provider.descriptor.model)
+              ) {
+                recordOutputUsage(usage);
               }
             },
             input.modelRequest.onOutputItem,
-          );
+          ).catch(failModel);
           return { summary };
         }
         if (directResult.kind !== "json") {
@@ -706,7 +777,7 @@ export const createModelProviderAgentAdapters = (
               (item.type === "reasoning" ||
                 (item.type === "message" && item.phase === "commentary"))
             )
-              input.modelRequest.onOutputItem?.(item);
+              input.modelRequest.onOutputItem?.(createPublicProgressItem(item));
           }
         }
         if (toolItems.length > 0 && input.modelRequest.onOutputItem === undefined)
@@ -719,17 +790,12 @@ export const createModelProviderAgentAdapters = (
             ? "Tool requests forwarded to the calling client."
             : extractTextContent(body);
         const responseUsage =
-          isRecord(directResult.body) && !providerReportedWorkerUsage
+          isRecord(directResult.body) &&
+          !hasReportedOutputUsage(directResult.upstreamModel ?? provider.descriptor.model)
             ? extractProviderUsage(directResult.body.usage)
             : null;
         if (responseUsage !== null) {
-          forwardExecutionReceipt({
-            host: executionHost,
-            model: directResult.upstreamModel ?? provider.descriptor.model,
-            role: "worker",
-            capabilities: executionCapabilities,
-            usage: responseUsage,
-          });
+          recordOutputUsage(responseUsage);
         }
         if (toolItems.length === 0) input.modelRequest.onOutputDelta?.(summary);
         return { summary };

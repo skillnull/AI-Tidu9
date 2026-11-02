@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 
 export const ENTERPRISE_CONTRACT_VERSION = "tidu-enterprise/1" as const;
 
@@ -145,6 +145,8 @@ export interface EnterpriseAdminKeyRecord {
   createdAt: string;
   /** ISO timestamp when this generation was revoked, or null while active. */
   revokedAt: string | null;
+  /** Monotonic generation used to revoke stateless administrator sessions. */
+  sessionGeneration?: number;
 }
 
 export interface EnterpriseSecurityAuditEvent {
@@ -272,9 +274,15 @@ export interface EnterpriseControlPlane {
     now?: Date,
   ) => Promise<EnterpriseState>;
   /** Initializes or rotates the one-time administrator access key. */
-  initializeAdministratorKey: () => Promise<{ key: string; record: EnterpriseAdminKeyRecord }>;
+  initializeAdministratorKey: () => Promise<{
+    key: string;
+    record: EnterpriseAdminKeyRecord;
+  }>;
   /** Rotates the administrator key after an authenticated session. */
-  rotateAdministratorKey: () => Promise<{ key: string; record: EnterpriseAdminKeyRecord }>;
+  rotateAdministratorKey: () => Promise<{
+    key: string;
+    record: EnterpriseAdminKeyRecord;
+  }>;
   /** Performs an explicitly authorized server-host key recovery and records an audit event. */
   recoverAdministratorKey: (
     hostAuthorized: boolean,
@@ -282,10 +290,10 @@ export interface EnterpriseControlPlane {
   ) => Promise<{ key: string; record: EnterpriseAdminKeyRecord }>;
   /** Authenticates a new short-lived administrator session. */
   authenticateAdministrator: (key: string, now?: Date) => Promise<EnterpriseAdminSession>;
-  /** Revokes every locally issued administrator session. */
-  revokeAdministratorSessions: () => void;
-  /** Validates a locally issued administrator session. */
-  validateAdministratorSession: (sessionId: string, now?: Date) => boolean;
+  /** Revokes every administrator session issued for the current key generation. */
+  revokeAdministratorSessions: () => Promise<void>;
+  /** Validates an administrator session against shared enterprise state. */
+  validateAdministratorSession: (sessionId: string, now?: Date) => Promise<boolean>;
   /** Generates administrator and employee guidance from live configuration. */
   generateGuidance: () => Promise<EnterpriseGuidance>;
 }
@@ -365,8 +373,11 @@ const validateEnterpriseState = (state: EnterpriseState): void => {
       throw new Error(`User-owned resource ${resource.id} requires an owner.`);
     }
   }
+  const poolIds = new Set<string>();
   for (const pool of state.quotaPools) {
+    assertIdentifier(pool.id, "Quota pool identifier");
     if (
+      poolIds.has(pool.id) ||
       !resourceIds.has(pool.resourceId) ||
       !scopeIds.has(pool.scopeId) ||
       ![pool.capacity, pool.remaining, pool.reserved, pool.settled].every(
@@ -378,6 +389,95 @@ const validateEnterpriseState = (state: EnterpriseState): void => {
     ) {
       throw new Error(`Quota pool ${pool.id} is invalid.`);
     }
+    poolIds.add(pool.id);
+  }
+  const allocationIds = new Set<string>();
+  for (const allocation of state.quotaAllocations) {
+    assertIdentifier(allocation.id, "Quota allocation identifier");
+    if (
+      allocationIds.has(allocation.id) ||
+      !poolIds.has(allocation.poolId) ||
+      !scopeIds.has(allocation.scopeId) ||
+      ![allocation.limit, allocation.reserved, allocation.settled].every(
+        (value) => Number.isSafeInteger(value) && value >= 0,
+      ) ||
+      allocation.reserved + allocation.settled > allocation.limit
+    ) {
+      throw new Error(`Quota allocation ${allocation.id} is invalid.`);
+    }
+    allocationIds.add(allocation.id);
+  }
+  const reservationIds = new Set<string>();
+  const reservedByAllocation = new Map<string, number>();
+  const settledByAllocation = new Map<string, number>();
+  for (const reservation of state.quotaReservations) {
+    assertIdentifier(reservation.id, "Quota reservation identifier");
+    if (
+      reservationIds.has(reservation.id) ||
+      !allocationIds.has(reservation.allocationId) ||
+      !Number.isSafeInteger(reservation.units) ||
+      reservation.units < 0 ||
+      (reservation.status !== "released" &&
+        reservation.status !== "reserved" &&
+        reservation.status !== "settled") ||
+      (reservation.status !== "settled" && reservation.units === 0) ||
+      Number.isNaN(Date.parse(reservation.updatedAt))
+    ) {
+      throw new Error(`Quota reservation ${reservation.id} is invalid.`);
+    }
+    reservationIds.add(reservation.id);
+    if (reservation.status === "reserved") {
+      reservedByAllocation.set(
+        reservation.allocationId,
+        (reservedByAllocation.get(reservation.allocationId) ?? 0) + reservation.units,
+      );
+    }
+    if (reservation.status === "settled") {
+      settledByAllocation.set(
+        reservation.allocationId,
+        (settledByAllocation.get(reservation.allocationId) ?? 0) + reservation.units,
+      );
+    }
+  }
+  for (const allocation of state.quotaAllocations) {
+    if (
+      allocation.reserved !== (reservedByAllocation.get(allocation.id) ?? 0) ||
+      allocation.settled !== (settledByAllocation.get(allocation.id) ?? 0)
+    ) {
+      throw new Error(`Quota allocation ${allocation.id} does not match its reservations.`);
+    }
+  }
+  for (const pool of state.quotaPools) {
+    const poolAllocations = state.quotaAllocations.filter(
+      (allocation) => allocation.poolId === pool.id,
+    );
+    const allocatedLimit = poolAllocations.reduce(
+      (total, allocation) => total + allocation.limit,
+      0,
+    );
+    const allocatedReserved = poolAllocations.reduce(
+      (total, allocation) => total + allocation.reserved,
+      0,
+    );
+    const allocatedSettled = poolAllocations.reduce(
+      (total, allocation) => total + allocation.settled,
+      0,
+    );
+    if (
+      allocatedLimit > pool.capacity ||
+      allocatedReserved !== pool.reserved ||
+      allocatedSettled !== pool.settled
+    ) {
+      throw new Error(`Quota pool ${pool.id} does not match its allocations.`);
+    }
+  }
+  if (
+    state.administratorKey !== null &&
+    state.administratorKey.sessionGeneration !== undefined &&
+    (!Number.isSafeInteger(state.administratorKey.sessionGeneration) ||
+      state.administratorKey.sessionGeneration < 0)
+  ) {
+    throw new Error("Administrator session generation is invalid.");
   }
 };
 
@@ -399,7 +499,10 @@ const collectScopeLineage = (state: EnterpriseState, scopeId: string): readonly 
   return lineage;
 };
 
-const createAdministratorKey = (): { key: string; record: EnterpriseAdminKeyRecord } => {
+const createAdministratorKey = (): {
+  key: string;
+  record: EnterpriseAdminKeyRecord;
+} => {
   const secret = randomBytes(32).toString("base64url");
   const salt = randomBytes(16);
   const record: EnterpriseAdminKeyRecord = {
@@ -409,15 +512,79 @@ const createAdministratorKey = (): { key: string; record: EnterpriseAdminKeyReco
     algorithm: "scrypt-v1",
     createdAt: new Date().toISOString(),
     revokedAt: null,
+    sessionGeneration: 0,
   };
   return { key: `tidu_admin_${secret}`, record };
+};
+
+interface EnterpriseAdminSessionPayload {
+  /** Random value preventing identical session tokens. */
+  nonce: string;
+  /** Administrator-key generation that issued the session. */
+  keyId: string;
+  /** Shared revocation generation active when the session was issued. */
+  sessionGeneration: number;
+  /** ISO expiration timestamp. */
+  expiresAt: string;
+}
+
+const signAdministratorSession = (
+  record: EnterpriseAdminKeyRecord,
+  payload: EnterpriseAdminSessionPayload,
+): string => {
+  const encodedPayload = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = createHmac("sha256", Buffer.from(record.verifier, "hex"))
+    .update(encodedPayload)
+    .digest("base64url");
+  return `${encodedPayload}.${signature}`;
+};
+
+const readAdministratorSession = (
+  sessionId: string,
+  record: EnterpriseAdminKeyRecord,
+): EnterpriseAdminSessionPayload | undefined => {
+  const [encodedPayload, encodedSignature, extraPart] = sessionId.split(".");
+  if (encodedPayload === undefined || encodedSignature === undefined || extraPart !== undefined) {
+    return undefined;
+  }
+  const expectedSignature = createHmac("sha256", Buffer.from(record.verifier, "hex"))
+    .update(encodedPayload)
+    .digest();
+  let receivedSignature: Buffer;
+  try {
+    receivedSignature = Buffer.from(encodedSignature, "base64url");
+  } catch {
+    return undefined;
+  }
+  if (
+    expectedSignature.byteLength !== receivedSignature.byteLength ||
+    !timingSafeEqual(expectedSignature, receivedSignature)
+  ) {
+    return undefined;
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8")) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    Array.isArray(payload) ||
+    typeof (payload as Record<string, unknown>).nonce !== "string" ||
+    typeof (payload as Record<string, unknown>).keyId !== "string" ||
+    !Number.isSafeInteger((payload as Record<string, unknown>).sessionGeneration) ||
+    typeof (payload as Record<string, unknown>).expiresAt !== "string"
+  ) {
+    return undefined;
+  }
+  return payload as EnterpriseAdminSessionPayload;
 };
 
 export const createEnterpriseControlPlane = (
   repository: EnterpriseStateRepository,
 ): EnterpriseControlPlane => {
-  const administratorSessions = new Map<string, EnterpriseAdminSession>();
-
   const mutate = async (
     mutation: (state: EnterpriseState) => EnterpriseState,
   ): Promise<EnterpriseState> => {
@@ -526,7 +693,11 @@ export const createEnterpriseControlPlane = (
           ...state,
           quotaPools: state.quotaPools.map((item) =>
             item.id === pool.id
-              ? { ...item, remaining: item.remaining - units, reserved: item.reserved + units }
+              ? {
+                  ...item,
+                  remaining: item.remaining - units,
+                  reserved: item.reserved + units,
+                }
               : item,
           ),
           quotaAllocations: state.quotaAllocations.map((item) =>
@@ -715,7 +886,6 @@ export const createEnterpriseControlPlane = (
           },
         ],
       }));
-      administratorSessions.clear();
       return generated;
     },
     recoverAdministratorKey: async (hostAuthorized, reason) => {
@@ -736,7 +906,6 @@ export const createEnterpriseControlPlane = (
           },
         ],
       }));
-      administratorSessions.clear();
       return generated;
     },
     authenticateAdministrator: async (key, now = new Date()) => {
@@ -754,18 +923,45 @@ export const createEnterpriseControlPlane = (
       if (candidate.byteLength !== expected.byteLength || !timingSafeEqual(candidate, expected)) {
         throw new Error("Administrator authentication failed.");
       }
-      const session: EnterpriseAdminSession = {
-        id: randomUUID(),
+      const payload: EnterpriseAdminSessionPayload = {
+        nonce: randomUUID(),
         keyId: record.id,
+        sessionGeneration: record.sessionGeneration ?? 0,
         expiresAt: new Date(now.getTime() + 15 * 60 * 1000).toISOString(),
       };
-      administratorSessions.set(session.id, session);
-      return session;
+      return {
+        id: signAdministratorSession(record, payload),
+        keyId: payload.keyId,
+        expiresAt: payload.expiresAt,
+      };
     },
-    revokeAdministratorSessions: () => administratorSessions.clear(),
-    validateAdministratorSession: (sessionId, now = new Date()) => {
-      const session = administratorSessions.get(sessionId);
-      return session !== undefined && Date.parse(session.expiresAt) > now.getTime();
+    revokeAdministratorSessions: async () => {
+      await mutate((state) => {
+        if (state.administratorKey === null) return state;
+        const currentGeneration = state.administratorKey.sessionGeneration ?? 0;
+        if (currentGeneration >= Number.MAX_SAFE_INTEGER) {
+          throw new Error("Administrator session generation is exhausted.");
+        }
+        return {
+          ...state,
+          administratorKey: {
+            ...state.administratorKey,
+            sessionGeneration: currentGeneration + 1,
+          },
+        };
+      });
+    },
+    validateAdministratorSession: async (sessionId, now = new Date()) => {
+      const state = await repository.load();
+      const record = state.administratorKey;
+      if (record === null || record.revokedAt !== null) return false;
+      const payload = readAdministratorSession(sessionId, record);
+      return (
+        payload !== undefined &&
+        payload.keyId === record.id &&
+        payload.sessionGeneration === (record.sessionGeneration ?? 0) &&
+        Date.parse(payload.expiresAt) > now.getTime()
+      );
     },
     generateGuidance: async () => {
       const state = await repository.load();

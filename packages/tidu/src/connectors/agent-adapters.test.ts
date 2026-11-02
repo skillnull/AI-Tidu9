@@ -195,6 +195,62 @@ test("Codex app-server adapter negotiates, streams, and completes a turn", async
   }
 });
 
+test("isolates agent-message phases across concurrent Codex turns", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tidu-codex-phase-isolation-"));
+  const command = join(root, "phase-agent");
+  writeFileSync(
+    command,
+    `#!/usr/bin/env node
+const args=process.argv.slice(2);
+if(args[0]==='login'&&args[1]==='status'){console.log('Logged in');process.exit(0);}
+const readline=require('node:readline').createInterface({input:process.stdin});
+const send=value=>process.stdout.write(JSON.stringify(value)+'\\n');
+let turnCount=0;
+readline.on('line',line=>{const request=JSON.parse(line);
+if(request.method==='initialize')send({id:request.id,result:{}});
+else if(request.method==='thread/start')send({id:request.id,result:{thread:{id:'thread-1'},model:'gpt-test'}});
+else if(request.method==='turn/start'){
+ turnCount+=1;const turnId='turn-'+turnCount;send({id:request.id,result:{turn:{id:turnId}}});
+ send({method:'item/started',params:{threadId:'thread-1',turnId,item:{type:'agentMessage',id:'shared-message',text:'',phase:turnCount===1?'commentary':'final_answer'}}});
+ if(turnCount===2){
+  send({method:'item/agentMessage/delta',params:{threadId:'thread-1',turnId:'turn-1',itemId:'shared-message',delta:'first-commentary'}});
+  send({method:'item/completed',params:{threadId:'thread-1',turnId:'turn-1',item:{type:'agentMessage',id:'shared-message',text:'first-commentary',phase:'commentary'}}});
+  send({method:'turn/completed',params:{threadId:'thread-1',turn:{id:'turn-1',status:'completed'}}});
+  send({method:'rawResponse/completed',params:{threadId:'thread-1',turnId:'turn-1',usage:{inputTokens:1,outputTokens:1,totalTokens:2}}});
+  send({method:'item/agentMessage/delta',params:{threadId:'thread-1',turnId:'turn-2',itemId:'shared-message',delta:'second-final'}});
+  send({method:'item/completed',params:{threadId:'thread-1',turnId:'turn-2',item:{type:'agentMessage',id:'shared-message',text:'second-final',phase:'final_answer'}}});
+  send({method:'turn/completed',params:{threadId:'thread-1',turn:{id:'turn-2',status:'completed'}}});
+  send({method:'rawResponse/completed',params:{threadId:'thread-1',turnId:'turn-2',usage:{inputTokens:1,outputTokens:1,totalTokens:2}}});
+ }
+}});`,
+  );
+  chmodSync(command, 0o700);
+  const client = createCodexAgentClient({ command, workingDirectory: root });
+  try {
+    await client.initialize();
+    const thread = await client.startThread();
+    const firstProcess: string[] = [];
+    const firstTurn = client.prompt(
+      thread.id,
+      [{ type: "text", text: "first" }],
+      undefined,
+      undefined,
+      undefined,
+      (delta) => firstProcess.push(delta),
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    const secondTurn = client.prompt(thread.id, [{ type: "text", text: "second" }]);
+    const [firstResult, secondResult] = await Promise.all([firstTurn, secondTurn]);
+
+    assert.equal(firstResult.text, "");
+    assert.deepEqual(firstProcess, ["first-commentary", "\n\n"]);
+    assert.equal(secondResult.text, "second-final");
+  } finally {
+    await client.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Cursor ACP adapter reuses official login and preserves Agent output", async () => {
   const root = mkdtempSync(join(tmpdir(), "tidu-cursor-adapter-"));
   try {

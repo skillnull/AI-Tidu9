@@ -221,7 +221,8 @@ readline.on("line", (line) => {
     send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, startedAtMs: Date.now(), item: { type: "agentMessage", id: "final-1", text: "", phase: "final_answer", memoryCitation: null, delivery: null, questions: null } } });
     send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId, itemId: "final-1", delta: finalText } });
     send({ jsonrpc: "2.0", method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId, tokenUsage: { last: { inputTokens: 11, cachedInputTokens: 3, cacheWriteInputTokens: 2, outputTokens: 4, reasoningOutputTokens: 1, totalTokens: 15 } } } });
-    send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: "thread-1", turn: { id: turnId, status: "completed" } } });
+    const terminalStatus = process.env.TIDU_CODEX_PROVIDER_TURN_STATUS || "completed";
+    send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: "thread-1", turn: { id: turnId, status: terminalStatus, ...(terminalStatus === "failed" ? { error: { message: "Fixture upstream stream disconnected" } } : {}) } } });
   }
   else if (request.method === "turn/interrupt") {
     send({ jsonrpc: "2.0", id: request.id, result: {} });
@@ -884,6 +885,53 @@ test("recreates a closed Codex connection before any visible output", async () =
   } finally {
     await provider?.close?.();
     rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("preserves failed Codex turn reasons and usage in streamed and JSON results", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-failed-turn-"));
+  const provider = await createCodexHostModelProvider(undefined, {
+    codexHomeDirectory: directory,
+    command: createFakeCodexProviderCommand(directory),
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: join(directory, "provider.log"),
+      TIDU_CODEX_PROVIDER_TURN_STATUS: "failed",
+    },
+  });
+  try {
+    assert.ok(provider);
+    for (const stream of [false, true]) {
+      const receipts: unknown[] = [];
+      const execute = (): ReturnType<ModelProvider["execute"]> =>
+        provider.execute({
+          protocol: "responses",
+          body: { model: "tidu", input: "fixture", stream },
+          virtualModelId: "tidu",
+          onExecutionReceipt: (receipt) => receipts.push(receipt.usage),
+        });
+      if (stream) {
+        const result = await execute();
+        assert.equal(result.kind, "stream");
+        if (result.kind !== "stream") throw new Error("Expected a stream.");
+        const events = await readStreamText(result.stream);
+        assert.match(events, /Fixture upstream stream disconnected/u);
+        assert.match(events, /response.failed/u);
+        assert.doesNotMatch(events, /response.completed/u);
+      } else {
+        await assert.rejects(execute, /Fixture upstream stream disconnected/u);
+      }
+      assert.deepEqual(receipts.at(-1), {
+        inputTokens: 11,
+        cachedInputTokens: 3,
+        cacheWriteInputTokens: 2,
+        outputTokens: 4,
+        reasoningTokens: 1,
+        totalTokens: 15,
+      });
+    }
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 

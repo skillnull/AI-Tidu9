@@ -93,6 +93,23 @@ export interface ProviderExecutionReceipt {
   } | null;
 }
 
+export const formatModelFailureMessage = (
+  body: ProviderExecutionRequest["body"],
+  source: Pick<ProviderExecutionReceipt, "host" | "model" | "role">,
+  message: string,
+): string => {
+  const chinese = /\p{Script=Han}/u.test(JSON.stringify(body.input ?? body.messages ?? ""));
+  const hostNames: Record<ProviderExecutionReceipt["host"], string> = {
+    codex: "Codex",
+    cursor: "Cursor",
+    ollama: "Ollama",
+    "openai-compatible": "OpenAI-compatible",
+  };
+  const host = hostNames[source.host];
+  if (message.startsWith(`${host}：`) || message.startsWith(`${host}: `)) return message;
+  return `${host}${chinese ? "：" : ": "}${message}`;
+};
+
 export interface ProviderJsonExecutionResult {
   /** JSON result discriminator. */
   kind: "json";

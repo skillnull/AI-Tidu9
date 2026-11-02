@@ -11,6 +11,7 @@ import type {
   ProviderExecutionResult,
   ProviderPrivacy,
 } from "../providers/index.js";
+import { formatModelFailureMessage } from "../providers/index.js";
 
 export interface RoutingMetricWeights {
   /** Weight assigned to required-capability coverage. */
@@ -1325,8 +1326,11 @@ export const createDynamicModelRouter = (
       }
       latestDecision = route.decision;
       if (route.decision.missingCapabilities.length > 0) {
-        throw new Error(
-          `No configured model combination covers required capabilities: ${route.decision.missingCapabilities.join(", ")}.`,
+        throw (
+          lastFailure ??
+          new Error(
+            `No configured model combination covers required capabilities: ${route.decision.missingCapabilities.join(", ")}.`,
+          )
         );
       }
       const cancellationBeforeRoute = requestCancellationError(request);
@@ -1442,6 +1446,16 @@ export const createDynamicModelRouter = (
             });
             if (callerToolRequest) return specialistResult;
           } catch (error) {
+            if (error instanceof Error && requestCancellationError(request, error) === undefined)
+              error.message = formatModelFailureMessage(
+                request.body,
+                {
+                  host: specialist.profile.host ?? request.routing?.host ?? "openai-compatible",
+                  model: executedModel ?? specialist.provider.descriptor.model,
+                  role: "specialist",
+                },
+                error.message,
+              );
             const message = error instanceof Error ? error.message : "Secondary model failed.";
             requestAttempts.push({
               modelId: specialist.profile.id,
@@ -1468,6 +1482,10 @@ export const createDynamicModelRouter = (
       let result: ProviderExecutionResult;
       const mainStartedAt = performance.now();
       let mainExecutedModel: string | null = null;
+      const mainRole =
+        route.main.profile.id === policy.mainModelId
+          ? (request.routing?.role ?? "main")
+          : "specialist";
       try {
         const mainCapabilities = route.decision.requiredCapabilities.filter((capability) =>
           route.main.profile.capabilities.includes(capability),
@@ -1494,7 +1512,7 @@ export const createDynamicModelRouter = (
             host: route.main.profile.host ?? routedRequest.routing?.host,
             requiredCapabilities: route.decision.requiredCapabilities,
             availableCapabilities: mainCapabilities,
-            role: request.routing?.role ?? "main",
+            role: mainRole,
           },
         });
       } catch (error) {
@@ -1563,7 +1581,7 @@ export const createDynamicModelRouter = (
             request.onExecutionReceipt?.({
               host: route.main.profile.host ?? request.routing?.host ?? "openai-compatible",
               model: confirmedMainModel,
-              role: request.routing?.role ?? "main",
+              role: mainRole,
               capabilities: route.main.profile.capabilities.filter((capability) =>
                 route.decision.requiredCapabilities.includes(capability),
               ),
@@ -1609,7 +1627,7 @@ export const createDynamicModelRouter = (
           request.onExecutionReceipt?.({
             host: route.main.profile.host ?? request.routing?.host ?? "openai-compatible",
             model: confirmedMainModel,
-            role: request.routing?.role ?? "main",
+            role: mainRole,
             capabilities: route.main.profile.capabilities.filter((capability) =>
               route.decision.requiredCapabilities.includes(capability),
             ),
@@ -1619,7 +1637,10 @@ export const createDynamicModelRouter = (
         return result;
       }
       lastFailure = new Error(
-        `Model ${route.main.profile.id} failed with HTTP ${result.statusCode}.`,
+        providerErrorMessage(
+          result,
+          `Model ${route.main.profile.id} failed with HTTP ${result.statusCode}.`,
+        ),
       );
       requestAttempts.push({
         modelId: route.main.profile.id,
@@ -1734,9 +1755,14 @@ export const createCapabilityCompletionProvider = (
         enabled: true,
       },
       provider: {
-        descriptor: provider.descriptor,
+        descriptor: {
+          ...provider.descriptor,
+          model: selection.model === "current" ? provider.descriptor.model : selection.model,
+        },
         execute: async (request) => {
           const startedAt = performance.now();
+          let executedModel =
+            selection.model === "current" ? provider.descriptor.model : selection.model;
           try {
             const selectedProvider =
               options.resolveProviderForHost === undefined
@@ -1759,6 +1785,19 @@ export const createCapabilityCompletionProvider = (
             resolvedProviders.add(selectedProvider);
             const result = await selectedProvider.execute({
               ...request,
+              onModelConfirmed: (model) => {
+                executedModel = model;
+                request.onModelConfirmed?.(model);
+                request.onExecutionReceipt?.({
+                  host,
+                  model,
+                  role: id.startsWith("specialist-")
+                    ? "specialist"
+                    : (request.routing?.role ?? "main"),
+                  capabilities: request.routing?.availableCapabilities ?? capabilities,
+                  usage: null,
+                });
+              },
               routing: {
                 ...request.routing,
                 host,
@@ -1777,10 +1816,41 @@ export const createCapabilityCompletionProvider = (
               );
             }
             recordPerformance(startedAt, result.statusCode >= 200 && result.statusCode < 300);
+            if (isRecord(result.body) && isRecord(result.body.error)) {
+              return {
+                ...result,
+                body: {
+                  ...result.body,
+                  error: {
+                    ...result.body.error,
+                    message: formatModelFailureMessage(
+                      request.body,
+                      {
+                        host,
+                        model: result.upstreamModel ?? executedModel,
+                        role: id.startsWith("specialist-") ? "specialist" : "main",
+                      },
+                      providerErrorMessage(result, `Model returned HTTP ${result.statusCode}.`),
+                    ),
+                  },
+                },
+              };
+            }
             return result;
           } catch (error) {
-            if (requestCancellationError(request, error) === undefined)
+            if (requestCancellationError(request, error) === undefined) {
               recordPerformance(startedAt, false);
+              if (error instanceof Error)
+                error.message = formatModelFailureMessage(
+                  request.body,
+                  {
+                    host,
+                    model: executedModel,
+                    role: id.startsWith("specialist-") ? "specialist" : "main",
+                  },
+                  error.message,
+                );
+            }
             throw error;
           }
         },

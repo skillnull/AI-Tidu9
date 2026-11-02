@@ -38,7 +38,7 @@ tidu <命令> --help             # 任意命令的专属帮助
 | `tidu mcp` | 运行供Agent宿主调用的stdio MCP桥 | 否 |
 | `tidu doctor` | 检查运行时、配置API和页面；可输出隐私安全报告 | 否 |
 | `tidu clients` | 发现本机支持的客户端 | 否 |
-| `tidu clients connect/switch/rollback codex` | 准备、切换或回滚 Codex 的互斥原生模式 | 是；官方账号不变，所有托管项均可恢复 |
+| `tidu clients connect/switch/rollback codex` | 准备、切换或回滚 Codex 原生双模式与同对话续聊 | 是；官方账号和 thread 不变，所有托管项均可恢复 |
 | `tidu channel list/run` | 查看或显式调用九门、官方宿主与厂商通道 | 否；调用会消耗所选通道额度 |
 | `tidu account` | 查看Codex和Cursor的可复用登录状态 | 否 |
 | `tidu account relogin/switch` | 调用宿主官方登录或切换流程 | 是，需要主动执行 |
@@ -94,13 +94,13 @@ tidu-codex --install-desktop
 tidu-codex --uninstall-desktop
 ```
 
-`setup` 默认动作是 `install`，不要求预先启动运行时。它会为 Codex 准备互斥的九门原生 Agent 模式、为其他宿主安装所需连接器，并自动启动当前版型的全部服务，但保持官方直连生效。`clients switch codex ai-tidu9` 使 Codex 只显示“九门赛博提督”，任务进入规划、能力补位、执行和独立验收的同一 Agent 内核；官方、公司或自定义上游只在九门配置页三选一，不会成为独立 Codex 模型项。`clients switch codex official` 精确恢复原始官方配置和官方模型列表。官方账号、套餐和额度始终由官方 Codex 管理。九门自有备份只保留首次安装基线与最新回滚点。
+`setup` 默认动作是 `install`，不要求预先启动运行时。它会为 Codex 准备九门原生 Agent 模式和双模式续聊接入、为其他宿主安装所需连接器，并自动启动当前版型的全部服务，但保持官方模式生效。`clients switch codex ai-tidu9` 使新一轮使用“九门赛博提督”；`clients switch codex official` 使新一轮使用官方模型。同一个对话保留原 thread ID 和完整上下文，下一轮跟随当前模式，已完成轮次不改写；原生重试与自动压缩也兼容双向切换。切回官方时恢复用户最近的官方模型、Provider 与模型目录选择。官方、公司或自定义上游只在九门配置页三选一，不会成为独立 Codex 模型项。官方账号、套餐和额度始终由官方 Codex 管理。九门自有备份只保留首次安装基线与最新回滚点。
 
-macOS 默认目录安装会准备客户端恢复接入，切到九门时通过 `CODEX_CLI_PATH` 注册；重启 Codex 后加载。也可使用 `tidu-codex --install-desktop` 显式安装。官方模式恢复之前的可执行文件设置，卸载只删除九门自有启动器。命令执行与审批仍交给官方 CLI；恢复只读官方会话，不新增会话存储。
+macOS 默认目录安装会通过 `CODEX_CLI_PATH` 注册两种模式共用的透明接入；首次安装后重启 Codex 一次即可加载。也可使用 `tidu-codex --install-desktop` 显式安装。模式切换后，同一对话的下一轮通过官方 `thread/resume` 应用当前 Provider 与模型；如只需继续当前对话，无需为每次切换重启。卸载会删除九门自有启动器并恢复之前的可执行文件设置。命令执行与审批仍交给官方 CLI；接入只读官方会话，不新增会话存储，仅有界保存 thread ID、turn ID、Provider 与模型标识来支持重启后的轮次归属恢复。
 
 桌面启动时的组织设置读取、守护进程管理及帮助和协议生成命令直接交给官方 CLI，原样保留输出与退出状态；只有持续的 stdio app-server 会话进入恢复接入。
 
-Codex 使用原生 Provider 接入，不注册九门 MCP；切换模式后需要重启 Codex 才会重新载入 Provider 和模型目录。Cursor 可使用 stdio 连接器作为传输层，但 `route_tidu_task` 仍进入与 Codex、CLI 和 OpenAI 兼容入口相同的 Agent 内核，传输协议不会绕过九门的规划、能力补位和验收。
+Codex 使用原生 Provider 接入，不注册九门 MCP。官方模式保留停用的九门 Provider 定义，避免历史聊天因 Provider 缺失而无法加载；若需要刷新宿主模型列表，可重启 Codex，但同一对话的下一轮切换不依赖重启。Cursor 可使用 stdio 连接器作为传输层，但 `route_tidu_task` 仍进入与 Codex、CLI 和 OpenAI 兼容入口相同的 Agent 内核，传输协议不会绕过九门的规划、能力补位和验收。
 
 企业服务器不执行员工电脑上的 `setup`，也不提供独立员工页面。员工安装个人版后，在本地页面的“企业接入”中填写管理员提供的公司链接。正式企业入口必须使用 HTTPS；本地开发仅允许回环地址使用 HTTP。企业配置在个人版中只读，并与个人草稿和生效配置分开保存。
 
