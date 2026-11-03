@@ -14,7 +14,7 @@
     "tidu:dev-e": "sh -c '. ./scripts/use-project-node.sh && TIDU_DEV_EDITION=enterprise exec node scripts/dev-tidu.mjs --service controller --start-frontend'",
     "tidu:dev-api-p": "sh -c '. ./scripts/use-project-node.sh && exec node scripts/dev-tidu.mjs --service api'",
     "tidu:dev-api-e": "sh -c '. ./scripts/use-project-node.sh && TIDU_DEV_EDITION=enterprise exec node scripts/dev-tidu.mjs --service api'",
-    "check": "sh -c '. ./scripts/use-project-node.sh && npm run policy -- versions && npm run lint && npm test'",
+    "check": "sh -c '. ./scripts/use-project-node.sh && node scripts/check-project.mjs'",
     "lint": "sh -c '. ./scripts/use-project-node.sh && biome check --config-path=config/biome.json .'",
     "prepare": "sh -c '. ./scripts/use-project-node.sh && node scripts/install-git-hooks.mjs'",
     "policy": "sh -c '. ./scripts/use-project-node.sh && node scripts/project-policy.mjs \"$@\"' --",

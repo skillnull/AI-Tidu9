@@ -72,6 +72,8 @@ npm run policy -- commit "feat(scope): description"
 
 Run `npm run check` before submitting. It covers version policy, linting, Node tests, workspace tests, and Python SDK tests. Passing tests are the baseline; changes involving clients, databases, networking, or upgrade paths also require recorded real-environment validation.
 
+Local checks keep a validation digest in Git's local directory. Pushes still check branch and release-line policy. A successful result is reused only when the pushed content matches the clean working tree and the source, installed dependency files, and runtime environment match that result. Missing evidence, changed inputs, or failed checks require full validation. Concurrent checks in one repository share one execution, including its failure. A standalone `npm run check` and CI still run all checks. Commit hooks invoke the same policy scripts directly to avoid repeated npm startup.
+
 Never commit credentials, personal data, private machine paths, account identifiers, internal domains, confidential artifacts, conversation bodies, unredacted diagnostics, irreproducible generated files, or unapproved large binaries.
 
 Do not disclose vulnerabilities in public Issues. Use [GitHub Private Vulnerability Reporting](https://github.com/skillnull/AI-Tidu9/security/advisories/new). No change may weaken mandatory policy, quota, approval, Secret Gate, or independent acceptance verification.
