@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -48,7 +48,7 @@ test("reads only the active top-level Codex model selection", async () => {
     );
     assert.deepEqual(readCodexActiveSelection(directory), {
       modelProvider: "ai_tidu9",
-      model: "official-resume-model",
+      model: "ai-tidu9-config",
     });
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -67,6 +67,7 @@ const send=message=>process.stdout.write(JSON.stringify(message)+'\\n');
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const message=JSON.parse(line);const params=message.params||{};
 if(message.method==='thread/start'||message.method==='thread/resume'||message.method==='thread/fork'){const previous=thread.modelProvider;const modelProvider=params.modelProvider||previous;const model=Object.prototype.hasOwnProperty.call(params,'model')?params.model:(modelProvider===previous?thread.model:defaults[modelProvider]);thread={...thread,id:message.method==='thread/fork'?'forked-chat':thread.id,modelProvider,model};send({id:message.id,result:{thread,model:thread.model,modelProvider:thread.modelProvider}});}
 else if(message.method==='thread/read')send({id:message.id,result:{thread}});
+else if(message.method==='thread/unsubscribe')send({id:message.id,result:{status:'unsubscribed'}});
 else if(['turn/start','review/start','thread/compact/start','thread/queue/start','thread/realtime/start'].includes(message.method))send({id:message.id,result:{turn:{id:'turn-'+Date.now()},effectiveProvider:thread.modelProvider,effectiveModel:thread.model,receivedParams:params}});
 });`,
   );
@@ -140,10 +141,20 @@ else if(['turn/start','review/start','thread/compact/start','thread/queue/start'
     selection = { modelProvider: "ai_tidu9", model: "managed-model" };
     const managedTurn = await request(3, "turn/start", {
       threadId: "same-chat",
+      model: "official-model-2",
+      collaborationMode: {
+        mode: "default",
+        settings: { model: "official-model-2", developer_instructions: null },
+      },
       input: [{ type: "text", text: "managed round" }],
     });
     assert.equal(managedTurn.result.effectiveProvider, "ai_tidu9");
-    assert.equal(managedTurn.result.effectiveModel, "official-model-2");
+    assert.equal(managedTurn.result.effectiveModel, "managed-model");
+    assert.equal(managedTurn.result.receivedParams.model, "managed-model");
+    assert.equal(
+      managedTurn.result.receivedParams.collaborationMode.settings.model,
+      "managed-model",
+    );
 
     const executionMethods = [
       "review/start",
@@ -160,6 +171,149 @@ else if(['turn/start','review/start','thread/compact/start','thread/queue/start'
       assert.equal(response.result.effectiveProvider, "openai");
       assert.equal(response.result.effectiveModel, `model-for-${method}`);
       requestId += 1;
+    }
+  } finally {
+    await proxy.close();
+    input.destroy();
+    output.destroy();
+    errors.destroy();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("keeps native effort options and official account metadata available in managed mode", {
+  timeout: 10000,
+}, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tidu-native-settings-"));
+  const fixture = join(directory, "official-fixture.cjs");
+  await writeFile(
+    fixture,
+    `#!/usr/bin/env node
+const official=process.argv.includes('model_provider="openai"');
+const send=message=>process.stdout.write(JSON.stringify(message)+'\\n');
+require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const message=JSON.parse(line);
+if(message.id===undefined)return;
+if(message.method==='initialize')send({id:message.id,result:{}});
+else if(message.method==='account/read')send({id:message.id,result:{account:official?{type:'chatgpt',email:null,planType:'plus'}:null,requiresOpenaiAuth:official}});
+else if(message.method==='account/rateLimits/read')setTimeout(()=>send({id:message.id,result:{rateLimits:official?{primary:{usedPercent:25}}:null,rateLimitResetCredits:{availableCount:0}}}),40);
+else if(message.method==='account/usage/read')send({id:message.id,result:{summary:{lifetimeTokens:official?42:0}}});
+else if(message.method==='fixture/limits'){send({method:'account/rateLimits/updated',params:{rateLimits:{limitId:'codex',primary:null,secondary:null}}});send({id:message.id,result:{}});}
+else send({id:message.id,error:{message:'Unexpected forwarded request'}});
+});`,
+  );
+  await chmod(fixture, 0o700);
+  await writeFile(
+    join(directory, ".ai-tidu9-model-catalog.json"),
+    JSON.stringify({
+      models: [
+        {
+          slug: "managed-model",
+          display_name: "AI-Tidu9",
+          visibility: "list",
+          supported_in_api: true,
+          default_reasoning_level: "medium",
+          supported_reasoning_levels: [
+            { effort: "low", description: "Fast" },
+            { effort: "high", description: "Thorough" },
+          ],
+        },
+      ],
+    }),
+  );
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const errors = new PassThrough();
+  const messages = createInterface({ input: output })[Symbol.asyncIterator]();
+  let selection: CodexActiveSelection = { modelProvider: "ai_tidu9", model: "managed-model" };
+  const proxy = createCodexClientProxy({
+    launch: {
+      command: fixture,
+      arguments: [],
+      environment: { PATH: process.env.PATH, CODEX_HOME: directory },
+    },
+    input,
+    output,
+    errorOutput: errors,
+    resolveActiveSelection: () => selection,
+  });
+  const request = async (id: number, method: string) => {
+    input.write(`${JSON.stringify({ id, method, params: {} })}\n`);
+    return JSON.parse((await messages.next()).value);
+  };
+  try {
+    const catalog = await request(1, "model/list");
+    assert.deepEqual(catalog.result.data[0].supportedReasoningEfforts, [
+      { reasoningEffort: "low", description: "Fast" },
+      { reasoningEffort: "high", description: "Thorough" },
+    ]);
+    assert.equal((await request(2, "account/read")).result.account?.type, "chatgpt");
+    const limits = (await request(3, "account/rateLimits/read")).result;
+    assert.equal(limits.rateLimits?.primary.usedPercent, 25);
+    assert.equal(limits.rateLimitResetCredits.availableCount, 0);
+    assert.equal((await request(4, "account/usage/read")).result.summary.lifetimeTokens, 42);
+    assert.equal((await request(5, "fixture/limits")).id, 5);
+    const managedUpdate = JSON.parse((await messages.next()).value);
+    assert.equal(managedUpdate.method, "account/rateLimits/updated");
+    assert.equal(managedUpdate.params.rateLimits.primary.usedPercent, 25);
+    selection = { modelProvider: "openai", model: "official-model" };
+    input.write(`${JSON.stringify({ id: 6, method: "fixture/limits", params: {} })}\n`);
+    const officialUpdate = JSON.parse((await messages.next()).value);
+    assert.equal(officialUpdate.params.rateLimits.primary, null);
+    assert.equal(JSON.parse((await messages.next()).value).id, 6);
+  } finally {
+    await proxy.close();
+    input.destroy();
+    output.destroy();
+    errors.destroy();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("publishes native model settings after a mode switch without another user message", {
+  timeout: 10000,
+}, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tidu-native-model-display-"));
+  const configurationPath = join(directory, "config.toml");
+  const fixture = join(directory, "official-fixture.cjs");
+  await writeFile(configurationPath, 'model_provider = "openai"\nmodel = "official-model"\n');
+  await writeFile(
+    fixture,
+    `let thread={id:'display-chat',modelProvider:'openai',model:'official-model'};
+const send=message=>process.stdout.write(JSON.stringify(message)+'\\n');
+require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const message=JSON.parse(line),params=message.params||{};
+if(message.method==='thread/start'||message.method==='thread/resume'){thread={...thread,modelProvider:params.modelProvider,model:params.model};send({id:message.id,result:{thread,model:thread.model,modelProvider:thread.modelProvider}});}
+else if(message.method==='thread/settings/update')send({id:message.id,result:null});
+else if(message.method==='thread/unsubscribe')send({id:message.id,result:{status:'unsubscribed'}});
+});`,
+  );
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const errors = new PassThrough();
+  const messages = createInterface({ input: output })[Symbol.asyncIterator]();
+  const proxy = createCodexClientProxy({
+    launch: {
+      command: process.execPath,
+      arguments: [fixture],
+      environment: { PATH: process.env.PATH, CODEX_HOME: directory },
+    },
+    input,
+    output,
+    errorOutput: errors,
+  });
+  try {
+    input.write(`${JSON.stringify({ id: 1, method: "thread/start", params: {} })}\n`);
+    assert.equal(JSON.parse((await messages.next()).value).result.thread.model, "official-model");
+    for (const selection of [
+      { modelProvider: "ai_tidu9", model: "ai-tidu9-config" },
+      { modelProvider: "openai", model: "official-model" },
+    ]) {
+      await writeFile(
+        configurationPath,
+        `model_provider = "${selection.modelProvider}"\nmodel = "${selection.model}"\n`,
+      );
+      const notification = JSON.parse((await messages.next()).value);
+      assert.equal(notification.method, "thread/settings/updated");
+      assert.deepEqual(notification.params.threadSettings, selection);
     }
   } finally {
     await proxy.close();
@@ -346,8 +500,8 @@ else if(message.method==='thread/items/list')send({id:message.id,result:{data:[]
     };
     const managed = response.result.thread.turns.find((turn) => turn.id === "managed-turn");
     const official = response.result.thread.turns.find((turn) => turn.id === "official-turn");
-    assert.match(JSON.stringify(managed), /Token：输入 12 · 输出 3 · 合计 15/u);
-    assert.doesNotMatch(JSON.stringify(official), /Token：/u);
+    assert.match(JSON.stringify(managed), /总：入 12 · 出 3 · 合 15/u);
+    assert.doesNotMatch(JSON.stringify(official), /总：/u);
 
     input.write(
       `${JSON.stringify({ id: 2, method: "thread/turns/list", params: { threadId: "mixed-chat" } })}\n`,
@@ -357,23 +511,23 @@ else if(message.method==='thread/items/list')send({id:message.id,result:{data:[]
     };
     assert.match(
       JSON.stringify(turnPage.result.data.find((turn) => turn.id === "managed-turn")),
-      /Token：输入 12 · 输出 3 · 合计 15/u,
+      /总：入 12 · 出 3 · 合 15/u,
     );
     assert.doesNotMatch(
       JSON.stringify(turnPage.result.data.find((turn) => turn.id === "official-turn")),
-      /Token：/u,
+      /总：/u,
     );
 
     input.write(
       `${JSON.stringify({ id: 3, method: "thread/items/list", params: { threadId: "mixed-chat", turnId: "managed-turn", sortDirection: "asc" } })}\n`,
     );
     const managedItems = JSON.parse((await messages.next()).value ?? "null");
-    assert.match(JSON.stringify(managedItems), /Token：输入 12 · 输出 3 · 合计 15/u);
+    assert.match(JSON.stringify(managedItems), /总：入 12 · 出 3 · 合 15/u);
     input.write(
       `${JSON.stringify({ id: 4, method: "thread/items/list", params: { threadId: "mixed-chat", turnId: "official-turn", sortDirection: "asc" } })}\n`,
     );
     const officialItems = JSON.parse((await messages.next()).value ?? "null");
-    assert.doesNotMatch(JSON.stringify(officialItems), /Token：/u);
+    assert.doesNotMatch(JSON.stringify(officialItems), /总：/u);
   } finally {
     await proxy.close();
     input.destroy();
@@ -460,20 +614,20 @@ else if(message.method==='fixture/cancel'){
     await until(
       (message) =>
         message.method === "item/completed" &&
-        JSON.stringify(message.params).includes("Token：未获取到"),
+        JSON.stringify(message.params).includes("总：未获取到"),
     );
     await until((message) => message.method === "turn/completed");
     send(3, "fixture/usage", { turnId: "known" });
     await until(
       (message) =>
         message.method === "item/completed" &&
-        JSON.stringify(message.params).includes("Token：输入 12 · 输出 3 · 合计 15"),
+        JSON.stringify(message.params).includes("总：入 12 · 出 3 · 合 15"),
     );
     send(4, "fixture/cancel", { turnId: "zero" });
     await until(
       (message) =>
         message.method === "item/completed" &&
-        JSON.stringify(message.params).includes("Token：未获取到"),
+        JSON.stringify(message.params).includes("总：未获取到"),
     );
     await until((message) => message.method === "turn/completed");
     send(5, "fixture/usage", { turnId: "zero", zero: true });
@@ -513,10 +667,11 @@ test("bounds proxy-only metadata reads and preserves official request flow", {
   await writeFile(
     fixture,
     `const send=message=>process.stdout.write(JSON.stringify(message)+'\\n');
+let thread={id:'official-chat',modelProvider:'ai_tidu9',model:'managed-model'};
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const message=JSON.parse(line);
-if(message.method==='thread/read'){setTimeout(()=>send({id:message.id,result:{thread:{id:'official-chat',modelProvider:'openai',model:'official-model'}}}),75);return;}
-if(message.method==='thread/resume')send({id:message.id,result:{thread:{id:'official-chat',modelProvider:message.params.modelProvider,model:message.params.model}}});
-else if(message.method==='turn/start')send({id:message.id,result:{continued:true,receivedParams:message.params}});
+if(message.method==='thread/read'){return;}
+if(message.method==='thread/resume'){thread={...thread,modelProvider:message.params.modelProvider,model:message.params.model};send({id:message.id,result:{thread}});}
+else if(message.method==='turn/start')send({id:message.id,result:{continued:true,effectiveProvider:thread.modelProvider,effectiveModel:thread.model,receivedParams:message.params}});
 });`,
   );
   const input = new PassThrough();
@@ -540,7 +695,7 @@ else if(message.method==='turn/start')send({id:message.id,result:{continued:true
     input,
     output,
     errorOutput: errors,
-    internalRequestTimeoutMs: 25,
+    internalRequestTimeoutMs: 200,
     resolveActiveSelection: () => ({
       modelProvider: "openai",
       model: "official-model",
@@ -559,16 +714,76 @@ else if(message.method==='turn/start')send({id:message.id,result:{continued:true
       input: [{ type: "text", text: "continue officially" }],
     });
     assert.equal(turn.result.continued, true);
+    assert.equal(turn.result.effectiveProvider, "openai");
+    assert.equal(turn.result.effectiveModel, "official-model");
     const resumed = await request(2, "thread/resume", {
       threadId: "official-chat",
     });
     assert.equal(resumed.result.thread.modelProvider, "openai");
     assert.equal(resumed.result.thread.model, "official-model");
-    assert.match(errorText, /forwarding the official request unchanged/u);
-    assert.match(errorText, /forwarding the client selection directly/u);
+    assert.doesNotMatch(errorText, /forwarding the official request unchanged/u);
     assert.doesNotMatch(errorText, /invalid client JSON-RPC/u);
-    await new Promise<void>((resolve) => setTimeout(resolve, 100));
     assert.doesNotMatch(outputText, /tidu_recovery_/u);
+  } finally {
+    await proxy.close();
+    input.destroy();
+    output.destroy();
+    errors.destroy();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("forwards approval decisions without waiting for mode synchronization", {
+  timeout: 5000,
+}, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tidu-native-approval-priority-"));
+  const fixture = join(directory, "official-fixture.cjs");
+  await writeFile(
+    fixture,
+    `const send=message=>process.stdout.write(JSON.stringify(message)+'\\n');
+let thread={id:'same-chat',modelProvider:'ai_tidu9',model:'managed-model'};
+require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const message=JSON.parse(line);
+if(message.method==='thread/resume'){setTimeout(()=>{thread={...thread,modelProvider:message.params.modelProvider,model:message.params.model};send({id:message.id,result:{thread}});},150);return;}
+if(message.method==='turn/start'){send({id:message.id,result:{effectiveProvider:thread.modelProvider}});return;}
+if(message.method===undefined&&message.id===99)send({method:'fixture/approvalReceived',params:{receivedAt:Date.now()}});
+});`,
+  );
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const errors = new PassThrough();
+  const messages = createInterface({ input: output })[Symbol.asyncIterator]();
+  const proxy = createCodexClientProxy({
+    launch: {
+      command: process.execPath,
+      arguments: [fixture],
+      environment: { PATH: process.env.PATH, CODEX_HOME: directory },
+    },
+    input,
+    output,
+    errorOutput: errors,
+    resolveActiveSelection: () => ({
+      modelProvider: "openai",
+      model: "official-model",
+    }),
+  });
+  const startedAt = Date.now();
+  input.write(
+    `${JSON.stringify({ id: 1, method: "turn/start", params: { threadId: "same-chat" } })}\n`,
+  );
+  input.write(`${JSON.stringify({ id: 99, result: { decision: "accept" } })}\n`);
+
+  try {
+    let approvalDelay: number | undefined;
+    let turnDelay: number | undefined;
+    while (approvalDelay === undefined || turnDelay === undefined) {
+      const message = JSON.parse((await messages.next()).value ?? "null");
+      if (message.method === "fixture/approvalReceived") {
+        approvalDelay = Number(message.params.receivedAt) - startedAt;
+      }
+      if (message.id === 1) turnDelay = Date.now() - startedAt;
+    }
+    assert.ok(approvalDelay < turnDelay);
+    assert.ok(turnDelay >= 100);
   } finally {
     await proxy.close();
     input.destroy();

@@ -17,6 +17,7 @@ import {
   formatCodexHostLogin,
   inspectCodexHostLogin,
   reloginCodexHost,
+  resolveCodexCommand,
   switchCodexHostAccount,
 } from "./codex-host.js";
 
@@ -39,6 +40,39 @@ const createFakeCodex = (directory: string): string => {
   chmodSync(commandPath, 0o700);
   return commandPath;
 };
+
+test("uses an installed CLI compatible with a newer host catalog without overriding explicit commands", () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-versions-"));
+  const legacyDirectory = join(directory, "legacy");
+  const currentDirectory = join(directory, "current");
+  const home = join(directory, "home");
+  for (const path of [legacyDirectory, currentDirectory, home]) mkdirSync(path);
+  const legacy = join(legacyDirectory, "codex");
+  const current = join(currentDirectory, "codex");
+  const writeVersion = (command: string, version: string): void =>
+    writeFileSync(command, `#!/bin/sh\nprintf 'codex-cli ${version}\\n'\n`, { mode: 0o700 });
+  const options = {
+    codexHomeDirectory: home,
+    environment: { PATH: `${legacyDirectory}:${currentDirectory}`, NVM_DIR: directory },
+  };
+  try {
+    writeVersion(legacy, "99.0.0");
+    writeVersion(current, "99.1.0-alpha.1");
+    assert.equal(resolveCodexCommand(options), legacy);
+    writeFileSync(
+      join(home, "models_cache.json"),
+      JSON.stringify({ client_version: "99.1.0", models: [] }),
+    );
+    assert.equal(resolveCodexCommand(options), current);
+    assert.equal(resolveCodexCommand({ ...options, command: legacy }), legacy);
+    writeVersion(legacy, "99.2.0");
+    assert.equal(resolveCodexCommand(options), legacy);
+    writeFileSync(join(home, "models_cache.json"), "invalid");
+    assert.equal(resolveCodexCommand(options), legacy);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("reuses a Codex-owned login without reading credential contents", () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-host-"));

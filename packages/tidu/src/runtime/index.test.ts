@@ -4,6 +4,8 @@ import { request as requestHttp } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { createServer as createViteServer, type ViteDevServer } from "vite";
 import { createAgentKernel, createInMemoryTaskCapsuleStore } from "../agent/index.js";
 import { CONFIG_SCHEMA_VERSION } from "../config/index.js";
 import type { ConfigCenterBootstrap } from "../config-center/index.js";
@@ -312,6 +314,7 @@ test("exposes the shared capability-completion policy and bounded usage status",
     databasePath: IN_MEMORY_DATABASE_PATH,
     port: 0,
     provider,
+    discoverHostProvider: false,
   });
   try {
     const response = await fetch(`${runtime.origin}/api/capability-completion`);
@@ -509,7 +512,7 @@ test("starts a loopback runtime with a verifiable health endpoint", async () => 
   }
 });
 
-test("configures the complete Codex dual-channel entry from the local API", async () => {
+test("configures the complete Codex dual-channel entry through the browser development proxy", async () => {
   const temporaryRoot = mkdtempSync(join(tmpdir(), "tidu-runtime-codex-"));
   const executableDirectory = join(temporaryRoot, "bin");
   const codexHomeDirectory = join(temporaryRoot, "codex-home");
@@ -517,6 +520,8 @@ test("configures the complete Codex dual-channel entry from the local API", asyn
   const originalEnvironment = {
     codexHome: process.env.CODEX_HOME,
     executablePath: process.env.PATH,
+    nodeEnvironment: process.env.NODE_ENV,
+    runtimePort: process.env.TIDU_RUNTIME_PORT,
   };
   mkdirSync(executableDirectory, { recursive: true });
   mkdirSync(codexHomeDirectory, { recursive: true });
@@ -567,11 +572,24 @@ test("configures the complete Codex dual-channel entry from the local API", asyn
     port: 0,
     provider,
   });
+  let frontend: ViteDevServer | undefined;
 
   try {
-    const response = await fetch(`${runtime.origin}/api/clients/codex/connect`, {
+    process.env.TIDU_RUNTIME_PORT = new URL(runtime.origin).port;
+    frontend = await createViteServer({
+      configFile: fileURLToPath(new URL("../../vite.config.ts", import.meta.url)),
+      logLevel: "silent",
+      optimizeDeps: { noDiscovery: true, include: [] },
+      server: { host: "127.0.0.1", port: 0, watch: null, ws: false },
+    });
+    await frontend.listen();
+    const address = frontend.httpServer?.address();
+    assert.ok(address !== undefined && address !== null && typeof address !== "string");
+    const browserOrigin = `http://127.0.0.1:${address.port}`;
+    const browserHeaders = { "content-type": "application/json", origin: browserOrigin };
+    const response = await fetch(`${browserOrigin}/api/clients/codex/connect`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: browserHeaders,
       body: "{}",
     });
     assert.equal(response.status, 200);
@@ -581,7 +599,7 @@ test("configures the complete Codex dual-channel entry from the local API", asyn
       model: "ai-tidu9-config",
       profile: "ai-tidu9",
     });
-    const statusResponse = await fetch(`${runtime.origin}/api/clients/codex/configuration`);
+    const statusResponse = await fetch(`${browserOrigin}/api/clients/codex/configuration`);
     assert.equal(statusResponse.status, 200);
     assert.deepEqual(await statusResponse.json(), {
       activeMode: "official",
@@ -589,22 +607,19 @@ test("configures the complete Codex dual-channel entry from the local API", asyn
       installed: true,
       model: "ai-tidu9-config",
     });
-    const modelSelectionResponse = await fetch(
-      `${runtime.origin}/api/clients/codex/configuration`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "ai-tidu9-config" }),
-      },
-    );
+    const modelSelectionResponse = await fetch(`${browserOrigin}/api/clients/codex/configuration`, {
+      method: "POST",
+      headers: browserHeaders,
+      body: JSON.stringify({ model: "ai-tidu9-config" }),
+    });
     assert.equal(modelSelectionResponse.status, 422);
     assert.match(
       JSON.stringify(await modelSelectionResponse.json()),
       /configuration mode must be official or ai-tidu9/iu,
     );
-    const tiduModeResponse = await fetch(`${runtime.origin}/api/clients/codex/configuration`, {
+    const tiduModeResponse = await fetch(`${browserOrigin}/api/clients/codex/configuration`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: browserHeaders,
       body: JSON.stringify({ mode: "ai-tidu9" }),
     });
     assert.equal(tiduModeResponse.status, 200);
@@ -622,9 +637,9 @@ test("configures the complete Codex dual-channel entry from the local API", asyn
       catalog.models.map(({ slug }) => slug),
       ["ai-tidu9-config"],
     );
-    const officialModeResponse = await fetch(`${runtime.origin}/api/clients/codex/configuration`, {
+    const officialModeResponse = await fetch(`${browserOrigin}/api/clients/codex/configuration`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: browserHeaders,
       body: JSON.stringify({ mode: "official" }),
     });
     assert.equal(officialModeResponse.status, 200);
@@ -632,10 +647,31 @@ test("configures the complete Codex dual-channel entry from the local API", asyn
     assert.match(officialConfiguration, /^model = "official-test"/u);
     assert.match(officialConfiguration, /\[model_providers\.ai_tidu9\]/u);
     assert.doesNotMatch(officialConfiguration, /AI-Tidu9 managed default:start/u);
+    for (const browserRequest of [
+      { origin: browserOrigin, headers: new Headers({ "content-type": "application/json" }) },
+      {
+        origin: `http://localhost:${address.port}`,
+        headers: new Headers({
+          "content-type": "application/json",
+          origin: `http://localhost:${address.port}`,
+        }),
+      },
+    ]) {
+      const repeatedOfficialResponse = await fetch(
+        `${browserRequest.origin}/api/clients/codex/configuration`,
+        {
+          method: "POST",
+          headers: browserRequest.headers,
+          body: JSON.stringify({ mode: "official" }),
+        },
+      );
+      const repeatedOfficialBody = await repeatedOfficialResponse.text();
+      assert.equal(repeatedOfficialResponse.status, 200, repeatedOfficialBody);
+    }
     providerFailure = new Error("official session expired");
-    const failedSwitchResponse = await fetch(`${runtime.origin}/api/clients/codex/configuration`, {
+    const failedSwitchResponse = await fetch(`${browserOrigin}/api/clients/codex/configuration`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: browserHeaders,
       body: JSON.stringify({ mode: "ai-tidu9" }),
     });
     assert.equal(failedSwitchResponse.status, 503);
@@ -656,13 +692,41 @@ test("configures the complete Codex dual-channel entry from the local API", asyn
     assert.match(retainedConfiguration, /^model = "official-test"/u);
     assert.match(retainedConfiguration, /\[model_providers\.ai_tidu9\]/u);
     assert.doesNotMatch(retainedConfiguration, /AI-Tidu9 managed default:start/u);
+    for (const origin of [
+      "https://untrusted.example",
+      runtime.origin,
+      browserOrigin.replace("127.0.0.1", "untrusted.example"),
+      browserOrigin.replace("http:", "https:"),
+      "null",
+    ]) {
+      const deniedResponse = await fetch(`${browserOrigin}/api/clients/codex/configuration`, {
+        method: "POST",
+        headers: { ...browserHeaders, origin },
+        body: JSON.stringify({ mode: "ai-tidu9" }),
+      });
+      assert.equal(deniedResponse.status, 422, origin);
+      assert.match(JSON.stringify(await deniedResponse.json()), /origin/iu);
+    }
+    assert.equal(
+      (
+        (await (await fetch(`${browserOrigin}/api/clients/codex/configuration`)).json()) as {
+          activeMode: string;
+        }
+      ).activeMode,
+      "official",
+    );
   } finally {
+    await frontend?.close();
     await runtime.close();
     if (originalEnvironment.codexHome === undefined) {
       delete process.env.CODEX_HOME;
     } else {
       process.env.CODEX_HOME = originalEnvironment.codexHome;
     }
+    if (originalEnvironment.runtimePort === undefined) delete process.env.TIDU_RUNTIME_PORT;
+    else process.env.TIDU_RUNTIME_PORT = originalEnvironment.runtimePort;
+    if (originalEnvironment.nodeEnvironment === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalEnvironment.nodeEnvironment;
     process.env.PATH = originalEnvironment.executablePath;
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
@@ -757,6 +821,53 @@ test("prevents concurrent runtimes from owning the same persistent data", async 
   } finally {
     await firstRuntime.close();
     rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
+test("reads account usage without starting an inactive host model session", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-usage-metadata-"));
+  const previousPath = process.env.PATH;
+  const callsPath = join(directory, "host-calls.jsonl");
+  const command = join(directory, "agent");
+  writeFileSync(
+    command,
+    `#!${process.execPath}
+const fs=require('node:fs');const args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(callsPath)},JSON.stringify(args)+'\\n');
+if(args[0]==='status'){console.log('Authenticated');process.exit(0)}
+if(args[0]==='acp'&&args[1]==='--help'){console.log('Agent Client Protocol ACP');process.exit(0)}
+process.exit(1);
+`,
+  );
+  chmodSync(command, 0o700);
+  const codex = join(directory, "codex");
+  writeFileSync(codex, "#!/bin/sh\nprintf 'Not logged in\\n'\nexit 1\n");
+  chmodSync(codex, 0o700);
+  process.env.PATH = directory;
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
+    port: 0,
+  });
+  try {
+    const response = await fetch(`${runtime.origin}/api/host-usage`);
+    assert.equal(response.status, 200);
+    const snapshot = (await response.json()) as {
+      cursor: { agentStatus: string; model: string | null };
+    };
+    assert.equal(snapshot.cursor.agentStatus, "authenticated");
+    assert.equal(snapshot.cursor.model, null);
+    assert.deepEqual(
+      readFileSync(callsPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line)),
+      [["status"], ["acp", "--help"]],
+    );
+  } finally {
+    await runtime.close();
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -1035,6 +1146,117 @@ test("routes ordinary inference through one Agent model call and preserves reaso
   }
 });
 
+test("makes Codex history portable before a managed request reaches another provider", async () => {
+  let receivedInput: unknown;
+  let receivedPreviousResponse: unknown;
+  const provider: ModelProvider = {
+    descriptor: { type: "codex-host", model: "portable-history-model" },
+    execute: async (request) => {
+      receivedInput = request.body.input;
+      receivedPreviousResponse = request.body.previous_response_id;
+      const unsafeItems = (Array.isArray(receivedInput) ? receivedInput : []).filter(
+        (item) => item.type !== "message",
+      );
+      if (unsafeItems.length > 0 || receivedPreviousResponse !== null)
+        throw new Error(
+          "Persisted response contains hosted-tool, compaction, or unverifiable hidden reasoning state that Rustponses cannot replay.",
+        );
+      return {
+        kind: "json",
+        statusCode: 200,
+        upstreamModel: "portable-history-model",
+        body: {
+          id: "portable-history-response",
+          object: "response",
+          model: request.virtualModelId,
+          status: "completed",
+          output: [
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "continued safely" }],
+            },
+          ],
+        },
+      };
+    },
+  };
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    port: 0,
+    provider,
+    discoverHostProvider: false,
+  });
+
+  try {
+    const response = await fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "official-model-alias",
+        previous_response_id: "response-owned-by-another-provider",
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "first question" }],
+          },
+          {
+            type: "reasoning",
+            id: "rs-provider-private",
+            summary: [{ type: "summary_text", text: "Reusable public summary" }],
+            encrypted_content: "provider-private-ciphertext",
+          },
+          { type: "compaction", encrypted_content: "provider-private-compaction" },
+          {
+            type: "file_search_call",
+            id: "old-search",
+            results: [{ text: "Public retrieved evidence" }],
+          },
+          { type: "computer_call", id: "old-computer", action: { type: "screenshot" } },
+          {
+            type: "code_interpreter_call",
+            id: "old-code",
+            code: "print(42)",
+            outputs: [{ type: "logs", logs: "42" }],
+          },
+          { type: "mcp_call", id: "old-tool", name: "inspect", output: "Public tool result" },
+          {
+            type: "message",
+            role: "assistant",
+            phase: "final_answer",
+            encrypted_content: "provider-private-message",
+            content: [
+              { type: "output_text", text: "first answer" },
+              { type: "compaction", encrypted_content: "provider-private-part" },
+            ],
+          },
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "follow-up question" }],
+          },
+        ],
+      }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /continued safely/u);
+    assert.equal(receivedPreviousResponse, null);
+    assert.doesNotMatch(
+      JSON.stringify(receivedInput),
+      /encrypted_content|provider-private-ciphertext|provider-private-compaction|"type":"compaction"/u,
+    );
+    assert.match(JSON.stringify(receivedInput), /Reusable public summary/u);
+    assert.match(JSON.stringify(receivedInput), /first answer/u);
+    assert.match(JSON.stringify(receivedInput), /follow-up question/u);
+    assert.match(JSON.stringify(receivedInput), /Public retrieved evidence/u);
+    assert.match(JSON.stringify(receivedInput), /Public tool result/u);
+  } finally {
+    await runtime.close();
+  }
+});
+
 test("routes the standard OpenAI endpoint through the configured host adapter", async () => {
   const routedHosts: Array<string | undefined> = [];
   const provider: ModelProvider = {
@@ -1204,10 +1426,17 @@ test("streams real upstream output deltas through the Agent Responses lifecycle"
         typeof item === "object" && item !== null && "type" in item && item.type === "reasoning"
       );
     });
-    assert.ok(reasoningItems.length >= 3);
+    assert.equal(reasoningItems.length, 2);
+    const addedItems = responseEvents.filter(
+      (event) => event.type === "response.output_item.added",
+    );
+    const commentaryItem = addedItems[0]?.item as Record<string, unknown>;
+    assert.equal(commentaryItem.id, "upstream-commentary");
+    assert.equal(commentaryItem.type, "message");
+    assert.equal(commentaryItem.phase, "commentary");
     assert.deepEqual(
-      reasoningItems.map((event) => event.output_index),
-      reasoningItems.map((_, index) => index),
+      addedItems.map((event) => event.output_index),
+      addedItems.map((_, index) => index),
     );
     const finalMessageItems = responseEvents.filter((event) => {
       if (event.type !== "response.output_item.added") return false;
@@ -1223,7 +1452,7 @@ test("streams real upstream output deltas through the Agent Responses lifecycle"
     });
     assert.deepEqual(
       finalMessageItems.map((event) => event.output_index),
-      [reasoningItems.length],
+      [reasoningItems.length + 1],
     );
     const createdEvent = responseEvents.find((event) => event.type === "response.created");
     const completedEvent = responseEvents.find((event) => event.type === "response.completed");
@@ -1245,7 +1474,9 @@ test("streams real upstream output deltas through the Agent Responses lifecycle"
     assert.equal(terminalOutput?.at(-1)?.type, "message");
     assert.equal(terminalOutput?.at(-1)?.phase, "final_answer");
     assert.equal(terminalOutput?.at(-1)?.status, "completed");
-    assert.ok(terminalOutput?.slice(0, -1).every((item) => item.type === "reasoning"));
+    assert.equal(terminalOutput?.[0]?.type, "message");
+    assert.equal(terminalOutput?.[0]?.phase, "commentary");
+    assert.ok(terminalOutput?.slice(1, -1).every((item) => item.type === "reasoning"));
   } finally {
     await runtime.close();
   }
@@ -1474,16 +1705,10 @@ test("Codex success shows host usage while failures stay concise", async () => {
           assert.equal(response.status, failed && !stream ? 502 : 200, body);
           if (failed) {
             assert.match(body, /Codex：Fixture failed/u);
-            assert.doesNotMatch(body, /Token：|未获取到/u);
+            assert.doesNotMatch(body, /总：|Codex：未获取到|未获取到/u);
           } else {
-            assert.match(
-              body,
-              reported ? /Token：输入 12 · 输出 3 · 合计 15/u : /Token：未获取到/u,
-            );
-            assert.match(
-              body,
-              reported ? /Codex：输入 12 · 输出 3 · 合计 15/u : /Codex：未获取到/u,
-            );
+            assert.match(body, reported ? /总：入 12 · 出 3 · 合 15/u : /总：未获取到/u);
+            assert.match(body, reported ? /Codex：入 12 · 出 3 · 合 15/u : /Codex：未获取到/u);
           }
           if (stream)
             assert.match(body, failed ? /event: response.failed/u : /event: response.completed/u);
@@ -1844,7 +2069,10 @@ test("forwards public progress without provider-private encrypted state", async 
       const reasoningItem = {
         id: "rs_fixture_private",
         type: "reasoning",
-        summary: [{ type: "summary_text", text: "Checked the visible process." }],
+        summary: [
+          { type: "summary_text", text: "Checked the visible process.\n\nKept its paragraphs." },
+          { type: "summary_text", text: "Verified the result." },
+        ],
         content: [{ type: "reasoning_text", text: "private reasoning text" }],
         encrypted_content: "provider-private-ciphertext",
         internal_chat_message_metadata_passthrough: { private: true },
@@ -1867,8 +2095,25 @@ test("forwards public progress without provider-private encrypted state", async 
               {
                 type: "response.output_item.added",
                 output_index: 0,
-                item: reasoningItem,
+                item: { ...reasoningItem, summary: [] },
               },
+              ...reasoningItem.summary.flatMap((part, summaryIndex) => {
+                const identity = {
+                  item_id: reasoningItem.id,
+                  output_index: 0,
+                  summary_index: summaryIndex,
+                };
+                return [
+                  {
+                    type: "response.reasoning_summary_part.added",
+                    ...identity,
+                    part: { type: "summary_text", text: "" },
+                  },
+                  { type: "response.reasoning_summary_text.delta", ...identity, delta: part.text },
+                  { type: "response.reasoning_summary_text.done", ...identity, text: part.text },
+                  { type: "response.reasoning_summary_part.done", ...identity, part },
+                ];
+              }),
               {
                 type: "response.output_item.done",
                 output_index: 0,
@@ -1878,7 +2123,7 @@ test("forwards public progress without provider-private encrypted state", async 
                 type: "response.completed",
                 response: {
                   status: "completed",
-                  output: [reasoningItem, messageItem],
+                  output: [reasoningItem, reasoningItem, messageItem],
                 },
               },
             ];
@@ -1920,6 +2165,47 @@ test("forwards public progress without provider-private encrypted state", async 
       /provider-private-ciphertext|private reasoning text|metadata_passthrough/u,
     );
     assert.match(events, /"encrypted_content":null/u);
+    const responseEvents = events.split(/\r?\n\r?\n/u).flatMap((frame) => {
+      const data = frame
+        .split(/\r?\n/u)
+        .find((line) => line.startsWith("data: "))
+        ?.slice(6);
+      return data === undefined || data === "[DONE]"
+        ? []
+        : [JSON.parse(data) as Record<string, unknown>];
+    });
+    for (const eventType of ["response.output_item.added", "response.output_item.done"]) {
+      const reasoningEvents = responseEvents.filter(
+        (event) =>
+          event.type === eventType &&
+          (event.item as Record<string, unknown> | undefined)?.type === "reasoning",
+      );
+      assert.equal(reasoningEvents.length, 1);
+      const reasoningEvent = reasoningEvents[0];
+      assert.ok(reasoningEvent);
+      assert.equal((reasoningEvent.item as Record<string, unknown>).id, "rs_fixture_private");
+      assert.equal(reasoningEvents[0]?.output_index, 0);
+    }
+    assert.deepEqual(
+      responseEvents
+        .filter((event) => event.type === "response.reasoning_summary_text.delta")
+        .map((event) => [event.item_id, event.summary_index, event.delta]),
+      [
+        ["rs_fixture_private", 0, "Checked the visible process.\n\nKept its paragraphs."],
+        ["rs_fixture_private", 1, "Verified the result."],
+      ],
+    );
+    const terminal = responseEvents.find((event) => event.type === "response.completed");
+    assert.ok(terminal);
+    const output = (terminal.response as Record<string, unknown>).output as Record<
+      string,
+      unknown
+    >[];
+    assert.equal(output.filter((item) => item.type === "reasoning").length, 1);
+    assert.deepEqual(output[0]?.summary, [
+      { type: "summary_text", text: "Checked the visible process.\n\nKept its paragraphs." },
+      { type: "summary_text", text: "Verified the result." },
+    ]);
   } finally {
     await runtime.close();
   }
@@ -2115,6 +2401,50 @@ test("preserves bounded provider error details across Agent response formats", a
       assert.ok((errorMessage?.split("\n\nToken")[0]?.length ?? 0) <= 240);
     }
     assert.equal(providerCalls, requests.length);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("preserves the upstream retry category on the direct diagnostic path", async () => {
+  let providerCalls = 0;
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    port: 0,
+    discoverHostProvider: false,
+    provider: {
+      descriptor: { type: "codex-host", model: "fixture" },
+      execute: async () => {
+        providerCalls += 1;
+        return {
+          kind: "json",
+          statusCode: 503,
+          body: {
+            error: {
+              code: "server_is_overloaded",
+              type: "service_unavailable_error",
+              message: "Fixture capacity failure",
+            },
+          },
+        };
+      },
+    },
+  });
+  try {
+    const response = await fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        input: "Probe",
+        metadata: { ai_tidu9_probe: true },
+      }),
+    });
+    assert.equal(response.status, 503);
+    const failure = (await response.json()) as { error: { code: string; type: string } };
+    assert.equal(failure.error.code, "server_is_overloaded");
+    assert.equal(failure.error.type, "service_unavailable_error");
+    assert.equal(providerCalls, 1);
   } finally {
     await runtime.close();
   }

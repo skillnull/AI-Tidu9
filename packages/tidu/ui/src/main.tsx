@@ -260,7 +260,9 @@ const App = () => {
   const refreshHostUsage = useCallback(async () => {
     setHostUsageState({ status: "loading" });
     try {
-      const response = await fetch("/api/host-usage", { cache: "no-store" });
+      const response = await fetch("/api/host-usage?refresh=1", {
+        cache: "no-store",
+      });
       if (!response.ok) throw new Error("Host usage unavailable");
       setHostUsageState({
         status: "ready",
@@ -502,11 +504,20 @@ const App = () => {
 
   const { bootstrap } = loadingState;
   const workspace = bootstrap.configuration.workspace;
-  const activeModelSelection = workspace.active.configuration.modelSelection;
+  const activeHost = agentHostForProviderType(bootstrap.runtime.provider.type);
+  const activeCapabilityPolicy =
+    activeHost === undefined
+      ? undefined
+      : workspace.active.configuration.capabilityCompletion.hostPolicies?.[activeHost];
+  const activeModelSelection =
+    activeCapabilityPolicy?.mainModel ?? workspace.active.configuration.modelSelection;
+  const activeSpecialistCount =
+    activeCapabilityPolicy?.specialists.length ??
+    workspace.active.configuration.capabilityCompletion.specialists.length;
   const activeModelName = modelDisplayName({
     catalog: upstreamModelCatalog,
     currentName: locale === "zh-CN" ? "跟随当前官方模型" : "Follow current official model",
-    host: agentHostForProviderType(bootstrap.runtime.provider.type),
+    host: activeHost,
     selection: activeModelSelection,
   });
   const form = configurationForm;
@@ -949,8 +960,7 @@ const App = () => {
                       ? "已关闭"
                       : "Disabled"}
                   {" · "}
-                  {locale === "zh-CN" ? "副模型" : "Secondary models"}{" "}
-                  {workspace.active.configuration.capabilityCompletion.specialists.length}
+                  {locale === "zh-CN" ? "副模型" : "Secondary models"} {activeSpecialistCount}
                 </p>
               </article>
             </section>

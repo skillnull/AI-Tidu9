@@ -65,7 +65,10 @@ test("keeps original images in history while a steer supplies new text and image
           role: "user",
           content: [
             { type: "input_text", text: "inspect the original image" },
-            { type: "input_image", image_url: "data:image/png;base64,b3JpZ2luYWw=" },
+            {
+              type: "input_image",
+              image_url: "data:image/png;base64,b3JpZ2luYWw=",
+            },
           ],
         },
         {
@@ -82,7 +85,10 @@ test("keeps original images in history while a steer supplies new text and image
           role: "user",
           content: [
             { type: "input_text", text: "compare it with this image" },
-            { type: "input_image", image_url: "data:image/png;base64,c3RlZXI=" },
+            {
+              type: "input_image",
+              image_url: "data:image/png;base64,c3RlZXI=",
+            },
           ],
         },
       ],
@@ -111,19 +117,28 @@ test("preserves every earlier steer while only the newest guidance is active inp
     virtualModelId: "ai-tidu9-config",
     body: {
       input: [
-        { role: "user", content: [{ type: "input_text", text: "original request" }] },
+        {
+          role: "user",
+          content: [{ type: "input_text", text: "original request" }],
+        },
         {
           role: "assistant",
           phase: "commentary",
           content: [{ type: "output_text", text: "first progress" }],
         },
-        { role: "user", content: [{ type: "input_text", text: "first steer" }] },
+        {
+          role: "user",
+          content: [{ type: "input_text", text: "first steer" }],
+        },
         {
           role: "assistant",
           phase: "commentary",
           content: [{ type: "output_text", text: "second progress" }],
         },
-        { role: "user", content: [{ type: "input_text", text: "second steer" }] },
+        {
+          role: "user",
+          content: [{ type: "input_text", text: "second steer" }],
+        },
       ],
     },
   });
@@ -175,7 +190,11 @@ test("keeps completed tool context when guidance is added before the final answe
       name: "inspect",
       arguments: "{}",
     },
-    { type: "function_call_output", call_id: "call-id", output: "inspection result" },
+    {
+      type: "function_call_output",
+      call_id: "call-id",
+      output: "inspection result",
+    },
     {
       type: "message",
       id: "user-steer",
@@ -236,7 +255,7 @@ test("keeps the completed answer when a later turn asks a follow-up question", (
   });
 });
 
-test("converts provider-private reasoning into reusable public history", () => {
+test("replays public summaries as text without unverifiable native reasoning state", () => {
   const turn = requestTurnInput({
     protocol: "responses",
     virtualModelId: "ai-tidu9-config",
@@ -250,7 +269,10 @@ test("converts provider-private reasoning into reusable public history", () => {
         {
           type: "reasoning",
           id: "rs-private",
-          summary: [{ type: "summary_text", text: "Checked the reusable context." }],
+          summary: [
+            { type: "summary_text", text: "Checked the reusable context." },
+            { type: "summary_text", text: "Verified the earlier result." },
+          ],
           encrypted_content: "provider-private-ciphertext",
         },
         {
@@ -284,7 +306,10 @@ test("converts provider-private reasoning into reusable public history", () => {
       type: "message",
       role: "assistant",
       phase: "commentary",
-      content: [{ type: "output_text", text: "Checked the reusable context." }],
+      content: [
+        { type: "output_text", text: "Checked the reusable context." },
+        { type: "output_text", text: "Verified the earlier result." },
+      ],
     },
     {
       type: "message",
@@ -295,8 +320,43 @@ test("converts provider-private reasoning into reusable public history", () => {
   ]);
   assert.doesNotMatch(
     JSON.stringify(turn.historyItems),
-    /encrypted_content|ciphertext|compaction/u,
+    /encrypted_content|ciphertext|compaction|rs-private|"type":"reasoning"/u,
   );
+});
+
+test("replays hosted tool evidence without importing hosted execution state", () => {
+  const turn = requestTurnInput({
+    protocol: "responses",
+    virtualModelId: "ai-tidu9-config",
+    body: {
+      input: [
+        {
+          type: "web_search_call",
+          id: "hosted-search",
+          action: { query: "public fixture" },
+          encrypted_content: "private",
+        },
+        {
+          type: "function_call",
+          call_id: "caller-call",
+          name: "inspect",
+          arguments: "{}",
+          encrypted_function_args: "private",
+        },
+        {
+          type: "function_call_output",
+          call_id: "caller-call",
+          output: "inspected",
+        },
+        { role: "user", content: "continue" },
+      ],
+    },
+  });
+  assert.equal(turn.historyItems[0]?.type, "message");
+  assert.match(JSON.stringify(turn.historyItems[0]?.content), /public fixture/u);
+  assert.equal(turn.historyItems[1]?.type, "function_call");
+  assert.equal(turn.historyItems[2]?.output, "inspected");
+  assert.doesNotMatch(JSON.stringify(turn.historyItems), /encrypted|private/u);
 });
 
 test("does not replay an old user message when Responses continuation items follow it", () => {

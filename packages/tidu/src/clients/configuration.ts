@@ -164,7 +164,7 @@ interface CodexProfileState {
   endpoint: string;
   /** Active virtual-model identifier. */
   model: string;
-  /** Official model alias retained so either mode can compact the same chat. */
+  /** Official model captured before activating managed mode. */
   officialModel?: string;
   /** Latest official top-level model selection restored after managed mode. */
   officialDefaultLines?: readonly string[];
@@ -854,7 +854,7 @@ const createCodexModelCatalog = (model: string, reasoningEffortSupported: boolea
           web_search_tool_type: "text_and_image",
           context_window: 128_000,
           max_context_window: 128_000,
-          comp_hash: "ai-tidu9-1",
+          comp_hash: null,
           effective_context_window_percent: 95,
           experimental_supported_tools: [],
           use_responses_lite: false,
@@ -1276,6 +1276,54 @@ const restoreDefaultConfigurationValues = (
   applyPrivateFileStatesAtomically([{ path: paths.defaultConfiguration, content }]);
 };
 
+const readManagedProfileEndpoint = (paths: CodexPaths): string | undefined => {
+  if (!existsSync(paths.profile)) return undefined;
+  assertSafeRegularFile(paths.profile);
+  const content = readFileSync(paths.profile, "utf8");
+  if (
+    !content.startsWith("# Managed by AI-Tidu9.") ||
+    !/^\s*\[model_providers\.ai_tidu9\]\s*$/mu.test(content)
+  )
+    return undefined;
+  const encodedBaseUrl = /^\s*base_url\s*=\s*("(?:[^"\\]|\\.)*")\s*$/mu.exec(content)?.[1];
+  if (encodedBaseUrl === undefined) return undefined;
+  try {
+    const baseUrl = JSON.parse(encodedBaseUrl) as unknown;
+    const suffix = "/v1/hosts/codex";
+    return typeof baseUrl === "string" && baseUrl.endsWith(suffix)
+      ? normalizeEndpoint(baseUrl.slice(0, -suffix.length))
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const deactivateManagedDefaultConfiguration = (
+  paths: CodexPaths,
+  retainedEndpoint?: string,
+): void => {
+  assertSafeRegularFile(paths.defaultConfiguration);
+  const current = existsSync(paths.defaultConfiguration)
+    ? readFileSync(paths.defaultConfiguration, "utf8")
+    : "";
+  const withoutManagedDefault = removeManagedBlock(
+    current,
+    MANAGED_DEFAULT_START,
+    MANAGED_DEFAULT_END,
+  );
+  const managedEndpoint = retainedEndpoint ?? readManagedProfileEndpoint(paths);
+  const officialCompatible =
+    managedEndpoint === undefined
+      ? withoutManagedDefault
+      : addManagedProviderBlock(withoutManagedDefault, managedEndpoint);
+  if (officialCompatible !== current) {
+    writePrivateFileAtomically(
+      paths.defaultConfiguration,
+      `${officialCompatible.replace(/\n+$/u, "")}\n`,
+    );
+  }
+};
+
 const listSnapshotIds = (paths: CodexPaths): readonly string[] => {
   if (!existsSync(paths.backups)) {
     return [];
@@ -1445,7 +1493,12 @@ export const inspectCodexClientConfiguration = (
   options: CodexClientRollbackOptions = {},
 ): CodexClientStatus => {
   const paths = resolveCodexPaths(options.codexHomeDirectory);
-  const state = readManagedState(paths.state);
+  let state: CodexProfileState | undefined;
+  try {
+    state = readManagedState(paths.state);
+  } catch (error) {
+    if (hasManagedDefaultConfiguration(paths)) throw error;
+  }
   return {
     installed: state !== undefined && existsSync(paths.profile) && existsSync(paths.modelCatalog),
     activeMode:
@@ -1483,16 +1536,46 @@ export const switchCodexClientConfiguration = async (
   options: CodexClientModeOptions,
 ): Promise<CodexClientStatus> => {
   const paths = resolveCodexPaths(options.codexHomeDirectory);
-  const state = readManagedState(paths.state);
-  if (state === undefined || !existsSync(paths.profile) || !existsSync(paths.modelCatalog)) {
+  let state: CodexProfileState | undefined;
+  try {
+    state = readManagedState(paths.state);
+  } catch (error) {
+    if (options.mode !== "official") throw error;
+    deactivateManagedDefaultConfiguration(paths);
+    prepareDesktopRecovery(paths.home, options.codexHomeDirectory);
+    switchCodexDesktopProxy(true, paths.home);
+    return inspectCodexClientConfiguration(options);
+  }
+  if (state === undefined) {
     if (options.mode === "official") {
-      return {
-        installed: false,
-        activeMode: "official",
-        endpoint: null,
-        model: null,
-      };
+      deactivateManagedDefaultConfiguration(paths);
+      prepareDesktopRecovery(paths.home, options.codexHomeDirectory);
+      switchCodexDesktopProxy(true, paths.home);
+      return inspectCodexClientConfiguration(options);
     }
+    throw new TiduError(
+      "CONFIGURATION_INVALID",
+      "Install the AI-Tidu9 Codex profile before switching to it.",
+    );
+  }
+  const installed = existsSync(paths.profile) && existsSync(paths.modelCatalog);
+  if (!installed && options.mode === "official") {
+    restoreDefaultConfigurationValues(
+      paths,
+      state.originalBackupId,
+      state.endpoint,
+      state.officialDefaultLines,
+    );
+    prepareDesktopRecovery(paths.home, options.codexHomeDirectory);
+    switchCodexDesktopProxy(true, paths.home);
+    writeManagedState(paths.state, {
+      ...state,
+      activeMode: "official",
+      configuredAt: new Date().toISOString(),
+    });
+    return inspectCodexClientConfiguration(options);
+  }
+  if (!installed) {
     throw new TiduError(
       "CONFIGURATION_INVALID",
       "Install the AI-Tidu9 Codex profile before switching to it.",
@@ -1501,20 +1584,30 @@ export const switchCodexClientConfiguration = async (
   const managedDefaultActive = hasManagedDefaultConfiguration(paths);
   const activeMode = managedDefaultActive ? "ai-tidu9" : "official";
   if (activeMode === options.mode && options.mode === "official") {
+    deactivateManagedDefaultConfiguration(paths, state.endpoint);
     prepareDesktopRecovery(paths.home, options.codexHomeDirectory);
     switchCodexDesktopProxy(true, paths.home);
+    if (state.activeMode !== "official") {
+      writeManagedState(paths.state, {
+        ...state,
+        activeMode: "official",
+        configuredAt: new Date().toISOString(),
+      });
+    }
     return inspectCodexClientConfiguration(options);
   }
   let nextState = state;
   if (options.mode === "ai-tidu9") {
     const request = options.request ?? fetch;
-    const officialModel = readCodexActiveSelection(paths.home).model;
-    const officialDefaultLines = readOfficialDefaultLines(paths.defaultConfiguration);
-    nextState = {
-      ...state,
-      officialModel,
-      officialDefaultLines,
-    };
+    if (activeMode === "official") {
+      const officialModel = readCodexActiveSelection(paths.home).model;
+      const officialDefaultLines = readOfficialDefaultLines(paths.defaultConfiguration);
+      nextState = {
+        ...state,
+        officialModel,
+        officialDefaultLines,
+      };
+    }
     try {
       prepareDesktopRecovery(paths.home, options.codexHomeDirectory);
       await verifyEndpoint(state.endpoint, request);

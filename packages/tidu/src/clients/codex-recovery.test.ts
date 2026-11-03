@@ -134,7 +134,7 @@ test("restores the real aborted command, exact turn usage, and duration without 
   assert.equal(items[0]?.status, "failed");
   assert.equal(items[0]?.exitCode, null);
   assert.equal(items[0]?.aggregatedOutput, "Wall time: 1.3 seconds\naborted by user");
-  assert.equal(items[1]?.text, "Token：输入 24 · 输出 6 · 合计 30");
+  assert.equal(items[1]?.text, "总：入 24 · 出 6 · 合 30");
   assert.deepEqual(recoverCodexTurn(recovered.turn, records, "/fixture").completedItems, []);
 });
 
@@ -146,7 +146,7 @@ test("does not invent an executed command from a call without an abort result", 
   );
   const items = recovered.turn.items as Record<string, unknown>[];
   assert.equal(items.length, 1);
-  assert.equal(items[0]?.text, "Token：未获取到");
+  assert.equal(items[0]?.text, "总：未获取到");
 });
 
 test("appends token usage to an existing partial answer without hiding it or duplicating final messages", () => {
@@ -166,10 +166,7 @@ test("appends token usage to an existing partial answer without hiding it or dup
   );
   assert.equal(answers.length, 1);
   assert.equal(answers[0]?.id, "partial");
-  assert.equal(
-    answers[0]?.text,
-    "The partial answer stays visible.\n\nToken：输入 24 · 输出 6 · 合计 30",
-  );
+  assert.equal(answers[0]?.text, "The partial answer stays visible.\n\n总：入 24 · 出 6 · 合 30");
   assert.deepEqual(recoverCodexTurn(recovered.turn, records, "/fixture").completedItems, []);
 });
 
@@ -255,7 +252,7 @@ test("does not add managed token presentation to an official turn in a mixed-mod
     JSON.stringify(
       recoverCodexTurn(turn, officialRecords, "/fixture", "openai", "official-model").turn,
     ),
-    /Token：输入 24/u,
+    /总：入 24/u,
   );
   assert.deepEqual(
     recoverCodexTurn(
@@ -288,7 +285,7 @@ test("does not add managed token presentation to an official turn in a mixed-mod
     JSON.stringify(
       recoverCodexTurn(turn, sharedModelRecords, "/fixture", "ai_tidu9", "shared-model", true).turn,
     ),
-    /Token：输入 24/u,
+    /总：入 24/u,
   );
 });
 

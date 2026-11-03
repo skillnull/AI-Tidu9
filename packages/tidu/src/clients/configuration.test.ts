@@ -282,7 +282,7 @@ test("restores the latest official model selection after a managed-mode round tr
     });
     assert.deepEqual(readCodexActiveSelection(codexHomeDirectory), {
       modelProvider: "ai_tidu9",
-      model: "official-updated",
+      model: "ai-tidu9-config",
     });
     await switchCodexClientConfiguration({
       mode: "official",
@@ -321,6 +321,208 @@ test("restores the latest official model selection after a managed-mode round tr
       codexHomeDirectory,
     });
     assert.doesNotMatch(readFileSync(defaultConfiguration, "utf8"), /^model\s*=/mu);
+  } finally {
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
+test("keeps official defaults intact when managed mode is selected repeatedly", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-repeat-managed-mode-"));
+  const codexHomeDirectory = join(temporaryDirectory, ".codex");
+  const defaultConfiguration = join(codexHomeDirectory, "config.toml");
+  const request: typeof fetch = async (input) => {
+    const url = String(input);
+    if (url.endsWith("/health")) return Response.json({ product: "九门赛博提督", status: "ok" });
+    if (url.endsWith("/v1/models")) {
+      return Response.json({
+        object: "list",
+        data: [{ id: "ai-tidu9-config", owned_by: "AI-Tidu9" }],
+      });
+    }
+    return Response.json({ id: "verified", object: "response", output: [] });
+  };
+
+  try {
+    mkdirSync(codexHomeDirectory, { mode: 0o700, recursive: true });
+    writeFileSync(
+      defaultConfiguration,
+      [
+        'model = "official-repeat"',
+        'model_provider = "official_repeat"',
+        'model_catalog_json = "/catalog/repeat.json"',
+        "[model_providers.official_repeat]",
+        'name = "Official repeat"',
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory,
+      verifyRuntime: false,
+    });
+
+    await switchCodexClientConfiguration({ mode: "ai-tidu9", codexHomeDirectory, request });
+    writeFileSync(
+      defaultConfiguration,
+      readFileSync(defaultConfiguration, "utf8").replace(
+        /# AI-Tidu9 managed provider:start[\s\S]*?# AI-Tidu9 managed provider:end\n?/u,
+        "",
+      ),
+      { mode: 0o600 },
+    );
+    await switchCodexClientConfiguration({ mode: "ai-tidu9", codexHomeDirectory, request });
+    assert.match(readFileSync(defaultConfiguration, "utf8"), /\[model_providers\.ai_tidu9\]/u);
+    await switchCodexClientConfiguration({ mode: "official", codexHomeDirectory });
+
+    const restored = readFileSync(defaultConfiguration, "utf8");
+    assert.match(restored, /^model = "official-repeat"/u);
+    assert.match(restored, /^model_provider = "official_repeat"/mu);
+    assert.match(restored, /^model_catalog_json = "\/catalog\/repeat\.json"/mu);
+    assert.doesNotMatch(restored, /AI-Tidu9 managed default:start/u);
+    const state = JSON.parse(
+      readFileSync(join(codexHomeDirectory, ".ai-tidu9-profile-state.json"), "utf8"),
+    ) as { activeMode: string; officialDefaultLines: string[] };
+    assert.equal(state.activeMode, "official");
+    assert.deepEqual(state.officialDefaultLines, [
+      'model = "official-repeat"',
+      'model_provider = "official_repeat"',
+      'model_catalog_json = "/catalog/repeat.json"',
+    ]);
+  } finally {
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
+test("recovers official mode and historical provider loading without readable managed state", async () => {
+  const scenarios = ["missing", "corrupt", "missing-config-and-state"] as const;
+  for (const scenario of scenarios) {
+    const temporaryDirectory = mkdtempSync(join(tmpdir(), `ai-tidu9-${scenario}-state-`));
+    const codexHomeDirectory = join(temporaryDirectory, ".codex");
+    const defaultConfiguration = join(codexHomeDirectory, "config.toml");
+    const statePath = join(codexHomeDirectory, ".ai-tidu9-profile-state.json");
+    const request: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.endsWith("/health")) return Response.json({ product: "九门赛博提督", status: "ok" });
+      if (url.endsWith("/v1/models")) {
+        return Response.json({
+          object: "list",
+          data: [{ id: "ai-tidu9-config", owned_by: "AI-Tidu9" }],
+        });
+      }
+      return Response.json({ id: "verified", object: "response", output: [] });
+    };
+
+    try {
+      await configureCodexClient({
+        endpoint: "http://127.0.0.1:9639",
+        codexHomeDirectory,
+        verifyRuntime: false,
+      });
+      await switchCodexClientConfiguration({ mode: "ai-tidu9", codexHomeDirectory, request });
+      const legacyConfiguration = readFileSync(defaultConfiguration, "utf8").replace(
+        /# AI-Tidu9 managed provider:start[\s\S]*?# AI-Tidu9 managed provider:end\n?/u,
+        "",
+      );
+      writeFileSync(defaultConfiguration, legacyConfiguration, { mode: 0o600 });
+      if (scenario === "corrupt") writeFileSync(statePath, "{invalid", { mode: 0o600 });
+      else rmSync(statePath);
+      if (scenario === "missing-config-and-state") rmSync(defaultConfiguration);
+
+      const status = await switchCodexClientConfiguration({
+        mode: "official",
+        codexHomeDirectory,
+      });
+      const recoveredConfiguration = readFileSync(defaultConfiguration, "utf8");
+      assert.equal(status.activeMode, "official");
+      assert.deepEqual(readCodexActiveSelection(codexHomeDirectory), { modelProvider: "openai" });
+      assert.doesNotMatch(recoveredConfiguration, /AI-Tidu9 managed default:start/u);
+      assert.match(recoveredConfiguration, /\[model_providers\.ai_tidu9\]/u);
+      assert.match(
+        recoveredConfiguration,
+        /base_url = "http:\/\/127\.0\.0\.1:9639\/v1\/hosts\/codex"/u,
+      );
+    } finally {
+      rmSync(temporaryDirectory, { force: true, recursive: true });
+    }
+  }
+});
+
+test("restores official mode when a managed artifact is missing", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-official-recovery-"));
+  const codexHomeDirectory = join(temporaryDirectory, ".codex");
+  const defaultConfiguration = join(codexHomeDirectory, "config.toml");
+  const request: typeof fetch = async (input) => {
+    const url = String(input);
+    if (url.endsWith("/health")) return Response.json({ product: "九门赛博提督", status: "ok" });
+    if (url.endsWith("/v1/models"))
+      return Response.json({
+        object: "list",
+        data: [{ id: "ai-tidu9-config", owned_by: "AI-Tidu9" }],
+      });
+    return Response.json({ id: "verified", object: "response", output: [] });
+  };
+
+  try {
+    mkdirSync(codexHomeDirectory, { mode: 0o700, recursive: true });
+    writeFileSync(defaultConfiguration, 'model = "official-model"\nmodel_provider = "openai"\n', {
+      mode: 0o600,
+    });
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory,
+      verifyRuntime: false,
+    });
+    await switchCodexClientConfiguration({
+      mode: "ai-tidu9",
+      codexHomeDirectory,
+      request,
+    });
+    rmSync(join(codexHomeDirectory, ".ai-tidu9-model-catalog.json"));
+
+    const status = await switchCodexClientConfiguration({
+      mode: "official",
+      codexHomeDirectory,
+    });
+    const restored = readFileSync(defaultConfiguration, "utf8");
+
+    assert.equal(status.activeMode, "official");
+    assert.equal(inspectCodexClientConfiguration({ codexHomeDirectory }).activeMode, "official");
+    assert.match(restored, /^model = "official-model"/u);
+    assert.match(restored, /^model_provider = "openai"/mu);
+    assert.doesNotMatch(restored, /AI-Tidu9 managed default:start/u);
+    assert.match(restored, /\[model_providers\.ai_tidu9\]/u);
+  } finally {
+    rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
+});
+
+test("repairs historical managed-provider loading when official mode is already active", async () => {
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-official-provider-repair-"));
+  const codexHomeDirectory = join(temporaryDirectory, ".codex");
+  const defaultConfiguration = join(codexHomeDirectory, "config.toml");
+
+  try {
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory,
+      verifyRuntime: false,
+    });
+    const legacyOfficialConfiguration = readFileSync(defaultConfiguration, "utf8").replace(
+      /# AI-Tidu9 managed provider:start[\s\S]*?# AI-Tidu9 managed provider:end\n?/u,
+      "",
+    );
+    writeFileSync(defaultConfiguration, legacyOfficialConfiguration, { mode: 0o600 });
+    assert.doesNotMatch(readFileSync(defaultConfiguration, "utf8"), /model_providers\.ai_tidu9/u);
+
+    const status = await switchCodexClientConfiguration({
+      mode: "official",
+      codexHomeDirectory,
+    });
+
+    assert.equal(status.activeMode, "official");
+    assert.match(readFileSync(defaultConfiguration, "utf8"), /\[model_providers\.ai_tidu9\]/u);
+    assert.deepEqual(readCodexActiveSelection(codexHomeDirectory), { modelProvider: "openai" });
   } finally {
     rmSync(temporaryDirectory, { force: true, recursive: true });
   }

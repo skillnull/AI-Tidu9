@@ -145,14 +145,14 @@ test("attributes model failures and terminal usage to the configured primary or 
           assert.equal(completed.task.status, "completed");
           const reported = receipts.filter((receipt) => receipt.usage !== null);
           assert.equal(reported.length, 1);
-          assert.equal(reported[0]?.role === "specialist", secondary);
+          assert.equal(reported[0]?.role, "worker");
           assert.equal(reported[0]?.host, secondary ? "cursor" : "codex");
           assert.equal(reported[0]?.usage?.totalTokens, 15);
           continue;
         }
         const failure = completed.events.find((event) => event.type === "task.failed");
         const reason = String((failure?.payload as { reason?: string } | undefined)?.reason);
-        const host = secondary ? "Cursor" : "Codex";
+        const host = secondary && failureMode === "stream" ? "Cursor" : "Codex";
         assert.ok(reason.startsWith(`${host}${chinese ? "：" : ": "}`), reason);
         assert.match(reason, /Fixture upstream failure/u);
         assert.doesNotMatch(reason, /主模型|副模型|Primary model|Secondary model/u);

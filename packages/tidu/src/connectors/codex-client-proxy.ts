@@ -13,6 +13,8 @@ import {
   renameSync,
   rmSync,
   statSync,
+  unwatchFile,
+  watchFile,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -24,7 +26,11 @@ import {
   readCodexRecoveryRecords,
   recoverCodexTurn,
 } from "../clients/codex-recovery.js";
-import type { JsonRpcProcessLaunch } from "./json-rpc.js";
+import {
+  createStdioJsonRpcClient,
+  type JsonRpcClient,
+  type JsonRpcProcessLaunch,
+} from "./json-rpc.js";
 
 type JsonObject = Record<string, unknown>;
 const isRecord = (value: unknown): value is JsonObject =>
@@ -123,22 +129,6 @@ const readConfigOverrides = (arguments_: readonly string[]): Partial<CodexActive
   return selection;
 };
 
-const readManagedOfficialModel = (codexHome: string): string | undefined => {
-  const statePath = join(codexHome, ".ai-tidu9-profile-state.json");
-  if (!existsSync(statePath)) return undefined;
-  try {
-    const state: unknown = JSON.parse(readFileSync(statePath, "utf8"));
-    return isRecord(state) &&
-      state.owner === "AI-Tidu9" &&
-      typeof state.officialModel === "string" &&
-      state.officialModel.trim() !== ""
-      ? state.officialModel
-      : undefined;
-  } catch {
-    return undefined;
-  }
-};
-
 const readStoredTurnSelections = (codexHome: string): Map<string, StoredTurnSelection> => {
   const historyPath = join(codexHome, TURN_PROVIDER_HISTORY_FILE);
   const selections = new Map<string, StoredTurnSelection>();
@@ -231,19 +221,13 @@ export const readCodexActiveSelection = (
     : {};
   const overridden = readConfigOverrides(launchArguments);
   const modelProvider = overridden.modelProvider ?? configured.modelProvider ?? "openai";
-  const managedOfficialModel =
-    overridden.model === undefined && modelProvider === "ai_tidu9"
-      ? readManagedOfficialModel(codexHome)
-      : undefined;
   return {
     modelProvider,
     ...(overridden.model !== undefined
       ? { model: overridden.model }
-      : managedOfficialModel !== undefined
-        ? { model: managedOfficialModel }
-        : configured.model !== undefined
-          ? { model: configured.model }
-          : {}),
+      : configured.model !== undefined
+        ? { model: configured.model }
+        : {}),
   };
 };
 
@@ -266,6 +250,103 @@ const applyActiveSelection = (
   return updated;
 };
 
+const applyActiveModel = (
+  params: JsonObject,
+  model: string,
+  previousMode?: unknown,
+): JsonObject => {
+  const collaborationMode = isRecord(params.collaborationMode)
+    ? params.collaborationMode
+    : isRecord(previousMode)
+      ? previousMode
+      : undefined;
+  return {
+    ...params,
+    model,
+    ...(collaborationMode !== undefined && isRecord(collaborationMode.settings)
+      ? {
+          collaborationMode: {
+            ...collaborationMode,
+            settings: { ...collaborationMode.settings, model },
+          },
+        }
+      : {}),
+  };
+};
+
+const readActiveModelList = (
+  codexHome: string,
+  selection: CodexActiveSelection,
+  params: JsonObject,
+  managedProvider: string,
+): JsonObject | undefined => {
+  if (selection.model === undefined) return undefined;
+  const catalogPath = join(
+    codexHome,
+    selection.modelProvider === managedProvider
+      ? ".ai-tidu9-model-catalog.json"
+      : "models_cache.json",
+  );
+  if (
+    !existsSync(catalogPath) ||
+    !lstatSync(catalogPath).isFile() ||
+    lstatSync(catalogPath).isSymbolicLink()
+  )
+    return undefined;
+  let catalog: unknown;
+  try {
+    catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(catalog) || !Array.isArray(catalog.models)) return undefined;
+  const models = catalog.models
+    .filter(isRecord)
+    .filter(
+      (model) =>
+        typeof model.slug === "string" &&
+        typeof model.display_name === "string" &&
+        model.supported_in_api === true &&
+        (selection.modelProvider === managedProvider
+          ? model.slug === selection.model
+          : model.slug !== "ai-tidu9-config") &&
+        (params.includeHidden === true || model.visibility === "list"),
+    )
+    .map((model) => ({
+      id: model.slug,
+      model: model.slug,
+      displayName: model.display_name,
+      description: typeof model.description === "string" ? model.description : "",
+      hidden: model.visibility !== "list",
+      isDefault: model.slug === selection.model,
+      defaultReasoningEffort: model.default_reasoning_level ?? "none",
+      supportedReasoningEfforts: Array.isArray(model.supported_reasoning_levels)
+        ? model.supported_reasoning_levels
+            .filter(isRecord)
+            .filter((level) => typeof level.effort === "string")
+            .map((level) => ({
+              reasoningEffort: level.effort,
+              description: typeof level.description === "string" ? level.description : "",
+            }))
+        : [],
+      ...(Array.isArray(model.input_modalities) ? { inputModalities: model.input_modalities } : {}),
+      supportsPersonality: false,
+    }));
+  if (models.length === 0) return undefined;
+  const offset =
+    typeof params.cursor === "string" && /^tidu_models:\d+$/u.test(params.cursor)
+      ? Number(params.cursor.slice("tidu_models:".length))
+      : 0;
+  const limit =
+    typeof params.limit === "number" && Number.isSafeInteger(params.limit) && params.limit > 0
+      ? params.limit
+      : models.length;
+  return {
+    data: models.slice(offset, offset + limit),
+    nextCursor: offset + limit < models.length ? `tidu_models:${offset + limit}` : null,
+  };
+};
+
 /** Transparent native-client relay. Derives cancelled presentation from the official session only. */
 export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexClientProxy => {
   const internalRequestTimeoutMs =
@@ -283,16 +364,39 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
   const resolveActiveSelection =
     options.resolveActiveSelection ??
     (() => readCodexActiveSelection(codexHome, options.launch.arguments));
-  const resolveThreadSelection = (
-    selection: CodexActiveSelection,
-    thread: JsonObject | undefined,
-  ): CodexActiveSelection =>
-    selection.modelProvider === provider &&
-    thread?.modelProvider !== provider &&
-    typeof thread?.model === "string" &&
-    thread.model.trim() !== ""
-      ? { ...selection, model: thread.model }
-      : selection;
+  const launchSelection = resolveActiveSelection();
+  let accountClient: JsonRpcClient | undefined;
+  let accountReady: Promise<void> | undefined;
+  const readOfficialAccount = async (method: string, params: unknown): Promise<unknown> => {
+    if (accountClient === undefined) {
+      accountClient = createStdioJsonRpcClient(
+        {
+          ...options.launch,
+          arguments: [...options.launch.arguments, "-c", 'model_provider="openai"'],
+        },
+        { requestTimeoutMilliseconds: internalRequestTimeoutMs },
+      );
+      const client = accountClient;
+      accountReady = client
+        .request("initialize", {
+          clientInfo: { name: "ai_tidu9_account", version: "1" },
+          capabilities: { experimentalApi: true },
+        })
+        .then(() => client.notify("initialized"));
+    }
+    const client = accountClient;
+    try {
+      await accountReady;
+      return await client.request(method, params);
+    } catch (error) {
+      if (accountClient === client) {
+        accountClient = undefined;
+        accountReady = undefined;
+      }
+      await client.close();
+      throw error;
+    }
+  };
   const requests = new Map<
     string,
     {
@@ -325,6 +429,7 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
     ]),
   );
   const threads = new Map<string, JsonObject>();
+  const runningThreads = new Set<string>();
   const terminalTurns = new Map<
     string,
     {
@@ -342,6 +447,21 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
   };
   const writeChild = (message: unknown): void => {
     if (!closed && child.stdin.writable) child.stdin.write(`${JSON.stringify(message)}\n`);
+  };
+  let rateLimitsRefresh: Promise<void> | undefined;
+  const refreshOfficialRateLimits = (): void => {
+    if (rateLimitsRefresh !== undefined) return;
+    rateLimitsRefresh = readOfficialAccount("account/rateLimits/read", undefined)
+      .then((result) => {
+        if (closed || resolveActiveSelection().modelProvider !== provider) return;
+        if (isRecord(result) && isRecord(result.rateLimits))
+          send({ method: "account/rateLimits/updated", params: { rateLimits: result.rateLimits } });
+      })
+      // Keep the last official snapshot when a metadata refresh is unavailable.
+      .catch(() => undefined)
+      .finally(() => {
+        rateLimitsRefresh = undefined;
+      });
   };
   const request = (method: string, params: unknown): Promise<unknown> =>
     new Promise((resolve, reject) => {
@@ -368,50 +488,35 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
       });
       writeChild({ jsonrpc: "2.0", id, method, params });
     });
-  const rememberThread = (thread: JsonObject): void => {
+  const rememberThread = (thread: JsonObject, settings?: JsonObject): void => {
     if (typeof thread.id !== "string") return;
+    const previous = threads.get(thread.id);
     threads.set(thread.id, {
       id: thread.id,
-      modelProvider: thread.modelProvider,
-      model: thread.model,
-      path: thread.path,
-      cwd: thread.cwd,
+      modelProvider: settings?.modelProvider ?? thread.modelProvider ?? previous?.modelProvider,
+      model: settings?.model ?? thread.model ?? previous?.model,
+      collaborationMode:
+        settings?.collaborationMode ?? thread.collaborationMode ?? previous?.collaborationMode,
+      path: thread.path ?? previous?.path,
+      cwd: thread.cwd ?? previous?.cwd,
     });
     if (threads.size > 32) {
       const oldest = threads.keys().next().value;
       if (oldest !== undefined) threads.delete(oldest);
     }
   };
-  const readThread = async (threadId: string): Promise<JsonObject | undefined> => {
-    const result = await request("thread/read", {
-      threadId,
-      includeTurns: false,
-    });
-    if (!isRecord(result) || !isRecord(result.thread)) return undefined;
-    rememberThread(result.thread);
-    return result.thread;
-  };
-  const readThreadForSelection = async (threadId: string): Promise<JsonObject | undefined> => {
-    const cached = threads.get(threadId);
-    if (cached !== undefined) return cached;
-    try {
-      return await readThread(threadId);
-    } catch {
-      options.errorOutput.write(
-        "AI-Tidu9 could not read official chat metadata; forwarding the client selection directly.\n",
-      );
-      return undefined;
-    }
-  };
   const ensureActiveThreadSelection = async (
     threadId: string,
     activeSelection: CodexActiveSelection,
-  ): Promise<void> => {
-    const known = threads.get(threadId) ?? (await readThread(threadId));
-    const selection = resolveThreadSelection(activeSelection, known);
+  ): Promise<JsonObject | undefined> => {
+    const known = threads.get(threadId);
+    const selection = activeSelection;
     const providerMatches = known?.modelProvider === selection.modelProvider;
     const modelMatches = selection.model === undefined || known?.model === selection.model;
     if (providerMatches && modelMatches) return;
+    if (known !== undefined && !providerMatches) {
+      await request("thread/unsubscribe", { threadId });
+    }
     const result = await request("thread/resume", {
       threadId,
       excludeTurns: true,
@@ -423,7 +528,8 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
     });
     if (!isRecord(result) || !isRecord(result.thread))
       throw new Error("Official Codex did not return the resumed chat.");
-    rememberThread(result.thread);
+    rememberThread(result.thread, result);
+    return result;
   };
   const loadLiveTurn = async (threadId: string, turn: JsonObject, managedTurnConfirmed = false) => {
     const metadata = await request("thread/read", {
@@ -498,6 +604,21 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
   };
   const processMessage = async (message: JsonObject, receivedAt: number): Promise<void> => {
     const params = isRecord(message.params) ? message.params : undefined;
+    if (
+      message.method === "account/rateLimits/updated" &&
+      resolveActiveSelection().modelProvider === provider
+    ) {
+      // Local-provider snapshots lack official quotas; refresh without delaying turn events.
+      refreshOfficialRateLimits();
+      return;
+    }
+    if (
+      message.method === "thread/settings/updated" &&
+      typeof params?.threadId === "string" &&
+      isRecord(params.threadSettings)
+    ) {
+      rememberThread({ id: params.threadId, ...params.threadSettings });
+    }
     if (
       message.method === "thread/tokenUsage/updated" &&
       typeof params?.threadId === "string" &&
@@ -583,6 +704,7 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
       isRecord(params.turn) &&
       typeof params.turn.id === "string"
     ) {
+      runningThreads.add(params.threadId);
       const thread = threads.get(params.threadId);
       if (typeof thread?.modelProvider === "string") {
         const key = `${params.threadId}:${params.turn.id}`;
@@ -609,6 +731,8 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
       isRecord(params.turn)
     ) {
       const threadId = params.threadId;
+      runningThreads.delete(threadId);
+      synchronizeSelection();
       const key = `${threadId}:${String(params.turn.id)}`;
       const turnSelection = turnSelections.get(key);
       const startedAt = turnSelection?.startedAt;
@@ -713,6 +837,7 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
         isRecord(message.result) &&
         isRecord(message.result.thread)
       ) {
+        rememberThread(message.result.thread, message.result);
         try {
           send({
             ...message,
@@ -851,16 +976,110 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
   const fromClient = createInterface({ input: options.input });
   const fromServer = createInterface({ input: child.stdout });
   let clientSequence = Promise.resolve();
-  fromClient.on("line", (line) => {
+  let observedSelection = JSON.stringify(resolveActiveSelection());
+  const synchronizeSelection = (): void => {
     clientSequence = clientSequence
       .then(async () => {
-        const parsed: unknown = JSON.parse(line);
+        const selection = resolveActiveSelection();
+        if (JSON.stringify(selection) === observedSelection) return;
+        for (const threadId of threads.keys()) {
+          if (runningThreads.has(threadId)) continue;
+          const resumed = await ensureActiveThreadSelection(threadId, selection);
+          if (selection.model !== undefined) {
+            await request(
+              "thread/settings/update",
+              applyActiveModel(
+                { threadId },
+                selection.model,
+                threads.get(threadId)?.collaborationMode,
+              ),
+            );
+          }
+          if (
+            resumed !== undefined &&
+            typeof resumed.model === "string" &&
+            typeof resumed.modelProvider === "string"
+          ) {
+            const threadSettings = applyActiveModel(
+              {
+                modelProvider: resumed.modelProvider,
+                cwd: resumed.cwd,
+                approvalPolicy: resumed.approvalPolicy,
+                approvalsReviewer: resumed.approvalsReviewer,
+                sandboxPolicy: resumed.sandbox,
+                activePermissionProfile: resumed.activePermissionProfile,
+                collaborationMode: resumed.collaborationMode,
+                effort: resumed.reasoningEffort,
+                serviceTier: resumed.serviceTier,
+                disabledPluginIds: resumed.disabledPluginIds,
+              },
+              resumed.model,
+              threads.get(threadId)?.collaborationMode,
+            );
+            send({ method: "thread/settings/updated", params: { threadId, threadSettings } });
+          }
+        }
+        if (runningThreads.size === 0) observedSelection = JSON.stringify(selection);
+      })
+      .catch(() => {
+        options.errorOutput.write("AI-Tidu9 could not synchronize the native model selection.\n");
+      });
+  };
+  const configurationPath = join(codexHome, "config.toml");
+  if (options.resolveActiveSelection === undefined) {
+    watchFile(configurationPath, { persistent: false, interval: 250 }, synchronizeSelection);
+  }
+  fromClient.on("line", (line) => {
+    let parsedMessage: unknown;
+    try {
+      parsedMessage = JSON.parse(line) as unknown;
+    } catch {
+      options.errorOutput.write("AI-Tidu9 received invalid client JSON-RPC.\n");
+      return;
+    }
+    if (isRecord(parsedMessage) && parsedMessage.method === undefined && "id" in parsedMessage) {
+      // Responses to server-initiated approvals must not wait behind mode synchronization.
+      writeChild(parsedMessage);
+      return;
+    }
+    clientSequence = clientSequence
+      .then(async () => {
+        const parsed = parsedMessage;
         if (!isRecord(parsed)) return;
         const params = isRecord(parsed.params) ? parsed.params : {};
+        if (
+          "id" in parsed &&
+          resolveActiveSelection().modelProvider === provider &&
+          ["account/read", "account/rateLimits/read", "account/usage/read"].includes(
+            String(parsed.method),
+          )
+        ) {
+          try {
+            const result = await readOfficialAccount(String(parsed.method), parsed.params);
+            send({ id: parsed.id, result });
+            return;
+          } catch {
+            // Let the native process report its own account result when metadata is unavailable.
+          }
+        }
+        if (parsed.method === "model/list" && "id" in parsed) {
+          const selection = resolveActiveSelection();
+          const catalog =
+            selection.modelProvider === provider || launchSelection.modelProvider === provider
+              ? readActiveModelList(codexHome, selection, params, provider)
+              : undefined;
+          if (catalog !== undefined) {
+            send({ id: parsed.id, result: catalog });
+            return;
+          }
+        }
         let message = parsed;
         if (parsed.method === "thread/resume" && typeof params.threadId === "string") {
-          const known = await readThreadForSelection(params.threadId);
-          const selection = resolveThreadSelection(resolveActiveSelection(), known);
+          const known = threads.get(params.threadId);
+          const selection = resolveActiveSelection();
+          if (known !== undefined && known.modelProvider !== selection.modelProvider) {
+            await request("thread/unsubscribe", { threadId: params.threadId });
+          }
           if (known?.modelProvider !== selection.modelProvider || selection.model !== undefined)
             message = {
               ...parsed,
@@ -871,8 +1090,8 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
               ),
             };
         } else if (parsed.method === "thread/fork" && typeof params.threadId === "string") {
-          const known = await readThreadForSelection(params.threadId);
-          const selection = resolveThreadSelection(resolveActiveSelection(), known);
+          const known = threads.get(params.threadId);
+          const selection = resolveActiveSelection();
           message = {
             ...parsed,
             params: applyActiveSelection(
@@ -899,26 +1118,30 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
           const activeSelection = resolveActiveSelection();
           try {
             await ensureActiveThreadSelection(params.threadId, activeSelection);
-          } catch {
-            if (activeSelection.modelProvider !== provider) {
-              options.errorOutput.write(
-                "AI-Tidu9 could not verify official chat metadata; forwarding the official request unchanged.\n",
-              );
-            } else {
-              if ("id" in parsed)
-                send({
-                  jsonrpc: "2.0",
-                  id: parsed.id,
-                  error: {
-                    code: -32_001,
-                    message: "Codex could not resume this chat with the currently selected mode.",
-                  },
-                });
-              options.errorOutput.write(
-                "AI-Tidu9 could not apply the selected mode to the current Codex chat.\n",
-              );
-              return;
+            if (parsed.method === "turn/start" && activeSelection.model !== undefined) {
+              message = {
+                ...parsed,
+                params: applyActiveModel(
+                  params,
+                  activeSelection.model,
+                  threads.get(params.threadId)?.collaborationMode,
+                ),
+              };
             }
+          } catch {
+            if ("id" in parsed)
+              send({
+                jsonrpc: "2.0",
+                id: parsed.id,
+                error: {
+                  code: -32_001,
+                  message: "Codex could not resume this chat with the currently selected mode.",
+                },
+              });
+            options.errorOutput.write(
+              "AI-Tidu9 could not apply the selected mode to the current Codex chat.\n",
+            );
+            return;
           }
         }
         if (typeof message.method === "string" && "id" in message) {
@@ -996,6 +1219,8 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
   child.stderr.pipe(options.errorOutput, { end: false });
   const disconnected = (): void => {
     closed = true;
+    void accountClient?.close();
+    unwatchFile(configurationPath, synchronizeSelection);
     internal.forEach((pending) => {
       clearTimeout(pending.timeout);
       pending.reject(new Error("Official Codex connection closed."));

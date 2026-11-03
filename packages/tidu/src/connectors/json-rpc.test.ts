@@ -41,6 +41,44 @@ test("stdio JSON-RPC correlates requests and notifications", async () => {
   }
 });
 
+test("stdio JSON-RPC exchanges messages above 64 MiB without a default byte cap", async () => {
+  const launch = {
+    command: process.execPath,
+    arguments: ["-e", CHILD_SOURCE],
+    environment: process.env,
+  };
+  const client = createStdioJsonRpcClient(launch);
+  const bounded = createStdioJsonRpcClient(launch, { maximumMessageBytes: 1024 });
+  try {
+    const text = "历史与附件".repeat(4_600_000);
+    assert.ok(Buffer.byteLength(text) > 64 * 1024 * 1024);
+    assert.equal((await client.request<{ text: string }>("echo", { text })).text, text);
+    await assert.rejects(bounded.request("echo", { text }), /message exceeds the limit/u);
+    assert.equal(await bounded.request("echo", "still connected"), "still connected");
+  } finally {
+    await Promise.all([client.close(), bounded.close()]);
+  }
+});
+
+test("stdio JSON-RPC reports the actual size failure for oversized incoming messages", async () => {
+  const client = createStdioJsonRpcClient(
+    {
+      command: process.execPath,
+      arguments: [
+        "-e",
+        `process.stdin.once('data',()=>process.stdout.write(JSON.stringify({id:1,result:'x'.repeat(2048)})+'\\n'))`,
+      ],
+      environment: process.env,
+    },
+    { maximumMessageBytes: 1024 },
+  );
+  try {
+    await assert.rejects(client.request("large-reply", {}), /message exceeds the limit/u);
+  } finally {
+    await client.close();
+  }
+});
+
 test("stdio JSON-RPC rejects cancelled work", async () => {
   const client = createStdioJsonRpcClient({
     command: process.execPath,

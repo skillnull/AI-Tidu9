@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 
-export { TiduError, type TiduErrorCode, type TiduErrorOptions } from "./errors.js";
+export { ProviderError, TiduError, type TiduErrorCode, type TiduErrorOptions } from "./errors.js";
 
 const packageMetadata = JSON.parse(
   readFileSync(new URL("../../package.json", import.meta.url), "utf8"),

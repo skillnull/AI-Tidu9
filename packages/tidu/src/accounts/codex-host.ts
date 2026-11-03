@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { accessSync, constants, existsSync, lstatSync, readdirSync } from "node:fs";
+import { accessSync, constants, existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 
@@ -89,15 +89,60 @@ export const resolveCodexCommand = (options: CodexHostInspectionOptions): string
   } catch {
     // NVM is optional.
   }
-  return (
-    [
-      ...pathCandidates,
-      join(homedir(), ".local", "bin", "codex"),
-      ...nvmCandidates,
-      "/opt/homebrew/bin/codex",
-      "/usr/local/bin/codex",
-    ].find(executableExists) ?? "codex"
-  );
+  const candidates = [
+    ...pathCandidates,
+    join(homedir(), ".local", "bin", "codex"),
+    ...nvmCandidates,
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+    ...(process.platform === "darwin"
+      ? [
+          "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+          "/Applications/Codex.app/Contents/Resources/codex",
+        ]
+      : []),
+  ];
+  const command = candidates.find(executableExists) ?? "codex";
+  try {
+    const catalogPath = join(resolveCodexHome(options), "models_cache.json");
+    const catalogStatus = lstatSync(catalogPath);
+    if (!catalogStatus.isFile() || catalogStatus.isSymbolicLink()) return command;
+    const catalog: unknown = JSON.parse(readFileSync(catalogPath, "utf8"));
+    const cachedVersion =
+      typeof catalog === "object" && catalog !== null && "client_version" in catalog
+        ? catalog.client_version
+        : undefined;
+    if (typeof cachedVersion !== "string" || !/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/u.test(cachedVersion))
+      return command;
+    const readVersion = (candidate: string): string | undefined =>
+      spawnSync(candidate, ["--version"], {
+        env: environment,
+        encoding: "utf8",
+        timeout: 5_000,
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .stdout?.trim()
+        .match(/^codex-cli (\d+\.\d+\.\d+(?:-[\w.-]+)?)$/u)?.[1];
+    const version = readVersion(command);
+    if (
+      version === undefined ||
+      version.replace(/-.*/u, "").localeCompare(cachedVersion.replace(/-.*/u, ""), undefined, {
+        numeric: true,
+      }) >= 0
+    )
+      return command;
+    // A newer desktop may have replaced the shared catalog with an incompatible schema.
+    return (
+      [...new Set(candidates)].find(
+        (candidate) =>
+          candidate !== command &&
+          executableExists(candidate) &&
+          readVersion(candidate)?.replace(/-.*/u, "") === cachedVersion.replace(/-.*/u, ""),
+      ) ?? command
+    );
+  } catch {
+    return command;
+  }
 };
 
 const resolveCodexHome = (options: CodexHostInspectionOptions): string =>

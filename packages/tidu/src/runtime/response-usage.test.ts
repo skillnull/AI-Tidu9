@@ -44,17 +44,14 @@ test("counts parallel tool calls once and separates the next user turn", () => {
 });
 
 test("shows retrieved usage, labels unavailable counts, and hides confirmed zero consumption", () => {
-  assert.equal(
-    formatResponseTokenFooter({ usage: null, complete: false }, true),
-    "Token：未获取到",
-  );
+  assert.equal(formatResponseTokenFooter({ usage: null, complete: false }, true), "总：未获取到");
   assert.equal(
     formatResponseTokenFooter({ usage: null, complete: false }, false),
-    "Tokens: not retrieved",
+    "Total: not retrieved",
   );
   assert.equal(
     formatResponseTokenFooter({ usage, complete: false }, true),
-    "Token：输入 12 · 输出 3 · 合计 15",
+    "总：入 12 · 出 3 · 合 15",
   );
   assert.equal(
     formatResponseTokenFooter(
@@ -65,7 +62,7 @@ test("shows retrieved usage, labels unavailable counts, and hides confirmed zero
   );
   assert.equal(
     formatResponseTokenFooter({ usage, complete: true }, false),
-    "Token: input 12 · output 3 · total 15",
+    "Total: input 12 · output 3 · total 15",
   );
 });
 
@@ -113,25 +110,25 @@ test("accumulates each model across three rounds without counting parallel tool 
   assert.equal(ledger.begin(outputs).snapshot(null).usage, null);
 });
 
-test("formats primary and secondary input, output, and total independently in both languages", () => {
+test("formats host totals before the overall total without model names or roles", () => {
   const snapshot = createResponseUsageLedger()
     .begin([])
     .snapshot({ inputTokens: 24, outputTokens: 6, totalTokens: 30 }, models);
   assert.equal(
     formatResponseTokenFooter(snapshot, true),
     [
-      "Token：输入 24 · 输出 6 · 合计 30",
-      "Codex：输入 12 · 输出 3 · 合计 15",
-      "副模型 Cursor (secondary-fixture)：输入 12 · 输出 3 · 合计 15",
-    ].join("\n\n"),
+      "Codex：入 12 · 出 3 · 合 15",
+      "Cursor：入 12 · 出 3 · 合 15",
+      "总：入 24 · 出 6 · 合 30",
+    ].join("  \n"),
   );
   assert.equal(
     formatResponseTokenFooter(snapshot, false),
     [
-      "Token: input 24 · output 6 · total 30",
       "Codex: input 12 · output 3 · total 15",
-      "Secondary Cursor (secondary-fixture): input 12 · output 3 · total 15",
-    ].join("\n\n"),
+      "Cursor: input 12 · output 3 · total 15",
+      "Total: input 24 · output 6 · total 30",
+    ].join("  \n"),
   );
 });
 
@@ -150,21 +147,47 @@ test("keeps missing model usage distinct from zero and marks partially reported 
     .snapshot(usage, [secondary]);
   assert.equal(snapshot.complete, false);
   assert.equal(snapshot.models?.find((model) => model.role === "secondary")?.complete, false);
-  assert.match(
-    formatResponseTokenFooter(snapshot, true),
-    /副模型 Cursor \(secondary-fixture\)：.*合计 15（部分统计）/u,
-  );
-  assert.match(
-    formatResponseTokenFooter(snapshot, false),
-    /Secondary Cursor \(secondary-fixture\): .*total 15 \(partial\)/u,
-  );
+  assert.match(formatResponseTokenFooter(snapshot, true), /Cursor：.*合 15（部分统计）/u);
+  assert.match(formatResponseTokenFooter(snapshot, false), /Cursor: .*total 15 \(partial\)/u);
   const missing = ledger.begin([]).snapshot(usage, [
     { ...primary, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } },
     { ...secondary, usage: null, complete: false },
   ]);
   const footer = formatResponseTokenFooter(missing, true);
   assert.doesNotMatch(footer, /Codex/u);
-  assert.match(footer, /副模型 Cursor \(secondary-fixture\)：未获取到/u);
+  assert.match(footer, /Cursor：未获取到/u);
+});
+
+test("aggregates multiple models on one host without exposing parameterized IDs", () => {
+  const snapshot = createResponseUsageLedger()
+    .begin([])
+    .snapshot({ inputTokens: 36, outputTokens: 9, totalTokens: 45 }, [
+      models[1],
+      { ...models[0], model: "fixture[context=256k,reasoning_effort=high,fast=true]" },
+      { ...models[0], model: "another-fixture", role: "main" },
+    ]);
+  assert.equal(
+    formatResponseTokenFooter(snapshot, true),
+    [
+      "Codex：入 12 · 出 3 · 合 15",
+      "Cursor：入 24 · 出 6 · 合 30",
+      "总：入 36 · 出 9 · 合 45",
+    ].join("  \n"),
+  );
+});
+
+test("keeps partial and unavailable consumption distinct when grouping one host", () => {
+  assert.equal(
+    formatResponseTokenFooter(
+      {
+        usage,
+        complete: false,
+        models: [models[0], { ...models[0], model: "unreported", usage: null, complete: false }],
+      },
+      true,
+    ),
+    "Cursor：入 12 · 出 3 · 合 15（部分统计）  \n总：入 12 · 出 3 · 合 15",
+  );
 });
 
 test("deduplicates one host execution even when adapter roles differ", () => {

@@ -161,32 +161,35 @@ export const formatResponseTokenFooter = (
     if (usage === null) return chinese ? "未获取到" : "not retrieved";
     if (usage.inputTokens === 0 && usage.outputTokens === 0 && usage.totalTokens === 0) return "";
     return chinese
-      ? `输入 ${usage.inputTokens} · 输出 ${usage.outputTokens} · 合计 ${usage.totalTokens}`
+      ? `入 ${usage.inputTokens} · 出 ${usage.outputTokens} · 合 ${usage.totalTokens}`
       : `input ${usage.inputTokens} · output ${usage.outputTokens} · total ${usage.totalTokens}`;
   };
-  const total = formatUsage(snapshot.usage);
-  const lines =
-    total === ""
-      ? []
-      : [chinese ? `Token：${total}` : `${snapshot.usage === null ? "Tokens" : "Token"}: ${total}`];
+  const hosts = new Map<
+    ResponseModelUsage["host"],
+    { usage: TokenUsage | null; complete: boolean }
+  >();
   for (const model of snapshot.models ?? []) {
-    const usage = formatUsage(model.usage);
-    if (usage === "") continue;
-    const hostNames: Record<ResponseModelUsage["host"], string> = {
-      codex: "Codex",
-      cursor: "Cursor",
-      ollama: "Ollama",
-      "openai-compatible": "OpenAI-compatible",
-    };
-    const source =
-      model.role === "main"
-        ? hostNames[model.host]
-        : chinese
-          ? `副模型 ${hostNames[model.host]} (${model.model})`
-          : `Secondary ${hostNames[model.host]} (${model.model})`;
-    const partial =
-      model.usage !== null && !model.complete ? (chinese ? "（部分统计）" : " (partial)") : "";
-    lines.push(`${source}${chinese ? "：" : ": "}${usage}${partial}`);
+    const previous = hosts.get(model.host);
+    hosts.set(model.host, {
+      usage: sumUsage([previous?.usage ?? null, model.usage]),
+      complete: (previous?.complete ?? true) && model.complete,
+    });
   }
-  return lines.join("\n\n");
+  const hostNames: Record<ResponseModelUsage["host"], string> = {
+    codex: "Codex",
+    cursor: "Cursor",
+    ollama: "Ollama",
+    "openai-compatible": "OpenAI-compatible",
+  };
+  const lines: string[] = [];
+  for (const [host, totals] of hosts) {
+    const usage = formatUsage(totals.usage);
+    if (usage === "") continue;
+    const partial =
+      totals.usage !== null && !totals.complete ? (chinese ? "（部分统计）" : " (partial)") : "";
+    lines.push(`${hostNames[host]}${chinese ? "：" : ": "}${usage}${partial}`);
+  }
+  const total = formatUsage(snapshot.usage);
+  if (total !== "") lines.push(chinese ? `总：${total}` : `Total: ${total}`);
+  return lines.join("  \n");
 };

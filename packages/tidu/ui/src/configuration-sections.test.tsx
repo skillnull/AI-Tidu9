@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { renderToStaticMarkup } from "react-dom/server";
 import { MODEL_ROUTING_CAPABILITIES } from "../../src/config/index.js";
+import { HostUsagePanel, type HostUsageSnapshot } from "./components/host-usage-panel.js";
 
 import {
   capabilityCompletionModelOutcomeLabel,
@@ -19,6 +21,54 @@ import {
   updateSpecialistModelSelection,
 } from "./configuration-sections.js";
 import { catalogModelName, modelDisplayName } from "./model-display.js";
+
+test("shows real quota, zero reset credits, and unavailable fields in both languages", () => {
+  for (const locale of ["zh-CN", "en-US"] as const) {
+    const snapshot: HostUsageSnapshot = {
+      activeProvider: null,
+      codex: {
+        account: null,
+        usage: {
+          limitId: "codex",
+          primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 2000000000 },
+          secondary: null,
+          availableResetCredits: 0,
+          creditBalance: null,
+          lifetimeTokens: null,
+          dailyTokens: [],
+        },
+      },
+      cursor: {
+        agentStatus: "unavailable",
+        agentProtocolAvailable: false,
+        accountEmail: null,
+        accountPlan: null,
+        model: null,
+      },
+    };
+    const render = () =>
+      renderToStaticMarkup(
+        HostUsagePanel({
+          state: { status: "ready", snapshot },
+          locale,
+          modelCatalog: undefined,
+          onRefresh: () => undefined,
+          onConnectCursor: () => undefined,
+          connectingCursor: false,
+          cursorConnectionError: null,
+        }),
+      );
+    assert.match(render(), /75\.0%/u);
+    assert.match(render(), locale === "zh-CN" ? /可用重置次数：0/u : /Available resets：0/u);
+    if (snapshot.codex?.usage) snapshot.codex.usage.availableResetCredits = null;
+    assert.match(
+      render(),
+      locale === "zh-CN"
+        ? /可用重置次数：官方接口未提供/u
+        : /Available resets：Not reported by the official API/u,
+    );
+  }
+});
 
 test("distinguishes cancellation from failure in both usage-history languages", () => {
   assert.equal(capabilityCompletionOutcomeLabel("cancelled", false), "已取消");

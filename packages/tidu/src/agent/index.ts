@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-
 import type {
   CapabilityAssembly,
   CapabilityAsset,
@@ -7,6 +6,7 @@ import type {
   CapabilityRegistry,
 } from "../capabilities/index.js";
 import type { AgentHostId } from "../config/index.js";
+import { ProviderError } from "../core/index.js";
 import {
   type AgentEvent,
   type AgentEventType,
@@ -25,11 +25,14 @@ const AGENT_EXECUTION_ERROR_CODE_PATTERN = /^[a-z][a-z0-9_.-]{0,63}$/u;
 export class AgentExecutionError extends Error {
   /** Safe machine-readable failure code exposed at the OpenAI-compatible boundary. */
   public readonly code: string;
+  /** Authoritative upstream error type, when a provider reports one. */
+  public readonly type: string;
 
-  public constructor(code: string, message: string) {
+  public constructor(code: string, message: string, type = "server_error") {
     super(message.slice(0, 240));
     this.name = "AgentExecutionError";
     this.code = AGENT_EXECUTION_ERROR_CODE_PATTERN.test(code) ? code : "agent_task_failed";
+    this.type = AGENT_EXECUTION_ERROR_CODE_PATTERN.test(type) ? type : "server_error";
   }
 }
 
@@ -59,6 +62,8 @@ export interface AgentModelRequest {
   onOutputDelta?: (delta: string) => void;
   /** Public model process output forwarded only to the active streaming caller. */
   onProcessDelta?: (delta: string) => void;
+  /** Public native process lifecycle, including item identity and summary indices. */
+  onProcessEvent?: (event: Record<string, unknown>) => void;
   /** Caller-owned tool requests returned without execution by the Agent worker. */
   onOutputItem?: (item: Record<string, unknown>) => void;
   /** Actual per-model execution receipts retained only for the active caller. */
@@ -364,6 +369,8 @@ export interface AgentWorkerInput {
 }
 
 export interface AgentWorker {
+  /** Whether the worker forwards native process lifecycles instead of requiring a startup item. */
+  nativeProcessEvents?: boolean;
   /** Executes reasoning or verification work without bypassing the kernel. */
   execute: (input: AgentWorkerInput) => Promise<AgentStepOutput>;
 }
@@ -450,6 +457,8 @@ export interface TaskControlView {
 }
 
 export interface AgentKernel {
+  /** Whether the response worker supplies its own native process lifecycle. */
+  nativeProcessEvents?: boolean;
   /** Creates, understands, plans, and durably checkpoints a task. */
   createTask: (input: CreateAgentTaskInput) => Promise<TaskCapsule>;
   /** Runs or continues a planned task within all configured bounds. */
@@ -539,9 +548,11 @@ const boundedResponse = (value: string): string =>
 const taskFailurePayload = (
   error: unknown,
   fallback: string,
-): { reason: string; errorCode?: string } => ({
+): { reason: string; errorCode?: string; errorType?: string } => ({
   reason: error instanceof Error ? error.message : fallback,
-  ...(error instanceof AgentExecutionError ? { errorCode: error.code } : {}),
+  ...(error instanceof AgentExecutionError || error instanceof ProviderError
+    ? { errorCode: error.code, ...(error.type === "server_error" ? {} : { errorType: error.type }) }
+    : {}),
 });
 
 const boundedPlanInput = (value: unknown): unknown => {
@@ -1360,6 +1371,7 @@ export const createAgentKernel = (options: AgentKernelOptions): AgentKernel => {
 
   return {
     createTask: createPlannedTask,
+    nativeProcessEvents: options.worker.nativeProcessEvents === true,
     runTask,
     pauseTask: (taskId) => controlInactiveTask(taskId, "pause"),
     resumeTask: runTask,

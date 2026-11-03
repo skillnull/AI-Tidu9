@@ -16,6 +16,7 @@ import {
 import {
   AgentExecutionError,
   type AgentKernel,
+  type AgentModelRequest,
   type AgentReasoningEffort,
   type CreateAgentTaskInput,
   createAgentKernel,
@@ -39,7 +40,7 @@ import {
 } from "../config/index.js";
 import { createConfigCenterBootstrap } from "../config-center/index.js";
 import { setupConnectors } from "../connectors/setup.js";
-import { PRODUCT, TiduError } from "../core/index.js";
+import { PRODUCT, ProviderError, TiduError } from "../core/index.js";
 import type { CapabilityProviderImplementation, CapabilityRuntime } from "../ecosystem/index.js";
 import type { EnterpriseControlPlane } from "../enterprise/index.js";
 import { createEnterpriseRuntimeFromEnvironment } from "../enterprise/runtime.js";
@@ -56,6 +57,7 @@ import { activateConfigurationSafely, previewConfigurationImpact } from "../pers
 import {
   createCodexHostModelProvider,
   createCursorHostModelProvider,
+  createPortableCodexResponsesInput,
   inspectCodexHostAccountReport,
   inspectCodexHostConfiguration,
 } from "../providers/codex-host.js";
@@ -569,6 +571,7 @@ const createProviderFailure = (
   provider: ModelProvider,
   reason: string,
   code = "provider_request_failed",
+  type = "server_error",
 ): OpenAiErrorBody => {
   const failureSource = providerFailureSource(provider);
   const sourceLabel = failureSource === "official-codex" ? "Official Codex" : "AI-Tidu9";
@@ -576,7 +579,7 @@ const createProviderFailure = (
   return createOpenAiError(
     code,
     `Failure source: ${sourceLabel}. Reason: ${reason} Next steps: ${nextSteps.join(" ")}`,
-    "server_error",
+    type,
     null,
     { failure_source: failureSource, next_steps: nextSteps, reason },
   );
@@ -606,11 +609,23 @@ const collectAgentInputText = (value: unknown, output: string[]): void => {
 
 const createAgentObjective = (body: Record<string, unknown>): string => {
   const inputParts: string[] = [];
+  const conversation = body.input ?? body.messages;
+  const currentUser = Array.isArray(conversation)
+    ? conversation.filter((item) => isRecord(item) && item.role === "user").at(-1)
+    : undefined;
+  collectAgentInputText(currentUser ?? conversation, inputParts);
+  const instructions = typeof body.instructions === "string" ? body.instructions.trim() : "";
+  const objective = inputParts.join("\n\n") || instructions;
+  // Task metadata stays bounded; the complete request is independently scanned and sent below.
+  return objective.slice(0, MAXIMUM_JSON_BODY_BYTES);
+};
+
+const isChineseAgentRequest = (body: Record<string, unknown>): boolean => {
+  const inputParts: string[] = [];
   collectAgentInputText(body.input, inputParts);
   collectAgentInputText(body.messages, inputParts);
-  const instructions = typeof body.instructions === "string" ? body.instructions.trim() : "";
-  const objective = [instructions, ...inputParts].filter((part) => part !== "").join("\n\n");
-  return objective.slice(0, MAXIMUM_INFERENCE_JSON_BODY_BYTES);
+  if (typeof body.instructions === "string") inputParts.push(body.instructions);
+  return inputParts.some((text) => /\p{Script=Han}/u.test(text));
 };
 
 type AgentTokenUsage = NonNullable<ProviderExecutionReceipt["usage"]>;
@@ -743,9 +758,16 @@ const createAgentChatBody = (
       }),
 });
 
-const resolveAgentFailure = (error: unknown): { code: string; message: string } => ({
-  code: error instanceof AgentExecutionError ? error.code : "agent_task_failed",
+const resolveAgentFailure = (error: unknown): { code: string; message: string; type: string } => ({
+  code:
+    error instanceof AgentExecutionError || error instanceof ProviderError
+      ? error.code
+      : "agent_task_failed",
   message: (error instanceof Error ? error.message : "The Agent task failed.").slice(0, 240),
+  type:
+    error instanceof AgentExecutionError || error instanceof ProviderError
+      ? error.type
+      : "server_error",
 });
 
 const createAgentResponsesStream = (
@@ -755,6 +777,7 @@ const createAgentResponsesStream = (
     onProcessDelta: (delta: string) => void,
     onOutputDelta: (delta: string) => void,
     onOutputItem?: (item: Record<string, unknown>) => void,
+    onProcessEvent?: AgentModelRequest["onProcessEvent"],
   ) => Promise<string>,
   chineseRequest: boolean,
   preserveProcessLifecycle: boolean,
@@ -765,6 +788,7 @@ const createAgentResponsesStream = (
     /** Correlates yielded tool requests or releases a finished user turn. */
     finish: (items: readonly Record<string, unknown>[]) => void;
   },
+  nativeProcessEvents = false,
 ): ReadableStream<Uint8Array> => {
   const responseId = `resp_${randomUUID()}`;
   const messageId = `${responseId}_message`;
@@ -822,6 +846,7 @@ const createAgentResponsesStream = (
       }, 10_000);
       keepAlive.unref();
       const completedOutputItems = new Map<number, Record<string, unknown>>();
+      const nativeOutputItems = new Map<string, { outputIndex: number; done: boolean }>();
       let activeProcess:
         | {
             id: string;
@@ -832,6 +857,7 @@ const createAgentResponsesStream = (
         | undefined;
       let nextOutputIndex = 0;
       let processCount = 0;
+      let sawNativeLifecycle = false;
       let messageStarted = false;
       let messageOutputIndex = 0;
       let outputText = "";
@@ -893,6 +919,8 @@ const createAgentResponsesStream = (
       };
       const startMessage = (): void => {
         if (messageStarted) return;
+        if (preserveProcessLifecycle && !sawNativeLifecycle && nextOutputIndex === 0)
+          startProcessLifecycle();
         finishProcessLifecycle();
         messageStarted = true;
         messageOutputIndex = nextOutputIndex;
@@ -972,10 +1000,42 @@ const createAgentResponsesStream = (
         });
         write("response.output_item.done", { output_index: outputIndex, item });
       };
-      if (preserveProcessLifecycle) {
+      const emitProcessEvent = (event: Record<string, unknown>): void => {
+        if (closed || typeof event.type !== "string") return;
+        const item = isRecord(event.item) ? event.item : undefined;
+        const itemId = typeof item?.id === "string" ? item.id : event.item_id;
+        if (typeof itemId !== "string") return;
+        let state = nativeOutputItems.get(itemId);
+        if (event.type === "response.output_item.added" && item !== undefined) {
+          sawNativeLifecycle = true;
+          if (item.type === "message" && item.phase !== "commentary") return;
+          if (state !== undefined) return;
+          finishProcessLifecycle();
+          state = { outputIndex: nextOutputIndex++, done: false };
+          nativeOutputItems.set(itemId, state);
+          write(event.type, { output_index: state.outputIndex, item });
+          return;
+        }
+        if (state === undefined || state.done) return;
+        if (event.type === "response.output_item.done" && item !== undefined) {
+          state.done = true;
+          completedOutputItems.set(state.outputIndex, item);
+          write(event.type, { output_index: state.outputIndex, item });
+          return;
+        }
+        const { type, output_index: upstreamOutputIndex, ...payload } = event;
+        write(type, { ...payload, output_index: state.outputIndex });
+      };
+      if (preserveProcessLifecycle && !nativeProcessEvents) {
         startProcessLifecycle();
       }
-      void run(abortController.signal, emitProcessDelta, emitOutputDelta, emitOutputItem)
+      void run(
+        abortController.signal,
+        emitProcessDelta,
+        emitOutputDelta,
+        emitOutputItem,
+        emitProcessEvent,
+      )
         .then((text) => {
           if (outputText === "" && toolCallCount === 0) {
             emitOutputDelta(text);
@@ -1167,7 +1227,7 @@ const createAgentChatStream = (
           const failure = resolveAgentFailure(error);
           const usage = readUsage();
           write(
-            `data: ${JSON.stringify({ error: { ...failure, type: "server_error" }, ...(usage === null ? {} : { usage: { prompt_tokens: usage.inputTokens, completion_tokens: usage.outputTokens, total_tokens: usage.totalTokens } }) })}\n\n`,
+            `data: ${JSON.stringify({ error: failure, ...(usage === null ? {} : { usage: { prompt_tokens: usage.inputTokens, completion_tokens: usage.outputTokens, total_tokens: usage.totalTokens } }) })}\n\n`,
           );
           write("data: [DONE]\n\n");
           close();
@@ -1191,6 +1251,7 @@ const runAgentResponsesTask = async (
   onOutputDelta?: (delta: string) => void,
   onExecutionReceipt?: (receipt: ProviderExecutionReceipt) => void,
   onOutputItem?: (item: Record<string, unknown>) => void,
+  onProcessEvent?: AgentModelRequest["onProcessEvent"],
 ): Promise<string> => {
   const model = typeof body.model === "string" ? body.model : "ai-tidu9-config";
   const requiredCapabilities = inferModelRequestCapabilities({
@@ -1240,6 +1301,7 @@ const runAgentResponsesTask = async (
       ...(onProcessDelta === undefined ? {} : { onProcessDelta }),
       ...(onExecutionReceipt === undefined ? {} : { onExecutionReceipt }),
       ...(onOutputItem === undefined ? {} : { onOutputItem }),
+      ...(onProcessEvent === undefined ? {} : { onProcessEvent }),
     },
   });
   const completed = await agentKernel.runTask(created.task.taskId, signal);
@@ -1260,9 +1322,15 @@ const runAgentResponsesTask = async (
         ? failureEvent.payload.errorCode
         : undefined;
     const message = failureReason ?? `The Agent task ended with status ${completed.task.status}.`;
+    const failureType =
+      failureEvent !== undefined &&
+      isRecord(failureEvent.payload) &&
+      typeof failureEvent.payload.errorType === "string"
+        ? failureEvent.payload.errorType
+        : "server_error";
     throw failureCode === undefined
       ? new Error(message)
-      : new AgentExecutionError(failureCode, message);
+      : new AgentExecutionError(failureCode, message, failureType);
   }
   return completed.result.summary;
 };
@@ -1344,7 +1412,16 @@ const handleOpenAiInference = async (
   if (sendOpenAiValidation(response, validation, requestId)) {
     return;
   }
-  const requestBody = normalizedBody as Record<string, unknown>;
+  const validatedRequestBody = normalizedBody as Record<string, unknown>;
+  const requestBody =
+    requestedHost === "codex" && protocol === "responses"
+      ? {
+          ...validatedRequestBody,
+          input: createPortableCodexResponsesInput(validatedRequestBody.input),
+          // The caller supplies full native history; upstream response IDs belong to another state owner.
+          previous_response_id: null,
+        }
+      : validatedRequestBody;
   const probe = isRecord(requestBody.metadata) && requestBody.metadata.ai_tidu9_probe === true;
   if (!probe) {
     const localGitResult = await executeLocalGitRequest({
@@ -1424,6 +1501,7 @@ const handleOpenAiInference = async (
       onProcessDelta?: (delta: string) => void,
       onOutputDelta?: (delta: string) => void,
       onOutputItem?: (item: Record<string, unknown>) => void,
+      onProcessEvent?: AgentModelRequest["onProcessEvent"],
     ): Promise<string> =>
       runAgentResponsesTask(
         agentKernel,
@@ -1435,6 +1513,7 @@ const handleOpenAiInference = async (
         onOutputDelta,
         usageCollector.record,
         onOutputItem,
+        onProcessEvent,
       );
     try {
       if (requestBody.stream === true) {
@@ -1443,10 +1522,11 @@ const handleOpenAiInference = async (
             ? createAgentResponsesStream(
                 model,
                 run,
-                /\p{Script=Han}/u.test(createAgentObjective(requestBody)),
+                isChineseAgentRequest(requestBody),
                 originHost === "codex",
                 usageCollector.read,
                 usageDisplay,
+                agentKernel.nativeProcessEvents === true,
               )
             : createAgentChatStream(model, run, usageCollector.read);
         await sendOpenAiStream(response, 200, stream, requestId);
@@ -1463,10 +1543,7 @@ const handleOpenAiInference = async (
         );
         const footer =
           !requestedTools && usageDisplay !== undefined
-            ? formatResponseTokenFooter(
-                usageDisplay.snapshot(),
-                /\p{Script=Han}/u.test(createAgentObjective(requestBody)),
-              )
+            ? formatResponseTokenFooter(usageDisplay.snapshot(), isChineseAgentRequest(requestBody))
             : "";
         const finalText = footer === "" ? text : `${text}\n\n${footer}`;
         const responseBody = createAgentResponsesBody(
@@ -1497,8 +1574,8 @@ const handleOpenAiInference = async (
       usageDisplay?.finish([]);
       sendOpenAiJson(
         response,
-        502,
-        createOpenAiError(failure.code, failure.message, "server_error"),
+        failure.code === "server_is_overloaded" ? 503 : 502,
+        createOpenAiError(failure.code, failure.message, failure.type),
         requestId,
       );
     }
@@ -1532,13 +1609,24 @@ const handleOpenAiInference = async (
       if (result.kind === "stream") {
         await sendOpenAiStream(response, result.statusCode, result.stream, requestId);
       } else if (result.statusCode >= 400) {
+        const reported =
+          isRecord(result.body) && isRecord(result.body.error) ? result.body.error : undefined;
+        const failure =
+          typeof reported?.code === "string"
+            ? new ProviderError(
+                reported.code,
+                providerResponseFailureReason(result.body, result.statusCode),
+                typeof reported.type === "string" ? reported.type : "server_error",
+              )
+            : undefined;
         sendOpenAiJson(
           response,
           result.statusCode,
           createProviderFailure(
             provider,
             providerResponseFailureReason(result.body, result.statusCode),
-            "upstream_request_failed",
+            failure?.code ?? "upstream_request_failed",
+            failure?.type,
           ),
           requestId,
         );
@@ -1553,7 +1641,17 @@ const handleOpenAiInference = async (
           : providerMessage === ""
             ? "The configured provider could not complete the request."
             : `The configured provider could not complete the request: ${providerMessage.slice(0, 240)}`;
-        sendOpenAiJson(response, 502, createProviderFailure(provider, reason), requestId);
+        sendOpenAiJson(
+          response,
+          error instanceof ProviderError && error.code === "server_is_overloaded" ? 503 : 502,
+          createProviderFailure(
+            provider,
+            reason,
+            error instanceof ProviderError ? error.code : undefined,
+            error instanceof ProviderError ? error.type : undefined,
+          ),
+          requestId,
+        );
       } else if (!response.writableEnded) {
         response.end();
       }
@@ -2410,14 +2508,15 @@ const handleRequest = async (
       sendJson(response, 403, { error: "PERSONAL_EDITION_ONLY" });
       return;
     }
+    const refresh =
+      new URL(request.url ?? "/", "http://localhost").searchParams.get("refresh") === "1";
+    if (refresh) runtimeReadCaches.get(storage)?.delete("host-usage");
     const snapshot = await readCachedRuntimeValue(storage, "host-usage", 60_000, async () => {
       const [codex, cursor] = await Promise.all([
         inspectCodexHostAccountReport(5_000).catch(() => null),
         inspectCursorHostLoginAsync().catch(() => null),
       ]);
-      const cursorProvider = cursor?.reusable
-        ? await getCatalogProviderForHost("cursor")
-        : undefined;
+      const cursorProvider = provider?.descriptor.type === "cursor-host" ? provider : undefined;
       return {
         activeProvider: provider?.descriptor ?? null,
         codex,

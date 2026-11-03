@@ -35,8 +35,8 @@ export interface OpenAiErrorBody {
     next_steps?: readonly string[];
     /** Request field responsible for the failure when applicable. */
     param: string | null;
-    /** Broad OpenAI-compatible error category. */
-    type: "invalid_request_error" | "server_error";
+    /** Broad category, preserving upstream types such as service_unavailable_error. */
+    type: string;
   };
 }
 

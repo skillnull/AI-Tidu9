@@ -11,6 +11,7 @@ import { runCursorHeadless } from "./cursor-headless.js";
 const createFakeAgent = (
   root: string,
   setModelResponse: "confirmed" | "missing" | "mismatched" = "confirmed",
+  usageFailure: "limits" | "usage" | "both" | "none" = "none",
 ): string => {
   const executable = join(root, "fake-agent");
   const source = `#!/usr/bin/env node
@@ -27,6 +28,12 @@ readline.on("line", (line) => {
   if (request.id === undefined) return;
   if (request.method === "initialize") send({ jsonrpc: "2.0", id: request.id, result: { agentCapabilities: { promptCapabilities: { image: true, audio: false, embeddedContext: false } } } });
   else if (request.method === "authenticate") send({ jsonrpc: "2.0", id: request.id, result: {} });
+  else if (request.method === "account/rateLimits/read" || request.method === "account/usage/read") {
+    const failure = ${JSON.stringify(usageFailure)};
+    const limits = request.method === "account/rateLimits/read";
+    if (failure === "both" || failure === (limits ? "limits" : "usage")) send({ id: request.id, error: { code: -32601, message: "Unavailable" } });
+    else send({ id: request.id, result: limits ? { rateLimits: { limitId: "codex", primary: { usedPercent: 25, resetsAt: 2000000000 }, secondary: { usedPercent: 50 } }, rateLimitResetCredits: { availableCount: 0 } } : { summary: { lifetimeTokens: 42 }, dailyUsageBuckets: [{ startDate: "2026-01-01", tokens: 42 }] } });
+  }
   else if (request.method === "thread/start") send({ jsonrpc: "2.0", id: request.id, result: { thread: { id: "thread-1" }, model: "gpt-test" } });
   else if (request.method === "turn/start") {
     send({ jsonrpc: "2.0", id: request.id, result: { turn: { id: "turn-1" } } });
@@ -35,7 +42,7 @@ readline.on("line", (line) => {
       send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", startedAtMs: Date.now(), item: userMessage } });
       send({ jsonrpc: "2.0", method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", completedAtMs: Date.now(), item: userMessage } });
     }
-    if (request.params.summary === "auto") send({ jsonrpc: "2.0", method: "item/reasoning/summaryTextDelta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "reasoning-1", summaryIndex: 0, delta: "reasoning-" } });
+    if (request.params.summary === "auto") send({ jsonrpc: "2.0", method: "item/reasoning/summaryTextDelta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "reasoning:1", summaryIndex: 0, delta: "reasoning-" } });
     send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", startedAtMs: Date.now(), item: { type: "agentMessage", id: "commentary-1", text: "", phase: "commentary", memoryCitation: null, delivery: null, questions: null } } });
     send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "commentary-1", delta: "working-" } });
     send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", startedAtMs: Date.now(), item: { type: "commandExecution", id: "command-1", command: "rg process src", cwd: ".", processId: null, source: "agent", status: "inProgress", commandActions: [{ type: "search", command: "rg process src", query: "process", path: "src" }], aggregatedOutput: null, exitCode: null, durationMs: null } } });
@@ -102,6 +109,30 @@ process.stdin.on("end", () => {
   return executable;
 };
 
+test("keeps quota and reset counts when the optional usage endpoint fails", async () => {
+  for (const failure of ["limits", "usage", "both", "none"] as const) {
+    const root = mkdtempSync(join(tmpdir(), "tidu-codex-quota-"));
+    const client = createCodexAgentClient({
+      command: createFakeAgent(root, "confirmed", failure),
+      workingDirectory: root,
+    });
+    try {
+      await client.initialize();
+      if (failure === "both") {
+        await assert.rejects(client.readUsage(), /Unavailable/u);
+        continue;
+      }
+      const usage = await client.readUsage();
+      assert.equal(usage.primary?.usedPercent ?? null, failure === "limits" ? null : 25);
+      assert.equal(usage.availableResetCredits, failure === "limits" ? null : 0);
+      assert.equal(usage.lifetimeTokens, failure === "usage" ? null : 42);
+    } finally {
+      await client.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("Codex app-server adapter negotiates, streams, and completes a turn", async () => {
   const root = mkdtempSync(join(tmpdir(), "tidu-codex-adapter-"));
   try {
@@ -115,6 +146,7 @@ test("Codex app-server adapter negotiates, streams, and completes a turn", async
     const thread = await client.startThread();
     const deltas: string[] = [];
     const processDeltas: string[] = [];
+    const processSources: unknown[] = [];
     const usageUpdates: unknown[] = [];
     const result = await client.prompt(
       thread.id,
@@ -125,7 +157,10 @@ test("Codex app-server adapter negotiates, streams, and completes a turn", async
       undefined,
       (delta) => deltas.push(delta),
       undefined,
-      (delta) => processDeltas.push(delta),
+      (delta, source) => {
+        processDeltas.push(delta);
+        processSources.push(source);
+      },
       [],
       undefined,
       (usage) => usageUpdates.push(usage),
@@ -161,6 +196,11 @@ test("Codex app-server adapter negotiates, streams, and completes a turn", async
       "上下文已自动压缩",
       "\n\n",
     ]);
+    assert.deepEqual(processSources[2], {
+      type: "reasoning",
+      itemId: "reasoning:1",
+      summaryIndex: 0,
+    });
     assert.deepEqual(usageUpdates, [
       {
         inputTokens: 7,
@@ -191,6 +231,27 @@ test("Codex app-server adapter negotiates, streams, and completes a turn", async
     assert.deepEqual(highDeltas, ["future-", "high-codex-result"]);
     await client.close();
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex adapter forwards prompts above 64 MiB without a separate byte cap", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tidu-codex-large-frame-"));
+  const client = createCodexAgentClient({
+    command: createFakeAgent(root),
+    workingDirectory: root,
+    reasoningEffort: "low",
+  });
+  try {
+    await client.initialize();
+    const thread = await client.startThread();
+    const result = await client.prompt(thread.id, [
+      { type: "text", text: "x".repeat(65 * 1024 * 1024) },
+    ]);
+    assert.equal(result.status, "completed");
+    assert.equal(result.text, "future-low-codex-result");
+  } finally {
+    await client.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -245,6 +306,72 @@ else if(request.method==='turn/start'){
     assert.equal(firstResult.text, "");
     assert.deepEqual(firstProcess, ["first-commentary", "\n\n"]);
     assert.equal(secondResult.text, "second-final");
+  } finally {
+    await client.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("replays early native items and process deltas in arrival order", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tidu-codex-early-events-"));
+  const command = join(root, "early-agent");
+  writeFileSync(
+    command,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === "login" && args[1] === "status") { console.log("Logged in"); process.exit(0); }
+const readline = require("node:readline").createInterface({ input: process.stdin });
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+readline.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  else if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "thread-early" }, model: "gpt-test" } });
+  else if (request.method === "turn/start") {
+    const params = { threadId: "thread-early", turnId: "turn-early" };
+    send({ method: "item/reasoning/summaryTextDelta", params: { ...params, itemId: "rs-early", summaryIndex: 0, delta: "Inspect the fixture." } });
+    send({ method: "rawResponseItem/completed", params: { ...params, item: { id: "rs-early", type: "reasoning", summary: [{ type: "summary_text", text: "Inspect the fixture." }] } } });
+    send({ method: "item/started", params: { ...params, item: { id: "msg-early", type: "agentMessage", phase: "commentary", text: "" } } });
+    send({ method: "item/agentMessage/delta", params: { ...params, itemId: "msg-early", delta: "Reading the fixture." } });
+    send({ method: "rawResponseItem/completed", params: { ...params, item: { id: "msg-early", type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text: "Reading the fixture." }] } } });
+    send({ method: "item/agentMessage/delta", params: { ...params, itemId: "msg-final", delta: "Done." } });
+    send({ method: "turn/completed", params: { threadId: "thread-early", turn: { id: "turn-early", status: "completed" } } });
+    send({ id: request.id, result: { turn: { id: "turn-early" } } });
+  }
+});`,
+  );
+  chmodSync(command, 0o700);
+  const client = createCodexAgentClient({ command, workingDirectory: root });
+  try {
+    await client.initialize();
+    const thread = await client.startThread();
+    const received: string[] = [];
+    const result = await client.prompt(
+      thread.id,
+      [{ type: "text", text: "fixture" }],
+      undefined,
+      (delta) => received.push(`text:${delta}`),
+      undefined,
+      (delta, source) => {
+        if (!source?.separator) received.push(`process:${delta}`);
+      },
+      [],
+      undefined,
+      undefined,
+      "auto",
+      (item) => received.push(`native:${String(item.id)}`),
+    );
+    assert.equal(result.text, "Done.");
+    assert.deepEqual(received, [
+      "process:Inspect the fixture.",
+      "native:rs-early",
+      "process:Reading the fixture.",
+      "native:msg-early",
+      "text:Done.",
+    ]);
+    assert.deepEqual(
+      result.progressItems?.map((item) => item.id),
+      ["rs-early", "msg-early"],
+    );
   } finally {
     await client.close();
     rmSync(root, { recursive: true, force: true });

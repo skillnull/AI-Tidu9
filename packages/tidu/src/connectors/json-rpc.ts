@@ -33,7 +33,7 @@ export interface JsonRpcNotification {
 }
 
 export interface JsonRpcClientOptions {
-  /** Maximum accepted UTF-8 bytes for one newline-framed message. */
+  /** Optional UTF-8 byte cap per newline-framed message; omitted adds no local byte limit. */
   maximumMessageBytes?: number;
   /** Default request timeout before the pending call is rejected; null disables the local timer. */
   requestTimeoutMilliseconds?: number | null;
@@ -72,7 +72,6 @@ interface PendingRequest {
 }
 
 const DEFAULT_LIMITS = Object.freeze({
-  maximumMessageBytes: 1_048_576,
   maximumPendingRequests: 128,
   requestTimeoutMilliseconds: 30_000,
 });
@@ -95,7 +94,7 @@ export const createStdioJsonRpcClient = (
   options: JsonRpcClientOptions = {},
 ): JsonRpcClient => {
   const limits = {
-    maximumMessageBytes: options.maximumMessageBytes ?? DEFAULT_LIMITS.maximumMessageBytes,
+    maximumMessageBytes: options.maximumMessageBytes,
     maximumPendingRequests: options.maximumPendingRequests ?? DEFAULT_LIMITS.maximumPendingRequests,
     requestTimeoutMilliseconds:
       options.requestTimeoutMilliseconds === undefined
@@ -125,7 +124,10 @@ export const createStdioJsonRpcClient = (
       throw new TiduError("INTERNAL_ERROR", "Agent protocol connection is closed.");
     }
     const encodedMessage = `${JSON.stringify(message)}\n`;
-    if (Buffer.byteLength(encodedMessage) > limits.maximumMessageBytes) {
+    if (
+      limits.maximumMessageBytes !== undefined &&
+      Buffer.byteLength(encodedMessage) > limits.maximumMessageBytes
+    ) {
       throw new TiduError("CONFIGURATION_INVALID", "Agent protocol message exceeds the limit.");
     }
     child.stdin.write(encodedMessage);
@@ -203,8 +205,13 @@ export const createStdioJsonRpcClient = (
   };
 
   lines.on("line", (line) => {
-    if (Buffer.byteLength(line) > limits.maximumMessageBytes) {
-      void closeConnection();
+    if (
+      limits.maximumMessageBytes !== undefined &&
+      Buffer.byteLength(line) > limits.maximumMessageBytes
+    ) {
+      void closeConnection(
+        new TiduError("CONFIGURATION_INVALID", "Agent protocol message exceeds the limit."),
+      );
       return;
     }
     let message: unknown;

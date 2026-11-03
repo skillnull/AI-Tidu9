@@ -59,7 +59,11 @@ const resolveCodexPlanPricing = (
   if (normalizedPlan === "free") return { price: "$0", unit: "USD / month", tierKnown: true };
   if (normalizedPlan === "plus") return { price: "$20", unit: "USD / month", tierKnown: true };
   if (normalizedPlan === "pro") {
-    return { price: "$100 / $200 / $500", unit: "USD / month", tierKnown: false };
+    return {
+      price: "$100 / $200 / $500",
+      unit: "USD / month",
+      tierKnown: false,
+    };
   }
   return { price: "—", unit: "—", tierKnown: false };
 };
@@ -202,7 +206,9 @@ export const HostUsagePanel = ({
               {formatResetTime(usage?.secondary?.resetsAt ?? null, locale)}
             </p>
             <p>
-              {chinese ? "可用重置次数" : "Available resets"}：{usage?.availableResetCredits ?? "—"}
+              {chinese ? "可用重置次数" : "Available resets"}：
+              {usage?.availableResetCredits ??
+                (chinese ? "官方接口未提供" : "Not reported by the official API")}
             </p>
             <p>
               {chinese ? "预付余额" : "Credit balance"}：{usage?.creditBalance ?? "—"}

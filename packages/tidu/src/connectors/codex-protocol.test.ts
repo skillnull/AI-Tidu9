@@ -14,6 +14,63 @@ import { createCodexHostModelProvider, createLiveJsonStream } from "../providers
 import { startLocalRuntime } from "../runtime/index.js";
 import { createStdioJsonRpcClient, type JsonRpcNotification } from "./json-rpc.js";
 
+test("official stdio accepts requests above 64 MiB directly and through the client proxy", {
+  skip: !process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND,
+  timeout: 30_000,
+}, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tidu-native-large-frame-"));
+  const padding = "x".repeat(65 * 1024 * 1024);
+  try {
+    for (const proxied of [false, true]) {
+      const home = join(directory, proxied ? "proxy" : "official");
+      await mkdir(home);
+      const client = createStdioJsonRpcClient({
+        command: proxied
+          ? process.execPath
+          : (process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND ?? "codex"),
+        arguments: proxied
+          ? [
+              ...(import.meta.url.endsWith(".ts") ? ["--import", import.meta.resolve("tsx")] : []),
+              fileURLToPath(
+                new URL(
+                  `./codex-client-cli.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`,
+                  import.meta.url,
+                ),
+              ),
+              "app-server",
+            ]
+          : ["app-server"],
+        environment: {
+          PATH: process.env.PATH,
+          CODEX_HOME: home,
+          TIDU_CODEX_REAL_COMMAND: process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND,
+        },
+        workingDirectory: directory,
+      });
+      try {
+        await client.request("initialize", {
+          clientInfo: { name: "stdio_frame_test", version: "1" },
+        });
+        client.notify("initialized");
+        // Unknown fields are ignored by the method, after the complete frame is read.
+        const account = await client.request<{ account: unknown }>("account/read", {
+          refreshToken: false,
+          padding,
+        });
+        assert.equal(account.account, null);
+        const next = await client.request<{ account: unknown }>("account/read", {
+          refreshToken: false,
+        });
+        assert.equal(next.account, null);
+      } finally {
+        await client.close();
+      }
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("official Codex retries a disconnected managed response with native reconnect notifications", {
   skip: !process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND,
   timeout: 30_000,
@@ -127,9 +184,9 @@ test("official Codex retries a disconnected managed response with native reconne
             notifications.filter((notification) => notification.method === "item/completed"),
           );
           assert.match(text, /Fixture recovered/u);
-          assert.match(text, /Token：输入 19 · 输出 5 · 合计 24/u);
-          assert.match(text, /Codex：输入 12 · 输出 3 · 合计 15/u);
-          assert.match(text, /副模型 Cursor \(secondary-fixture\)：输入 7 · 输出 2 · 合计 9/u);
+          assert.match(text, /总：入 19 · 出 5 · 合 24/u);
+          assert.match(text, /Codex：入 12 · 出 3 · 合 15/u);
+          assert.match(text, /Cursor：入 7 · 出 2 · 合 9/u);
         }
       } finally {
         await client.close();
@@ -137,6 +194,398 @@ test("official Codex retries a disconnected managed response with native reconne
     }
   } finally {
     await runtime.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("native retry resumes a terminal failed chat after the managed proxy restarts", {
+  skip: !process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND,
+  timeout: 30_000,
+}, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tidu-terminal-retry-"));
+  const fixture = { recovered: false, attempts: 0 };
+  const runtime = await startLocalRuntime({
+    databasePath: ":memory:",
+    port: 0,
+    discoverHostProvider: false,
+    provider: {
+      descriptor: { type: "codex-host", model: "fixture" },
+      execute: async (request) => ({
+        kind: "stream",
+        statusCode: 200,
+        stream: createLiveJsonStream(request, async () => {
+          fixture.attempts += 1;
+          if (!fixture.recovered) throw new Error("Fixture stream temporarily unavailable.");
+          return { text: "Recovered after manual retry.", usage: null };
+        }),
+      }),
+    },
+  });
+  await configureCodexClient({
+    endpoint: runtime.origin,
+    codexHomeDirectory: directory,
+    verifyRuntime: false,
+  });
+  await writeFile(
+    join(directory, "config.toml"),
+    await readFile(join(directory, "ai-tidu9.config.toml")),
+  );
+  let complete: ((params: unknown) => void) | undefined;
+  const notifications: JsonRpcNotification[] = [];
+  const createClient = () =>
+    createStdioJsonRpcClient(
+      {
+        command: process.execPath,
+        arguments: [
+          ...(import.meta.url.endsWith(".ts") ? ["--import", import.meta.resolve("tsx")] : []),
+          fileURLToPath(
+            new URL(
+              `./codex-client-cli.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`,
+              import.meta.url,
+            ),
+          ),
+          "app-server",
+        ],
+        environment: {
+          PATH: process.env.PATH,
+          CODEX_HOME: directory,
+          TIDU_CODEX_REAL_COMMAND: process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND,
+        },
+        workingDirectory: directory,
+      },
+      {
+        onNotification: (notification) => {
+          notifications.push(notification);
+          if (notification.method === "turn/completed") complete?.(notification.params);
+        },
+      },
+    );
+  let client = createClient();
+  const initialize = async () => {
+    await client.request("initialize", {
+      clientInfo: { name: "tidu_terminal_retry_test", version: "1" },
+      capabilities: { experimentalApi: true },
+    });
+    client.notify("initialized");
+  };
+  const runTurn = async (threadId: string, input: readonly unknown[]) => {
+    const terminal = new Promise<unknown>((resolve) => {
+      complete = resolve;
+    });
+    await client.request("turn/start", { threadId, input });
+    return terminal;
+  };
+  try {
+    await initialize();
+    const started = await client.request<{ thread: { id: string } }>("thread/start", {
+      cwd: directory,
+      approvalPolicy: "never",
+      sandbox: "read-only",
+    });
+    const failed = await runTurn(started.thread.id, [{ type: "text", text: "检查终态后重试" }]);
+    assert.match(JSON.stringify(failed), /"status":"failed"/u);
+    assert.ok(fixture.attempts > 1);
+    assert.ok(
+      notifications.some(
+        (notification) =>
+          notification.method === "error" &&
+          (notification.params as { willRetry?: boolean }).willRetry === true,
+      ),
+    );
+    await client.close();
+    fixture.recovered = true;
+    client = createClient();
+    await initialize();
+    const resumed = await client.request<{ thread: { id: string } }>("thread/resume", {
+      threadId: started.thread.id,
+    });
+    assert.equal(resumed.thread.id, started.thread.id);
+    const retried = await runTurn(started.thread.id, []);
+    assert.match(JSON.stringify(retried), /"status":"completed"/u);
+    assert.match(JSON.stringify(retried), /Recovered after manual retry\./u);
+    const saved = await client.request<{ thread: { turns: { status: string }[] } }>("thread/read", {
+      threadId: started.thread.id,
+      includeTurns: true,
+    });
+    assert.deepEqual(
+      saved.thread.turns.map((turn) => turn.status),
+      ["failed", "completed"],
+    );
+  } finally {
+    await client.close();
+    await runtime.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("compaction preserves native user-message timing and paginated history through the proxy", {
+  skip: !process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND,
+  timeout: 30_000,
+}, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tidu-compaction-history-"));
+  const executable = process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND ?? "codex";
+  let modelCalls = 0;
+  const compaction: { release?: () => void } = {};
+  const releaseCompaction = () => {
+    const release = compaction.release;
+    compaction.release = undefined;
+    release?.();
+    return release !== undefined;
+  };
+  const modelServer = createServer(async (request, response) => {
+    for await (const chunk of request) void chunk;
+    const call = ++modelCalls;
+    const finish = () => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      const send = (type: string, payload: Record<string, unknown>) => {
+        response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`);
+      };
+      const item = {
+        type: "message",
+        id: `compaction_message_${call}`,
+        role: "assistant",
+        phase: "final_answer",
+        content: [
+          {
+            type: "output_text",
+            text: call === 2 ? "Compaction fixture summary." : `Fixture answer ${call}.`,
+            annotations: [],
+          },
+        ],
+      };
+      send("response.created", {
+        response: {
+          id: `response_${call}`,
+          object: "response",
+          status: "in_progress",
+          output: [],
+        },
+      });
+      send("response.output_item.added", { output_index: 0, item });
+      send("response.output_item.done", { output_index: 0, item });
+      send("response.completed", {
+        response: {
+          id: `response_${call}`,
+          object: "response",
+          status: "completed",
+          output: [item],
+          usage: {
+            input_tokens: call === 1 ? 5500 : 100,
+            output_tokens: 10,
+            total_tokens: call === 1 ? 5510 : 110,
+          },
+        },
+      });
+      response.end();
+    };
+    if (call === 2) compaction.release = finish;
+    else finish();
+  });
+  await new Promise<void>((resolve) => modelServer.listen(0, "127.0.0.1", resolve));
+  const address = modelServer.address();
+  assert.ok(address !== null && typeof address !== "string");
+  const waitFor = async (matches: () => boolean) => {
+    const deadline = Date.now() + 10_000;
+    while (!matches()) {
+      if (Date.now() >= deadline) throw new Error("Compaction fixture event did not arrive.");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+  type HistoryTurn = {
+    id: string;
+    items: {
+      id: string;
+      type: string;
+      content?: { type: string; text?: string }[];
+    }[];
+  };
+  let directSequence: string[] | undefined;
+  try {
+    for (const proxied of [false, true]) {
+      modelCalls = 0;
+      compaction.release = undefined;
+      const home = join(directory, proxied ? "proxy" : "direct");
+      await mkdir(home);
+      await writeFile(
+        join(home, "config.toml"),
+        [
+          'model="gpt-5.1-codex"',
+          'model_provider="fixture"',
+          "model_context_window=8000",
+          "model_auto_compact_token_limit=4000",
+          "[model_providers.fixture]",
+          'name="fixture"',
+          `base_url="http://127.0.0.1:${address.port}/v1"`,
+          'wire_api="responses"',
+          "requires_openai_auth=false",
+          "supports_websockets=false",
+        ].join("\n"),
+      );
+      const notifications: JsonRpcNotification[] = [];
+      const createClient = () =>
+        createStdioJsonRpcClient(
+          {
+            command: proxied ? process.execPath : executable,
+            arguments: proxied
+              ? [
+                  ...(import.meta.url.endsWith(".ts")
+                    ? ["--import", import.meta.resolve("tsx")]
+                    : []),
+                  fileURLToPath(
+                    new URL(
+                      `./codex-client-cli.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`,
+                      import.meta.url,
+                    ),
+                  ),
+                  "app-server",
+                ]
+              : ["app-server"],
+            environment: {
+              PATH: process.env.PATH,
+              CODEX_HOME: home,
+              TIDU_CODEX_REAL_COMMAND: executable,
+              TIDU_CODEX_RECOVERY_PROVIDER: "fixture",
+            },
+            workingDirectory: directory,
+          },
+          {
+            onNotification: (notification) => notifications.push(notification),
+          },
+        );
+      let client = createClient();
+      const initialize = async () => {
+        await client.request("initialize", {
+          clientInfo: { name: "compaction_history_test", version: "1" },
+          capabilities: { experimentalApi: true },
+        });
+        client.notify("initialized");
+      };
+      const itemEvents = () =>
+        notifications
+          .filter(
+            (notification) =>
+              notification.method === "item/started" || notification.method === "item/completed",
+          )
+          .map((notification) => ({
+            method: notification.method,
+            ...(notification.params as {
+              threadId: string;
+              turnId: string;
+              item: HistoryTurn["items"][number];
+            }),
+          }));
+      try {
+        await initialize();
+        const started = await client.request<{ thread: { id: string } }>("thread/start", {
+          cwd: directory,
+          approvalPolicy: "never",
+          sandbox: "read-only",
+          persistExtendedHistory: true,
+        });
+        const threadId = started.thread.id;
+        const first = await client.request<{ turn: { id: string } }>("turn/start", {
+          threadId,
+          input: [{ type: "text", text: "First fixture question" }],
+        });
+        await waitFor(() => notifications.some((event) => event.method === "turn/completed"));
+        assert.equal(itemEvents()[0]?.item.type, "userMessage");
+        notifications.length = 0;
+        const second = await client.request<{ turn: { id: string } }>("turn/start", {
+          threadId,
+          input: [{ type: "text", text: "Question during compaction" }],
+        });
+        await waitFor(
+          () =>
+            compaction.release !== undefined &&
+            itemEvents().some((event) => event.item.type === "contextCompaction"),
+        );
+        assert.equal(
+          itemEvents().some((event) => event.item.type === "userMessage"),
+          false,
+        );
+        const before = await client.request<{ data: HistoryTurn[] }>("thread/turns/list", {
+          threadId,
+          itemsView: "full",
+          limit: 10,
+        });
+        assert.deepEqual(before.data.find((turn) => turn.id === second.turn.id)?.items, []);
+        assert.ok(
+          before.data
+            .find((turn) => turn.id === first.turn.id)
+            ?.items.some((item) => item.type === "userMessage"),
+        );
+        assert.ok(releaseCompaction());
+        await waitFor(() => notifications.some((event) => event.method === "turn/completed"));
+        assert.equal(modelCalls, 3);
+        const events = itemEvents();
+        assert.ok(
+          events.every((event) => event.threadId === threadId && event.turnId === second.turn.id),
+        );
+        const sequence = events.map((event) => `${event.method}:${event.item.type}`);
+        assert.deepEqual(sequence, [
+          "item/started:contextCompaction",
+          "item/completed:contextCompaction",
+          "item/started:userMessage",
+          "item/completed:userMessage",
+          "item/started:agentMessage",
+          "item/completed:agentMessage",
+        ]);
+        if (proxied) assert.deepEqual(sequence, directSequence);
+        else directSequence = sequence;
+        const completedUser = events.filter(
+          (event) => event.method === "item/completed" && event.item.type === "userMessage",
+        );
+        assert.equal(completedUser.length, 1);
+        assert.equal(completedUser[0]?.item.content?.[0]?.text, "Question during compaction");
+        const page = await client.request<{
+          data: HistoryTurn[];
+          nextCursor: string | null;
+        }>("thread/turns/list", { threadId, itemsView: "full", limit: 1 });
+        assert.equal(page.data.length, 1);
+        assert.equal(page.data[0]?.id, second.turn.id);
+        assert.deepEqual(
+          page.data[0]?.items.map((item) => item.type),
+          ["contextCompaction", "userMessage", "agentMessage"],
+        );
+        assert.ok(page.nextCursor);
+        const older = await client.request<{
+          data: HistoryTurn[];
+          nextCursor: string | null;
+        }>("thread/turns/list", {
+          threadId,
+          itemsView: "full",
+          limit: 1,
+          cursor: page.nextCursor,
+        });
+        assert.equal(older.data.length, 1);
+        assert.equal(older.data[0]?.id, first.turn.id);
+        assert.equal(older.nextCursor, null);
+        const expectedTurns = [...older.data, ...page.data].map((turn) => ({
+          id: turn.id,
+          items: turn.items,
+        }));
+        await client.close();
+        client = createClient();
+        await initialize();
+        const reopened = await client.request<{
+          thread: { turns: HistoryTurn[] };
+        }>("thread/resume", { threadId });
+        assert.deepEqual(
+          reopened.thread.turns.map((turn) => ({
+            id: turn.id,
+            items: turn.items,
+          })),
+          expectedTurns,
+        );
+        assert.equal(modelCalls, 3);
+      } finally {
+        releaseCompaction();
+        await client.close();
+      }
+    }
+  } finally {
+    modelServer.closeAllConnections();
+    await new Promise<void>((resolve) => modelServer.close(() => resolve()));
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -150,6 +599,7 @@ test("one native chat uses the selected mode on every new turn", {
   let officialRequests = 0;
   let holdNextOfficialRequest = false;
   const officialRequestModels: string[] = [];
+  const officialRequestPaths: string[] = [];
   const officialServer = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -159,8 +609,10 @@ test("one native chat uses the selected mode on every new turn", {
       requestBody !== null &&
       "model" in requestBody &&
       typeof requestBody.model === "string"
-    )
+    ) {
       officialRequestModels.push(requestBody.model);
+      officialRequestPaths.push(request.url ?? "");
+    }
     officialRequests += 1;
     const responseId = `official-response-${officialRequests}`;
     const item = {
@@ -323,11 +775,12 @@ test("one native chat uses the selected mode on every new turn", {
           };
         });
     };
-    const runTurn = async (threadId: string, text: string) => {
+    const runTurn = async (threadId: string, text: string, model?: string) => {
       const offset = notifications.length;
       await client.request("turn/start", {
         threadId,
         input: [{ type: "text", text }],
+        ...(model === undefined ? {} : { model }),
       });
       await waitFor(() =>
         notifications
@@ -350,7 +803,7 @@ test("one native chat uses the selected mode on every new turn", {
     const threadId = started.thread.id;
     assert.equal(started.thread.modelProvider, "official_fixture");
     const firstOfficial = await session.runTurn(threadId, "Official first round");
-    assert.doesNotMatch(JSON.stringify(firstOfficial), /Token：/u);
+    assert.doesNotMatch(JSON.stringify(firstOfficial), /总：/u);
     const cancellationOffset = session.notifications.length;
     holdNextOfficialRequest = true;
     const cancelledOfficial = await session.client.request<{
@@ -365,6 +818,13 @@ test("one native chat uses the selected mode on every new turn", {
         throw new Error("Official cancellation fixture request did not start.");
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
+    const runningSwitchOffset = session.notifications.length;
+    await switchCodexClientConfiguration({ mode: "ai-tidu9", codexHomeDirectory, request: fetch });
+    const runningThread = await session.client.request<{ thread: { modelProvider: string } }>(
+      "thread/read",
+      { threadId },
+    );
+    assert.equal(runningThread.thread.modelProvider, "official_fixture");
     await session.client.request("turn/interrupt", {
       threadId,
       turnId: cancelledOfficial.turn.id,
@@ -376,6 +836,16 @@ test("one native chat uses the selected mode on every new turn", {
           (notification) =>
             notification.method === "turn/completed" &&
             JSON.stringify(notification.params).includes(cancelledOfficial.turn.id),
+        ),
+    );
+    await session.waitFor(() =>
+      session.notifications
+        .slice(runningSwitchOffset)
+        .some(
+          (notification) =>
+            notification.method === "thread/settings/updated" &&
+            (notification.params as { threadSettings?: { modelProvider?: string } }).threadSettings
+              ?.modelProvider === "ai_tidu9",
         ),
     );
     await session.client.close();
@@ -396,13 +866,13 @@ test("one native chat uses the selected mode on every new turn", {
     }>("thread/resume", { threadId });
     assert.equal(managedResume.thread.id, threadId);
     assert.equal(managedResume.thread.modelProvider, "ai_tidu9");
-    assert.equal(managedResume.thread.model, "gpt-6.1-sol");
+    assert.equal(managedResume.thread.model, "ai-tidu9-config");
     const cancelledHistory = JSON.stringify(
       managedResume.thread.turns.find((turn) => turn.id === cancelledOfficial.turn.id),
     );
-    assert.doesNotMatch(cancelledHistory, /Token：/u);
+    assert.doesNotMatch(cancelledHistory, /总：/u);
     const firstManaged = await session.runTurn(threadId, "Managed round");
-    assert.match(JSON.stringify(firstManaged), /Token：输入 11 · 输出 3 · 合计 14/u);
+    assert.match(JSON.stringify(firstManaged), /总：入 11 · 出 3 · 合 14/u);
     await session.client.close();
 
     await switchCodexClientConfiguration({
@@ -416,7 +886,7 @@ test("one native chat uses the selected mode on every new turn", {
     assert.equal(officialResume.thread.id, threadId);
     assert.equal(officialResume.thread.modelProvider, "official_fixture");
     const secondOfficial = await session.runTurn(threadId, "Official second round");
-    assert.doesNotMatch(JSON.stringify(secondOfficial), /Token：/u);
+    assert.doesNotMatch(JSON.stringify(secondOfficial), /总：/u);
     await session.client.close();
 
     await switchCodexClientConfiguration({
@@ -431,7 +901,7 @@ test("one native chat uses the selected mode on every new turn", {
     assert.equal(secondManagedResume.thread.id, threadId);
     assert.equal(secondManagedResume.thread.modelProvider, "ai_tidu9");
     const secondManaged = await session.runTurn(threadId, "Managed second round");
-    assert.match(JSON.stringify(secondManaged), /Token：输入 11 · 输出 3 · 合计 14/u);
+    assert.match(JSON.stringify(secondManaged), /总：入 11 · 出 3 · 合 14/u);
     const saved = await session.client.request<{
       thread: { id: string; turns: unknown[] };
     }>("thread/read", { threadId, includeTurns: true });
@@ -446,10 +916,10 @@ test("one native chat uses the selected mode on every new turn", {
       sandbox: "read-only",
     });
     assert.equal(managedStarted.thread.modelProvider, "ai_tidu9");
-    assert.equal(managedStarted.thread.model, "gpt-6.1-sol");
+    assert.equal(managedStarted.thread.model, "ai-tidu9-config");
     const managedOriginThreadId = managedStarted.thread.id;
     const managedOriginFirst = await session.runTurn(managedOriginThreadId, "Managed origin round");
-    assert.match(JSON.stringify(managedOriginFirst), /Token：输入 11 · 输出 3 · 合计 14/u);
+    assert.match(JSON.stringify(managedOriginFirst), /总：入 11 · 出 3 · 合 14/u);
     await session.client.close();
 
     await switchCodexClientConfiguration({
@@ -466,7 +936,7 @@ test("one native chat uses the selected mode on every new turn", {
       managedOriginThreadId,
       "Managed origin official round",
     );
-    assert.doesNotMatch(JSON.stringify(managedOriginOfficialTurn), /Token：/u);
+    assert.doesNotMatch(JSON.stringify(managedOriginOfficialTurn), /总：/u);
     await session.client.close();
 
     await switchCodexClientConfiguration({
@@ -479,14 +949,59 @@ test("one native chat uses the selected mode on every new turn", {
       thread: { id: string; model: string; modelProvider: string };
     }>("thread/resume", { threadId: managedOriginThreadId });
     assert.equal(managedOriginResume.thread.modelProvider, "ai_tidu9");
-    assert.equal(managedOriginResume.thread.model, "gpt-6.1-sol");
+    assert.equal(managedOriginResume.thread.model, "ai-tidu9-config");
     const managedOriginSecond = await session.runTurn(
       managedOriginThreadId,
       "Managed origin second round",
     );
-    assert.match(JSON.stringify(managedOriginSecond), /Token：输入 11 · 输出 3 · 合计 14/u);
+    assert.match(JSON.stringify(managedOriginSecond), /总：入 11 · 出 3 · 合 14/u);
+    await switchCodexClientConfiguration({ mode: "official", codexHomeDirectory });
+    await session.waitFor(() =>
+      session.notifications.some(
+        (notification) =>
+          notification.method === "thread/settings/updated" &&
+          (notification.params as { threadSettings?: { model?: string } }).threadSettings?.model ===
+            "gpt-6.1-sol",
+      ),
+    );
+    const liveOfficial = await session.runTurn(
+      managedOriginThreadId,
+      "Live official round",
+      "ai-tidu9-config",
+    );
+    assert.doesNotMatch(JSON.stringify(liveOfficial), /总：/u);
+    const officialCatalog = await session.client.request<{
+      data: { id: string; isDefault: boolean }[];
+    }>("model/list", {});
+    assert.equal(officialCatalog.data.find((model) => model.isDefault)?.id, "gpt-6.1-sol");
+    const managedOffset = session.notifications.length;
+    await switchCodexClientConfiguration({ mode: "ai-tidu9", codexHomeDirectory, request: fetch });
+    await session.waitFor(() =>
+      session.notifications
+        .slice(managedOffset)
+        .some(
+          (notification) =>
+            notification.method === "thread/settings/updated" &&
+            (notification.params as { threadSettings?: { model?: string } }).threadSettings
+              ?.model === "ai-tidu9-config",
+        ),
+    );
+    const liveManaged = await session.runTurn(
+      managedOriginThreadId,
+      "Live managed round",
+      "gpt-6.1-sol",
+    );
+    assert.match(JSON.stringify(liveManaged), /总：入 11 · 出 3 · 合 14/u);
+    const managedCatalog = await session.client.request<{
+      data: { id: string; isDefault: boolean }[];
+    }>("model/list", {});
+    assert.equal(managedCatalog.data.find((model) => model.isDefault)?.id, "ai-tidu9-config");
     assert.ok(officialRequests >= 3);
-    assert.doesNotMatch(JSON.stringify(officialRequestModels), /ai-tidu9-config/u);
+    assert.doesNotMatch(
+      JSON.stringify(officialRequestModels),
+      /ai-tidu9-config/u,
+      JSON.stringify(officialRequestPaths),
+    );
   } finally {
     await session.client.close();
     await runtime.close();
@@ -550,7 +1065,7 @@ const renderNativeStoppedStatus = async (durationMs: number): Promise<string | u
       | undefined,
   };
   runInNewContext(
-    `${formatCode}\n${cacheName}=new Map();\n${worked}\nS={c:size=>Array(size).fill(Symbol.for("react.memo_cache_sentinel"))};C=React;w=jsxRuntime;o=()=>({locale:"zh-CN"});m=()=>{};h=${formatter[1]};n=(...values)=>values.filter(Boolean).join(" ");s=props=>stoppedLabel.replace("{time}",props.values.time);NativeWorkedFor=v;`,
+    `${formatCode}\n${cacheName}=new Map();\n${worked}\nS={c:size=>Array(size).fill(Symbol.for("react.memo_cache_sentinel"))};C=React;w=jsxRuntime;o=t=()=>({locale:"zh-CN"});m=()=>{};h=${formatter[1]};n=r=(...values)=>values.filter(Boolean).join(" ");s=c=props=>stoppedLabel.replace("{time}",props.values.time);NativeWorkedFor=v;`,
     context,
   );
   assert.ok(context.NativeWorkedFor);
@@ -719,7 +1234,7 @@ test("official caller executes delegated commands as native command items and re
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString()) as {
-      input?: { type?: string; output?: unknown }[];
+      input?: { type?: string; output?: unknown; content?: unknown }[];
       tools?: Record<string, unknown>[];
     };
     modelRequests += 1;
@@ -750,6 +1265,30 @@ test("official caller executes delegated commands as native command items and re
         summary: [{ type: "summary_text", text: "Waiting for the fixture model." }],
       };
       send("response.output_item.added", { output_index: 0, item });
+      send("response.reasoning_summary_part.added", {
+        item_id: item.id,
+        output_index: 0,
+        summary_index: 0,
+        part: { type: "summary_text", text: "" },
+      });
+      send("response.reasoning_summary_text.delta", {
+        item_id: item.id,
+        output_index: 0,
+        summary_index: 0,
+        delta: "Waiting for the fixture model.",
+      });
+      send("response.reasoning_summary_text.done", {
+        item_id: item.id,
+        output_index: 0,
+        summary_index: 0,
+        text: "Waiting for the fixture model.",
+      });
+      send("response.reasoning_summary_part.done", {
+        item_id: item.id,
+        output_index: 0,
+        summary_index: 0,
+        part: item.summary[0],
+      });
       send("response.output_item.done", { output_index: 0, item });
       return;
     }
@@ -774,7 +1313,10 @@ test("official caller executes delegated commands as native command items and re
             {
               type: "reasoning",
               id: `rs_fixture_${modelRequests}`,
-              summary: [{ type: "summary_text", text: "Inspect the fixture file." }],
+              summary: [
+                { type: "summary_text", text: "Inspect the fixture file." },
+                { type: "summary_text", text: "Verify the fixture content." },
+              ],
               encrypted_content: null,
             },
             {
@@ -806,17 +1348,18 @@ test("official caller executes delegated commands as native command items and re
               }),
             },
           ];
-    if (!receivedToolOutput && !cancelFixture)
+    if (!receivedToolOutput && !cancelFixture) {
       output.push({
         type: "function_call",
         id: "fc_parallel_fixture",
         name: "tidu_caller_tool_0",
         call_id: "call_parallel_fixture",
         arguments: JSON.stringify({
-          cmd: "cat second-fixture.txt",
+          cmd: "printf 'native-edit-content\\n' > edited-fixture.txt && cat second-fixture.txt",
           max_output_tokens: 1000,
         }),
       });
+    }
     send("response.created", {
       response: {
         id: `resp_fixture_${modelRequests}`,
@@ -827,6 +1370,51 @@ test("official caller executes delegated commands as native command items and re
     });
     output.forEach((item, outputIndex) => {
       send("response.output_item.added", { output_index: outputIndex, item });
+      if (item.type === "reasoning" && Array.isArray(item.summary)) {
+        item.summary.forEach((part: { type: string; text: string }, summaryIndex) => {
+          const identity = {
+            item_id: item.id,
+            output_index: outputIndex,
+            summary_index: summaryIndex,
+          };
+          send("response.reasoning_summary_part.added", {
+            ...identity,
+            part: { type: "summary_text", text: "" },
+          });
+          send("response.reasoning_summary_text.delta", {
+            ...identity,
+            delta: part.text,
+          });
+          send("response.reasoning_summary_text.done", {
+            ...identity,
+            text: part.text,
+          });
+          send("response.reasoning_summary_part.done", { ...identity, part });
+        });
+      }
+      if (item.type === "message" && Array.isArray(item.content)) {
+        const identity = {
+          item_id: item.id,
+          output_index: outputIndex,
+          content_index: 0,
+        };
+        send("response.content_part.added", {
+          ...identity,
+          part: { type: "output_text", text: "", annotations: [] },
+        });
+        send("response.output_text.delta", {
+          ...identity,
+          delta: item.content[0].text,
+        });
+        send("response.output_text.done", {
+          ...identity,
+          text: item.content[0].text,
+        });
+        send("response.content_part.done", {
+          ...identity,
+          part: item.content[0],
+        });
+      }
       send("response.output_item.done", { output_index: outputIndex, item });
     });
     send("response.completed", {
@@ -911,8 +1499,21 @@ test("official caller executes delegated commands as native command items and re
       modelProvider: "fixture",
       cwd: directory,
       approvalPolicy: "never",
-      sandbox: "read-only",
+      sandbox: "workspace-write",
       persistExtendedHistory: true,
+    });
+    await caller.request("thread/inject_items", {
+      threadId: started.thread.id,
+      items: ["user", "assistant"].map((role) => ({
+        type: "message",
+        role,
+        content: [
+          {
+            type: role === "assistant" ? "output_text" : "input_text",
+            text: "fixture context ".repeat(40_000),
+          },
+        ],
+      })),
     });
     await caller.request("turn/start", {
       threadId: started.thread.id,
@@ -946,18 +1547,28 @@ test("official caller executes delegated commands as native command items and re
           status: string;
           items: {
             type: string;
+            id: string;
             command?: string;
             aggregatedOutput?: string;
             phase?: string;
             text?: string;
+            summary?: string[];
           }[];
         }[];
       };
     }>("thread/read", { threadId: started.thread.id, includeTurns: true });
     const turn = saved.thread.turns[0];
-    assert.equal(turn?.status, "completed");
+    assert.equal(
+      turn?.status,
+      "completed",
+      JSON.stringify(notifications.filter((notification) => notification.method === "error")),
+    );
     assert.equal(modelRequests, 2);
     assert.equal(receivedToolOutput, true);
+    assert.equal(
+      await readFile(join(directory, "edited-fixture.txt"), "utf8"),
+      "native-edit-content\n",
+    );
     const executed = turn?.items.filter((item) => item.type === "commandExecution");
     assert.equal(executed?.length, 2);
     assert.match(
@@ -969,19 +1580,44 @@ test("official caller executes delegated commands as native command items and re
       executed?.filter((item) => item.command?.includes("cat second-fixture.txt")).length,
       1,
     );
-    assert.ok(
-      turn?.items.some(
-        (item) =>
-          item.type === "agentMessage" &&
-          item.phase === "commentary" &&
-          item.text === "Reading the fixture.",
-      ),
+    const reasoning = turn?.items.filter((item) => item.type === "reasoning");
+    assert.equal(reasoning?.length, 1, JSON.stringify(turn));
+    assert.deepEqual(reasoning?.[0]?.summary, [
+      "Inspect the fixture file.",
+      "Verify the fixture content.",
+    ]);
+    const commentary = turn?.items.filter(
+      (item) => item.type === "agentMessage" && item.phase === "commentary",
     );
+    assert.equal(commentary?.length, 1, JSON.stringify(turn));
+    assert.equal(commentary?.[0]?.text, "Reading the fixture.");
+    const reasoningDeltas = notifications
+      .filter((notification) => notification.method === "item/reasoning/summaryTextDelta")
+      .map((notification) => {
+        const { itemId, summaryIndex, delta } = notification.params as {
+          itemId: string;
+          summaryIndex: number;
+          delta: string;
+        };
+        return { itemId, summaryIndex, delta };
+      });
+    assert.deepEqual(reasoningDeltas, [
+      {
+        itemId: reasoning?.[0]?.id,
+        summaryIndex: 0,
+        delta: "Inspect the fixture file.",
+      },
+      {
+        itemId: reasoning?.[0]?.id,
+        summaryIndex: 1,
+        delta: "Verify the fixture content.",
+      },
+    ]);
     const answer =
       turn?.items.find((item) => item.type === "agentMessage" && item.phase === "final_answer")
         ?.text ?? "";
     assert.match(answer, /Native fixture verified\./u);
-    assert.match(answer, /(?:合计|total) 30/u);
+    assert.match(answer, /(?:合|total) 30/u);
     cancelFixture = true;
     notifications.length = 0;
     const cancellable = await caller.request<{ turn: { id: string } }>("turn/start", {
@@ -1043,7 +1679,7 @@ test("official caller executes delegated commands as native command items and re
     );
     assert.ok(
       cancelledTurn?.items.some(
-        (item) => item.type === "agentMessage" && item.text === "Token：输入 24 · 输出 6 · 合计 30",
+        (item) => item.type === "agentMessage" && item.text === "总：入 24 · 出 6 · 合 30",
       ),
     );
     assert.ok(
@@ -1075,9 +1711,7 @@ test("official caller executes delegated commands as native command items and re
       limit: 100,
     });
     assert.ok(itemPage.data.some((entry) => entry.item.command?.includes("sleep 20")));
-    assert.ok(
-      itemPage.data.some((entry) => entry.item.text === "Token：输入 24 · 输出 6 · 合计 30"),
-    );
+    assert.ok(itemPage.data.some((entry) => entry.item.text === "总：入 24 · 出 6 · 合 30"));
     const itemRead = await caller.request<{ data: { item: { id: string } }[] }>(
       "thread/items/read",
       {
@@ -1114,7 +1748,7 @@ test("official caller executes delegated commands as native command items and re
     );
     assert.ok(
       reopenedTurn?.items.some(
-        (item) => item.type === "agentMessage" && item.text === "Token：输入 24 · 输出 6 · 合计 30",
+        (item) => item.type === "agentMessage" && item.text === "总：入 24 · 出 6 · 合 30",
       ),
     );
     const stoppedHtml = await renderNativeStoppedStatus(reopenedTurn?.durationMs ?? 0);
@@ -1131,7 +1765,7 @@ test("official caller executes delegated commands as native command items and re
     await waitFor(() =>
       notifications.some(
         (notification) =>
-          notification.method === "item/completed" &&
+          notification.method === "item/reasoning/summaryTextDelta" &&
           JSON.stringify(notification.params).includes("Waiting for the fixture model."),
       ),
     );
@@ -1147,7 +1781,7 @@ test("official caller executes delegated commands as native command items and re
       notifications.some(
         (notification) =>
           notification.method === "item/completed" &&
-          JSON.stringify(notification.params).includes("Token：未获取到"),
+          JSON.stringify(notification.params).includes("总：未获取到"),
       ),
     );
     await caller.close();
@@ -1167,9 +1801,7 @@ test("official caller executes delegated commands as native command items and re
     }>("thread/resume", { threadId: started.thread.id });
     const earlyTurn = earlyReopened.thread.turns.at(-1);
     assert.ok(
-      earlyTurn?.items.some(
-        (item) => item.type === "agentMessage" && item.text === "Token：未获取到",
-      ),
+      earlyTurn?.items.some((item) => item.type === "agentMessage" && item.text === "总：未获取到"),
     );
     const earlyStoppedHtml = await renderNativeStoppedStatus(earlyTurn?.durationMs ?? 0);
     if (earlyStoppedHtml !== undefined) {

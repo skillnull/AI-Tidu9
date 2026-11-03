@@ -217,6 +217,7 @@ test("setup preserves official Codex defaults without requiring a running runtim
     writeFileSync(fakeCodex, '#!/bin/sh\nif [ "$2" = "get" ]; then exit 1; fi\nexit 0\n', {
       mode: 0o700,
     });
+    writeFileSync(join(binaryDirectory, "launchctl"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
     const environment = {
       ...process.env,
       CODEX_HOME: codexHomeDirectory,
@@ -231,7 +232,10 @@ test("setup preserves official Codex defaults without requiring a running runtim
 
     assert.equal(configured.status, 0, configured.stderr);
     assert.match(configured.stdout, /Codex AI-Tidu9 configuration prepared: ai-tidu9/u);
-    assert.equal(existsSync(join(codexHomeDirectory, "config.toml")), false);
+    assert.doesNotMatch(
+      readFileSync(join(codexHomeDirectory, "config.toml"), "utf8"),
+      /^\s*(model|model_provider|model_catalog_json)\s*=/mu,
+    );
     assert.equal(existsSync(join(codexHomeDirectory, "ai-tidu9.config.toml")), true);
   } finally {
     rmSync(temporaryDirectory, { force: true, recursive: true });

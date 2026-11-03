@@ -4,6 +4,7 @@ import type {
   CapabilitySpecialistConfiguration,
   ModelSelection,
 } from "../config/index.js";
+import { ProviderError } from "../core/index.js";
 import { requestRequiresToolExecution } from "../openai/index.js";
 import type {
   ModelProvider,
@@ -658,6 +659,21 @@ const providerErrorMessage = (result: ProviderExecutionResult, fallback: string)
     : fallback;
 };
 
+const providerResultError = (result: ProviderExecutionResult, fallback: string): Error => {
+  const message = providerErrorMessage(result, fallback);
+  const failure =
+    result.kind === "json" && isRecord(result.body) && isRecord(result.body.error)
+      ? result.body.error
+      : undefined;
+  return typeof failure?.code === "string"
+    ? new ProviderError(
+        failure.code,
+        message,
+        typeof failure.type === "string" ? failure.type : "server_error",
+      )
+    : new Error(message);
+};
+
 const isHostBridgeCapabilityUnsupported = (result: ProviderExecutionResult): boolean => {
   if (result.kind !== "json" || result.statusCode !== 400 || !isRecord(result.body)) return false;
   const error = isRecord(result.body.error) ? result.body.error : undefined;
@@ -1128,7 +1144,7 @@ export const createDynamicModelRouter = (
 
   const selectRoute = (
     request: ProviderExecutionRequest,
-    excludedMainIds: ReadonlySet<string> = new Set(),
+    excludedModelIds: ReadonlySet<string> = new Set(),
   ): {
     main: RoutableModel;
     specialists: readonly RoutableModel[];
@@ -1137,7 +1153,7 @@ export const createDynamicModelRouter = (
     const requiredCapabilities = inferCapabilities(request);
     const privacy = request.routing?.privacy ?? "external";
     const eligible = eligibleModels(privacy).filter(
-      (model) => !excludedMainIds.has(model.profile.id),
+      (model) => !excludedModelIds.has(model.profile.id),
     );
     if (eligible.length === 0) {
       throw new Error("No enabled model satisfies the verified request routing constraints.");
@@ -1257,7 +1273,7 @@ export const createDynamicModelRouter = (
     if (main === undefined) {
       throw new Error("No enabled model satisfies the verified request routing constraints.");
     }
-    if (excludedMainIds.size > 0) reason = "failure-fallback";
+    if (excludedModelIds.size > 0) reason = "failure-fallback";
     else if (main.profile.id !== policy.mainModelId && reason === "main-capability-match") {
       reason = "capability-gap";
     }
@@ -1309,13 +1325,14 @@ export const createDynamicModelRouter = (
       };
     };
     latestAttempts = requestAttempts;
-    const attemptedMainIds = new Set<string>();
+    const excludedModelIds = new Set<string>();
     let lastFailure: Error | undefined;
     let lastCapabilityUnsupportedResult: ProviderExecutionResult | undefined;
-    while (attemptedMainIds.size < models.length) {
+    let specialistFailureObserved = false;
+    while (excludedModelIds.size < models.length) {
       let route: ReturnType<typeof selectRoute>;
       try {
-        route = selectRoute(request, attemptedMainIds);
+        route = selectRoute(request, excludedModelIds);
       } catch (error) {
         const cancellation = requestCancellationError(request, error);
         if (cancellation !== undefined) throw cancellation;
@@ -1325,7 +1342,10 @@ export const createDynamicModelRouter = (
         throw lastFailure ?? error;
       }
       latestDecision = route.decision;
-      if (route.decision.missingCapabilities.length > 0) {
+      if (
+        route.decision.missingCapabilities.length > 0 &&
+        (!specialistFailureObserved || route.main.profile.id !== policy.mainModelId)
+      ) {
         throw (
           lastFailure ??
           new Error(
@@ -1346,6 +1366,7 @@ export const createDynamicModelRouter = (
           totalTokens: number;
         } | null;
       }>;
+      let failedSpecialistId: string | undefined;
       try {
         contributions = [];
         for (const specialist of route.specialists) {
@@ -1392,14 +1413,15 @@ export const createDynamicModelRouter = (
             });
             statusCode = specialistResult.statusCode;
             if (specialistResult.statusCode === 429) {
-              throw new Error(`Secondary model quota exhausted (HTTP 429).`);
+              throw providerResultError(
+                specialistResult,
+                "Secondary model quota exhausted (HTTP 429).",
+              );
             }
             if (specialistResult.statusCode < 200 || specialistResult.statusCode >= 300) {
-              throw new Error(
-                providerErrorMessage(
-                  specialistResult,
-                  `Secondary model failed with HTTP ${specialistResult.statusCode}.`,
-                ),
+              throw providerResultError(
+                specialistResult,
+                `Secondary model failed with HTTP ${specialistResult.statusCode}.`,
               );
             }
             const callerToolRequest =
@@ -1467,6 +1489,7 @@ export const createDynamicModelRouter = (
               durationMilliseconds: Math.round(performance.now() - startedAt),
               message: message.slice(0, 500),
             });
+            failedSpecialistId = specialist.profile.id;
             throw error;
           }
         }
@@ -1475,6 +1498,11 @@ export const createDynamicModelRouter = (
         if (cancellation !== undefined) throw cancellation;
         lastFailure =
           error instanceof Error ? error : new Error("Capability secondary model failed.");
+        if (failedSpecialistId !== undefined) {
+          specialistFailureObserved = true;
+          excludedModelIds.add(failedSpecialistId);
+          continue;
+        }
         throw lastFailure;
       }
       const cancellationAfterSpecialists = requestCancellationError(request);
@@ -1482,10 +1510,7 @@ export const createDynamicModelRouter = (
       let result: ProviderExecutionResult;
       const mainStartedAt = performance.now();
       let mainExecutedModel: string | null = null;
-      const mainRole =
-        route.main.profile.id === policy.mainModelId
-          ? (request.routing?.role ?? "main")
-          : "specialist";
+      const mainRole = request.routing?.role ?? "main";
       try {
         const mainCapabilities = route.decision.requiredCapabilities.filter((capability) =>
           route.main.profile.capabilities.includes(capability),
@@ -1529,8 +1554,9 @@ export const createDynamicModelRouter = (
           message: lastFailure.message.slice(0, 500),
         });
         if (cancellation !== undefined) throw cancellation;
-        attemptedMainIds.add(route.main.profile.id);
-        if (attemptedMainIds.size >= models.length) {
+        if (route.main.profile.id !== policy.mainModelId) specialistFailureObserved = true;
+        excludedModelIds.add(route.main.profile.id);
+        if (excludedModelIds.size >= models.length) {
           if (lastCapabilityUnsupportedResult !== undefined) {
             return lastCapabilityUnsupportedResult;
           }
@@ -1553,11 +1579,9 @@ export const createDynamicModelRouter = (
       }
       if (isHostBridgeCapabilityUnsupported(result)) {
         lastCapabilityUnsupportedResult = result;
-        lastFailure = new Error(
-          providerErrorMessage(
-            result,
-            `Model ${route.main.profile.id} does not support a required capability.`,
-          ),
+        lastFailure = providerResultError(
+          result,
+          `Model ${route.main.profile.id} does not support a required capability.`,
         );
         requestAttempts.push({
           modelId: route.main.profile.id,
@@ -1568,8 +1592,36 @@ export const createDynamicModelRouter = (
           durationMilliseconds: Math.round(performance.now() - mainStartedAt),
           message: lastFailure.message.slice(0, 500),
         });
-        attemptedMainIds.add(route.main.profile.id);
-        if (attemptedMainIds.size >= models.length) return result;
+        if (route.main.profile.id !== policy.mainModelId) specialistFailureObserved = true;
+        excludedModelIds.add(route.main.profile.id);
+        if (excludedModelIds.size >= models.length) return result;
+        continue;
+      }
+      const successfulResult = result.statusCode >= 200 && result.statusCode < 300;
+      if (
+        !successfulResult &&
+        route.main.profile.id !== policy.mainModelId &&
+        !excludedModelIds.has(policy.mainModelId) &&
+        result.statusCode !== 429 &&
+        result.statusCode < 500
+      ) {
+        const resultTokenUsage = extractTokenUsage(result);
+        recordUsage(route.main.profile.id, resultTokenUsage);
+        lastFailure = providerResultError(
+          result,
+          `Alternate model ${route.main.profile.id} failed with HTTP ${result.statusCode}.`,
+        );
+        requestAttempts.push({
+          modelId: route.main.profile.id,
+          role: "main",
+          outcome: "failed",
+          executedModel: result.upstreamModel ?? mainExecutedModel,
+          statusCode: result.statusCode,
+          durationMilliseconds: Math.round(performance.now() - mainStartedAt),
+          message: lastFailure.message.slice(0, 500),
+        });
+        specialistFailureObserved = true;
+        excludedModelIds.add(route.main.profile.id);
         continue;
       }
       if (result.statusCode !== 429 && result.statusCode < 500) {
@@ -1613,14 +1665,11 @@ export const createDynamicModelRouter = (
         requestAttempts.push({
           modelId: route.main.profile.id,
           role: "main",
-          outcome: result.statusCode >= 200 && result.statusCode < 300 ? "succeeded" : "failed",
+          outcome: successfulResult ? "succeeded" : "failed",
           executedModel: result.upstreamModel ?? null,
           statusCode: result.statusCode,
           durationMilliseconds: Math.round(performance.now() - mainStartedAt),
-          message:
-            result.statusCode >= 200 && result.statusCode < 300
-              ? ""
-              : `Primary model returned HTTP ${result.statusCode}.`,
+          message: successfulResult ? "" : `Primary model returned HTTP ${result.statusCode}.`,
         });
         const confirmedMainModel = result.upstreamModel ?? mainExecutedModel;
         if (confirmedMainModel !== null) {
@@ -1636,11 +1685,9 @@ export const createDynamicModelRouter = (
         }
         return result;
       }
-      lastFailure = new Error(
-        providerErrorMessage(
-          result,
-          `Model ${route.main.profile.id} failed with HTTP ${result.statusCode}.`,
-        ),
+      lastFailure = providerResultError(
+        result,
+        `Model ${route.main.profile.id} failed with HTTP ${result.statusCode}.`,
       );
       requestAttempts.push({
         modelId: route.main.profile.id,
@@ -1652,7 +1699,8 @@ export const createDynamicModelRouter = (
         message: lastFailure.message.slice(0, 500),
       });
       if (result.statusCode === 429) exhaustedModels.add(route.main.profile.id);
-      attemptedMainIds.add(route.main.profile.id);
+      if (route.main.profile.id !== policy.mainModelId) specialistFailureObserved = true;
+      excludedModelIds.add(route.main.profile.id);
     }
     if (lastCapabilityUnsupportedResult !== undefined) return lastCapabilityUnsupportedResult;
     throw lastFailure ?? new Error("All eligible models failed.");
@@ -1791,9 +1839,8 @@ export const createCapabilityCompletionProvider = (
                 request.onExecutionReceipt?.({
                   host,
                   model,
-                  role: id.startsWith("specialist-")
-                    ? "specialist"
-                    : (request.routing?.role ?? "main"),
+                  role:
+                    request.routing?.role ?? (id.startsWith("specialist-") ? "specialist" : "main"),
                   capabilities: request.routing?.availableCapabilities ?? capabilities,
                   usage: null,
                 });
@@ -2223,6 +2270,8 @@ export const createCapabilityCompletionProvider = (
             });
           }
         }
+        const selectedModelIds = new Set([decision.mainModelId, ...decision.specialistModelIds]);
+        const attempts = router.inspectAttempts();
         records.unshift({
           host: requestHost,
           ...decision,
@@ -2236,8 +2285,8 @@ export const createCapabilityCompletionProvider = (
             hostPolicy.modelSelection.model,
             "main",
             assignedCapabilities(decision.requiredCapabilities, hostPolicy.mainCapabilities, true),
-            router.inspectAttempts(),
-            new Set([decision.mainModelId, ...decision.specialistModelIds]),
+            attempts,
+            selectedModelIds,
           ),
           secondaryResults: hostPolicy.specialists.map((specialist, index) =>
             modelResult(
@@ -2246,8 +2295,8 @@ export const createCapabilityCompletionProvider = (
               specialist.model,
               "secondary",
               assignedCapabilities(decision.requiredCapabilities, specialist.capabilities, false),
-              router.inspectAttempts(),
-              new Set([decision.mainModelId, ...decision.specialistModelIds]),
+              attempts,
+              selectedModelIds,
             ),
           ),
         });

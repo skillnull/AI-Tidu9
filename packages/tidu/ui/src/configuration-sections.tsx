@@ -785,6 +785,12 @@ export const CapabilityCompletionPanel = ({
           ) : null}
           {recordsHost !== null ? (
             <div className="capability-record-dialog-backdrop">
+              <button
+                type="button"
+                className="capability-record-dialog-dismiss"
+                aria-label={english ? "Close usage history" : "关闭使用记录"}
+                onClick={() => setRecordsHost(null)}
+              />
               <section
                 className="capability-record-dialog"
                 role="dialog"

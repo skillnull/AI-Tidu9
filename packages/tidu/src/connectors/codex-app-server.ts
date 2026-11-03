@@ -99,6 +99,8 @@ export interface CodexTurnResult {
   error?: {
     /** Original upstream failure message. */
     message: string;
+    /** Authoritative native failure category, including capacity and transport errors. */
+    codexErrorInfo?: unknown;
   };
   /** Concatenated assistant message deltas. */
   text: string;
@@ -153,6 +155,17 @@ export type CodexTurnInput =
 /** Host-defined message phase; known values are hints, not a closed compatibility gate. */
 export type CodexMessagePhase = "commentary" | "final_answer" | (string & {});
 
+export interface CodexProcessDeltaSource {
+  /** Official item identifier that emitted this process delta. */
+  itemId: string;
+  /** Native process kind retained while the item is streaming. */
+  type: "activity" | "commentary" | "reasoning";
+  /** Native reasoning summary part receiving this delta. */
+  summaryIndex?: number;
+  /** Adapter-inserted separator rather than model-authored text. */
+  separator?: boolean;
+}
+
 export interface CodexAgentClient {
   /** Negotiates protocol capabilities and sends the initialized notification. */
   initialize: () => Promise<void>;
@@ -173,7 +186,7 @@ export interface CodexAgentClient {
     signal?: AbortSignal,
     onTextDelta?: (delta: string) => void,
     reasoningEffort?: CodexReasoningEffort,
-    onProcessDelta?: (delta: string) => void,
+    onProcessDelta?: (delta: string, source?: CodexProcessDeltaSource) => void,
     historyItems?: readonly Record<string, unknown>[],
     outputSchema?: Record<string, unknown>,
     onUsageUpdate?: (usage: NonNullable<CodexTurnResult["usage"]>) => void,
@@ -210,7 +223,7 @@ interface TurnState {
   /** Receives text as soon as the official app-server emits it. */
   onTextDelta?: (delta: string) => void;
   /** Receives public reasoning summaries and commentary as soon as they are emitted. */
-  onProcessDelta?: (delta: string) => void;
+  onProcessDelta?: (delta: string, source?: CodexProcessDeltaSource) => void;
   /** Process item whose deltas were most recently forwarded. */
   processItemKey?: string;
   /** Latest per-turn token usage reported by the official app-server. */
@@ -228,12 +241,12 @@ interface TurnState {
 interface BufferedTurnNotifications {
   /** A model response boundary received before local turn registration. */
   modelResponseCompleted?: boolean;
-  /** Native progress completed before the turn-start response was registered. */
-  nativeItems?: Record<string, unknown>[];
-  /** Text deltas received before the turn was registered locally. */
-  deltas: string[];
-  /** Public process deltas received before the turn was registered locally. */
-  processDeltas: Array<{ itemKey: string; delta: string }>;
+  /** Native items and deltas in their original arrival order before local registration. */
+  notifications: Array<
+    | { type: "native"; item: Record<string, unknown> }
+    | { type: "text"; delta: string }
+    | { type: "process"; itemKey: string; delta: string; separator?: boolean }
+  >;
   /** Terminal result received before the turn was registered locally. */
   completion?: Omit<CodexTurnResult, "text" | "usage">;
   /** Token usage received before the turn was registered locally. */
@@ -434,8 +447,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     update: (buffer: BufferedTurnNotifications) => void,
   ): void => {
     const buffer = bufferedTurnNotifications.get(turnId) ?? {
-      deltas: [],
-      processDeltas: [],
+      notifications: [],
     };
     update(buffer);
     bufferedTurnNotifications.set(turnId, buffer);
@@ -445,17 +457,56 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     }
   };
 
-  const forwardProcessDelta = (turnId: string, itemKey: string, delta: string): void => {
+  const processDeltaSource = (itemKey: string): CodexProcessDeltaSource | undefined => {
+    const typeSeparator = itemKey.indexOf(":");
+    if (typeSeparator <= 0) return undefined;
+    const type = itemKey.slice(0, typeSeparator);
+    if (type !== "activity" && type !== "commentary" && type !== "reasoning") return undefined;
+    const encodedItemId = itemKey.slice(typeSeparator + 1);
+    const indexSeparator = type === "commentary" ? -1 : encodedItemId.lastIndexOf(":");
+    const itemId = indexSeparator === -1 ? encodedItemId : encodedItemId.slice(0, indexSeparator);
+    return itemId === ""
+      ? undefined
+      : {
+          type,
+          itemId,
+          ...(type === "reasoning" && indexSeparator !== -1
+            ? { summaryIndex: Number(encodedItemId.slice(indexSeparator + 1)) }
+            : {}),
+        };
+  };
+
+  const forwardProcessDelta = (
+    turnId: string,
+    itemKey: string,
+    delta: string,
+    separator = false,
+  ): void => {
     const state = activeTurns.get(turnId);
     if (state === undefined) {
-      bufferTurnNotification(turnId, (buffer) => buffer.processDeltas.push({ itemKey, delta }));
+      bufferTurnNotification(turnId, (buffer) =>
+        buffer.notifications.push({
+          type: "process",
+          itemKey,
+          delta,
+          separator,
+        }),
+      );
       return;
     }
     if (state.processItemKey !== undefined && state.processItemKey !== itemKey) {
-      state.onProcessDelta?.("\n\n");
+      const source = processDeltaSource(state.processItemKey);
+      state.onProcessDelta?.(
+        "\n\n",
+        source === undefined ? undefined : { ...source, separator: true },
+      );
     }
-    state.processItemKey = delta === "\n\n" ? undefined : itemKey;
-    state.onProcessDelta?.(delta);
+    state.processItemKey = separator ? undefined : itemKey;
+    const source = processDeltaSource(itemKey);
+    state.onProcessDelta?.(
+      delta,
+      source === undefined || !separator ? source : { ...source, separator: true },
+    );
   };
 
   const forwardProcessItem = (turnId: string, item: Record<string, unknown>): void => {
@@ -470,7 +521,12 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       forwardProcessDelta(turnId, `activity:${itemId}:${String(index)}`, description);
     });
     // An observed activity is already a complete public record, even while its command runs.
-    forwardProcessDelta(turnId, `activity:${itemId}:${String(descriptions.length - 1)}`, "\n\n");
+    forwardProcessDelta(
+      turnId,
+      `activity:${itemId}:${String(descriptions.length - 1)}`,
+      "\n\n",
+      true,
+    );
     const state = activeTurns.get(turnId);
     if (state !== undefined) state.processItemKey = undefined;
   };
@@ -594,8 +650,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           state.onNativeItem?.(item);
         } else
           bufferTurnNotification(turnId, (buffer) => {
-            buffer.nativeItems ??= [];
-            buffer.nativeItems.push(item);
+            buffer.notifications.push({ type: "native", item });
           });
       }
       return;
@@ -668,7 +723,9 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
         state.text += delta;
         state.onTextDelta?.(delta);
       } else if (delta !== undefined) {
-        bufferTurnNotification(turnId, (buffer) => buffer.deltas.push(delta));
+        bufferTurnNotification(turnId, (buffer) =>
+          buffer.notifications.push({ type: "text", delta }),
+        );
       }
       return;
     }
@@ -703,7 +760,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
             state.onTextDelta?.(trailing);
           } else
             bufferTurnNotification(turnId, (buffer) => {
-              buffer.deltas.push(trailing);
+              buffer.notifications.push({ type: "text", delta: trailing });
             });
         }
         forwardedMessageText.delete(messageKey);
@@ -713,8 +770,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
         (state?.processItemKey?.startsWith(`reasoning:${itemId}:`) ||
           state?.processItemKey === `commentary:${itemId}`)
       ) {
-        state.onProcessDelta?.("\n\n");
-        state.processItemKey = undefined;
+        forwardProcessDelta(turnId, state.processItemKey, "\n\n", true);
       }
       if (itemId !== undefined) messagePhases.delete(messagePhaseKey(turnId, itemId));
       forwardProcessItem(turnId, item);
@@ -741,7 +797,14 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       threadId,
       turnId: completedTurnId,
       status,
-      ...(message === undefined ? {} : { error: { message } }),
+      ...(message === undefined
+        ? {}
+        : {
+            error: {
+              message,
+              codexErrorInfo: isRecord(turn.error) ? turn.error.codexErrorInfo : undefined,
+            },
+          }),
     } satisfies Omit<CodexTurnResult, "text" | "usage">;
     const state = activeTurns.get(completedTurnId);
     if (state === undefined) {
@@ -859,7 +922,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
               dynamicTools: callerTools,
               experimentalRawEvents: true,
               developerInstructions:
-                "Tools belong to the calling client. Use only the registered tidu_caller_tool_* names; their descriptions identify the original caller tools. The client executes them under its own permissions and returns real results. Do not invoke the original tool names or execute commands or edit files in this delegated thread.",
+                "Use the registered tidu_caller_tool_* tools to carry out the user's task, including reading workspace files, running commands, editing files, and verifying changes when those tools are available. Each tool description identifies its original caller name. These are executable tools: the calling client performs each requested action in its workspace under its current permissions, sandbox, and approval rules, then returns the real result. Request the registered alias instead of the original name. The inference process's local tools are disabled because execution belongs to the calling client; this does not prohibit using the registered tools. Report a permission restriction only when the caller's current policy or a real tool result establishes it.",
               config: {
                 "features.shell_tool": false,
                 "features.apply_patch_freeform": false,
@@ -908,10 +971,15 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     },
     readUsage: async (): Promise<CodexUsageSummary> => {
       requireInitialized();
-      const [limits, usage] = await Promise.all([
+      const [limitsResult, usageResult] = await Promise.allSettled([
         client.request<Record<string, unknown>>("account/rateLimits/read", undefined),
         client.request<Record<string, unknown>>("account/usage/read", undefined),
       ]);
+      if (limitsResult.status === "rejected" && usageResult.status === "rejected") {
+        throw limitsResult.reason;
+      }
+      const limits = limitsResult.status === "fulfilled" ? limitsResult.value : {};
+      const usage = usageResult.status === "fulfilled" ? usageResult.value : {};
       const byId = isRecord(limits.rateLimitsByLimitId)
         ? limits.rateLimitsByLimitId.codex
         : undefined;
@@ -945,7 +1013,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       signal?: AbortSignal,
       onTextDelta?: (delta: string) => void,
       reasoningEffort?: CodexReasoningEffort,
-      onProcessDelta?: (delta: string) => void,
+      onProcessDelta?: (delta: string, source?: CodexProcessDeltaSource) => void,
       historyItems: readonly Record<string, unknown>[] = [],
       outputSchema?: Record<string, unknown>,
       onUsageUpdate?: (usage: NonNullable<CodexTurnResult["usage"]>) => void,
@@ -1021,16 +1089,21 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
         if (buffered === undefined) return;
         bufferedTurnNotifications.delete(turnId);
         state.modelResponseCompleted = buffered.modelResponseCompleted === true;
-        for (const item of buffered.nativeItems ?? []) {
-          state.progressItems.push(item);
-          state.onNativeItem?.(item);
-        }
-        for (const delta of buffered.deltas) {
-          state.text += delta;
-          state.onTextDelta?.(delta);
-        }
-        for (const processDelta of buffered.processDeltas) {
-          forwardProcessDelta(turnId, processDelta.itemKey, processDelta.delta);
+        for (const notification of buffered.notifications) {
+          if (notification.type === "native") {
+            state.progressItems.push(notification.item);
+            state.onNativeItem?.(notification.item);
+          } else if (notification.type === "text") {
+            state.text += notification.delta;
+            state.onTextDelta?.(notification.delta);
+          } else {
+            forwardProcessDelta(
+              turnId,
+              notification.itemKey,
+              notification.delta,
+              notification.separator,
+            );
+          }
         }
         if (buffered.usage !== undefined) {
           state.usage = buffered.usage;

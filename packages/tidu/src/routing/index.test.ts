@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { MODEL_ROUTING_CAPABILITIES } from "../config/index.js";
+import { ProviderError } from "../core/index.js";
 import type { ModelProvider, ProviderExecutionRequest } from "../providers/index.js";
 import {
   createCapabilityCompletionProvider,
@@ -14,6 +15,42 @@ import {
 
 const waitForMilliseconds = async (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+test("keeps the final upstream retry category after capability routes are exhausted", async () => {
+  const provider = createDynamicModelRouter(
+    [
+      {
+        profile: profile({ id: "cheap-main", capabilities: ["text"] }),
+        provider: {
+          descriptor: { type: "codex-host", model: "fixture" },
+          execute: async () => ({
+            kind: "json",
+            statusCode: 503,
+            body: {
+              error: {
+                code: "server_is_overloaded",
+                type: "service_unavailable_error",
+                message: "Fixture capacity failure",
+              },
+            },
+          }),
+        },
+      },
+    ],
+    policy,
+  );
+  await assert.rejects(
+    provider.execute({
+      protocol: "responses",
+      virtualModelId: "ai-tidu9-config",
+      body: { input: "Respond to the fixture" },
+    }),
+    (error) =>
+      error instanceof ProviderError &&
+      error.code === "server_is_overloaded" &&
+      error.type === "service_unavailable_error",
+  );
+});
 
 const streamEncoder = new TextEncoder();
 
@@ -252,6 +289,7 @@ test("records primary and secondary results for the shared Agent policy", async 
 
 test("executes only the secondary model when the primary has zero assigned capabilities", async () => {
   const calls: string[] = [];
+  const receipts: { host: string; role: string }[] = [];
   const provider: ModelProvider = {
     descriptor: { type: "codex-host", model: "primary-model" },
     execute: async (request) => {
@@ -291,17 +329,190 @@ test("executes only the secondary model when the primary has zero assigned capab
       host: "codex",
       requiredCapabilities: [...MODEL_ROUTING_CAPABILITIES],
     },
+    onExecutionReceipt: (receipt) => receipts.push(receipt),
   });
 
   assert.equal(result.statusCode, 200);
   assert.deepEqual(calls, ["cursor:secondary-model"]);
+  assert.ok(receipts.length > 0);
+  assert.ok(receipts.every((receipt) => receipt.host === "cursor" && receipt.role === "main"));
   const record = (await completion.inspectCapabilityCompletion()).records[0];
   assert.equal(record?.outcome, "succeeded");
   assert.equal(record?.complemented, true);
+  assert.equal(record?.mainResult.modelId, "main:codex:official");
+  assert.equal(record?.mainResult.role, "main");
   assert.equal(record?.mainResult.outcome, "not-run");
+  assert.equal(record?.mainResult.skipReason, "not-selected");
   assert.equal(record?.mainResult.executedModel, null);
+  assert.equal(record?.secondaryResults[0]?.modelId, "specialist-0:cursor:official");
+  assert.equal(record?.secondaryResults[0]?.role, "secondary");
   assert.equal(record?.secondaryResults[0]?.outcome, "succeeded");
   assert.equal(record?.secondaryResults[0]?.executedModel, "secondary-model");
+});
+
+test("tries another specialist before the official primary when capability completion fails", async () => {
+  const calls: string[] = [];
+  const primary: ModelProvider = {
+    descriptor: { type: "codex-host", model: "official-primary" },
+    execute: async () => {
+      calls.push("codex:official-primary");
+      return {
+        kind: "json",
+        statusCode: 200,
+        upstreamModel: "official-primary",
+        body: { choices: [{ message: { content: "official answer" } }] },
+      };
+    },
+  };
+  const failingSpecialist: ModelProvider = {
+    descriptor: { type: "ollama", model: "local-specialist" },
+    execute: async () => {
+      calls.push("ollama:local-specialist");
+      return {
+        kind: "json",
+        statusCode: 503,
+        upstreamModel: "local-specialist",
+        body: { error: { message: "local specialist unavailable" } },
+      };
+    },
+  };
+  const healthySpecialist: ModelProvider = {
+    descriptor: { type: "cursor-host", model: "cursor-specialist" },
+    execute: async () => {
+      calls.push("cursor:cursor-specialist");
+      return {
+        kind: "json",
+        statusCode: 200,
+        upstreamModel: "cursor-specialist",
+        body: { choices: [{ message: { content: "research evidence" } }] },
+      };
+    },
+  };
+  const completion = createCapabilityCompletionProvider(
+    primary,
+    async () => ({
+      modelSelection: { source: "official", model: "official-primary" },
+      capabilityCompletion: {
+        enabled: true,
+        mainCapabilities: ["text"],
+        specialists: [
+          {
+            host: "ollama",
+            source: "official",
+            model: "local-specialist",
+            capabilities: ["web-research"],
+          },
+          {
+            host: "cursor",
+            source: "official",
+            model: "cursor-specialist",
+            capabilities: ["web-research"],
+          },
+        ],
+        maximumSpecialists: 2,
+      },
+    }),
+    {
+      resolveProviderForHost: async (host) =>
+        host === "codex"
+          ? primary
+          : host === "ollama"
+            ? failingSpecialist
+            : host === "cursor"
+              ? healthySpecialist
+              : undefined,
+    },
+  );
+
+  const result = await completion.execute({
+    protocol: "chat-completions",
+    virtualModelId: "ai-tidu9-config",
+    body: { messages: [{ role: "user", content: "research this" }] },
+    routing: { host: "codex", requiredCapabilities: ["web-research"] },
+  });
+
+  assert.equal(result.statusCode, 200);
+  assert.deepEqual(calls, [
+    "ollama:local-specialist",
+    "cursor:cursor-specialist",
+    "codex:official-primary",
+  ]);
+  const record = (await completion.inspectCapabilityCompletion()).records[0];
+  assert.equal(record?.outcome, "succeeded");
+  assert.equal(record?.mainResult.executedModel, "official-primary");
+  assert.equal(record?.secondaryResults[0]?.outcome, "failed");
+  assert.equal(record?.secondaryResults[1]?.outcome, "succeeded");
+});
+
+test("falls back to the official primary after every selected specialist fails", async () => {
+  const calls: string[] = [];
+  let primaryRequest: ProviderExecutionRequest | undefined;
+  const primary: ModelProvider = {
+    descriptor: { type: "codex-host", model: "official-primary" },
+    execute: async (request) => {
+      calls.push("codex:official-primary");
+      primaryRequest = request;
+      return {
+        kind: "json",
+        statusCode: 200,
+        upstreamModel: "official-primary",
+        body: {
+          choices: [{ message: { content: "official limitation response" } }],
+        },
+      };
+    },
+  };
+  const specialist: ModelProvider = {
+    descriptor: { type: "ollama", model: "local-specialist" },
+    execute: async () => {
+      calls.push("ollama:local-specialist");
+      return {
+        kind: "json",
+        statusCode: 503,
+        upstreamModel: "local-specialist",
+        body: { error: { message: "local specialist unavailable" } },
+      };
+    },
+  };
+  const completion = createCapabilityCompletionProvider(
+    primary,
+    async () => ({
+      modelSelection: { source: "official", model: "official-primary" },
+      capabilityCompletion: {
+        enabled: true,
+        mainCapabilities: [],
+        specialists: [
+          {
+            host: "ollama",
+            source: "official",
+            model: "local-specialist",
+            capabilities: ["text"],
+          },
+        ],
+        maximumSpecialists: 1,
+      },
+    }),
+    {
+      resolveProviderForHost: async (host) =>
+        host === "codex" ? primary : host === "ollama" ? specialist : undefined,
+    },
+  );
+
+  const result = await completion.execute({
+    protocol: "chat-completions",
+    virtualModelId: "ai-tidu9-config",
+    body: { messages: [{ role: "user", content: "research this" }] },
+    routing: { host: "codex" },
+  });
+
+  assert.equal(result.statusCode, 200);
+  assert.deepEqual(calls, ["ollama:local-specialist", "codex:official-primary"]);
+  assert.match(JSON.stringify(primaryRequest?.body), /missingCapabilities/u);
+  const record = (await completion.inspectCapabilityCompletion()).records[0];
+  assert.equal(record?.outcome, "succeeded");
+  assert.deepEqual(record?.missingCapabilities, ["text"]);
+  assert.equal(record?.mainResult.executedModel, "official-primary");
+  assert.equal(record?.secondaryResults[0]?.outcome, "failed");
 });
 
 test("splits Chinese text and non-text capabilities across the assigned specialist and primary", async () => {
@@ -358,7 +569,10 @@ test("splits Chinese text and non-text capabilities across the assigned speciali
   assert.deepEqual(calls, ["cursor:secondary-model"]);
   const record = (await completion.inspectCapabilityCompletion()).records[0];
   assert.deepEqual(record?.requiredCapabilities, ["text"]);
+  assert.equal(record?.mainResult.modelId, "main:codex:official");
   assert.equal(record?.mainResult.outcome, "not-run");
+  assert.equal(record?.mainResult.skipReason, "not-selected");
+  assert.equal(record?.secondaryResults[0]?.modelId, "specialist-0:cursor:official");
   assert.equal(record?.secondaryResults[0]?.outcome, "succeeded");
 
   await completion.execute({
@@ -376,8 +590,10 @@ test("splits Chinese text and non-text capabilities across the assigned speciali
   ]);
   const combinedRecord = (await completion.inspectCapabilityCompletion()).records[0];
   assert.deepEqual(combinedRecord?.requiredCapabilities, ["text", "vision"]);
+  assert.equal(combinedRecord?.mainResult.modelId, "main:codex:official");
   assert.deepEqual(combinedRecord?.mainResult.capabilities, ["vision"]);
   assert.equal(combinedRecord?.mainResult.outcome, "succeeded");
+  assert.equal(combinedRecord?.secondaryResults[0]?.modelId, "specialist-0:cursor:official");
   assert.deepEqual(combinedRecord?.secondaryResults[0]?.capabilities, ["text"]);
   assert.equal(combinedRecord?.secondaryResults[0]?.outcome, "succeeded");
   assert.deepEqual(process, ["Codex 已完成视觉检查。\n", "Cursor 正在汇总共享结果。\n"]);
@@ -664,7 +880,9 @@ test("uses the Ollama host as a verifiably local privacy boundary", async () => 
   );
 });
 
-test("records streaming latency only after the stream completes", async () => {
+test("records streaming latency only after the stream completes", async (context) => {
+  const clock = { milliseconds: 0 };
+  context.mock.method(performance, "now", () => clock.milliseconds);
   const calls: string[] = [];
   const mainControllers: ReadableStreamDefaultController<Uint8Array>[] = [];
   const provider: ModelProvider = {
@@ -673,7 +891,7 @@ test("records streaming latency only after the stream completes", async () => {
       const targetModel = request.routing?.targetModel ?? "main";
       calls.push(targetModel);
       if (targetModel === "secondary") {
-        await waitForMilliseconds(10);
+        clock.milliseconds += 10;
         return {
           kind: "json",
           statusCode: 200,
@@ -720,7 +938,7 @@ test("records streaming latency only after the stream completes", async () => {
   assert.deepEqual(calls, ["secondary", "main", "main"]);
   assert.equal((await completion.inspectCapabilityCompletion()).records.length, 0);
 
-  await waitForMilliseconds(25);
+  clock.milliseconds += 25;
   mainControllers[0]?.enqueue(
     encodeSseData({
       type: "response.output_text.delta",
@@ -886,7 +1104,9 @@ test("does not reuse performance observations after a configured model changes",
   assert.deepEqual(calls, ["main"]);
 });
 
-test("does not treat lower token use as lower cost when prices are unknown", async () => {
+test("does not treat lower token use as lower cost when prices are unknown", async (context) => {
+  const clock = { milliseconds: 0 };
+  context.mock.method(performance, "now", () => clock.milliseconds);
   const calls: string[] = [];
   const provider: ModelProvider = {
     descriptor: { type: "openai-compatible", model: "main-model" },
@@ -894,6 +1114,7 @@ test("does not treat lower token use as lower cost when prices are unknown", asy
       const model = request.routing?.targetModel ?? "main-model";
       calls.push(model);
       const specialist = model === "vision-model";
+      clock.milliseconds += specialist ? 10 : 1;
       return {
         kind: "json",
         statusCode: 200,
@@ -1023,7 +1244,12 @@ test("returns specialist native tool requests before asking the text model for a
         enabled: true,
         mainCapabilities: ["text"],
         specialists: [
-          { host: "cursor", source: "official", model: "code", capabilities: ["code"] },
+          {
+            host: "cursor",
+            source: "official",
+            model: "code",
+            capabilities: ["code"],
+          },
         ],
         maximumSpecialists: 1,
       },
@@ -1561,7 +1787,12 @@ test("keeps reported usage when cancellation skips another selected model", asyn
         mainCapabilities: ["text"],
         maximumSpecialists: 1,
         specialists: [
-          { host: "cursor", source: "official", model: "vision", capabilities: ["vision"] },
+          {
+            host: "cursor",
+            source: "official",
+            model: "vision",
+            capabilities: ["vision"],
+          },
         ],
       },
     }),
@@ -1598,7 +1829,11 @@ test("retains usage on failed and incomplete stream terminal events", async () =
                   type: terminalType,
                   response: {
                     error: { message: "fixture failure" },
-                    usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15 },
+                    usage: {
+                      input_tokens: 12,
+                      output_tokens: 3,
+                      total_tokens: 15,
+                    },
                   },
                 }),
               );
@@ -2428,6 +2663,47 @@ test("tries another capable model after an explicit host bridge capability rejec
   );
 });
 
+test("retains the primary replay error instead of asking a text-only fallback to refuse the task", async () => {
+  const calls: string[] = [];
+  const router = createDynamicModelRouter(
+    [
+      {
+        profile: profile({
+          id: "cheap-main",
+          capabilities: ["text", "code", "vision", "reasoning", "long-context"],
+        }),
+        provider: jsonProvider("primary", async () => {
+          calls.push("primary");
+          throw new Error("Persisted response contains unverifiable hidden reasoning state");
+        }),
+      },
+      {
+        profile: profile({ id: "vision-specialist", capabilities: ["text"] }),
+        provider: jsonProvider("secondary", async () => {
+          calls.push("secondary");
+          return {
+            statusCode: 200,
+            body: { output_text: "Cannot fix this task" },
+          };
+        }),
+      },
+    ],
+    policy,
+  );
+  await assert.rejects(
+    router.execute({
+      protocol: "responses",
+      virtualModelId: "tidu",
+      body: { input: "Fix this code" },
+      routing: {
+        requiredCapabilities: ["code", "vision", "reasoning", "long-context"],
+      },
+    }),
+    /Persisted response contains unverifiable/u,
+  );
+  assert.deepEqual(calls, ["primary"]);
+});
+
 test("preserves the explicit bridge limitation when every fallback is unavailable", async () => {
   const calls: string[] = [];
   const router = createDynamicModelRouter(
@@ -2521,6 +2797,60 @@ test("does not fall back for an ordinary client error", async () => {
   assert.equal(result.statusCode, 400);
   assert.deepEqual(calls, ["cheap-main"]);
   assert.equal(router.inspectAttempts()[0]?.outcome, "failed");
+});
+
+test("tries the configured official primary after a preferred alternate returns a client error", async () => {
+  const calls: string[] = [];
+  const router = createDynamicModelRouter(
+    [
+      {
+        profile: profile({
+          id: "cheap-main",
+          inputCostPerMillionTokens: 1,
+          outputCostPerMillionTokens: 1,
+        }),
+        provider: jsonProvider("official", async () => {
+          calls.push("cheap-main");
+          return { statusCode: 200, body: { output_text: "official answer" } };
+        }),
+      },
+      {
+        profile: profile({
+          id: "vision-specialist",
+          inputCostPerMillionTokens: 0,
+          outputCostPerMillionTokens: 0,
+        }),
+        provider: jsonProvider("alternate", async () => {
+          calls.push("vision-specialist");
+          return {
+            statusCode: 400,
+            body: {
+              error: {
+                code: "adapter_rejected",
+                message: "Alternate rejected input.",
+              },
+            },
+          };
+        }),
+      },
+    ],
+    policy,
+  );
+
+  const result = await router.execute({
+    protocol: "responses",
+    virtualModelId: "tidu",
+    body: { input: "continue through official" },
+  });
+
+  assert.equal(result.statusCode, 200);
+  assert.deepEqual(calls, ["vision-specialist", "cheap-main"]);
+  assert.equal(router.inspect()?.mainModelId, "cheap-main");
+  assert.equal(router.inspect()?.reason, "failure-fallback");
+  assert.deepEqual(
+    router.inspectAttempts().map((attempt) => attempt.outcome),
+    ["failed", "succeeded"],
+  );
 });
 
 test("falls back after the preferred model reports quota exhaustion", async () => {

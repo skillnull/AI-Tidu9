@@ -28,3 +28,18 @@ export class TiduError extends Error {
     this.details = Object.freeze({ ...options.details });
   }
 }
+
+/** Preserves an authoritative upstream category across model and streaming boundaries. */
+export class ProviderError extends Error {
+  /** Original machine-readable upstream category. */
+  public readonly code: string;
+  /** Public protocol error type used by the receiving client. */
+  public readonly type: string;
+
+  public constructor(code: string, message: string, type = "server_error") {
+    super(message);
+    this.name = "ProviderError";
+    this.code = /^[a-z][a-z0-9_.-]{0,63}$/u.test(code) ? code : "upstream_request_failed";
+    this.type = /^[a-z][a-z0-9_.-]{0,63}$/u.test(type) ? type : "server_error";
+  }
+}

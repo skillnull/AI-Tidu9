@@ -9,6 +9,7 @@ import { formatModelFailureMessage } from "../providers/index.js";
 import {
   AgentExecutionError,
   type AgentModelPreferences,
+  type AgentModelRequest,
   type AgentPlan,
   type AgentStepOutput,
   type AgentWorker,
@@ -62,6 +63,7 @@ const createProviderExecutionError = (
   return new AgentExecutionError(
     code,
     sanitizeProviderErrorMessage(error?.message, fallbackMessage),
+    typeof error?.type === "string" ? error.type : "server_error",
   );
 };
 
@@ -262,6 +264,7 @@ const consumeProviderTextStream = async (
   onProcessDelta?: (delta: string) => void,
   onTerminalUsage?: (usage: ProviderTokenUsage) => void,
   onOutputItem?: (item: Record<string, unknown>) => void,
+  onProcessEvent?: AgentModelRequest["onProcessEvent"],
 ): Promise<string> => {
   const reader = source.getReader();
   const decoder = new TextDecoder();
@@ -274,20 +277,35 @@ const consumeProviderTextStream = async (
   const forwardedToolCalls = new Set<string>();
   const forwardedProgressItems = new Set<string>();
   const streamedProgressItems = new Set<string>();
+  const nativeProgressItems = new Set<string>();
+  const forwardNativeStart = (item: Record<string, unknown>): void => {
+    if (
+      onProcessEvent === undefined ||
+      typeof item.id !== "string" ||
+      nativeProgressItems.has(item.id)
+    )
+      return;
+    nativeProgressItems.add(item.id);
+    publicProcessItemIds.add(item.id);
+    onProcessEvent({ type: "response.output_item.added", item: createPublicProgressItem(item) });
+  };
   const forwardProgressItem = (item: unknown): void => {
     if (
-      onOutputItem === undefined ||
+      (onOutputItem === undefined && onProcessEvent === undefined) ||
       !isRecord(item) ||
       typeof item.id !== "string" ||
       (item.type !== "reasoning" &&
         item.type !== "web_search_call" &&
         !(item.type === "message" && item.phase === "commentary")) ||
       forwardedProgressItems.has(item.id) ||
-      streamedProgressItems.has(item.id)
+      (onProcessEvent === undefined && streamedProgressItems.has(item.id))
     )
       return;
     forwardedProgressItems.add(item.id);
-    onOutputItem(createPublicProgressItem(item));
+    if (onProcessEvent !== undefined) {
+      forwardNativeStart(item);
+      onProcessEvent({ type: "response.output_item.done", item: createPublicProgressItem(item) });
+    } else onOutputItem?.(createPublicProgressItem(item));
   };
   const forwardToolItem = (item: unknown): void => {
     if (
@@ -346,6 +364,13 @@ const consumeProviderTextStream = async (
       } else if (body.item.type === "reasoning") {
         publicProcessItemIds.add(body.item.id);
       }
+      if (publicProcessItemIds.has(body.item.id) || body.item.type === "web_search_call")
+        forwardNativeStart(body.item);
+      else if (body.item.type === "message")
+        onProcessEvent?.({
+          type: "response.output_item.added",
+          item: createPublicProgressItem(body.item),
+        });
     }
     if (isRecord(body) && isRecord(body.error)) {
       throw createProviderExecutionError(
@@ -379,6 +404,7 @@ const consumeProviderTextStream = async (
         {
           error: {
             code: responseError?.code,
+            type: responseError?.type,
             message:
               responseError?.message ??
               incompleteDetails?.reason ??
@@ -405,6 +431,7 @@ const consumeProviderTextStream = async (
           {
             error: {
               code: responseError?.code,
+              type: responseError?.type,
               message:
                 responseError?.message ??
                 incompleteDetails?.reason ??
@@ -433,7 +460,34 @@ const consumeProviderTextStream = async (
       streamedText += delta;
       onOutputDelta(delta);
     }
-    const processDelta = extractStreamProcessDelta(body, messagePhases);
+    const nativeProcessEvent =
+      onProcessEvent !== undefined &&
+      isRecord(body) &&
+      typeof body.item_id === "string" &&
+      nativeProgressItems.has(body.item_id) &&
+      typeof body.type === "string" &&
+      /^(?:response\.reasoning_summary_(?:part|text)\.(?:added|delta|done)|response\.(?:content_part|output_text)\.(?:added|delta|done))$/u.test(
+        body.type,
+      );
+    if (nativeProcessEvent && isRecord(body)) {
+      onProcessEvent?.(
+        Object.fromEntries(
+          Object.entries(body).filter(([field]) =>
+            [
+              "type",
+              "item_id",
+              "output_index",
+              "summary_index",
+              "content_index",
+              "delta",
+              "text",
+              "part",
+            ].includes(field),
+          ),
+        ),
+      );
+    }
+    const processDelta = nativeProcessEvent ? "" : extractStreamProcessDelta(body, messagePhases);
     if (processDelta !== "" && isRecord(body) && typeof body.item_id === "string")
       streamedProgressItems.add(body.item_id);
     if (processDelta !== "") onProcessDelta?.(processDelta);
@@ -442,7 +496,8 @@ const consumeProviderTextStream = async (
       body.type === "response.output_item.done" &&
       isRecord(body.item) &&
       typeof body.item.id === "string" &&
-      publicProcessItemIds.delete(body.item.id)
+      publicProcessItemIds.delete(body.item.id) &&
+      onProcessEvent === undefined
     ) {
       onProcessDelta?.("\n\n");
     }
@@ -610,6 +665,7 @@ export const createModelProviderAgentAdapters = (
   };
 
   const worker: AgentWorker = {
+    nativeProcessEvents: true,
     execute: async (input) => {
       if (input.modelRequest !== undefined) {
         const shouldStream = input.modelRequest.onOutputDelta !== undefined;
@@ -749,6 +805,7 @@ export const createModelProviderAgentAdapters = (
               }
             },
             input.modelRequest.onOutputItem,
+            input.modelRequest.onProcessEvent,
           ).catch(failModel);
           return { summary };
         }
