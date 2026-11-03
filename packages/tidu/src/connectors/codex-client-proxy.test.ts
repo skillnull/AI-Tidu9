@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -188,8 +188,7 @@ test("keeps native effort options and official account metadata available in man
   const fixture = join(directory, "official-fixture.cjs");
   await writeFile(
     fixture,
-    `#!/usr/bin/env node
-const official=process.argv.includes('model_provider="openai"');
+    `const official=process.argv.includes('model_provider="openai"');
 const send=message=>process.stdout.write(JSON.stringify(message)+'\\n');
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const message=JSON.parse(line);
 if(message.id===undefined)return;
@@ -201,7 +200,6 @@ else if(message.method==='fixture/limits'){send({method:'account/rateLimits/upda
 else send({id:message.id,error:{message:'Unexpected forwarded request'}});
 });`,
   );
-  await chmod(fixture, 0o700);
   await writeFile(
     join(directory, ".ai-tidu9-model-catalog.json"),
     JSON.stringify({
@@ -227,8 +225,8 @@ else send({id:message.id,error:{message:'Unexpected forwarded request'}});
   let selection: CodexActiveSelection = { modelProvider: "ai_tidu9", model: "managed-model" };
   const proxy = createCodexClientProxy({
     launch: {
-      command: fixture,
-      arguments: [],
+      command: process.execPath,
+      arguments: [fixture],
       environment: { PATH: process.env.PATH, CODEX_HOME: directory },
     },
     input,
@@ -241,6 +239,8 @@ else send({id:message.id,error:{message:'Unexpected forwarded request'}});
     return JSON.parse((await messages.next()).value);
   };
   try {
+    assert.deepEqual((await request(0, "initialize")).result, {});
+    input.write(`${JSON.stringify({ method: "initialized" })}\n`);
     const catalog = await request(1, "model/list");
     assert.deepEqual(catalog.result.data[0].supportedReasoningEfforts, [
       { reasoningEffort: "low", description: "Fast" },
@@ -668,11 +668,15 @@ test("bounds proxy-only metadata reads and preserves official request flow", {
     fixture,
     `const send=message=>process.stdout.write(JSON.stringify(message)+'\\n');
 let thread={id:'official-chat',modelProvider:'ai_tidu9',model:'managed-model'};
+setTimeout(()=>{
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const message=JSON.parse(line);
 if(message.method==='thread/read'){return;}
-if(message.method==='thread/resume'){thread={...thread,modelProvider:message.params.modelProvider,model:message.params.model};send({id:message.id,result:{thread}});}
+if(message.method==='initialize')send({id:message.id,result:{}});
+else if(message.method==='thread/resume'){thread={...thread,modelProvider:message.params.modelProvider,model:message.params.model};send({id:message.id,result:{thread}});}
+else if(message.method==='thread/turns/list')send({id:message.id,result:{data:[],nextCursor:null}});
 else if(message.method==='turn/start')send({id:message.id,result:{continued:true,effectiveProvider:thread.modelProvider,effectiveModel:thread.model,receivedParams:message.params}});
-});`,
+});
+},350);`,
   );
   const input = new PassThrough();
   const output = new PassThrough();
@@ -709,10 +713,21 @@ else if(message.method==='turn/start')send({id:message.id,result:{continued:true
     }
   };
   try {
+    // Initialize before starting bounded metadata calls, as the native client does.
+    const initialized = await request(0, "initialize", {
+      clientInfo: { name: "metadata_timeout_test", version: "1" },
+    });
+    assert.equal(initialized.error, undefined);
+    input.write(`${JSON.stringify({ method: "initialized" })}\n`);
+    // An unknown chat forces a thread/read that the fixture deliberately never answers.
+    const page = await request(3, "thread/turns/list", { threadId: "unseen-chat" });
+    assert.deepEqual(page.result, { data: [], nextCursor: null });
+    assert.match(errorText, /could not derive paginated display/u);
     const turn = await request(1, "turn/start", {
       threadId: "official-chat",
       input: [{ type: "text", text: "continue officially" }],
     });
+    assert.equal(turn.error, undefined);
     assert.equal(turn.result.continued, true);
     assert.equal(turn.result.effectiveProvider, "openai");
     assert.equal(turn.result.effectiveModel, "official-model");

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
 import {
   chmodSync,
   mkdirSync,
@@ -8,6 +9,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -41,7 +43,7 @@ const createFakeCodex = (directory: string): string => {
   return commandPath;
 };
 
-test("uses an installed CLI compatible with a newer host catalog without overriding explicit commands", () => {
+test("uses an installed CLI compatible with a newer host catalog without overriding explicit commands", (context) => {
   const directory = mkdtempSync(join(tmpdir(), "tidu-codex-versions-"));
   const legacyDirectory = join(directory, "legacy");
   const currentDirectory = join(directory, "current");
@@ -49,8 +51,29 @@ test("uses an installed CLI compatible with a newer host catalog without overrid
   for (const path of [legacyDirectory, currentDirectory, home]) mkdirSync(path);
   const legacy = join(legacyDirectory, "codex");
   const current = join(currentDirectory, "codex");
-  const writeVersion = (command: string, version: string): void =>
+  const versions = new Map<string, string>();
+  const writeVersion = (command: string, version: string): void => {
     writeFileSync(command, `#!/bin/sh\nprintf 'codex-cli ${version}\\n'\n`, { mode: 0o700 });
+    versions.set(command, version);
+  };
+  // Selection policy must not depend on process startup completing under parallel test load.
+  const versionProbe = context.mock.method(
+    childProcess,
+    "spawnSync",
+    (command: string, argumentsList: readonly string[]) => {
+      assert.deepEqual(argumentsList, ["--version"]);
+      const version = versions.get(command);
+      return version === undefined
+        ? {
+            stdout: "",
+            error: Object.assign(new Error("Fixture version probe timed out."), {
+              code: "ETIMEDOUT",
+            }),
+          }
+        : { stdout: `codex-cli ${version}\n` };
+    },
+  );
+  syncBuiltinESMExports();
   const options = {
     codexHomeDirectory: home,
     environment: { PATH: `${legacyDirectory}:${currentDirectory}`, NVM_DIR: directory },
@@ -64,12 +87,22 @@ test("uses an installed CLI compatible with a newer host catalog without overrid
       JSON.stringify({ client_version: "99.1.0", models: [] }),
     );
     assert.equal(resolveCodexCommand(options), current);
+    const probesBeforeExplicitCommand = versionProbe.mock.callCount();
     assert.equal(resolveCodexCommand({ ...options, command: legacy }), legacy);
+    assert.equal(versionProbe.mock.callCount(), probesBeforeExplicitCommand);
+    versions.delete(current);
+    assert.equal(resolveCodexCommand(options), legacy);
+    versions.set(current, "99.1.0-alpha.1");
+    assert.equal(resolveCodexCommand(options), current);
+    versions.delete(legacy);
+    assert.equal(resolveCodexCommand(options), legacy);
     writeVersion(legacy, "99.2.0");
     assert.equal(resolveCodexCommand(options), legacy);
     writeFileSync(join(home, "models_cache.json"), "invalid");
     assert.equal(resolveCodexCommand(options), legacy);
   } finally {
+    versionProbe.mock.restore();
+    syncBuiltinESMExports();
     rmSync(directory, { recursive: true, force: true });
   }
 });
