@@ -43,7 +43,7 @@ tidu <命令> --help             # 任意命令的专属帮助
 | `tidu account` | 查看Codex和Cursor的可复用登录状态 | 否 |
 | `tidu account relogin/switch` | 调用宿主官方登录或切换流程 | 是，需要主动执行 |
 | `tidu config` | 引导式配置，或查看、修改隔离草稿 | `set`会保存草稿，`--activate`才启用 |
-| `tidu uninstall` | 清理全部九门自有连接器、Profile、数据与安装内容 | 是，需要输入 `DELETE` |
+| `tidu uninstall` | 清理九门自有连接器、Profile、数据与安装内容 | 是，需要输入 `DELETE` |
 | `tidu restore` | 恢复最近一次个人数据快照 | 是，需要确认 |
 | `tidu enterprise recover-admin` | 在服务器生成新的管理员密钥 | 是，记录安全审计 |
 | `tidu version` | 显示版本 | 否 |
@@ -164,7 +164,7 @@ tidu uninstall [--confirm DELETE] [--endpoint <url>]
 tidu restore [--yes]
 ```
 
-`uninstall` 会清理 AI-Tidu9 连接器、专属Codex Profile及备份、默认数据、快照和检测到的全局npm安装。`restore` 仅用于恢复旧版本留下的可恢复快照。
+`uninstall` 会清理 AI-Tidu9 连接器、专属Codex Profile及备份、默认数据、快照和检测到的全局npm安装。进程互斥文件不含配置或会话，保留以避免并发进程持有不同锁。`restore` 仅用于恢复旧版本留下的可恢复快照。
 
 永久操作必须输入 `DELETE`，自动化环境可显式传入 `--confirm DELETE`。宿主账号、会话、无关插件、无关配置和自定义数据库路径不会被删除。
 

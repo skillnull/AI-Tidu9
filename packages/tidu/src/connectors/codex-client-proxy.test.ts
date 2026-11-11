@@ -938,85 +938,110 @@ else if(message.method==='thread/unsubscribe')send({id:message.id,result:{status
   }
 });
 
-test("routes concurrent native approvals and loaded threads to their owning processes", {
-  timeout: 10000,
-}, async () => {
-  const directory = await mkdtemp(join(tmpdir(), "tidu-native-owner-routing-"));
-  const fixture = join(directory, "official-fixture.cjs");
-  await writeFile(
-    fixture,
-    `const provider=process.argv.includes('model_provider="openai"')?'openai':'ai_tidu9',threadId=provider+'-chat';let loaded=false;
+for (const approvalOrder of [
+  ["openai", "ai_tidu9"],
+  ["ai_tidu9", "openai"],
+])
+  for (const replyOrder of ["forward", "reverse"])
+    test(`routes concurrent native approvals and loaded threads to their owning processes (${approvalOrder.join(" then ")}; ${replyOrder} replies)`, {
+      timeout: 10000,
+    }, async () => {
+      const directory = await mkdtemp(join(tmpdir(), "tidu-native-owner-routing-"));
+      const fixture = join(directory, "official-fixture.cjs");
+      await writeFile(
+        fixture,
+        `const provider=process.argv.includes('model_provider="openai"')?'openai':'ai_tidu9',threadId=provider+'-chat';let loaded=false;
 const send=message=>process.stdout.write(JSON.stringify(message)+'\\n');
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const message=JSON.parse(line);
 if(message.method==='initialize')send({id:message.id,result:{}});
 else if(message.method==='initialized'&&provider==='ai_tidu9')send({method:'account/updated',params:{account:null}});
 else if(message.method==='thread/start'){loaded=true;send({id:message.id,result:{thread:{id:threadId,modelProvider:provider},modelProvider:provider}});}
 else if(message.method==='thread/loaded/list')send({id:message.id,result:{data:loaded?[threadId]:[]}});
-else if(message.method==='fixture/approval')send({id:99,method:'item/commandExecution/requestApproval',params:{threadId,provider}});
+else if(message.method==='fixture/approval')send({method:'fixture/approvalReady',params:{threadId,provider}});
+else if(message.method==='fixture/releaseApproval')send({id:99,method:'item/commandExecution/requestApproval',params:{threadId,provider}});
 else if(message.method===undefined&&message.id===99)send({method:'fixture/decision',params:{provider,decision:message.result}});
 else if(message.method==='turn/interrupt')send({id:message.id,result:{provider}});
 });`,
-  );
-  const input = new PassThrough();
-  const output = new PassThrough();
-  const errors = new PassThrough();
-  const messages = createInterface({ input: output })[Symbol.asyncIterator]();
-  let selection: CodexActiveSelection = { modelProvider: "openai" };
-  const proxy = createCodexClientProxy({
-    launch: await createFixtureLaunch(fixture, directory),
-    input,
-    output,
-    errorOutput: errors,
-    resolveActiveSelection: () => selection,
-  });
-  const send = (message: unknown) => input.write(`${JSON.stringify(message)}\n`);
-  const receive = async () => JSON.parse((await messages.next()).value);
-  try {
-    send({ id: 1, method: "initialize", params: {} });
-    assert.equal((await receive()).id, 1);
-    send({ id: 2, method: "thread/start", params: {} });
-    assert.equal((await receive()).result.thread.id, "openai-chat");
-    selection = { modelProvider: "ai_tidu9" };
-    send({ id: 3, method: "thread/start", params: {} });
-    assert.equal((await receive()).result.thread.id, "ai_tidu9-chat");
-    send({ id: 4, method: "thread/loaded/list", params: {} });
-    assert.deepEqual(
-      new Set((await receive()).result.data),
-      new Set(["openai-chat", "ai_tidu9-chat"]),
-    );
-    for (const threadId of ["openai-chat", "ai_tidu9-chat"])
-      send({ method: "fixture/approval", params: { threadId } });
-    const approvals = [await receive(), await receive()];
-    assert.notEqual(approvals[0].id, approvals[1].id);
-    for (const approval of approvals.reverse())
-      send({
-        id: approval.id,
-        result: {
-          decision: approval.params.provider === "openai" ? "decline" : "acceptForSession",
-        },
+      );
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const errors = new PassThrough();
+      const messages = createInterface({ input: output })[Symbol.asyncIterator]();
+      let selection: CodexActiveSelection = { modelProvider: "openai" };
+      const proxy = createCodexClientProxy({
+        launch: await createFixtureLaunch(fixture, directory),
+        input,
+        output,
+        errorOutput: errors,
+        resolveActiveSelection: () => selection,
       });
-    const decisions = [await receive(), await receive()].map((message) => message.params);
-    assert.deepEqual(decisions.find((entry) => entry.provider === "openai")?.decision, {
-      decision: "decline",
+      const send = (message: unknown) => input.write(`${JSON.stringify(message)}\n`);
+      const receive = async () => JSON.parse((await messages.next()).value);
+      try {
+        send({ id: 1, method: "initialize", params: {} });
+        assert.equal((await receive()).id, 1);
+        send({ id: 2, method: "thread/start", params: {} });
+        assert.equal((await receive()).result.thread.id, "openai-chat");
+        selection = { modelProvider: "ai_tidu9" };
+        send({ id: 3, method: "thread/start", params: {} });
+        assert.equal((await receive()).result.thread.id, "ai_tidu9-chat");
+        send({ id: 4, method: "thread/loaded/list", params: {} });
+        assert.deepEqual(
+          new Set((await receive()).result.data),
+          new Set(["openai-chat", "ai_tidu9-chat"]),
+        );
+        for (const threadId of ["openai-chat", "ai_tidu9-chat"])
+          send({ method: "fixture/approval", params: { threadId } });
+        const ready = [await receive(), await receive()];
+        assert.ok(ready.every((message) => message.method === "fixture/approvalReady"));
+        assert.deepEqual(
+          new Set(ready.map((message) => message.params.provider)),
+          new Set(["openai", "ai_tidu9"]),
+        );
+        const approvals = [];
+        for (const provider of approvalOrder) {
+          send({ method: "fixture/releaseApproval", params: { threadId: `${provider}-chat` } });
+          const approval = await receive();
+          assert.equal(approval.method, "item/commandExecution/requestApproval");
+          assert.equal(approval.params.provider, provider);
+          approvals.push(approval);
+        }
+        assert.notEqual(approvals[0].id, approvals[1].id);
+        for (const approval of replyOrder === "reverse" ? approvals.reverse() : approvals)
+          send({
+            id: approval.id,
+            result: {
+              decision: approval.params.provider === "openai" ? "decline" : "acceptForSession",
+            },
+          });
+        const receivedDecisions = [await receive(), await receive()];
+        assert.ok(receivedDecisions.every((message) => message.method === "fixture/decision"));
+        const decisions = receivedDecisions.map((message) => message.params);
+        assert.deepEqual(
+          new Set(decisions.map((entry) => entry.provider)),
+          new Set(["openai", "ai_tidu9"]),
+        );
+        assert.deepEqual(decisions.find((entry) => entry.provider === "openai")?.decision, {
+          decision: "decline",
+        });
+        assert.deepEqual(decisions.find((entry) => entry.provider === "ai_tidu9")?.decision, {
+          decision: "acceptForSession",
+        });
+        selection = { modelProvider: "openai" };
+        send({
+          id: 5,
+          method: "turn/interrupt",
+          params: { threadId: "ai_tidu9-chat", turnId: "running-turn" },
+        });
+        assert.equal((await receive()).result.provider, "ai_tidu9");
+      } finally {
+        await proxy.close();
+        input.destroy();
+        output.destroy();
+        errors.destroy();
+        await rm(directory, { recursive: true, force: true });
+      }
     });
-    assert.deepEqual(decisions.find((entry) => entry.provider === "ai_tidu9")?.decision, {
-      decision: "acceptForSession",
-    });
-    selection = { modelProvider: "openai" };
-    send({
-      id: 5,
-      method: "turn/interrupt",
-      params: { threadId: "ai_tidu9-chat", turnId: "running-turn" },
-    });
-    assert.equal((await receive()).result.provider, "ai_tidu9");
-  } finally {
-    await proxy.close();
-    input.destroy();
-    output.destroy();
-    errors.destroy();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
 
 test("preserves exact approval decisions and leaves official direct-mode history unchanged", {
   timeout: 10000,

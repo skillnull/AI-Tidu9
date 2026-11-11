@@ -43,7 +43,7 @@ tidu <command> --help         # Command-specific help
 | `tidu account` | Inspect reusable Codex and Cursor login state | No |
 | `tidu account relogin/switch` | Invoke the host's official login or switch flow | Yes, only when explicitly run |
 | `tidu config` | Guided configuration or isolated-draft management | `set` saves; only `--activate` changes runtime behavior |
-| `tidu uninstall` | Remove all AI-Tidu9-owned connectors, profiles, data, and installed content | Yes, requires `DELETE` |
+| `tidu uninstall` | Remove AI-Tidu9-owned connectors, profiles, data, and installed content | Yes, requires `DELETE` |
 | `tidu restore` | Restore the newest personal-data snapshot | Yes, with confirmation |
 | `tidu enterprise recover-admin` | Generate a new administrator key on the server | Yes, with a security audit event |
 | `tidu version` | Print the version | No |
@@ -164,7 +164,7 @@ tidu uninstall [--confirm DELETE] [--endpoint <url>]
 tidu restore [--yes]
 ```
 
-`uninstall` removes AI-Tidu9 connectors, the dedicated Codex profile and backups, default data, snapshots, and a detected global npm installation. `restore` remains available only for recoverable snapshots created by older versions.
+`uninstall` removes AI-Tidu9 connectors, the dedicated Codex profile and backups, default data, snapshots, and a detected global npm installation. The process mutex file contains no configuration or conversation data and remains in place to prevent concurrent processes from holding different locks. `restore` remains available only for recoverable snapshots created by older versions.
 
 Permanent operations require the full word `DELETE`; automation may pass `--confirm DELETE`. Host accounts, conversations, unrelated plugins or configuration, and custom database paths are preserved.
 

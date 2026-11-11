@@ -653,6 +653,73 @@ test("keeps official mode during stalled validation and drains cancelled or supe
   }
 });
 
+test("serializes legacy retry cleanup with a competing process after the inference probe", {
+  timeout: 10000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "client-retry-cleanup-ownership-"));
+  const profilePath = join(directory, "ai-tidu9.config.toml");
+  const configurationModule = new URL(
+    `./configuration.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`,
+    import.meta.url,
+  ).href;
+  try {
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory: directory,
+      verifyRuntime: false,
+    });
+    writeFileSync(
+      profilePath,
+      readFileSync(profilePath, "utf8").replace(
+        "[model_providers.ai_tidu9]",
+        "[model_providers.ai_tidu9]\nrequest_max_retries = 0\nstream_max_retries = 0",
+      ),
+    );
+    const contender = `import {configureCodexClient} from ${JSON.stringify(configurationModule)};
+try {await configureCodexClient({endpoint:'http://127.0.0.1:9640',codexHomeDirectory:process.argv[1],verifyRuntime:false});console.log(JSON.stringify({status:'completed'}));}
+catch(error){console.log(JSON.stringify({status:'failed',code:error.code}));}`;
+    const script = `import fs from 'node:fs';
+import {execFileSync} from 'node:child_process';
+import {syncBuiltinESMExports} from 'node:module';
+import {switchCodexClientConfiguration} from ${JSON.stringify(configurationModule)};
+const home=process.argv[1],profile=process.argv[2],write=fs.writeFileSync;
+let contenderResult,probeRetainedLegacy=false;
+fs.writeFileSync=(path,...args)=>{if(contenderResult===undefined&&String(path).startsWith(profile+'.')){contenderResult=JSON.parse(execFileSync(process.execPath,['--import',${JSON.stringify(import.meta.resolve("tsx"))},'--input-type=module','-e',${JSON.stringify(contender)},home],{encoding:'utf8',stdio:['ignore','pipe','pipe'],timeout:5000}));}return write(path,...args);};
+syncBuiltinESMExports();
+try {const status=await switchCodexClientConfiguration({mode:'ai-tidu9',codexHomeDirectory:home,request:async input=>{if(String(input).endsWith('/responses'))probeRetainedLegacy=/request_max_retries\\s*=\\s*0/u.test(fs.readFileSync(profile,'utf8'));return Response.json(String(input).endsWith('/health')?{product:${JSON.stringify(PRODUCT.name)},status:'ok'}:String(input).endsWith('/v1/models')?{data:[{id:'ai-tidu9-config',owned_by:'AI-Tidu9'}]}:{});}});console.log(JSON.stringify({mode:status.activeMode,contender:contenderResult,probeRetainedLegacy}));}
+catch(error){console.log(JSON.stringify({error:error.code,contender:contenderResult,probeRetainedLegacy}));}
+finally {fs.writeFileSync=write;syncBuiltinESMExports();}`;
+    const result = JSON.parse(
+      execFileSync(
+        process.execPath,
+        [
+          "--import",
+          import.meta.resolve("tsx"),
+          "--input-type=module",
+          "-e",
+          script,
+          directory,
+          profilePath,
+        ],
+        { encoding: "utf8", stdio: "pipe", timeout: 8000 },
+      ),
+    );
+    assert.deepEqual(result, {
+      mode: "ai-tidu9",
+      contender: { status: "failed", code: "CONFIGURATION_CONFLICT" },
+      probeRetainedLegacy: true,
+    });
+    assert.equal(
+      inspectCodexClientConfiguration({ codexHomeDirectory: directory }).endpoint,
+      "http://127.0.0.1:9639",
+    );
+    assert.match(readFileSync(profilePath, "utf8"), /127\.0\.0\.1:9639/u);
+    assert.doesNotMatch(readFileSync(profilePath, "utf8"), /(?:request|stream)_max_retries/u);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("lists current and retained official Codex models without managed entries", () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-model-list-"));
   const codexHomeDirectory = join(temporaryDirectory, ".codex");

@@ -145,10 +145,10 @@ tidu clients               # Inspect local client compatibility
 tidu account               # Inspect reusable host login state
 tidu channel list          # Inspect AI-Tidu9, official host, and provider channels
 tidu doctor --json         # Generate a privacy-safe diagnostic summary
-tidu uninstall             # Remove every AI-Tidu9-owned artifact
+tidu uninstall             # Remove connectors, profiles, data, and installed content
 ```
 
-Complete removal preserves host accounts, conversations, unrelated plugins and configuration, and custom database paths.
+Complete removal preserves host accounts, conversations, unrelated plugins and configuration, and custom database paths. The process mutex file contains no configuration or conversation data and remains in place to prevent concurrent processes from holding different locks.
 
 Generic clients use `/v1/models`, `/v1/chat/completions`, and `/v1/responses` on the same base URL. Ordinary inference uses a single-model fast path: policy and capability checks, dynamic routing, one model execution, and a response-completeness check. It does not add serial model calls merely to simulate collaboration. Use the full task flow or explicitly configured capability completion when goal decomposition, checkpoints, or independent business acceptance is required.
 

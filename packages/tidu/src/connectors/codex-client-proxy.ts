@@ -607,7 +607,7 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
       typeof originalParams.threadId === "string" && typeof turnId === "string"
         ? turnOwners.get(`${threadLinks.logical(originalParams.threadId)}:${turnId}`)
         : undefined;
-    const forwarded =
+    let forwarded =
       turnOwner === undefined
         ? threadLinks.toServer(message)
         : { ...message, params: { ...originalParams, threadId: turnOwner.threadId } };
@@ -615,11 +615,12 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
     const method = typeof forwarded.method === "string" ? forwarded.method : "";
     let channel = target ?? turnOwner?.channel;
     if (channel === undefined && method === "" && "id" in forwarded) {
-      const pending = serverRequests.get(idKey(forwarded.id));
+      const responseKey = idKey(forwarded.id);
+      const pending = serverRequests.get(responseKey);
       if (pending !== undefined) {
         channel = pending.channel;
-        forwarded.id = pending.id;
-        serverRequests.delete(idKey(message.id));
+        forwarded = { ...forwarded, id: pending.id };
+        serverRequests.delete(responseKey);
       }
     }
     channel ??=

@@ -1728,7 +1728,6 @@ const applyCodexClientMode = async (
         await verifyEndpoint(state.endpoint, request, options.signal);
         options.signal?.throwIfAborted();
         assertManagedStateUnchanged(paths.state, state);
-        restoreCodexNativeRetries(paths.profile);
         await verifyInference(
           state.endpoint,
           state.model,
@@ -1744,6 +1743,7 @@ const applyCodexClientMode = async (
         options.signal?.throwIfAborted();
         catalogLock = acquireManagedCodexCatalogLock(paths.home);
         assertManagedStateUnchanged(paths.state, state);
+        restoreCodexNativeRetries(paths.profile);
         if (activeMode === "official") {
           nextState = {
             ...nextState,

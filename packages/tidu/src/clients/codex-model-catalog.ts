@@ -1,17 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
-  rmdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import { TiduError } from "../core/index.js";
-import { acquireRuntimeDataLock } from "../lifecycle/index.js";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -51,6 +53,24 @@ const baseVersion = (version: unknown): string | undefined =>
 const fingerprint = (content: string): string => createHash("sha256").update(content).digest("hex");
 
 const catalogLocks = new Map<string, { references: number; release: () => void }>();
+const requireBuiltin = createRequire(import.meta.url);
+const loadCatalogSqlite = () => {
+  const emitWarning = process.emitWarning;
+  try {
+    process.emitWarning = (...parameters: unknown[]) => {
+      const [warning, type] = parameters;
+      if (
+        warning === "SQLite is an experimental feature and might change at any time" &&
+        (type === "ExperimentalWarning" || (isRecord(type) && type.type === "ExperimentalWarning"))
+      )
+        return;
+      Reflect.apply(emitWarning, process, parameters);
+    };
+    return requireBuiltin("node:sqlite") as typeof import("node:sqlite");
+  } finally {
+    process.emitWarning = emitWarning;
+  }
+};
 
 /** Owns only a synchronous catalog/state commit; network validation must release it first. */
 export const acquireManagedCodexCatalogLock = (codexHomeDirectory: string) => {
@@ -69,29 +89,47 @@ export const acquireManagedCodexCatalogLock = (codexHomeDirectory: string) => {
     const status = lstatSync(directory);
     if (!status.isDirectory() || status.isSymbolicLink())
       throw new TiduError("CONFIGURATION_CONFLICT", "Unsafe Codex catalog configuration lock.");
-    const cleanup = () => {
-      try {
-        rmdirSync(directory);
-      } catch {
-        /* Another process may already own the lock. */
-      }
-    };
-    let lock: ReturnType<typeof acquireRuntimeDataLock>;
+    const databasePath = join(directory, "lease.sqlite");
+    let database: DatabaseSync | undefined;
     try {
-      lock = acquireRuntimeDataLock(join(directory, "catalog"));
+      try {
+        closeSync(openSync(databasePath, "wx", 0o600));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      const databaseStatus = lstatSync(databasePath);
+      if (
+        !databaseStatus.isFile() ||
+        databaseStatus.isSymbolicLink() ||
+        databaseStatus.size > 1024 * 1024
+      )
+        throw new TiduError("CONFIGURATION_CONFLICT", "Unsafe Codex catalog configuration lock.");
+      chmodSync(databasePath, 0o600);
+      const { DatabaseSync } = loadCatalogSqlite();
+      database = new DatabaseSync(databasePath, { allowExtension: false });
+      database.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE;");
     } catch (error) {
-      cleanup();
+      database?.close();
+      if (error instanceof TiduError) throw error;
+      const nativeCode = (error as { errcode?: unknown }).errcode;
       throw new TiduError(
         "CONFIGURATION_CONFLICT",
-        "Codex model catalog configuration is being updated by another process.",
+        nativeCode === 5 || nativeCode === 6
+          ? "Codex model catalog configuration is being updated by another process."
+          : "Codex model catalog configuration lock is unavailable.",
         { cause: error },
       );
     }
+    const ownedDatabase = database;
     held = {
       references: 0,
       release: () => {
-        lock?.release();
-        cleanup();
+        try {
+          ownedDatabase.exec("ROLLBACK;");
+        } finally {
+          ownedDatabase.close();
+        }
+        // The shared inode must remain stable while other processes may open it.
       },
     };
     catalogLocks.set(home, held);
