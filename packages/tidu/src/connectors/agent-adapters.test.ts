@@ -21,6 +21,7 @@ if (args[0] === "status") { console.log("Authenticated"); process.exit(0); }
 if (args[0] === "acp" && args[1] === "--help") { console.log("Agent Client Protocol ACP"); process.exit(0); }
 const mode = args[0] === "app-server" ? "codex" : "cursor";
 let selectedModel = "auto-smart";
+let turnCount = 0;
 const readline = require("node:readline").createInterface({ input: process.stdin });
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 readline.on("line", (line) => {
@@ -36,26 +37,30 @@ readline.on("line", (line) => {
   }
   else if (request.method === "thread/start") send({ jsonrpc: "2.0", id: request.id, result: { thread: { id: "thread-1" }, model: "gpt-test" } });
   else if (request.method === "turn/start") {
-    send({ jsonrpc: "2.0", id: request.id, result: { turn: { id: "turn-1" } } });
+    process.stdout.cork();
+    const turnId = "turn-" + (++turnCount);
+    send({ jsonrpc: "2.0", id: request.id, result: { turn: { id: turnId } } });
+    send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: "thread-1", turn: { id: turnId, status: "inProgress" } } });
     if (request.params.input.some((item) => item.type === "localImage")) {
       const userMessage = { type: "userMessage", id: "user-1", clientId: null, content: [{ type: "text", text: "test", text_elements: [] }, { type: "localImage", path: "/tmp/input.png" }] };
-      send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", startedAtMs: Date.now(), item: userMessage } });
-      send({ jsonrpc: "2.0", method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", completedAtMs: Date.now(), item: userMessage } });
+      send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, startedAtMs: Date.now(), item: userMessage } });
+      send({ jsonrpc: "2.0", method: "item/completed", params: { threadId: "thread-1", turnId, completedAtMs: Date.now(), item: userMessage } });
     }
-    if (request.params.summary === "auto") send({ jsonrpc: "2.0", method: "item/reasoning/summaryTextDelta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "reasoning:1", summaryIndex: 0, delta: "reasoning-" } });
-    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", startedAtMs: Date.now(), item: { type: "agentMessage", id: "commentary-1", text: "", phase: "commentary", memoryCitation: null, delivery: null, questions: null } } });
-    send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "commentary-1", delta: "working-" } });
-    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", startedAtMs: Date.now(), item: { type: "commandExecution", id: "command-1", command: "rg process src", cwd: ".", processId: null, source: "agent", status: "inProgress", commandActions: [{ type: "search", command: "rg process src", query: "process", path: "src" }], aggregatedOutput: null, exitCode: null, durationMs: null } } });
-    send({ jsonrpc: "2.0", method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "fileChange", id: "file-1", changes: [{ path: "src/index.ts", kind: "update", diff: "" }], status: "completed" } } });
-    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", startedAtMs: Date.now(), item: { type: "webSearch", id: "web-1", query: "Responses API events", action: { type: "search", query: "Responses API events", queries: null }, results: null } } });
-    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", startedAtMs: Date.now(), item: { type: "contextCompaction", id: "compact-1" } } });
-    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", startedAtMs: Date.now(), item: { type: "agentMessage", id: "future-1", text: "", phase: "future_answer", memoryCitation: null, delivery: null, questions: null } } });
-    send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "future-1", delta: "future-" } });
-    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", startedAtMs: Date.now(), item: { type: "agentMessage", id: "final-1", text: "", phase: "final_answer", memoryCitation: null, delivery: null, questions: null } } });
-    send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "final-1", delta: request.params.effort + "-codex-result" } });
-    send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
-    setTimeout(() => send({ jsonrpc: "2.0", method: "rawResponse/completed", params: { threadId: "thread-1", turnId: "turn-1", responseId: "response-1", usage: { inputTokens: 7, cachedInputTokens: 2, cacheWriteInputTokens: 1, outputTokens: 2, reasoningOutputTokens: 1, totalTokens: 9 }, usageMetadata: null } }), 5);
-    setTimeout(() => send({ jsonrpc: "2.0", method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: "turn-1", tokenUsage: { last: { inputTokens: 11, cachedInputTokens: 3, cacheWriteInputTokens: 2, outputTokens: 4, reasoningOutputTokens: 1, totalTokens: 15 } } } }), 10);
+    if (request.params.summary === "auto") send({ jsonrpc: "2.0", method: "item/reasoning/summaryTextDelta", params: { threadId: "thread-1", turnId, itemId: "reasoning:1", summaryIndex: 0, delta: "reasoning-" } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, startedAtMs: Date.now(), item: { type: "agentMessage", id: "commentary-1", text: "", phase: "commentary", memoryCitation: null, delivery: null, questions: null } } });
+    send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId, itemId: "commentary-1", delta: "working-" } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, startedAtMs: Date.now(), item: { type: "commandExecution", id: "command-1", command: "rg process src", cwd: ".", processId: null, source: "agent", status: "inProgress", commandActions: [{ type: "search", command: "rg process src", query: "process", path: "src" }], aggregatedOutput: null, exitCode: null, durationMs: null } } });
+    send({ jsonrpc: "2.0", method: "item/completed", params: { threadId: "thread-1", turnId, item: { type: "fileChange", id: "file-1", changes: [{ path: "src/index.ts", kind: "update", diff: "" }], status: "completed" } } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, startedAtMs: Date.now(), item: { type: "webSearch", id: "web-1", query: "Responses API events", action: { type: "search", query: "Responses API events", queries: null }, results: null } } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, startedAtMs: Date.now(), item: { type: "contextCompaction", id: "compact-1" } } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, startedAtMs: Date.now(), item: { type: "agentMessage", id: "future-1", text: "", phase: "future_answer", memoryCitation: null, delivery: null, questions: null } } });
+    send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId, itemId: "future-1", delta: "future-" } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, startedAtMs: Date.now(), item: { type: "agentMessage", id: "final-1", text: "", phase: "final_answer", memoryCitation: null, delivery: null, questions: null } } });
+    send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId, itemId: "final-1", delta: request.params.effort + "-codex-result" } });
+    send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: "thread-1", turn: { id: turnId, status: "completed" } } });
+    process.stdout.uncork();
+    setTimeout(() => send({ jsonrpc: "2.0", method: "rawResponse/completed", params: { threadId: "thread-1", turnId, responseId: "response-1", usage: { inputTokens: 7, cachedInputTokens: 2, cacheWriteInputTokens: 1, outputTokens: 2, reasoningOutputTokens: 1, totalTokens: 9 }, usageMetadata: null } }), 5);
+    setTimeout(() => send({ jsonrpc: "2.0", method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId, tokenUsage: { last: { inputTokens: 11, cachedInputTokens: 3, cacheWriteInputTokens: 2, outputTokens: 4, reasoningOutputTokens: 1, totalTokens: 15 } } } }), 10);
   }
   else if (request.method === "session/new") send({ jsonrpc: "2.0", id: request.id, result: { sessionId: "session-1", configOptions: [{ configId: "model", category: "model", type: "select", currentValue: selectedModel, options: [{ value: "auto-smart", name: "Auto Balance" }, { value: "cursor-fast", name: "Cursor Fast" }, { value: "claude-opus-5[thinking=true,context=300k,effort=high,fast=false]", name: "claude-opus-5" }] }] } });
   else if (request.method === "session/set_config_option") {
@@ -266,22 +271,23 @@ const args=process.argv.slice(2);
 if(args[0]==='login'&&args[1]==='status'){console.log('Logged in');process.exit(0);}
 const readline=require('node:readline').createInterface({input:process.stdin});
 const send=value=>process.stdout.write(JSON.stringify(value)+'\\n');
-let turnCount=0;
+let turnCount=0;let threadCount=0;
 readline.on('line',line=>{const request=JSON.parse(line);
 if(request.method==='initialize')send({id:request.id,result:{}});
-else if(request.method==='thread/start')send({id:request.id,result:{thread:{id:'thread-1'},model:'gpt-test'}});
+else if(request.method==='thread/start')send({id:request.id,result:{thread:{id:'thread-'+(++threadCount)},model:'gpt-test'}});
 else if(request.method==='turn/start'){
  turnCount+=1;const turnId='turn-'+turnCount;send({id:request.id,result:{turn:{id:turnId}}});
- send({method:'item/started',params:{threadId:'thread-1',turnId,item:{type:'agentMessage',id:'shared-message',text:'',phase:turnCount===1?'commentary':'final_answer'}}});
+ send({method:'turn/started',params:{threadId:request.params.threadId,turn:{id:turnId,status:'inProgress'}}});
+ send({method:'item/started',params:{threadId:request.params.threadId,turnId,item:{type:'agentMessage',id:'shared-message',text:'',phase:turnCount===1?'commentary':'final_answer'}}});
  if(turnCount===2){
   send({method:'item/agentMessage/delta',params:{threadId:'thread-1',turnId:'turn-1',itemId:'shared-message',delta:'first-commentary'}});
   send({method:'item/completed',params:{threadId:'thread-1',turnId:'turn-1',item:{type:'agentMessage',id:'shared-message',text:'first-commentary',phase:'commentary'}}});
   send({method:'turn/completed',params:{threadId:'thread-1',turn:{id:'turn-1',status:'completed'}}});
   send({method:'rawResponse/completed',params:{threadId:'thread-1',turnId:'turn-1',usage:{inputTokens:1,outputTokens:1,totalTokens:2}}});
-  send({method:'item/agentMessage/delta',params:{threadId:'thread-1',turnId:'turn-2',itemId:'shared-message',delta:'second-final'}});
-  send({method:'item/completed',params:{threadId:'thread-1',turnId:'turn-2',item:{type:'agentMessage',id:'shared-message',text:'second-final',phase:'final_answer'}}});
-  send({method:'turn/completed',params:{threadId:'thread-1',turn:{id:'turn-2',status:'completed'}}});
-  send({method:'rawResponse/completed',params:{threadId:'thread-1',turnId:'turn-2',usage:{inputTokens:1,outputTokens:1,totalTokens:2}}});
+  send({method:'item/agentMessage/delta',params:{threadId:'thread-2',turnId:'turn-2',itemId:'shared-message',delta:'second-final'}});
+  send({method:'item/completed',params:{threadId:'thread-2',turnId:'turn-2',item:{type:'agentMessage',id:'shared-message',text:'second-final',phase:'final_answer'}}});
+  send({method:'turn/completed',params:{threadId:'thread-2',turn:{id:'turn-2',status:'completed'}}});
+  send({method:'rawResponse/completed',params:{threadId:'thread-2',turnId:'turn-2',usage:{inputTokens:1,outputTokens:1,totalTokens:2}}});
  }
 }});`,
   );
@@ -300,12 +306,185 @@ else if(request.method==='turn/start'){
       (delta) => firstProcess.push(delta),
     );
     await new Promise<void>((resolve) => setTimeout(resolve, 20));
-    const secondTurn = client.prompt(thread.id, [{ type: "text", text: "second" }]);
+    const secondThread = await client.startThread();
+    const secondTurn = client.prompt(secondThread.id, [{ type: "text", text: "second" }]);
     const [firstResult, secondResult] = await Promise.all([firstTurn, secondTurn]);
 
     assert.equal(firstResult.text, "");
     assert.deepEqual(firstProcess, ["first-commentary", "\n\n"]);
     assert.equal(secondResult.text, "second-final");
+  } finally {
+    await client.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("returns parallel caller results to sequential native RPCs without restarting the turn", {
+  timeout: 5000,
+}, async () => {
+  const root = mkdtempSync(join(tmpdir(), "tidu-codex-tool-continuation-"));
+  const command = join(root, "tool-agent");
+  writeFileSync(
+    command,
+    `#!/usr/bin/env node
+if (process.argv[2] === "login" && process.argv[3] === "status") { console.log("Logged in to fixture"); process.exit(0); }
+const readline = require("node:readline").createInterface({ input: process.stdin });
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+const params = { threadId: "tool-thread", turnId: "tool-turn" };
+const requests = [];
+const outputs = [];
+const tool = (callId) => ({ type: "function_call", call_id: callId, name: "inspect", arguments: "{}" });
+const requestTool = (callId) => send({ id: callId, method: "item/tool/call", params: { ...params, callId, tool: "inspect", arguments: {} } });
+const response = (callIds) => {
+  for (const callId of callIds) send({ method: "rawResponseItem/completed", params: { ...params, item: tool(callId) } });
+  send({ method: "rawResponse/completed", params: { ...params, usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 } } });
+  requestTool(callIds[0]);
+};
+readline.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method) requests.push({ method: request.method, params: request.params });
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  else if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "tool-thread" }, model: "gpt-test" } });
+  else if (request.method === "turn/start") {
+    send({ id: request.id, result: { turn: { id: "tool-turn" } } });
+    send({ method: "turn/started", params: { threadId: params.threadId, turn: { id: params.turnId, status: "inProgress" } } });
+    response(["call-first", "call-second"]);
+  } else if (request.method === "turn/steer") send({ id: request.id, result: { turnId: "tool-turn" } });
+  else if (request.id && request.result) {
+    outputs.push({ callId: request.id, ...request.result });
+    if (request.id === "call-first") requestTool("call-second");
+    else if (request.id === "call-second") {
+      send({ method: "thread/tokenUsage/updated", params: { ...params, tokenUsage: { last: { inputTokens: 5, outputTokens: 3, totalTokens: 8 } } } });
+      send({ method: "rawResponseItem/completed", params: { ...params, item: tool("call-third") } });
+      requestTool("call-third");
+      setTimeout(() => {
+        send({ method: "rawResponseItem/completed", params: { ...params, item: tool("call-fourth") } });
+        send({ method: "rawResponse/completed", params: { ...params, usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 } } });
+      }, 20);
+    } else if (request.id === "call-third") requestTool("call-fourth");
+    else if (request.id === "call-fourth") {
+      send({ method: "item/agentMessage/delta", params: { ...params, itemId: "final", delta: JSON.stringify({ requests, outputs }) } });
+      send({ method: "thread/tokenUsage/updated", params: { ...params, tokenUsage: { last: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } } } });
+      send({ method: "turn/completed", params: { threadId: params.threadId, turn: { id: params.turnId, status: "completed" } } });
+    }
+  } else if (request.id) send({ id: request.id, error: { message: "Unexpected native request: " + request.method } });
+});`,
+  );
+  chmodSync(command, 0o700);
+  const client = createCodexAgentClient({ command, workingDirectory: root });
+  try {
+    await client.initialize();
+    const thread = await client.startThread("gpt-test", []);
+    const first = await client.prompt(thread.id, [{ type: "text", text: "Inspect and verify." }]);
+    assert.deepEqual(
+      first.toolCalls?.map((call) => call.callId),
+      ["call-first", "call-second"],
+    );
+    assert.equal(first.usage?.totalTokens, 8);
+    await assert.rejects(
+      client.prompt(thread.id, [], undefined, undefined, undefined, undefined, [
+        {
+          type: "function_call_output",
+          call_id: "call-first",
+          output: "incomplete",
+        },
+      ]),
+      /All pending caller tool results/u,
+    );
+    const second = await client.prompt(
+      thread.id,
+      [{ type: "text", text: "Keep the same scope." }],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      [
+        {
+          type: "function_call_output",
+          call_id: "call-first",
+          output: "first result",
+        },
+        {
+          type: "custom_tool_call_output",
+          call_id: "call-second",
+          output: "second result",
+          is_error: true,
+        },
+      ],
+    );
+    assert.equal(second.turnId, first.turnId);
+    assert.deepEqual(
+      second.toolCalls?.map((call) => call.callId),
+      ["call-third", "call-fourth"],
+    );
+    assert.equal(second.usage?.totalTokens, 10);
+    const completed = await client.prompt(
+      thread.id,
+      [],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      [
+        {
+          type: "function_call_output",
+          call_id: "call-third",
+          output: "verified",
+        },
+        {
+          type: "function_call_output",
+          call_id: "call-fourth",
+          output: "final verification",
+        },
+      ],
+    );
+    const observed = JSON.parse(completed.text) as {
+      requests: { method: string; params: Record<string, unknown> }[];
+      outputs: {
+        callId: string;
+        contentItems: { type: string; text: string }[];
+        success: boolean;
+      }[];
+    };
+    assert.equal(completed.turnId, first.turnId);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.usage?.totalTokens, 3);
+    assert.equal(observed.requests.filter((request) => request.method === "turn/start").length, 1);
+    assert.equal(
+      observed.requests.filter((request) => request.method === "turn/interrupt").length,
+      0,
+    );
+    assert.equal(
+      observed.requests.filter((request) => request.method === "thread/inject_items").length,
+      0,
+    );
+    assert.deepEqual(observed.requests.find((request) => request.method === "turn/steer")?.params, {
+      threadId: thread.id,
+      expectedTurnId: first.turnId,
+      input: [{ type: "text", text: "Keep the same scope." }],
+    });
+    assert.deepEqual(observed.outputs, [
+      {
+        callId: "call-first",
+        contentItems: [{ type: "inputText", text: "first result" }],
+        success: true,
+      },
+      {
+        callId: "call-second",
+        contentItems: [{ type: "inputText", text: "second result" }],
+        success: false,
+      },
+      {
+        callId: "call-third",
+        contentItems: [{ type: "inputText", text: "verified" }],
+        success: true,
+      },
+      {
+        callId: "call-fourth",
+        contentItems: [{ type: "inputText", text: "final verification" }],
+        success: true,
+      },
+    ]);
   } finally {
     await client.close();
     rmSync(root, { recursive: true, force: true });
@@ -328,6 +507,7 @@ readline.on("line", (line) => {
   else if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "thread-early" }, model: "gpt-test" } });
   else if (request.method === "turn/start") {
     const params = { threadId: "thread-early", turnId: "turn-early" };
+    send({ method: "turn/started", params: { threadId: params.threadId, turn: { id: params.turnId, status: "inProgress" } } });
     send({ method: "item/reasoning/summaryTextDelta", params: { ...params, itemId: "rs-early", summaryIndex: 0, delta: "Inspect the fixture." } });
     send({ method: "rawResponseItem/completed", params: { ...params, item: { id: "rs-early", type: "reasoning", summary: [{ type: "summary_text", text: "Inspect the fixture." }] } } });
     send({ method: "item/started", params: { ...params, item: { id: "msg-early", type: "agentMessage", phase: "commentary", text: "" } } });

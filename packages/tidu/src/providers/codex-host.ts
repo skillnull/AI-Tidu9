@@ -35,7 +35,12 @@ import {
 } from "../connectors/cursor-acp.js";
 import { runCursorHeadless } from "../connectors/cursor-headless.js";
 import { ProviderError, TiduError } from "../core/index.js";
-import { createCallerToolCatalog } from "./caller-tools.js";
+import {
+  type CallerToolCatalog,
+  callerToolPayloadKey,
+  createCallerToolCatalog,
+  normalizeCallerToolInput,
+} from "./caller-tools.js";
 import type { ModelProvider, ProviderExecutionRequest, ProviderExecutionResult } from "./index.js";
 
 const CURSOR_DISCOVERY_TIMEOUT_MILLISECONDS = 30_000;
@@ -193,14 +198,23 @@ export const createPortableCodexResponsesInput = (input: unknown): unknown => {
       const sanitized = sanitizePortableHistoryValue(item);
       return sanitized === undefined ? [] : [sanitized];
     }
-    return typeof item.role === "string"
-      ? [normalizePortableHistoryMessage(item)]
-      : createCodexReplayItems(item);
+    if (typeof item.role === "string") return [normalizePortableHistoryMessage(item)];
+    if (
+      item.type === "tool_search_output" ||
+      (item.type === "tool_search_call" && item.execution === "client")
+    )
+      return normalizePortableHistoryItem(item);
+    return createCodexReplayItems(item);
   });
 };
 
 const createCodexReplayItems = (item: Record<string, unknown>): Record<string, unknown>[] => {
   const portableItems = normalizePortableHistoryItem(item);
+  if (
+    item.type === "tool_search_output" ||
+    (item.type === "tool_search_call" && item.execution === "client")
+  )
+    return portableItems;
   if (item.type === "reasoning") {
     return portableItems.map((portable) => ({
       type: "message",
@@ -475,8 +489,19 @@ export const requestTurnInput = (
         break;
       }
     }
-  } else if (conversationItems.at(-1)?.role === "user") {
-    activeItemIndex = conversationItems.length - 1;
+  } else {
+    for (let itemIndex = conversationItems.length - 1; itemIndex >= 0; itemIndex -= 1) {
+      const item = conversationItems[itemIndex];
+      if (
+        item?.role === "developer" ||
+        item?.role === "system" ||
+        item?.type === "compaction" ||
+        item?.type === "context_compaction"
+      )
+        continue;
+      if (item?.role === "user") activeItemIndex = itemIndex;
+      break;
+    }
   }
   const activeUserMessage =
     request.protocol === "chat-completions"
@@ -529,23 +554,15 @@ export const requestTurnInput = (
       historyItems.push(...messages.slice(0, lastUserIndex).map(normalizePortableHistoryMessage));
     }
   } else {
-    const historyEndIndex = activeItemIndex >= 0 ? activeItemIndex : conversationItems.length;
     historyItems.push(
       ...conversationItems
-        .slice(0, historyEndIndex)
+        .filter((_item, itemIndex) => itemIndex !== activeItemIndex)
         .flatMap((item) =>
           typeof item.role === "string"
             ? [normalizePortableHistoryMessage(item)]
             : createCodexReplayItems(item),
         ),
     );
-  }
-  if (input.length === 0) {
-    input.push({
-      type: "text",
-      text: historyItems.length > 0 ? "Continue from the supplied conversation." : " ",
-      text_elements: [],
-    });
   }
   return { input, historyItems };
 };
@@ -681,6 +698,7 @@ export const createLiveJsonStream = (
       }
   >,
   readUsage: () => HostTokenUsage | null = () => null,
+  onCancel?: () => void,
 ): ReadableStream<Uint8Array> => {
   const responseId = `tidu_${randomUUID()}`;
   const createdAt = Math.floor(Date.now() / 1_000);
@@ -946,9 +964,18 @@ export const createLiveJsonStream = (
           if (!streamOpen) return;
           const message = error instanceof Error ? error.message : "The host model failed.";
           const failure = {
-            code: error instanceof ProviderError ? error.code : "host_model_failed",
+            code:
+              error instanceof ProviderError || error instanceof TiduError
+                ? error.code
+                : "host_model_failed",
             message: message.slice(0, 240),
-            type: error instanceof ProviderError ? error.type : "server_error",
+            type:
+              error instanceof ProviderError
+                ? error.type
+                : error instanceof TiduError &&
+                    ["CONFIGURATION_INVALID", "CONFIGURATION_CONFLICT"].includes(error.code)
+                  ? "invalid_request_error"
+                  : "server_error",
           };
           const usage = readUsage();
           if (request.protocol === "chat-completions") {
@@ -966,6 +993,7 @@ export const createLiveJsonStream = (
     },
     cancel() {
       streamOpen = false;
+      onCancel?.();
     },
   });
 };
@@ -1117,12 +1145,59 @@ interface CodexClientSession {
   initialThread?: CodexThread;
   /** Model identifier explicitly confirmed by the Codex host for this session. */
   model: string;
+  /** Caller tool batches still waiting for results on their original native turn. */
+  callerTurns: Map<string, CodexCallerContinuation>;
+  /** Public call ownership shared by all model sessions in this provider. */
+  callerOwners: Map<string, CodexCallerContinuation>;
+  /** Whether the underlying native connection has been retired. */
+  closed?: boolean;
+  /** Retires only this model connection. */
+  discard?: () => Promise<void>;
+  /** Recreates this model connection for a shared batch recovery. */
+  recover?: () => Promise<CodexClientSession>;
 }
+
+interface CodexCallerContinuation {
+  /** Model session that owns the original native operation. */
+  owner: CodexClientSession;
+  /** Thread whose live tool RPCs must receive the caller results. */
+  thread: CodexThread;
+  /** Native turn interrupted when its static tool catalog must be replaced. */
+  turnId: string;
+  /** Original alias mapping retained throughout native execution. */
+  catalog: CallerToolCatalog;
+  /** Complete tool batch, including RPCs the host dispatches sequentially. */
+  callIds: readonly string[];
+  /** Native IDs keyed by globally distinct public IDs to isolate concurrent turns. */
+  nativeCallIds: ReadonlyMap<string, string>;
+  /** Instructions already installed before this batch was emitted. */
+  instructions: unknown;
+  /** Public conversation including this batch, sufficient for isolated recovery. */
+  replayItems: readonly Record<string, unknown>[];
+  /** A terminal native turn can only be continued through its public replay history. */
+  retired?: boolean;
+  /** One atomic delivery shared by concurrent and completed retries. */
+  delivery?: {
+    key: string;
+    resultsKey: string;
+    promise: Promise<CodexExecutionResult>;
+    controller: AbortController;
+    subscribers: number;
+    settled: boolean;
+  };
+}
+
+type CodexExecutionResult = CodexTurnResult & {
+  /** Public caller tool requests to execute after a successful model response. */
+  outputItems?: readonly Record<string, unknown>[];
+};
 
 const createCodexClientSession = async (
   model?: string,
   hostOptions: CodexHostInspectionOptions = {},
+  callerOwners = new Map<string, CodexCallerContinuation>(),
 ): Promise<CodexClientSession> => {
+  let session: CodexClientSession | undefined;
   const client = createCodexAgentClient({
     ...hostOptions,
     workingDirectory: process.cwd(),
@@ -1130,22 +1205,49 @@ const createCodexClientSession = async (
     modelProvider: hostOptions.modelProvider ?? "openai",
     ephemeral: true,
     sandbox: "workspace-write",
+    onEvent: (notification) => {
+      if (
+        notification.method !== "turn/completed" ||
+        !isRecord(notification.params) ||
+        !isRecord(notification.params.turn) ||
+        !["failed", "interrupted"].includes(String(notification.params.turn.status))
+      )
+        return;
+      for (const continuation of new Set(session?.callerTurns.values() ?? [])) {
+        if (
+          continuation.thread.id === notification.params.threadId &&
+          continuation.turnId === notification.params.turn.id
+        )
+          continuation.retired = true;
+      }
+    },
   });
   try {
     await client.initialize();
     const initialThread = await client.startThread();
-    return {
+    session = {
       client,
       initialThread,
       model: initialThread.model,
+      callerTurns: new Map(),
+      callerOwners,
     };
+    return session;
   } catch (error) {
     await client.close().catch(() => undefined);
     throw error;
   }
 };
 
-const closeCodexClientSession = async (session: CodexClientSession): Promise<void> => {
+const closeCodexClientSession = async (
+  session: CodexClientSession,
+  preserveDeliveries = false,
+): Promise<void> => {
+  session.closed = true;
+  if (!preserveDeliveries) {
+    for (const callId of session.callerTurns.keys()) session.callerOwners.delete(callId);
+    session.callerTurns.clear();
+  }
   await session.client.close().catch(() => undefined);
 };
 
@@ -1160,22 +1262,345 @@ const requireCodexSessionModel = (session: CodexClientSession, requestedModel: s
   return confirmedModel;
 };
 
-const runCodexTurn = async (
+const callerOutputs = (request: ProviderExecutionRequest): Record<string, unknown>[] =>
+  request.protocol === "responses" && Array.isArray(request.body.input)
+    ? request.body.input.filter(
+        (item): item is Record<string, unknown> =>
+          isRecord(item) &&
+          ["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(
+            String(item.type),
+          ),
+      )
+    : [];
+
+const callerContinuationPayload = (
+  continuation: CodexCallerContinuation,
+  request: ProviderExecutionRequest,
+) => {
+  const items = Array.isArray(request.body.input) ? request.body.input.filter(isRecord) : [];
+  const firstCall = items.findIndex(
+    (item) =>
+      ["function_call", "custom_tool_call", "tool_search_call"].includes(String(item.type)) &&
+      continuation.callIds.includes(String(item.call_id)),
+  );
+  const delta = items.slice(firstCall < 0 ? 0 : firstCall + 1).filter((item) => {
+    if (["function_call", "custom_tool_call", "tool_search_call"].includes(String(item.type)))
+      return !continuation.callIds.includes(String(item.call_id));
+    return true;
+  });
+  return requestTurnInput({
+    ...request,
+    body: {
+      ...request.body,
+      input: delta,
+      instructions:
+        request.body.instructions === continuation.instructions
+          ? undefined
+          : request.body.instructions,
+    },
+  });
+};
+
+const callerRequestItems = (request: ProviderExecutionRequest): Record<string, unknown>[] => {
+  const input = createPortableCodexResponsesInput(request.body.input);
+  return Array.isArray(input)
+    ? input.filter(isRecord)
+    : typeof input === "string"
+      ? [{ type: "message", role: "user", content: [{ type: "input_text", text: input }] }]
+      : [];
+};
+
+const callerReplayInput = (
+  continuation: CodexCallerContinuation,
+  request: ProviderExecutionRequest,
+): Record<string, unknown>[] => {
+  const supplied = callerRequestItems(request);
+  return supplied.some(
+    (item) =>
+      continuation.callIds.includes(String(item.call_id)) &&
+      ["function_call", "custom_tool_call", "tool_search_call"].includes(String(item.type)),
+  )
+    ? supplied
+    : [...continuation.replayItems, ...supplied];
+};
+
+const callerReplayRequest = (
+  continuation: CodexCallerContinuation,
+  request: ProviderExecutionRequest,
+): ProviderExecutionRequest => ({
+  ...request,
+  routing: { ...request.routing, targetModel: continuation.owner.model },
+  body: {
+    ...request.body,
+    input: callerReplayInput(continuation, request),
+    tools: request.body.tools ?? continuation.catalog.sourceTools,
+    instructions: request.body.instructions ?? continuation.instructions,
+  },
+});
+
+const callerDeliveryKeys = (
+  continuation: CodexCallerContinuation,
+  request: ProviderExecutionRequest,
+) => {
+  const payload = callerContinuationPayload(continuation, request);
+  const resultsKey = callerToolPayloadKey(
+    callerOutputs(request)
+      .filter((item) => continuation.callIds.includes(String(item.call_id)))
+      .sort((left, right) => String(left.call_id).localeCompare(String(right.call_id))),
+  );
+  return {
+    resultsKey,
+    key: callerToolPayloadKey({
+      input: payload.input,
+      context: payload.historyItems.filter(
+        (item) => !continuation.callIds.includes(String(item.call_id)),
+      ),
+      definitions:
+        createCallerToolCatalog(request)?.definitions ?? continuation.catalog.definitions,
+      effort: requestReasoningEffort(request),
+      summary: requestReasoningSummary(request),
+      outputFormat: structuredOutputFormat(request),
+      resultsKey,
+    }),
+  };
+};
+
+const resolveCallerContinuation = (
+  owners: ReadonlyMap<string, CodexCallerContinuation>,
+  request: ProviderExecutionRequest,
+): CodexCallerContinuation | undefined => {
+  const known = [
+    ...new Set(callerOutputs(request).flatMap((item) => owners.get(String(item.call_id)) ?? [])),
+  ];
+  const hasNewUser = (item: CodexCallerContinuation): boolean => {
+    const payload = callerContinuationPayload(item, request);
+    return payload.input.length > 0 || payload.historyItems.some((entry) => entry.role === "user");
+  };
+  const live = known.filter(
+    (item) =>
+      item.delivery?.settled !== true &&
+      (item.delivery !== undefined || !item.retired || !hasNewUser(item)),
+  );
+  if (live.length > 1)
+    throw new TiduError("CONFIGURATION_INVALID", "Caller tool results belong to different turns.");
+  if (live[0] !== undefined) return live[0];
+  const latest = known.at(-1);
+  if (latest === undefined) return undefined;
+  if (latest.retired && latest.delivery === undefined)
+    return hasNewUser(latest) ? undefined : latest;
+  const keys = callerDeliveryKeys(latest, request);
+  if (latest.delivery?.resultsKey !== keys.resultsKey)
+    throw new TiduError("CONFIGURATION_CONFLICT", "Conflicting caller tool results.");
+  return requestTurnInput(request).input.length === 0 || latest.delivery.key === keys.key
+    ? latest
+    : undefined;
+};
+
+const forgetCallerContinuation = (continuation: CodexCallerContinuation): void => {
+  for (const callId of continuation.callIds) {
+    continuation.owner.callerTurns.delete(callId);
+    continuation.owner.callerOwners.delete(callId);
+  }
+};
+
+const runCodexTurn = (
   session: CodexClientSession,
   request: ProviderExecutionRequest,
   onTextDelta?: (delta: string) => void,
   onProcessDelta?: (delta: string, source?: CodexProcessDeltaSource) => void,
   onNativeItem?: (item: Record<string, unknown>) => void,
-): Promise<CodexTurnResult & { outputItems?: readonly Record<string, unknown>[] }> => {
-  const callerTools = createCallerToolCatalog(request);
+): Promise<CodexExecutionResult> => {
+  const continuation = resolveCallerContinuation(session.callerOwners, request);
+  if (continuation === undefined)
+    return runCodexTurnBody(session, request, onTextDelta, onProcessDelta, onNativeItem);
+  const { key, resultsKey } = callerDeliveryKeys(continuation, request);
+  if (continuation.delivery !== undefined && continuation.delivery.key !== key)
+    return Promise.reject(
+      new TiduError("CONFIGURATION_CONFLICT", "Conflicting caller tool deliveries."),
+    );
+  if (continuation.delivery === undefined) {
+    const controller = new AbortController();
+    const delivery = {
+      key,
+      resultsKey,
+      controller,
+      subscribers: 0,
+      settled: false,
+      promise: Promise.resolve().then(async () => {
+        const sharedRequest = { ...request, signal: controller.signal };
+        const replay = continuation.owner.closed || continuation.retired === true;
+        try {
+          return await runCodexTurnBody(
+            session,
+            replay ? callerReplayRequest(continuation, sharedRequest) : sharedRequest,
+            onTextDelta,
+            onProcessDelta,
+            onNativeItem,
+            replay ? undefined : continuation,
+          );
+        } catch (error) {
+          if (
+            !isCodexConnectionFailure(error) ||
+            controller.signal.aborted ||
+            session.recover === undefined
+          )
+            throw error;
+          const restoredSession = await session.recover();
+          try {
+            return await runCodexTurnBody(
+              restoredSession,
+              callerReplayRequest(continuation, sharedRequest),
+              onTextDelta,
+              onProcessDelta,
+              onNativeItem,
+            );
+          } catch (recoveryError) {
+            if (isCodexConnectionFailure(recoveryError)) await restoredSession.discard?.();
+            throw recoveryError;
+          }
+        }
+      }),
+    };
+    continuation.delivery = delivery;
+    delivery.promise = delivery.promise.then(
+      (result) => {
+        delivery.settled = true;
+        return result;
+      },
+      (error: unknown) => {
+        delivery.settled = true;
+        if (controller.signal.aborted || isCodexConnectionFailure(error))
+          forgetCallerContinuation(continuation);
+        else continuation.delivery = undefined;
+        throw error;
+      },
+    );
+  }
+  const delivery = continuation.delivery;
+  delivery.subscribers += 1;
+  return new Promise<CodexExecutionResult>((resolve, reject) => {
+    let finished = false;
+    const finish = (): boolean => {
+      if (finished) return false;
+      finished = true;
+      request.signal?.removeEventListener("abort", abort);
+      delivery.subscribers -= 1;
+      return true;
+    };
+    const abort = (): void => {
+      if (!finish()) return;
+      if (delivery.subscribers === 0 && !delivery.settled) {
+        forgetCallerContinuation(continuation);
+        delivery.controller.abort();
+      }
+      reject(new DOMException("Codex turn cancelled.", "AbortError"));
+    };
+    request.signal?.addEventListener("abort", abort, { once: true });
+    if (request.signal?.aborted) abort();
+    delivery.promise.then(
+      (result) => {
+        if (finish()) resolve(result);
+      },
+      (error: unknown) => {
+        if (finish()) reject(error);
+      },
+    );
+  });
+};
+
+const runCodexTurnBody = async (
+  session: CodexClientSession,
+  request: ProviderExecutionRequest,
+  onTextDelta?: (delta: string) => void,
+  onProcessDelta?: (delta: string, source?: CodexProcessDeltaSource) => void,
+  onNativeItem?: (item: Record<string, unknown>) => void,
+  continuation?: CodexCallerContinuation,
+): Promise<CodexExecutionResult> => {
+  const outputs =
+    request.protocol === "responses" && Array.isArray(request.body.input)
+      ? request.body.input.filter(
+          (item): item is Record<string, unknown> =>
+            isRecord(item) &&
+            ["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(
+              String(item.type),
+            ),
+        )
+      : [];
+  let turnPayload =
+    continuation === undefined
+      ? requestTurnInput(request)
+      : callerContinuationPayload(continuation, request);
+  const hasReplayContext = outputs.every((output) =>
+    typeof output.call_id === "string"
+      ? turnPayload.historyItems.some(
+          (item) =>
+            item.call_id === output.call_id &&
+            ["function_call", "custom_tool_call", "tool_search_call"].includes(String(item.type)),
+        )
+      : output.type === "function_call_output" &&
+        typeof output.name === "string" &&
+        output.name.trim() !== "",
+  );
+  if (
+    continuation === undefined &&
+    turnPayload.input.length === 0 &&
+    outputs.length > 0 &&
+    !hasReplayContext
+  ) {
+    throw new TiduError(
+      "CONFIGURATION_CONFLICT",
+      "The native turn for these caller tool results is no longer available.",
+    );
+  }
+  if (
+    continuation !== undefined &&
+    !continuation.callIds.every((callId) => outputs.some((item) => item.call_id === callId))
+  ) {
+    throw new TiduError("CONFIGURATION_INVALID", "All pending caller tool results are required.");
+  }
+  const requestedCatalog = createCallerToolCatalog(request);
+  const replaceCatalog =
+    continuation !== undefined &&
+    requestedCatalog !== undefined &&
+    callerToolPayloadKey({
+      definitions: requestedCatalog.definitions,
+      webSearchMode: requestedCatalog.webSearchMode,
+    }) !==
+      callerToolPayloadKey({
+        definitions: continuation.catalog.definitions,
+        webSearchMode: continuation.catalog.webSearchMode,
+      });
+  const callerTools = replaceCatalog
+    ? requestedCatalog
+    : (continuation?.catalog ?? requestedCatalog);
+  if (replaceCatalog && continuation !== undefined) {
+    await session.client.cancel(continuation.thread.id, continuation.turnId);
+    const replayInput = callerReplayInput(continuation, request);
+    turnPayload = {
+      input: [],
+      historyItems: [
+        ...(typeof request.body.instructions === "string"
+          ? [
+              {
+                type: "message",
+                role: "developer",
+                content: [{ type: "input_text", text: request.body.instructions }],
+              },
+            ]
+          : []),
+        ...replayInput,
+      ],
+    };
+  }
   const thread =
-    callerTools === undefined
+    (replaceCatalog ? undefined : continuation?.thread) ??
+    (callerTools === undefined
       ? (session.initialThread ?? (await session.client.startThread(session.model)))
       : await session.client.startThread(
           session.model,
           callerTools.definitions,
           callerTools.webSearchMode,
-        );
+        ));
   session.initialThread = undefined;
   if (thread.model !== session.model) {
     throw new TiduError(
@@ -1183,7 +1608,6 @@ const runCodexTurn = async (
       `Codex host confirmed model ${thread.model} instead of session model ${session.model}.`,
     );
   }
-  const turnPayload = requestTurnInput(request);
   const forwardProcessDelta =
     callerTools === undefined || onProcessDelta === undefined
       ? onProcessDelta
@@ -1199,32 +1623,43 @@ const runCodexTurn = async (
       : outputFormat?.type === "json_object"
         ? { type: "object" }
         : undefined;
-  const result = await session.client.prompt(
-    thread.id,
-    turnPayload.input,
-    request.signal,
-    onTextDelta,
-    requestReasoningEffort(request),
-    forwardProcessDelta,
-    callerTools === undefined
-      ? turnPayload.historyItems
-      : callerTools.historyItems(turnPayload.historyItems),
-    outputSchema,
-    (usage) => reportCodexExecution(request, session.model, usage),
-    requestReasoningSummary(request),
-    onNativeItem,
-  );
-  if (
-    callerTools !== undefined &&
-    (result.toolCalls?.length ?? 0) > 0 &&
-    !request.signal?.aborted
-  ) {
-    return {
-      ...result,
-      outputItems: result.toolCalls?.map(callerTools.outputItem),
-    };
-  }
+  const result = await session.client
+    .prompt(
+      thread.id,
+      turnPayload.input,
+      request.signal,
+      onTextDelta,
+      requestReasoningEffort(request),
+      forwardProcessDelta,
+      continuation !== undefined && !replaceCatalog
+        ? turnPayload.historyItems.map((item) => {
+            const nativeCallId = continuation.nativeCallIds.get(String(item.call_id));
+            if (nativeCallId !== undefined) return { ...item, call_id: nativeCallId };
+            if (
+              ["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(
+                String(item.type),
+              ) &&
+              item.call_id !== undefined &&
+              item.call_id !== null
+            )
+              throw new TiduError("CONFIGURATION_INVALID", "Unknown caller tool result.");
+            return item;
+          })
+        : callerTools === undefined
+          ? turnPayload.historyItems
+          : callerTools.historyItems(turnPayload.historyItems),
+      outputSchema,
+      (usage) => reportCodexExecution(request, session.model, usage),
+      requestReasoningSummary(request),
+      onNativeItem,
+    )
+    .catch((error: unknown) => {
+      if (continuation !== undefined && request.signal?.aborted)
+        forgetCallerContinuation(continuation);
+      throw error;
+    });
   if (result.status !== "completed") {
+    if (continuation !== undefined) forgetCallerContinuation(continuation);
     if (result.status === "interrupted")
       throw new DOMException("Codex turn cancelled.", "AbortError");
     if (result.error?.codexErrorInfo === "serverOverloaded")
@@ -1238,6 +1673,51 @@ const runCodexTurn = async (
         ? "The current host model did not complete the request."
         : readableHostFailureMessage(result.error.message),
     );
+  }
+  if (request.signal?.aborted) {
+    if ((result.toolCalls?.length ?? 0) > 0)
+      await session.client.cancel(thread.id, result.turnId).catch(() => undefined);
+    throw new DOMException("Codex turn cancelled.", "AbortError");
+  }
+  if (
+    callerTools !== undefined &&
+    (result.toolCalls?.length ?? 0) > 0 &&
+    !request.signal?.aborted
+  ) {
+    const calls =
+      result.toolCalls?.map((call) => ({
+        nativeCallId: call.callId,
+        item: { ...callerTools.outputItem(call), call_id: `call_${randomUUID()}` },
+      })) ?? [];
+    const pending: CodexCallerContinuation = {
+      owner: session,
+      thread,
+      turnId: result.turnId,
+      catalog: callerTools,
+      callIds: calls.map((call) => call.item.call_id),
+      nativeCallIds: new Map(calls.map((call) => [call.item.call_id, call.nativeCallId])),
+      instructions: request.body.instructions,
+      replayItems: [
+        ...(continuation === undefined
+          ? callerRequestItems(request)
+          : callerReplayInput(continuation, request)),
+        ...calls.map((call) => call.item),
+      ],
+    };
+    for (const callId of pending.callIds) {
+      session.callerTurns.set(callId, pending);
+      session.callerOwners.set(callId, pending);
+    }
+    if (session.callerOwners.size > 512) {
+      for (const previous of new Set(session.callerOwners.values())) {
+        if (session.callerOwners.size <= 512) break;
+        if (previous.delivery?.settled) forgetCallerContinuation(previous);
+      }
+    }
+    return {
+      ...result,
+      outputItems: calls.map((call) => call.item),
+    };
   }
   return { ...result, text: requireValidHostModelText(request, result.text) };
 };
@@ -1363,9 +1843,10 @@ export const createCodexHostModelProvider = async (
   hostOptions: CodexHostInspectionOptions = {},
 ): Promise<ModelProvider | undefined> => {
   if (!inspectCodexHostLogin(hostOptions).reusable) return undefined;
+  const callerOwners = new Map<string, CodexCallerContinuation>();
   let initialSession: CodexClientSession;
   try {
-    initialSession = await createCodexClientSession(modelOverride, hostOptions);
+    initialSession = await createCodexClientSession(modelOverride, hostOptions, callerOwners);
   } catch {
     return undefined;
   }
@@ -1389,10 +1870,15 @@ export const createCodexHostModelProvider = async (
   const resolveSession = (requestedModel: string): Promise<CodexClientSession> => {
     const current = sessions.get(requestedModel);
     if (current !== undefined) return current;
-    const created = createCodexClientSession(requestedModel, hostOptions)
+    const created = createCodexClientSession(requestedModel, hostOptions, callerOwners)
       .then(async (session) => {
         try {
           requireCodexSessionModel(session, requestedModel);
+          session.discard = () => discardSession(requestedModel, created, session);
+          session.recover = async () => {
+            await session.discard?.();
+            return resolveSession(requestedModel);
+          };
           return session;
         } catch (error) {
           await closeCodexClientSession(session);
@@ -1412,22 +1898,44 @@ export const createCodexHostModelProvider = async (
     session: CodexClientSession,
   ): Promise<void> => {
     if (sessions.get(requestedModel) === sessionPromise) sessions.delete(requestedModel);
-    await closeCodexClientSession(session);
+    await closeCodexClientSession(session, true);
+  };
+  initialSession.discard = () =>
+    discardSession(initialModel, initialSessionPromise, initialSession);
+  initialSession.recover = async () => {
+    await initialSession.discard?.();
+    return resolveSession(initialModel);
   };
 
-  return {
+  const provider: ModelProvider = {
     descriptor: { type: "codex-host", model: initialModel },
     execute: async (request): Promise<ProviderExecutionResult> => {
-      const requestedModel = requestedModelFor(request);
+      request = {
+        ...request,
+        body: {
+          ...request.body,
+          input:
+            request.protocol === "responses"
+              ? normalizeCallerToolInput(request.body.input)
+              : request.body.input,
+        },
+      };
+      const ownedContinuation = resolveCallerContinuation(callerOwners, request);
+      const requestedModel = ownedContinuation?.owner.model ?? requestedModelFor(request);
       const sessionPromise = resolveSession(requestedModel);
       const session = await sessionPromise;
       const upstreamModel = requireCodexSessionModel(session, requestedModel);
       request.onModelConfirmed?.(upstreamModel);
       try {
         if (request.body.stream === true) {
+          const streamController = new AbortController();
           let reportedUsage: HostTokenUsage | null = null;
           const streamingRequest: ProviderExecutionRequest = {
             ...request,
+            signal:
+              request.signal === undefined
+                ? streamController.signal
+                : AbortSignal.any([request.signal, streamController.signal]),
             onExecutionReceipt: (receipt) => {
               if (receipt.usage !== null) reportedUsage = receipt.usage;
               request.onExecutionReceipt?.(receipt);
@@ -1478,14 +1986,17 @@ export const createCodexHostModelProvider = async (
                 } catch (error) {
                   if (!isCodexConnectionFailure(error)) throw error;
                   await discardSession(requestedModel, sessionPromise, session);
-                  if (request.signal?.aborted || emittedVisibleOutput) throw error;
+                  if (ownedContinuation !== undefined) throw error;
+                  if (streamingRequest.signal?.aborted || emittedVisibleOutput) throw error;
                   const retrySessionPromise = resolveSession(requestedModel);
                   const retrySession = await retrySessionPromise;
                   const retryModel = requireCodexSessionModel(retrySession, requestedModel);
                   try {
                     const result = await runCodexTurn(
                       retrySession,
-                      streamingRequest,
+                      ownedContinuation === undefined
+                        ? streamingRequest
+                        : callerReplayRequest(ownedContinuation, streamingRequest),
                       forwardTextDelta,
                       forwardProcessDelta,
                       forwardNativeItem,
@@ -1510,6 +2021,7 @@ export const createCodexHostModelProvider = async (
                 }
               },
               () => reportedUsage,
+              () => streamController.abort(),
             ),
           };
         }
@@ -1555,8 +2067,10 @@ export const createCodexHostModelProvider = async (
       );
       await Promise.all([...uniqueSessions].map((session) => closeCodexClientSession(session)));
       sessions.clear();
+      callerOwners.clear();
     },
   };
+  return provider;
 };
 
 export const createCursorHostModelProvider = async (

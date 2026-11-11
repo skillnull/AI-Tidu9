@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type { ProviderExecutionReceipt } from "../providers/index.js";
 
 type TokenUsage = NonNullable<ProviderExecutionReceipt["usage"]>;
@@ -66,6 +65,8 @@ export const createResponseUsageLedger = () => {
       groupId: string;
       usage: TokenUsage | null;
       models: readonly ResponseModelUsage[];
+      complete: boolean;
+      ancestors: ReadonlySet<string>;
       createdAt: number;
     }
   >();
@@ -79,9 +80,15 @@ export const createResponseUsageLedger = () => {
       });
       const previousGroups = new Map<
         string,
-        { usage: TokenUsage | null; models: readonly ResponseModelUsage[] }
+        {
+          usage: TokenUsage | null;
+          models: readonly ResponseModelUsage[];
+          complete: boolean;
+          ancestors: ReadonlySet<string>;
+        }
       >();
       const callIds: string[] = [];
+      let hadKnownParent = false;
       for (const item of items.slice(userIndex + 1)) {
         if (
           (item.type !== "function_call_output" &&
@@ -91,35 +98,45 @@ export const createResponseUsageLedger = () => {
         )
           continue;
         const entry = pendingCalls.get(item.call_id);
+        if (entry !== undefined) hadKnownParent = true;
         callIds.push(item.call_id);
         previousGroups.set(entry?.groupId ?? item.call_id, {
           usage: entry?.usage ?? null,
           models: entry?.models ?? [],
+          complete: entry?.complete ?? false,
+          ancestors: entry?.ancestors ?? new Set(),
         });
       }
+      const previous = [...previousGroups].filter(
+        ([groupId]) => ![...previousGroups.values()].some((group) => group.ancestors.has(groupId)),
+      );
+      const snapshot = (
+        current: TokenUsage | null,
+        models: readonly ResponseModelUsage[] = [],
+      ): ResponseUsageSnapshot => {
+        const groups = [...previous.map(([_groupId, group]) => group), { usage: current, models }];
+        const combinedModels = combineModels(groups.flatMap((group) => group.models));
+        return {
+          complete:
+            current !== null &&
+            previous.every(([_groupId, group]) => group.complete) &&
+            combinedModels.every((model) => model.complete),
+          usage: sumUsage(groups.map((group) => group.usage)),
+          models: combinedModels,
+        };
+      };
       return {
         /** Returns footer totals; wire-protocol usage remains per response to avoid double counting. */
-        snapshot: (
-          current: TokenUsage | null,
-          models: readonly ResponseModelUsage[] = [],
-        ): ResponseUsageSnapshot => {
-          const groups = [...previousGroups.values(), { usage: current, models }];
-          const usage = groups.map((group) => group.usage);
-          const combinedModels = combineModels(groups.flatMap((group) => group.models));
-          return {
-            complete:
-              usage.every((item) => item !== null) &&
-              combinedModels.every((model) => model.complete),
-            usage: sumUsage(usage),
-            models: combinedModels,
-          };
-        },
+        snapshot,
         /** Saves usage once per yielded response and releases correlations at a final result. */
         finish: (
           output: readonly Record<string, unknown>[],
           current: TokenUsage | null,
           models: readonly ResponseModelUsage[] = [],
+          completed = true,
         ): void => {
+          // A cancelled duplicate must not release a sibling delivery's ancestry.
+          if (!completed) return;
           const requested = output.filter(
             (item) =>
               (item.type === "function_call" ||
@@ -127,19 +144,34 @@ export const createResponseUsageLedger = () => {
                 item.type === "tool_search_call") &&
               typeof item.call_id === "string",
           );
-          if (requested.length === 0) {
-            callIds.forEach((callId) => {
-              pendingCalls.delete(callId);
+          const ancestors = new Set<string>();
+          const activeGroups = new Set([...pendingCalls.values()].map((entry) => entry.groupId));
+          for (const [groupId, group] of previousGroups) {
+            if (activeGroups.has(groupId)) ancestors.add(groupId);
+            group.ancestors.forEach((ancestor) => {
+              if (activeGroups.has(ancestor)) ancestors.add(ancestor);
             });
+          }
+          if (requested.length === 0) {
+            for (const [callId, entry] of pendingCalls) {
+              if (ancestors.has(entry.groupId) || callIds.includes(callId))
+                pendingCalls.delete(callId);
+            }
             return;
           }
-          const groupId = randomUUID();
+          if (hadKnownParent && callIds.every((callId) => !pendingCalls.has(callId))) return;
+          const cumulative = snapshot(current, models);
+          const groupId = JSON.stringify(
+            [...new Set(requested.map((item) => String(item.call_id)))].sort(),
+          );
           const createdAt = Date.now();
           requested.forEach((item) => {
             pendingCalls.set(item.call_id as string, {
               groupId,
-              usage: current,
-              models,
+              usage: cumulative.usage,
+              models: cumulative.models ?? [],
+              complete: cumulative.complete,
+              ancestors,
               createdAt,
             });
           });

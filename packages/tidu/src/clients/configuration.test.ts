@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -9,12 +10,15 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { readCodexActiveSelection } from "../connectors/codex-client-proxy.js";
-import { TiduError } from "../core/index.js";
+import { createStdioJsonRpcClient } from "../connectors/json-rpc.js";
+import { PRODUCT, TiduError } from "../core/index.js";
 import { startLocalRuntime } from "../runtime/index.js";
+import { refreshManagedCodexCatalog } from "./codex-model-catalog.js";
 import {
   configureCodexClient,
   inspectCodexClientConfiguration,
@@ -47,6 +51,607 @@ const writeOfficialModelCache = (codexHomeDirectory: string): void => {
     { mode: 0o600 },
   );
 };
+
+const successfulConfigurationRequest: typeof fetch = async (input) =>
+  Response.json(
+    String(input).endsWith("/health")
+      ? { product: PRODUCT.name, status: "ok" }
+      : String(input).endsWith("/v1/models")
+        ? { data: [{ id: "ai-tidu9-config", owned_by: "AI-Tidu9" }] }
+        : { codexReasoningEffortSupported: false },
+  );
+
+test("inherits current harness metadata without changing execution declarations across 80 catalog combinations", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "client-harness-catalog-"));
+  try {
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory: directory,
+      verifyRuntime: false,
+    });
+    const catalogPath = join(directory, ".ai-tidu9-model-catalog.json");
+    const statePath = join(directory, ".ai-tidu9-profile-state.json");
+    const cachePath = join(directory, "models_cache.json");
+    const baseline = JSON.parse(readFileSync(catalogPath, "utf8"));
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    let verified = 0;
+    for (const hostVersion of ["0.167.0-alpha.3.2", "0.163.0"])
+      for (const cacheKind of ["valid", "missing", "invalid", "unversioned", "symlink"])
+        for (const selected of ["official-a", "official-b"])
+          for (const reasoning of [false, true])
+            for (const extraCapability of [false, true]) {
+              const ownEntry = {
+                ...baseline.models[0],
+                context_window: 8192,
+                max_context_window: 8192,
+                input_modalities: ["text"],
+                supports_search_tool: false,
+                supports_parallel_tool_calls: false,
+                supported_reasoning_levels: reasoning ? [{ effort: "medium" }] : [],
+                ...(reasoning ? { default_reasoning_level: "medium" } : {}),
+              };
+              const managed = `${JSON.stringify({ models: [ownEntry] }, null, 2)}\n`;
+              writeFileSync(catalogPath, managed);
+              writeFileSync(statePath, JSON.stringify({ ...state, officialModel: selected }));
+              if (existsSync(cachePath)) rmSync(cachePath);
+              const models = ["official-a", "official-b"].map((slug) => ({
+                slug,
+                display_name: slug,
+                visibility: "list",
+                supported_in_api: true,
+                tool_mode: slug === "official-a" ? "code_mode_only" : null,
+                multi_agent_version: slug === "official-a" ? "v2" : null,
+                shell_type: "unified_exec",
+                apply_patch_tool_type: "freeform",
+                include_plugin_usage_instructions: true,
+                include_future_runtime_usage_instructions: true,
+                node_repl_auto_review_required: slug === "official-a",
+                node_repl_disabled: slug === "official-b",
+                base_instructions: `Official ${slug}`,
+                model_messages: {
+                  ...ownEntry.model_messages,
+                  instructions_template: `Template ${slug}`,
+                  future_protocol_section: { selected: slug, revision: 1 },
+                  permissions: { required: true },
+                },
+                input_modalities: ["text", "image", "audio"],
+                context_window: 872000,
+                supported_reasoning_levels: [{ effort: "ultra" }],
+                supports_future_superpower: extraCapability,
+              }));
+              const source = {
+                ...(cacheKind === "unversioned" ? {} : { client_version: "0.167.0" }),
+                models,
+              };
+              if (cacheKind === "symlink") {
+                const linked = join(directory, "linked-catalog.json");
+                writeFileSync(linked, JSON.stringify(source));
+                symlinkSync(linked, cachePath);
+              } else if (cacheKind !== "missing")
+                writeFileSync(
+                  cachePath,
+                  cacheKind === "invalid" ? "invalid JSON" : JSON.stringify(source),
+                );
+              const result = refreshManagedCodexCatalog({
+                codexHomeDirectory: directory,
+                hostVersion,
+              });
+              const label = JSON.stringify({
+                hostVersion,
+                cacheKind,
+                selected,
+                reasoning,
+                extraCapability,
+              });
+              if (hostVersion.startsWith("0.167.") && cacheKind === "valid") {
+                assert.equal(result.changed, true, label);
+                assert.equal(typeof result.fingerprint, "string", label);
+                const generated = JSON.parse(readFileSync(catalogPath, "utf8"));
+                assert.equal(generated.models.length, 1, label);
+                const actual = generated.models[0];
+                const selectedSource = models.find((model) => model.slug === selected);
+                assert.ok(selectedSource);
+                assert.equal(actual.slug, ownEntry.slug, label);
+                assert.equal(actual.display_name, ownEntry.display_name, label);
+                assert.deepEqual(actual.model_messages, selectedSource.model_messages, label);
+                assert.equal(actual.tool_mode, selectedSource.tool_mode, label);
+                assert.equal(actual.multi_agent_version, selectedSource.multi_agent_version, label);
+                assert.equal(
+                  actual.node_repl_auto_review_required,
+                  selectedSource.node_repl_auto_review_required,
+                  label,
+                );
+                assert.equal(actual.node_repl_disabled, selectedSource.node_repl_disabled, label);
+                assert.equal(actual.include_plugin_usage_instructions, true, label);
+                assert.equal(actual.include_future_runtime_usage_instructions, true, label);
+                for (const field of [
+                  "context_window",
+                  "max_context_window",
+                  "input_modalities",
+                  "supported_reasoning_levels",
+                  "supports_search_tool",
+                  "supports_parallel_tool_calls",
+                ])
+                  assert.deepEqual(actual[field], ownEntry[field], `${label} ${field}`);
+                assert.equal(actual.supports_future_superpower, undefined, label);
+                assert.deepEqual(
+                  refreshManagedCodexCatalog({ codexHomeDirectory: directory, hostVersion }),
+                  { changed: false, fingerprint: result.fingerprint },
+                  label,
+                );
+                selectedSource.model_messages.future_protocol_section.revision = 2;
+                writeFileSync(cachePath, JSON.stringify(source));
+                const next = refreshManagedCodexCatalog({
+                  codexHomeDirectory: directory,
+                  hostVersion,
+                });
+                assert.equal(next.changed, true, label);
+                assert.notEqual(next.fingerprint, result.fingerprint, label);
+              } else {
+                assert.deepEqual(result, { changed: false, fingerprint: null }, label);
+                assert.equal(readFileSync(catalogPath, "utf8"), managed, label);
+              }
+              verified += 1;
+            }
+    assert.equal(verified, 80);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("keeps inherited harness updates while configuration changes only verified execution declarations", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "client-harness-preservation-"));
+  try {
+    writeFileSync(join(directory, "config.toml"), 'model = "official-a"\n');
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory: directory,
+      verifyRuntime: false,
+    });
+    const catalogPath = join(directory, ".ai-tidu9-model-catalog.json");
+    const statePath = join(directory, ".ai-tidu9-profile-state.json");
+    const profilePath = join(directory, "ai-tidu9.config.toml");
+    const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
+    const official = {
+      ...catalog.models[0],
+      slug: "official-a",
+      display_name: "Official A",
+      tool_mode: "code_mode_only",
+      multi_agent_version: "v2",
+      node_repl_auto_review_required: true,
+      model_messages: {
+        ...catalog.models[0].model_messages,
+        instructions_template: "Native current template.",
+        future_protocol: { revision: 1 },
+      },
+      context_window: 872000,
+      supported_reasoning_levels: [{ effort: "ultra" }],
+    };
+    const cache = { client_version: "0.167.0", models: [official] };
+    writeFileSync(join(directory, "models_cache.json"), JSON.stringify(cache));
+    const state = readFileSync(statePath, "utf8");
+    const profile = readFileSync(profilePath, "utf8");
+    const configuration = readFileSync(join(directory, "config.toml"), "utf8");
+    const first = refreshManagedCodexCatalog({
+      codexHomeDirectory: directory,
+      hostVersion: "0.167.0-alpha.3.2",
+    });
+    assert.equal(first.changed, true);
+    assert.equal(readFileSync(statePath, "utf8"), state);
+    assert.equal(readFileSync(profilePath, "utf8"), profile);
+    assert.equal(readFileSync(join(directory, "config.toml"), "utf8"), configuration);
+    official.model_messages.future_protocol.revision = 2;
+    writeFileSync(join(directory, "models_cache.json"), JSON.stringify(cache));
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory: directory,
+      request: async (input) =>
+        String(input).endsWith("/api/capability-completion")
+          ? Response.json({ codexReasoningEffortSupported: true })
+          : successfulConfigurationRequest(input),
+    });
+    const updated = JSON.parse(readFileSync(catalogPath, "utf8"));
+    assert.equal(updated.models.length, 1);
+    assert.equal(updated.models[0].slug, "ai-tidu9-config");
+    assert.deepEqual(updated.models[0].model_messages, official.model_messages);
+    assert.equal(updated.models[0].context_window, 128000);
+    assert.deepEqual(
+      updated.models[0].supported_reasoning_levels.map((entry: { effort: string }) => entry.effort),
+      ["low", "medium", "high", "xhigh", "max", "ultra"],
+    );
+    const nextHost = refreshManagedCodexCatalog({
+      codexHomeDirectory: directory,
+      hostVersion: "0.167.0-alpha.3.3",
+    });
+    assert.equal(nextHost.changed, false);
+    assert.notEqual(nextHost.fingerprint, first.fingerprint);
+    const secondModel = {
+      ...official,
+      slug: "official-b",
+      tool_mode: null,
+      model_messages: { ...official.model_messages, instructions_template: "Template B." },
+    } as Record<string, unknown>;
+    delete secondModel.node_repl_auto_review_required;
+    writeFileSync(
+      join(directory, "models_cache.json"),
+      JSON.stringify({ client_version: "0.167.0", models: [official, secondModel] }),
+    );
+    const selectedState = JSON.parse(readFileSync(statePath, "utf8"));
+    for (const selected of ["official-b", "official-a"]) {
+      writeFileSync(statePath, JSON.stringify({ ...selectedState, officialModel: selected }));
+      assert.equal(
+        refreshManagedCodexCatalog({
+          codexHomeDirectory: directory,
+          hostVersion: "0.167.0-alpha.3.3",
+        }).changed,
+        true,
+      );
+      const switched = JSON.parse(readFileSync(catalogPath, "utf8")).models[0];
+      assert.equal(switched.tool_mode, selected === "official-a" ? "code_mode_only" : null);
+      assert.equal(
+        switched.node_repl_auto_review_required,
+        selected === "official-a" ? true : undefined,
+      );
+      assert.deepEqual(
+        switched.supported_reasoning_levels,
+        updated.models[0].supported_reasoning_levels,
+      );
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("leaves ambiguous or unowned catalogs unchanged instead of choosing a template", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "client-harness-ownership-"));
+  try {
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory: directory,
+      verifyRuntime: false,
+    });
+    const catalogPath = join(directory, ".ai-tidu9-model-catalog.json");
+    const statePath = join(directory, ".ai-tidu9-profile-state.json");
+    const managed = readFileSync(catalogPath, "utf8");
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    const models = ["official-a", "official-b"].map((slug) => ({
+      slug,
+      display_name: slug,
+      visibility: "list",
+      supported_in_api: true,
+      tool_mode: "code_mode_only",
+    }));
+    writeFileSync(
+      join(directory, "models_cache.json"),
+      JSON.stringify({ client_version: "0.167.0", models }),
+    );
+    for (const variant of [
+      { ...state, officialModel: undefined },
+      { ...state, officialModel: "not-in-current-cache" },
+      { ...state, owner: "unmanaged", officialModel: "official-a" },
+      { ...state, profile: "other", officialModel: "official-a" },
+      { ...state, model: "different-virtual", officialModel: "official-a" },
+    ]) {
+      writeFileSync(statePath, JSON.stringify(variant));
+      assert.deepEqual(
+        refreshManagedCodexCatalog({ codexHomeDirectory: directory, hostVersion: "0.167.0" }),
+        { changed: false, fingerprint: null },
+      );
+      assert.equal(readFileSync(catalogPath, "utf8"), managed);
+    }
+    writeFileSync(statePath, JSON.stringify({ ...state, officialModel: "official-a" }));
+    assert.deepEqual(refreshManagedCodexCatalog({ codexHomeDirectory: directory }), {
+      changed: false,
+      fingerprint: null,
+    });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the current native host loads an inherited harness catalog in an isolated home", {
+  skip: !process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND,
+  timeout: 15_000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "client-native-harness-schema-"));
+  const command = process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND ?? "codex";
+  const environment = {
+    PATH: process.env.PATH,
+    CODEX_HOME: directory,
+    OPENAI_API_KEY: undefined,
+    CODEX_ACCESS_TOKEN: undefined,
+  };
+  let client: ReturnType<typeof createStdioJsonRpcClient> | undefined;
+  try {
+    const version = execFileSync(command, ["--version"], {
+      env: environment,
+      encoding: "utf8",
+    })
+      .trim()
+      .match(/^codex-cli\s+(\d+\.\d+\.\d+(?:-[a-z0-9.-]+)?)$/iu)?.[1];
+    assert.ok(version);
+    writeFileSync(join(directory, "config.toml"), 'model = "official-schema"\n');
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory: directory,
+      verifyRuntime: false,
+    });
+    const catalogPath = join(directory, ".ai-tidu9-model-catalog.json");
+    const baseline = JSON.parse(readFileSync(catalogPath, "utf8")).models[0];
+    const { base_instructions: _legacyInstructions, ...native } = baseline;
+    const source = {
+      ...native,
+      slug: "official-schema",
+      display_name: "Official Schema Fixture",
+      tool_mode: "code_mode_only",
+      multi_agent_version: "v2",
+      node_repl_auto_review_required: true,
+      node_repl_disabled: false,
+      model_messages: {
+        ...native.model_messages,
+        instructions_template: "Preserve the current native tool and permission contracts.",
+      },
+    };
+    writeFileSync(
+      join(directory, "models_cache.json"),
+      JSON.stringify({ client_version: version.replace(/-.*/u, ""), models: [source] }),
+    );
+    assert.equal(
+      refreshManagedCodexCatalog({ codexHomeDirectory: directory, hostVersion: version }).changed,
+      true,
+    );
+    const inherited = JSON.parse(readFileSync(catalogPath, "utf8")).models[0];
+    assert.equal(inherited.base_instructions, undefined);
+    assert.deepEqual(inherited.model_messages, source.model_messages);
+    client = createStdioJsonRpcClient({
+      command,
+      arguments: [
+        "-c",
+        'model_provider="schema_fixture"',
+        "-c",
+        'model_providers.schema_fixture={name="Schema Fixture",base_url="http://127.0.0.1:9/v1",wire_api="responses",requires_openai_auth=false}',
+        "-c",
+        `model_catalog_json=${JSON.stringify(catalogPath)}`,
+        "app-server",
+      ],
+      environment,
+      workingDirectory: directory,
+    });
+    await client.request("initialize", {
+      clientInfo: { name: "schema_fixture", version: "1" },
+      capabilities: { experimentalApi: true },
+    });
+    client.notify("initialized");
+    const models = await client.request<{ data: { model: string }[] }>("model/list", {});
+    assert.deepEqual(
+      models.data.map((model) => model.model),
+      ["ai-tidu9-config"],
+    );
+    const started = await client.request<{ model: string; thread: { id: string } }>(
+      "thread/start",
+      {
+        model: "ai-tidu9-config",
+        modelProvider: "schema_fixture",
+        cwd: directory,
+        approvalPolicy: "never",
+        sandbox: "read-only",
+        ephemeral: true,
+      },
+    );
+    assert.equal(started.model, "ai-tidu9-config");
+    assert.equal(typeof started.thread.id, "string");
+  } finally {
+    await client?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("cancels stale preparation before it can overtake a newer official choice", {
+  timeout: 5000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "client-preparation-order-"));
+  let release: (() => void) | undefined;
+  let reached: (() => void) | undefined;
+  const paused = new Promise<void>((resolve) => {
+    reached = resolve;
+  });
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  try {
+    writeFileSync(join(directory, "config.toml"), 'model = "official-fixture"\n');
+    await configureCodexClient({
+      endpoint: "http://127.0.0.1:9639",
+      codexHomeDirectory: directory,
+      verifyRuntime: false,
+    });
+    const pending = configureCodexClient({
+      endpoint: "http://127.0.0.1:9640",
+      codexHomeDirectory: directory,
+      request: async (input, init) => {
+        reached?.();
+        await barrier;
+        return successfulConfigurationRequest(input, init);
+      },
+    });
+    const settled = pending.then(
+      () => "completed",
+      () => "cancelled",
+    );
+    await paused;
+    const official = switchCodexClientConfiguration({
+      mode: "official",
+      codexHomeDirectory: directory,
+    });
+    release?.();
+    await official;
+    assert.equal(await settled, "cancelled");
+    assert.equal(
+      inspectCodexClientConfiguration({ codexHomeDirectory: directory }).endpoint,
+      "http://127.0.0.1:9639",
+    );
+  } finally {
+    release?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+for (const mutation of [
+  "remove",
+  "external-remove",
+  "external-official",
+  "external-roundtrip",
+  "rollback",
+  "latest-model",
+  "latest-model-failure",
+] as const)
+  test(`does not let a pending probe undo ${mutation}`, { timeout: 5000 }, async () => {
+    const directory = mkdtempSync(join(tmpdir(), "client-probe-ownership-"));
+    const configuration = join(directory, "config.toml");
+    let release: (() => void) | undefined;
+    let reached: (() => void) | undefined;
+    const paused = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      writeFileSync(configuration, 'model = "official-fixture"\n');
+      await configureCodexClient({
+        endpoint: "http://127.0.0.1:9639",
+        codexHomeDirectory: directory,
+        verifyRuntime: false,
+      });
+      const pending = switchCodexClientConfiguration({
+        mode: "ai-tidu9",
+        codexHomeDirectory: directory,
+        request: async (input, init) => {
+          if (String(input).endsWith("/responses")) {
+            reached?.();
+            await barrier;
+            if (mutation === "latest-model-failure")
+              return Response.json({ error: { message: "fixture failure" } }, { status: 400 });
+          }
+          return successfulConfigurationRequest(input, init);
+        },
+      });
+      const settled = pending.then(
+        () => "completed",
+        () => "cancelled",
+      );
+      await paused;
+      if (mutation === "remove") removeCodexClientConfiguration({ codexHomeDirectory: directory });
+      if (mutation === "rollback")
+        rollbackCodexClientConfiguration({ codexHomeDirectory: directory });
+      if (mutation.startsWith("external-"))
+        execFileSync(
+          process.execPath,
+          [
+            "--import",
+            import.meta.resolve("tsx"),
+            "--input-type=module",
+            "-e",
+            `import {removeCodexClientConfiguration,switchCodexClientConfiguration,configureCodexClient,rollbackCodexClientConfiguration} from ${JSON.stringify(new URL(`./configuration.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`, import.meta.url).href)};${mutation === "external-remove" ? "removeCodexClientConfiguration({codexHomeDirectory:process.argv[1]});" : mutation === "external-official" ? "await switchCodexClientConfiguration({mode:'official',codexHomeDirectory:process.argv[1]});" : "await configureCodexClient({endpoint:'http://127.0.0.1:9640',verifyRuntime:false,codexHomeDirectory:process.argv[1]});rollbackCodexClientConfiguration({codexHomeDirectory:process.argv[1]});"}`,
+            directory,
+          ],
+          { stdio: "pipe" },
+        );
+      if (mutation.startsWith("latest-model"))
+        writeFileSync(
+          configuration,
+          readFileSync(configuration, "utf8").replace('"official-fixture"', '"official-latest"'),
+        );
+      release?.();
+      if (mutation.startsWith("latest-model")) {
+        assert.equal(await settled, mutation === "latest-model" ? "completed" : "cancelled");
+        await switchCodexClientConfiguration({ mode: "official", codexHomeDirectory: directory });
+        assert.equal(readCodexActiveSelection(directory).model, "official-latest");
+      } else {
+        assert.equal(await settled, "cancelled");
+        if (mutation === "external-official" || mutation === "external-roundtrip") {
+          assert.equal(
+            inspectCodexClientConfiguration({ codexHomeDirectory: directory }).activeMode,
+            "official",
+          );
+          return;
+        }
+        assert.equal(
+          inspectCodexClientConfiguration({ codexHomeDirectory: directory }).installed,
+          false,
+        );
+        assert.equal(existsSync(join(directory, "ai-tidu9.config.toml")), false);
+      }
+    } finally {
+      release?.();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+test("keeps official mode during stalled validation and drains cancelled or superseded switches", {
+  timeout: 10000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-mode-verification-"));
+  let probeStarted: (() => void) | undefined;
+  const server = createServer((request, response) => {
+    if (request.url?.endsWith("/responses")) {
+      probeStarted?.();
+      return;
+    }
+    response.setHeader("content-type", "application/json");
+    response.end(
+      JSON.stringify(
+        request.url === "/health"
+          ? { product: PRODUCT.name, status: "ok" }
+          : request.url === "/v1/models"
+            ? { data: [{ id: "ai-tidu9-config", owned_by: "AI-Tidu9" }] }
+            : { codexReasoningEffortSupported: false },
+      ),
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address !== null && typeof address !== "string");
+  try {
+    writeFileSync(join(directory, "config.toml"), 'model = "official-fixture"\n');
+    await configureCodexClient({
+      endpoint: `http://127.0.0.1:${address.port}`,
+      codexHomeDirectory: directory,
+      verifyRuntime: false,
+    });
+    for (const cancellation of ["timeout", "disconnect", "superseded"]) {
+      const reached = new Promise<void>((resolve) => {
+        probeStarted = resolve;
+      });
+      const controller = new AbortController();
+      const pending = switchCodexClientConfiguration({
+        mode: "ai-tidu9",
+        codexHomeDirectory: directory,
+        signal: controller.signal,
+        verificationTimeoutMilliseconds: cancellation === "timeout" ? 100 : 3000,
+      });
+      const rejected = assert.rejects(pending);
+      await reached;
+      assert.equal(
+        inspectCodexClientConfiguration({ codexHomeDirectory: directory }).activeMode,
+        "official",
+      );
+      if (cancellation === "disconnect") controller.abort();
+      if (cancellation === "superseded")
+        await switchCodexClientConfiguration({ mode: "official", codexHomeDirectory: directory });
+      await rejected;
+      assert.equal(
+        inspectCodexClientConfiguration({ codexHomeDirectory: directory }).activeMode,
+        "official",
+      );
+      assert.equal(readCodexActiveSelection(directory).model, "official-fixture");
+    }
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("lists current and retained official Codex models without managed entries", () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-codex-model-list-"));
@@ -191,8 +796,11 @@ test("writes an isolated Codex profile and switches back to the official configu
       request: async (input, init) => {
         const url = String(input);
         if (url.endsWith("/v1/hosts/codex/responses") && init?.method === "POST") {
-          assert.equal(init.signal, undefined);
-          assert.match(readFileSync(defaultConfiguration, "utf8"), /model_provider = "ai_tidu9"/u);
+          assert.ok(init.signal instanceof AbortSignal);
+          assert.doesNotMatch(
+            readFileSync(defaultConfiguration, "utf8"),
+            /AI-Tidu9 managed default:start/u,
+          );
           return Response.json({
             id: "verified",
             object: "response",
@@ -1131,7 +1739,10 @@ test("keeps the official configuration active when inference verification fails"
           data: [{ id: "ai-tidu9-config", owned_by: "AI-Tidu9" }],
         });
       }
-      assert.match(readFileSync(defaultConfiguration, "utf8"), /model_provider = "ai_tidu9"/u);
+      assert.doesNotMatch(
+        readFileSync(defaultConfiguration, "utf8"),
+        /AI-Tidu9 managed default:start/u,
+      );
       return Response.json(
         {
           error: {
@@ -1193,7 +1804,10 @@ test("attributes an official Codex inference failure and keeps official mode act
           data: [{ id: "ai-tidu9-config", owned_by: "AI-Tidu9" }],
         });
       }
-      assert.match(readFileSync(defaultConfiguration, "utf8"), /model_provider = "ai_tidu9"/u);
+      assert.doesNotMatch(
+        readFileSync(defaultConfiguration, "utf8"),
+        /AI-Tidu9 managed default:start/u,
+      );
       return Response.json(
         {
           error: {

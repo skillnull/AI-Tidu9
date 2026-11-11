@@ -12,7 +12,361 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { configureCodexClient, switchCodexClientConfiguration } from "../clients/configuration.js";
 import { createCodexHostModelProvider, createLiveJsonStream } from "../providers/codex-host.js";
 import { startLocalRuntime } from "../runtime/index.js";
+import { createCodexAgentClient } from "./codex-app-server.js";
+import { createCodexThreadLinks } from "./codex-thread-links.js";
 import { createStdioJsonRpcClient, type JsonRpcNotification } from "./json-rpc.js";
+
+test("native idle turns resume injected tool history without replaying the user or tools", {
+  skip: !process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND,
+  timeout: 30_000,
+}, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "native-history-continuation-"));
+  const received: Record<string, unknown>[] = [];
+  const modelServer = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(chunk);
+    received.push(JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>);
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    const item = {
+      type: "message",
+      id: `recovered_${received.length}`,
+      role: "assistant",
+      phase: "final_answer",
+      content: [
+        { type: "output_text", text: "Recovered from the supplied result.", annotations: [] },
+      ],
+    };
+    for (const event of [
+      { type: "response.created", response: { id: item.id, status: "in_progress", output: [] } },
+      { type: "response.output_item.added", output_index: 0, item },
+      { type: "response.output_item.done", output_index: 0, item },
+      {
+        type: "response.completed",
+        response: {
+          id: item.id,
+          status: "completed",
+          output: [item],
+          usage: { input_tokens: 5, output_tokens: 2, total_tokens: 7 },
+        },
+      },
+    ])
+      response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    response.end();
+  });
+  await new Promise<void>((resolve) => modelServer.listen(0, "127.0.0.1", resolve));
+  const address = modelServer.address();
+  assert.ok(address !== null && typeof address !== "string");
+  await writeFile(
+    join(directory, "config.toml"),
+    [
+      "[model_providers.fixture]",
+      'name="fixture"',
+      `base_url="http://127.0.0.1:${address.port}/v1"`,
+      'wire_api="responses"',
+      "requires_openai_auth=false",
+      "supports_websockets=false",
+    ].join("\n"),
+  );
+  const wrapper = join(directory, "fixture-host");
+  await writeFile(
+    wrapper,
+    `#!${process.execPath}
+const {spawn}=require("node:child_process");
+if(process.argv[2]==="login"){console.log("Logged in to fixture");process.exit(0)}
+const child=spawn(${JSON.stringify(process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND)},process.argv.slice(2),{stdio:"inherit"});
+process.on("SIGTERM",()=>child.kill("SIGTERM"));child.on("exit",code=>process.exit(code??1));
+`,
+    { mode: 0o700 },
+  );
+  const client = createCodexAgentClient({
+    command: wrapper,
+    codexHomeDirectory: directory,
+    workingDirectory: directory,
+    model: "gpt-5.1-codex",
+    modelProvider: "fixture",
+    ephemeral: true,
+    sandbox: "read-only",
+  });
+  try {
+    await client.initialize();
+    for (const bootstrap of [false, true]) {
+      const thread = await client.startThread();
+      const output = {
+        type: "function_call_output",
+        ...(bootstrap ? { name: "inspect", namespace: "context" } : { call_id: "saved-call" }),
+        output: "Saved result, already executed.",
+      };
+      const history = [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Explain the saved result." }],
+        },
+        ...(bootstrap
+          ? []
+          : [{ type: "function_call", call_id: "saved-call", name: "inspect", arguments: "{}" }]),
+        output,
+      ];
+      const result = await client.prompt(
+        thread.id,
+        [],
+        AbortSignal.timeout(10_000),
+        undefined,
+        undefined,
+        undefined,
+        history,
+      );
+      assert.equal(result.status, "completed");
+      assert.equal(result.text, "Recovered from the supplied result.");
+      const input = received.at(-1)?.input as Record<string, unknown>[];
+      assert.equal(
+        input.filter(
+          (item) =>
+            item.role === "user" &&
+            JSON.stringify(item.content).includes("Explain the saved result."),
+        ).length,
+        1,
+      );
+      assert.equal(input.filter((item) => item.type === "function_call_output").length, 1);
+      assert.equal(input.filter((item) => item.type === "function_call").length, bootstrap ? 0 : 1);
+      assert.ok(
+        input.some((item) => item.type === "function_call_output" && item.output === output.output),
+      );
+      assert.doesNotMatch(JSON.stringify(input), /Continue from the supplied conversation/u);
+    }
+    assert.equal(received.length, 2);
+  } finally {
+    await client.close();
+    modelServer.closeAllConnections();
+    await new Promise<void>((resolve) => modelServer.close(() => resolve()));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+for (const initialMode of ["openai", "ai_tidu9"])
+  test(`desktop process-local identity survives managed mode from ${initialMode}`, {
+    skip: !process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND,
+    timeout: 30000,
+  }, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "native-desktop-identity-"));
+    const backendPaths: string[] = [];
+    let inferenceAuthorization: string | undefined;
+    let inferenceModel: string | undefined;
+    const backend = createServer(async (request, response) => {
+      backendPaths.push(request.url ?? "");
+      if (request.url === "/inference/responses") {
+        inferenceAuthorization = request.headers.authorization;
+        const chunks: Buffer[] = [];
+        for await (const chunk of request) chunks.push(chunk);
+        inferenceModel = (JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model: string })
+          .model;
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        const item = {
+          type: "message",
+          id: "managed-identity-reply",
+          role: "assistant",
+          phase: "final_answer",
+          content: [
+            { type: "output_text", text: "Managed identity fixture reply", annotations: [] },
+          ],
+        };
+        for (const event of [
+          {
+            type: "response.created",
+            response: { id: "managed-identity-response", status: "in_progress", output: [] },
+          },
+          { type: "response.output_item.added", output_index: 0, item },
+          { type: "response.output_item.done", output_index: 0, item },
+          {
+            type: "response.completed",
+            response: {
+              id: "managed-identity-response",
+              status: "completed",
+              output: [item],
+              usage: { input_tokens: 5, output_tokens: 2, total_tokens: 7 },
+            },
+          },
+        ])
+          response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+        response.end();
+        return;
+      }
+      response.setHeader("content-type", "application/json");
+      const account = {
+        id: "fixture-account",
+        account_user_id: "fixture-user",
+        account_user_role: "account-owner",
+        name: "Fixture",
+        structure: "personal",
+        plan_type: "plus",
+        workspace_backend_origin: "https://chatgpt.com",
+        account_routing_override: "NO_CONSTRAINT",
+        can_access_with_session: true,
+        is_deactivated: false,
+        is_zdr: false,
+        is_openai_internal: false,
+      };
+      response.end(
+        JSON.stringify({
+          accounts: [account],
+          account_ordering: ["fixture-account"],
+          default_account_id: "fixture-account",
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
+    const address = backend.address();
+    assert.ok(address !== null && typeof address !== "string");
+    const configuration = join(directory, "config.toml");
+    const select = async (modelProvider: string) =>
+      writeFile(
+        configuration,
+        [
+          `model = "${modelProvider === "ai_tidu9" ? "ai-tidu9-config" : "gpt-6.1-sol"}"`,
+          `model_provider = "${modelProvider}"`,
+          `chatgpt_base_url = "http://127.0.0.1:${address.port}/backend-api"`,
+          "[model_providers.ai_tidu9]",
+          'name = "Local fixture"',
+          `base_url = "http://127.0.0.1:${address.port}/inference"`,
+          'wire_api = "responses"',
+          "requires_openai_auth = false",
+          "supports_websockets = false",
+        ].join("\n"),
+      );
+    await select(initialMode);
+    await writeFile(
+      join(directory, ".ai-tidu9-profile-state.json"),
+      JSON.stringify({
+        owner: "AI-Tidu9",
+        officialModel: "gpt-6.1-sol",
+        officialDefaultLines: ['model = "gpt-6.1-sol"', 'model_provider = "openai"'],
+      }),
+    );
+    let completeTurn: (() => void) | undefined;
+    let completedTurnStatus: string | undefined;
+    const client = createStdioJsonRpcClient(
+      {
+        command: process.execPath,
+        arguments: [
+          ...(import.meta.url.endsWith(".ts") ? ["--import", import.meta.resolve("tsx")] : []),
+          fileURLToPath(
+            new URL(
+              `./codex-client-cli.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`,
+              import.meta.url,
+            ),
+          ),
+          "app-server",
+        ],
+        environment: {
+          PATH: process.env.PATH,
+          CODEX_HOME: directory,
+          TIDU_CODEX_REAL_COMMAND: process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND,
+        },
+      },
+      {
+        onNotification: (notification) => {
+          if (notification.method === "turn/completed") {
+            completedTurnStatus = (notification.params as { turn: { status: string } }).turn.status;
+            completeTurn?.();
+          }
+        },
+      },
+    );
+    try {
+      await client.request("initialize", {
+        clientInfo: { name: "desktop_identity_fixture", version: "1" },
+        capabilities: { experimentalApi: true },
+      });
+      client.notify("initialized");
+      const claims = {
+        sub: "fixture-user",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+        "https://api.openai.com/auth": {
+          chatgpt_account_id: "fixture-account",
+          chatgpt_plan_type: "plus",
+        },
+        "https://api.openai.com/profile": { email: "fixture@example.test" },
+      };
+      const syntheticToken = `${Buffer.from('{"alg":"none"}').toString("base64url")}.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.fixture`;
+      await client
+        .request("account/login/start", {
+          type: "chatgptAuthTokens",
+          accessToken: syntheticToken,
+          chatgptAccountId: "fixture-account",
+          chatgptPlanType: "plus",
+        })
+        .catch((error: Error) => {
+          throw new Error(
+            `Synthetic desktop login: ${error.message}; paths ${JSON.stringify(backendPaths)}`,
+          );
+        });
+      for (const nextMode of [initialMode, "ai_tidu9", "openai", "ai_tidu9"]) {
+        await select(nextMode);
+        const identity = await client
+          .request<{ account: { type: string } | null; requiresOpenaiAuth: boolean }>(
+            "account/read",
+            { refreshToken: false },
+          )
+          .catch((error: Error) => {
+            throw new Error(
+              `Synthetic desktop account read: ${error.message}; paths ${JSON.stringify(backendPaths)}`,
+            );
+          });
+        assert.equal(
+          identity.account?.type,
+          "chatgpt",
+          `Desktop identity was lost in ${nextMode} after starting in ${initialMode}`,
+        );
+        assert.equal(identity.requiresOpenaiAuth, true);
+        const legacy = await client.request<{
+          authMethod: string | null;
+          authToken: string | null;
+        }>("getAuthStatus", { includeToken: true, refreshToken: false });
+        assert.ok(legacy.authMethod === "chatgpt" || legacy.authMethod === "chatgptAuthTokens");
+        assert.equal(legacy.authToken, syntheticToken);
+      }
+      const started = await client.request<{ thread: { id: string; modelProvider: string } }>(
+        "thread/start",
+        { cwd: directory, approvalPolicy: "never", sandbox: "read-only" },
+      );
+      assert.equal(started.thread.modelProvider, "ai_tidu9");
+      for (const mode of ["ai_tidu9", "openai", "ai_tidu9"]) {
+        await select(mode);
+        const identity = await client.request<{ account: { type: string } }>("account/read", {
+          refreshToken: false,
+        });
+        assert.equal(identity.account.type, "chatgpt");
+        // Real official inference stays covered by the separate local-provider history fixture.
+        if (mode === "openai") continue;
+        const completed = new Promise<void>((resolve) => {
+          completeTurn = resolve;
+        });
+        await client.request("turn/start", {
+          threadId: started.thread.id,
+          input: [
+            {
+              type: "text",
+              text: "Verify the reply in the same chat after switching modes.",
+            },
+          ],
+        });
+        await completed;
+        assert.equal(completedTurnStatus, "completed");
+        assert.equal(inferenceModel, "ai-tidu9-config");
+        assert.equal(inferenceAuthorization, undefined);
+      }
+      await client.request("account/logout", {});
+      const signedOut = await client.request<{ account: unknown }>("account/read", {
+        refreshToken: false,
+      });
+      assert.equal(signedOut.account, null);
+    } finally {
+      await client.close();
+      backend.closeAllConnections();
+      await new Promise<void>((resolve) => backend.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 
 test("official stdio accepts requests above 64 MiB directly and through the client proxy", {
   skip: !process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND,
@@ -724,6 +1078,7 @@ test("one native chat uses the selected mode on every new turn", {
   });
   const initializeClient = async () => {
     const notifications: JsonRpcNotification[] = [];
+    let standardError = "";
     let notify: (() => void) | undefined;
     const client = createStdioJsonRpcClient(
       {
@@ -750,6 +1105,9 @@ test("one native chat uses the selected mode on every new turn", {
           notifications.push(notification);
           notify?.();
         },
+        onStandardError: (message) => {
+          standardError = `${standardError}${message}`.slice(-4000);
+        },
       },
     );
     await client.request("initialize", {
@@ -764,7 +1122,7 @@ test("one native chat uses the selected mode on every new turn", {
             () =>
               reject(
                 new Error(
-                  `Mode-switch fixture event did not arrive after ${officialRequests} official requests: ${JSON.stringify(notifications.slice(-12))}`,
+                  `Mode-switch fixture event did not arrive after ${officialRequests} official requests: ${JSON.stringify(notifications.slice(-12))}; stderr: ${standardError}`,
                 ),
               ),
             10_000,
@@ -777,11 +1135,15 @@ test("one native chat uses the selected mode on every new turn", {
     };
     const runTurn = async (threadId: string, text: string, model?: string) => {
       const offset = notifications.length;
-      await client.request("turn/start", {
-        threadId,
-        input: [{ type: "text", text }],
-        ...(model === undefined ? {} : { model }),
-      });
+      await client
+        .request("turn/start", {
+          threadId,
+          input: [{ type: "text", text }],
+          ...(model === undefined ? {} : { model }),
+        })
+        .catch((error: Error) => {
+          throw new Error(`Native fixture turn ${text}: ${error.message}`);
+        });
       await waitFor(() =>
         notifications
           .slice(offset)
@@ -803,6 +1165,11 @@ test("one native chat uses the selected mode on every new turn", {
     const threadId = started.thread.id;
     assert.equal(started.thread.modelProvider, "official_fixture");
     const firstOfficial = await session.runTurn(threadId, "Official first round");
+    await session.client
+      .request("thread/name/set", { threadId, name: "Continuation fixture" })
+      .catch((error: Error) => {
+        throw new Error(`Native name update failed: ${error.message}`);
+      });
     assert.doesNotMatch(JSON.stringify(firstOfficial), /总：/u);
     const cancellationOffset = session.notifications.length;
     holdNextOfficialRequest = true;
@@ -873,6 +1240,15 @@ test("one native chat uses the selected mode on every new turn", {
     assert.doesNotMatch(cancelledHistory, /总：/u);
     const firstManaged = await session.runTurn(threadId, "Managed round");
     assert.match(JSON.stringify(firstManaged), /总：入 11 · 出 3 · 合 14/u);
+    const listed = await session.client.request<{ data: { id: string; name: string | null }[] }>(
+      "thread/list",
+      { limit: 100 },
+    );
+    assert.equal(listed.data.filter((thread) => thread.id === threadId).length, 1);
+    assert.equal(
+      listed.data.find((thread) => thread.id === threadId)?.name,
+      "Continuation fixture",
+    );
     await session.client.close();
 
     await switchCodexClientConfiguration({
@@ -1002,6 +1378,71 @@ test("one native chat uses the selected mode on every new turn", {
       /ai-tidu9-config/u,
       JSON.stringify(officialRequestPaths),
     );
+    const empty = await session.client.request<{ thread: { id: string } }>("thread/start", {
+      cwd: directory,
+      approvalPolicy: "never",
+      sandbox: "read-only",
+    });
+    const emptyOffset = session.notifications.length;
+    await switchCodexClientConfiguration({ mode: "official", codexHomeDirectory });
+    await session.waitFor(() =>
+      session.notifications
+        .slice(emptyOffset)
+        .some(
+          (notification) =>
+            notification.method === "thread/settings/updated" &&
+            (notification.params as { threadId?: string }).threadId === empty.thread.id,
+        ),
+    );
+    await session.runTurn(empty.thread.id, "First message after switching an empty chat");
+    const emptyHistory = await session.client.request<{ thread: { id: string; turns: unknown[] } }>(
+      "thread/read",
+      {
+        threadId: empty.thread.id,
+        includeTurns: true,
+      },
+    );
+    assert.equal(emptyHistory.thread.id, empty.thread.id);
+    assert.equal(emptyHistory.thread.turns.length, 1);
+    const loaded = await session.client.request<{ data: string[] }>("thread/loaded/list", {});
+    assert.equal(loaded.data.filter((id) => id === empty.thread.id).length, 1);
+    const peer = await initializeClient();
+    try {
+      const continued = await peer.client.request<{ thread: { id: string } }>("thread/fork", {
+        threadId: empty.thread.id,
+      });
+      createCodexThreadLinks(codexHomeDirectory).record(empty.thread.id, continued.thread.id);
+      await assert.rejects(
+        () => session.runTurn(empty.thread.id, "Blocked while the native writer is active"),
+        /already has an active writer/u,
+      );
+      await peer.client.close();
+      await session.runTurn(empty.thread.id, "Continue after another relay creates a continuation");
+      const shared = await session.client.request<{ thread: { id: string; turns: unknown[] } }>(
+        "thread/read",
+        { threadId: empty.thread.id, includeTurns: true },
+      );
+      assert.equal(shared.thread.id, empty.thread.id);
+      assert.equal(shared.thread.turns.length, 2);
+      await session.client.request("thread/unsubscribe", { threadId: empty.thread.id });
+      await session.runTurn(empty.thread.id, "Continue after the native thread was unsubscribed");
+      await session.client.request("thread/unsubscribe", { threadId: empty.thread.id });
+      await session.client.request("thread/read", {
+        threadId: empty.thread.id,
+        includeTurns: false,
+      });
+      await session.runTurn(
+        empty.thread.id,
+        "Continue after reading metadata for an unloaded thread",
+      );
+      const continuedHistory = await session.client.request<{
+        thread: { id: string; turns: unknown[] };
+      }>("thread/read", { threadId: empty.thread.id, includeTurns: true });
+      assert.equal(continuedHistory.thread.id, empty.thread.id);
+      assert.equal(continuedHistory.thread.turns.length, 4);
+    } finally {
+      await peer.client.close();
+    }
   } finally {
     await session.client.close();
     await runtime.close();
@@ -1225,6 +1666,7 @@ test("official caller executes delegated commands as native command items and re
 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "tidu-caller-tools-"));
   const command = process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND ?? "codex";
+  const nativeTracePath = join(directory, "native-rpc.jsonl");
   let modelRequests = 0;
   let receivedToolOutput = false;
   let cancelFixture = false;
@@ -1237,8 +1679,10 @@ test("official caller executes delegated commands as native command items and re
       input?: { type?: string; output?: unknown; content?: unknown }[];
       tools?: Record<string, unknown>[];
     };
-    modelRequests += 1;
-    if (cancelFixture) cancellationRequests += 1;
+    const compacting =
+      !waitingFixture && !body.tools?.some((tool) => tool.name === "tidu_caller_tool_0");
+    if (!compacting) modelRequests += 1;
+    if (cancelFixture && !compacting) cancellationRequests += 1;
     const runningFixture = cancelFixture && cancellationRequests > 1;
     receivedToolOutput =
       body.input?.some(
@@ -1246,10 +1690,42 @@ test("official caller executes delegated commands as native command items and re
           item.type === "function_call_output" &&
           JSON.stringify(item.output).includes("native-fixture-content"),
       ) ?? false;
+    const receivedFollowupOutput =
+      body.input?.some(
+        (item) =>
+          item.type === "function_call_output" &&
+          JSON.stringify(item.output).includes("native-edit-content"),
+      ) ?? false;
     response.writeHead(200, { "content-type": "text/event-stream" });
     const send = (type: string, payload: Record<string, unknown>): void => {
       response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`);
     };
+    if (compacting) {
+      // Compaction does not declare the caller tools and must receive a summary, not a tool call.
+      const item = {
+        type: "message",
+        id: "compaction_summary",
+        role: "assistant",
+        phase: "final_answer",
+        content: [{ type: "output_text", text: "Fixture conversation summary.", annotations: [] }],
+      };
+      send("response.created", {
+        response: { id: "compact_fixture", object: "response", status: "in_progress", output: [] },
+      });
+      send("response.output_item.added", { output_index: 0, item });
+      send("response.output_item.done", { output_index: 0, item });
+      send("response.completed", {
+        response: {
+          id: "compact_fixture",
+          object: "response",
+          status: "completed",
+          output: [item],
+          usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15 },
+        },
+      });
+      response.end();
+      return;
+    }
     if (waitingFixture) {
       send("response.created", {
         response: {
@@ -1293,7 +1769,7 @@ test("official caller executes delegated commands as native command items and re
       return;
     }
     const output: Record<string, unknown>[] =
-      receivedToolOutput && !cancelFixture
+      receivedFollowupOutput && !cancelFixture
         ? [
             {
               type: "message",
@@ -1309,45 +1785,58 @@ test("official caller executes delegated commands as native command items and re
               ],
             },
           ]
-        : [
-            {
-              type: "reasoning",
-              id: `rs_fixture_${modelRequests}`,
-              summary: [
-                { type: "summary_text", text: "Inspect the fixture file." },
-                { type: "summary_text", text: "Verify the fixture content." },
-              ],
-              encrypted_content: null,
-            },
-            {
-              type: "message",
-              id: `comment_fixture_${modelRequests}`,
-              role: "assistant",
-              phase: "commentary",
-              content: [
-                {
-                  type: "output_text",
-                  text: "Reading the fixture.",
-                  annotations: [],
-                },
-              ],
-            },
-            {
-              type: "function_call",
-              id: `fc_fixture_${modelRequests}`,
-              name: "tidu_caller_tool_0",
-              call_id: runningFixture
-                ? "call_fixture_cancel"
-                : cancelFixture
-                  ? "call_fixture_read_before_cancel"
-                  : "call_fixture_native",
-              arguments: JSON.stringify({
-                cmd: runningFixture ? "sleep 20" : "cat fixture.txt",
-                max_output_tokens: 1000,
-                yield_time_ms: 10000,
-              }),
-            },
-          ];
+        : receivedToolOutput && !cancelFixture
+          ? [
+              {
+                type: "function_call",
+                id: "fc_fixture_followup",
+                name: "tidu_caller_tool_0",
+                call_id: "call_fixture_followup",
+                arguments: JSON.stringify({
+                  cmd: "cat edited-fixture.txt",
+                  max_output_tokens: 1000,
+                }),
+              },
+            ]
+          : [
+              {
+                type: "reasoning",
+                id: `rs_fixture_${modelRequests}`,
+                summary: [
+                  { type: "summary_text", text: "Inspect the fixture file." },
+                  { type: "summary_text", text: "Verify the fixture content." },
+                ],
+                encrypted_content: null,
+              },
+              {
+                type: "message",
+                id: `comment_fixture_${modelRequests}`,
+                role: "assistant",
+                phase: "commentary",
+                content: [
+                  {
+                    type: "output_text",
+                    text: "Reading the fixture.",
+                    annotations: [],
+                  },
+                ],
+              },
+              {
+                type: "function_call",
+                id: `fc_fixture_${modelRequests}`,
+                name: "tidu_caller_tool_0",
+                call_id: runningFixture
+                  ? "call_fixture_cancel"
+                  : cancelFixture
+                    ? "call_fixture_read_before_cancel"
+                    : "call_fixture_native",
+                arguments: JSON.stringify({
+                  cmd: runningFixture ? "sleep 20" : "cat fixture.txt",
+                  max_output_tokens: 1000,
+                  yield_time_ms: 10000,
+                }),
+              },
+            ];
     if (!receivedToolOutput && !cancelFixture) {
       output.push({
         type: "function_call",
@@ -1435,7 +1924,17 @@ test("official caller executes delegated commands as native command items and re
   // The synthetic login status applies only to this isolated local model fixture.
   await writeFile(
     wrapper,
-    `#!/usr/bin/env node\nconst {spawn}=require("node:child_process");\nif(process.argv[2]==="login"){console.log("Logged in to fixture");process.exit(0)}\nconst child=spawn(${JSON.stringify(command)},["-c",${JSON.stringify(`model_providers.fixture={name="fixture",base_url="http://127.0.0.1:${address.port}/v1",wire_api="responses",requires_openai_auth=false}`)},...process.argv.slice(2)],{stdio:"inherit"});\nprocess.on("SIGTERM",()=>child.kill("SIGTERM"));child.on("exit",code=>process.exit(code??1));\n`,
+    `#!/usr/bin/env node
+const {spawn}=require("node:child_process");
+const {appendFileSync}=require("node:fs");
+const {createInterface}=require("node:readline");
+if(process.argv[2]==="login"){console.log("Logged in to fixture");process.exit(0)}
+const child=spawn(${JSON.stringify(command)},["-c",${JSON.stringify(`model_providers.fixture={name="fixture",base_url="http://127.0.0.1:${address.port}/v1",wire_api="responses",requires_openai_auth=false}`)},...process.argv.slice(2)],{stdio:["pipe","pipe","inherit"]});
+const forward=(direction,line,target)=>{const message=JSON.parse(line);if(message.method==='thread/inject_items')message.params={threadId:message.params.threadId,itemCount:message.params.items.length};appendFileSync(${JSON.stringify(nativeTracePath)},JSON.stringify({direction,...message})+'\\n');target.write(line+'\\n');};
+createInterface({input:process.stdin}).on("line",line=>forward("client",line,child.stdin));
+createInterface({input:child.stdout}).on("line",line=>forward("server",line,process.stdout));
+process.on("SIGTERM",()=>child.kill("SIGTERM"));child.on("exit",code=>process.exit(code??1));
+`,
   );
   await chmod(wrapper, 0o700);
   await writeFile(join(directory, "fixture.txt"), "native-fixture-content\n");
@@ -1563,14 +2062,93 @@ test("official caller executes delegated commands as native command items and re
       "completed",
       JSON.stringify(notifications.filter((notification) => notification.method === "error")),
     );
-    assert.equal(modelRequests, 2);
+    assert.equal(modelRequests, 3);
     assert.equal(receivedToolOutput, true);
+    const nativeTrace = (await readFile(nativeTracePath, "utf8"))
+      .trim()
+      .split("\n")
+      .map(
+        (line) =>
+          JSON.parse(line) as {
+            direction: string;
+            id?: string | number;
+            method?: string;
+            params?: {
+              threadId?: string;
+              turnId?: string;
+              callId?: string;
+              input?: unknown;
+              dynamicTools?: Record<string, unknown>[];
+            };
+            result?: { success?: boolean; contentItems?: unknown; thread?: { id: string } };
+          },
+      );
+    const nativeTurns = nativeTrace.filter(
+      (message) => message.direction === "client" && message.method === "turn/start",
+    );
+    const callerStarts = new Set(
+      nativeTrace
+        .filter(
+          (message) =>
+            message.direction === "client" &&
+            message.method === "thread/start" &&
+            (message.params?.dynamicTools?.length ?? 0) > 0,
+        )
+        .map((message) => message.id),
+    );
+    const callerThreads = new Set(
+      nativeTrace
+        .filter((message) => message.direction === "server" && callerStarts.has(message.id))
+        .flatMap((message) => message.result?.thread?.id ?? []),
+    );
+    const callerTurns = nativeTurns.filter((message) =>
+      callerThreads.has(message.params?.threadId ?? ""),
+    );
+    assert.equal(callerThreads.size, 1, "Static caller tools retain one native thread.");
+    assert.equal(callerTurns.length, 1, "Tool results must continue the original native turn.");
+    const compactionTurns = nativeTurns.filter(
+      (message) => !callerThreads.has(message.params?.threadId ?? ""),
+    );
+    assert.ok(
+      compactionTurns.every((message) =>
+        JSON.stringify(message.params?.input).includes("CONTEXT CHECKPOINT COMPACTION"),
+      ),
+      "Only independent context compaction may start a non-caller turn.",
+    );
+    assert.equal(
+      nativeTrace.some((message) => message.method === "turn/interrupt"),
+      false,
+    );
+    assert.doesNotMatch(JSON.stringify(nativeTurns), /Continue from the supplied conversation/u);
+    const nativeToolRequests = nativeTrace.filter(
+      (message) => message.direction === "server" && message.method === "item/tool/call",
+    );
+    assert.equal(nativeToolRequests.length, 3);
+    assert.equal(new Set(nativeToolRequests.map((message) => message.params?.threadId)).size, 1);
+    assert.equal(new Set(nativeToolRequests.map((message) => message.params?.turnId)).size, 1);
+    for (const toolRequest of nativeToolRequests) {
+      const reply = nativeTrace.find(
+        (message) =>
+          message.direction === "client" &&
+          message.method === undefined &&
+          message.id === toolRequest.id,
+      );
+      assert.equal(
+        reply?.result?.success,
+        true,
+        `Missing native reply for ${toolRequest.params?.callId}`,
+      );
+      assert.match(
+        JSON.stringify(reply?.result?.contentItems),
+        /native-(?:fixture|second|edit)-content/u,
+      );
+    }
     assert.equal(
       await readFile(join(directory, "edited-fixture.txt"), "utf8"),
       "native-edit-content\n",
     );
     const executed = turn?.items.filter((item) => item.type === "commandExecution");
-    assert.equal(executed?.length, 2);
+    assert.equal(executed?.length, 3);
     assert.match(
       executed?.find((item) => item.command?.includes("cat fixture.txt"))?.aggregatedOutput ?? "",
       /native-fixture-content/u,
@@ -1578,6 +2156,10 @@ test("official caller executes delegated commands as native command items and re
     assert.equal(executed?.filter((item) => item.command?.includes("cat fixture.txt")).length, 1);
     assert.equal(
       executed?.filter((item) => item.command?.includes("cat second-fixture.txt")).length,
+      1,
+    );
+    assert.equal(
+      executed?.filter((item) => item.command?.includes("cat edited-fixture.txt")).length,
       1,
     );
     const reasoning = turn?.items.filter((item) => item.type === "reasoning");
@@ -1617,7 +2199,7 @@ test("official caller executes delegated commands as native command items and re
       turn?.items.find((item) => item.type === "agentMessage" && item.phase === "final_answer")
         ?.text ?? "";
     assert.match(answer, /Native fixture verified\./u);
-    assert.match(answer, /(?:合|total) 30/u);
+    assert.match(answer, /(?:合|total) 45/u);
     cancelFixture = true;
     notifications.length = 0;
     const cancellable = await caller.request<{ turn: { id: string } }>("turn/start", {
@@ -1651,6 +2233,7 @@ test("official caller executes delegated commands as native command items and re
           status: string;
           durationMs: number;
           items: {
+            id: string;
             type: string;
             command?: string;
             summary?: string[];
@@ -1717,7 +2300,10 @@ test("official caller executes delegated commands as native command items and re
       {
         threadId: started.thread.id,
         turnId: cancellable.turn.id,
-        itemIds: ["call_fixture_cancel", `tidu_usage_${cancellable.turn.id}`],
+        itemIds: [
+          cancelledTurn?.items.find((item) => item.command?.includes("sleep 20"))?.id,
+          `tidu_usage_${cancellable.turn.id}`,
+        ],
       },
     );
     assert.equal(itemRead.data.length, 2);

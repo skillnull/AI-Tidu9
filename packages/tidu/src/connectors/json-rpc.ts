@@ -101,10 +101,13 @@ export const createStdioJsonRpcClient = (
         ? DEFAULT_LIMITS.requestTimeoutMilliseconds
         : options.requestTimeoutMilliseconds,
   };
+  const ownsProcessGroup = process.platform !== "win32";
   const child = spawn(launch.command, [...launch.arguments], {
     cwd: launch.workingDirectory,
     env: launch.environment,
     stdio: ["pipe", "pipe", "pipe"],
+    // Keep owned descendants in an isolated group so forced relay shutdown cannot orphan them.
+    detached: ownsProcessGroup,
   });
   const pendingRequests = new Map<JsonRpcId, PendingRequest>();
   const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
@@ -112,6 +115,21 @@ export const createStdioJsonRpcClient = (
   let closed = false;
   let closeNotified = false;
   let closePromise: Promise<void> | undefined;
+  let processClosed = false;
+  child.once("close", () => {
+    processClosed = true;
+  });
+  const signalProcess = (signal: NodeJS.Signals): void => {
+    if (!ownsProcessGroup || child.pid === undefined) {
+      child.kill(signal);
+      return;
+    }
+    try {
+      process.kill(-child.pid, signal);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+  };
 
   const notifyClose = (error: Error): void => {
     if (closeNotified) return;
@@ -163,17 +181,22 @@ export const createStdioJsonRpcClient = (
     if (!child.stdin.destroyed && !child.stdin.writableEnded) {
       child.stdin.end();
     }
-    if (child.exitCode !== null || child.signalCode !== null) {
+    if (processClosed) {
       closePromise = Promise.resolve();
       return closePromise;
     }
     closePromise = new Promise<void>((resolve) => {
-      const forceTimer = setTimeout(() => child.kill("SIGKILL"), 1_000);
-      child.once("exit", () => {
+      const forceTimer = setTimeout(() => {
+        signalProcess("SIGKILL");
+        child.stdin.destroy();
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }, 1_000);
+      child.once("close", () => {
         clearTimeout(forceTimer);
         resolve();
       });
-      child.kill("SIGTERM");
+      signalProcess("SIGTERM");
     });
     return closePromise;
   };
@@ -281,6 +304,7 @@ export const createStdioJsonRpcClient = (
     );
     notifyClose(error);
     rejectAllPending(error);
+    void closeConnection(error);
   });
 
   const client: JsonRpcClient = {

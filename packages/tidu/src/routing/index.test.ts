@@ -1814,6 +1814,49 @@ test("keeps reported usage when cancellation skips another selected model", asyn
   assert.equal(record?.tokenUsage?.totalTokens, 15);
 });
 
+test("retains execution-receipt usage when a primary JSON response omits usage", async () => {
+  const usage = { inputTokens: 7, outputTokens: 3, totalTokens: 10 };
+  const completion = createCapabilityCompletionProvider(
+    {
+      descriptor: { type: "codex-host", model: "actual-model" },
+      execute: async (request) => {
+        request.onExecutionReceipt?.({
+          host: "codex",
+          model: "actual-model",
+          role: "main",
+          capabilities: ["text"],
+          usage,
+        });
+        return {
+          kind: "json",
+          statusCode: 200,
+          upstreamModel: "actual-model",
+          body: { output_text: "Fixture complete." },
+        };
+      },
+    },
+    async () => ({
+      modelSelection: { source: "official", model: "current" },
+      capabilityCompletion: {
+        enabled: false,
+        mainCapabilities: ["text"],
+        maximumSpecialists: 0,
+        specialists: [],
+      },
+    }),
+  );
+  await completion.execute({
+    protocol: "responses",
+    virtualModelId: "fixture",
+    body: { input: "fixture" },
+    routing: { host: "codex" },
+  });
+  const record = (await completion.inspectCapabilityCompletion()).records[0];
+  assert.equal(record?.outcome, "succeeded");
+  assert.deepEqual(record?.tokenUsage, usage);
+  assert.deepEqual(record?.modelTokenUsage, [{ modelId: "main:codex:official", ...usage }]);
+});
+
 test("retains usage on failed and incomplete stream terminal events", async () => {
   for (const terminalType of ["response.failed", "response.incomplete"] as const) {
     const completion = createCapabilityCompletionProvider(

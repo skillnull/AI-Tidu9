@@ -38,10 +38,27 @@ import {
   discoverOllamaModels,
   type ModelProvider,
   type ProviderExecutionRequest,
+  type ProviderExecutionResult,
 } from "./index.js";
 
 const readStreamText = async (stream: ReadableStream<Uint8Array>): Promise<string> =>
   new Response(stream).text();
+
+const readCodexResponseBody = async (result: ProviderExecutionResult) => {
+  if (result.kind === "json") {
+    assert.ok(typeof result.body === "object" && result.body !== null);
+    return result.body as { output: Record<string, unknown>[] };
+  }
+  const events = await readStreamText(result.stream);
+  const completed = events
+    .split("\n")
+    .filter((line) => line.startsWith("data: {"))
+    .map((line) => JSON.parse(line.slice("data: ".length)))
+    .find((event) => event.type === "response.completed");
+  assert.ok(completed, events);
+  assert.doesNotMatch(events, /response\.failed/u);
+  return completed.response as { output: Record<string, unknown>[] };
+};
 
 const createCommitRequest = (text: string): ProviderExecutionRequest => ({
   protocol: "responses",
@@ -218,22 +235,74 @@ const fs = require("node:fs");
 fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "start\\n");
 let turnCount = 0;
 let threadCount = 0;
+let rejectedSteer = false;
+const callerToolTurns = new Map();
+const replayThreads = new Set();
+const matrixTools = new Map();
+const matrixCalls = new Map();
+const matrixHistory = new Map();
+const matrixGuidance = new Map();
 const readline = require("node:readline").createInterface({ input: process.stdin });
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 readline.on("line", (line) => {
   const request = JSON.parse(line);
   if (request.id === undefined) return;
+  if (request.method === undefined && matrixCalls.has(request.id)) {
+    const pending = matrixCalls.get(request.id);
+    matrixCalls.delete(request.id);
+    if (request.error !== undefined) return;
+    const disconnectMarker = process.env.TIDU_CODEX_PROVIDER_TEST_LOG + ".disconnect-" + pending.state.spec.case;
+    if (pending.state.spec.disconnect && !fs.existsSync(disconnectMarker)) {
+      fs.writeFileSync(disconnectMarker, "disconnected\\n");
+      process.exit(0);
+    }
+    pending.state.results.push({ callId: pending.callId, result: request.result });
+    fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "matrixResult:" + JSON.stringify({ ...pending.identity, callId: pending.callId, result: request.result }) + "\\n");
+    if (pending.state.results.length === pending.state.spec.batch) {
+      const text = JSON.stringify({ case: pending.state.spec.case, results: pending.state.results, history: matrixHistory.get(pending.identity.threadId) || [], guidance: matrixGuidance.get(pending.identity.threadId) || [] });
+      send({ method: "item/agentMessage/delta", params: { ...pending.identity, itemId: "final-" + pending.identity.turnId, delta: text } });
+      send({ method: "thread/tokenUsage/updated", params: { ...pending.identity, tokenUsage: { last: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } } } });
+      send({ method: "turn/completed", params: { threadId: pending.identity.threadId, turn: { id: pending.identity.turnId, status: "completed" } } });
+    }
+    return;
+  }
+  if (process.env.TIDU_CODEX_PROVIDER_CALLER_CONTINUATION_TEST === "true" && request.method === undefined) {
+    const pending = callerToolTurns.get(request.id);
+    if (pending === undefined) return;
+    callerToolTurns.delete(request.id);
+    if (request.error !== undefined) {
+      fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "nativeError:" + JSON.stringify({ ...pending, error: request.error }) + "\\n");
+      return;
+    }
+    fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "nativeResult:" + JSON.stringify({ ...pending, result: request.result }) + "\\n");
+    send({ method: "item/agentMessage/delta", params: { ...pending, itemId: "final-" + pending.turnId, delta: JSON.stringify({ ...pending, result: request.result }) } });
+    send({ method: "thread/tokenUsage/updated", params: { ...pending, tokenUsage: { last: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } } } });
+    send({ method: "turn/completed", params: { threadId: pending.threadId, turn: { id: pending.turnId, status: "completed" } } });
+    return;
+  }
   if (request.method === "initialize") send({ jsonrpc: "2.0", id: request.id, result: {} });
   else if (request.method === "thread/start") {
+    if (!request.params.dynamicTools?.length) {
+      for (const pending of callerToolTurns.values()) {
+        if (!pending.endStatus || pending.endSent) continue;
+        pending.endSent = true;
+        send({ method: "thread/tokenUsage/updated", params: { ...pending, tokenUsage: { last: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } } } });
+        send({ method: "turn/completed", params: { threadId: pending.threadId, turn: { id: pending.turnId, status: pending.endStatus, error: { message: "Yielded turn ended." } } } });
+        fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "yieldedEnd:" + pending.endStatus + "\\n");
+      }
+    }
     threadCount += 1;
     const requestedModel = request.params.model;
     const confirmedModel = process.env.TIDU_CODEX_PROVIDER_IGNORE_REQUESTED_MODEL === "true"
       ? "gpt-test"
       : requestedModel || (threadCount === 1 ? "gpt-test" : "ai-tidu9-config");
     fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "threadModel:" + JSON.stringify(requestedModel) + "\\n");
+    matrixTools.set("thread-" + threadCount, request.params.dynamicTools || []);
     send({ jsonrpc: "2.0", id: request.id, result: { thread: { id: "thread-" + threadCount }, model: confirmedModel } });
   }
   else if (request.method === "thread/inject_items") {
+    matrixHistory.set(request.params.threadId, [...(matrixHistory.get(request.params.threadId) || []), ...request.params.items]);
+    if (request.params.items.some((item) => ["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(item.type))) replayThreads.add(request.params.threadId);
     fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "history:" + JSON.stringify(request.params.items) + "\\n");
     send({ jsonrpc: "2.0", id: request.id, result: {} });
   }
@@ -251,35 +320,101 @@ readline.on("line", (line) => {
     fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "effort:" + request.params.effort + "\\n");
     fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "summary:" + request.params.summary + "\\n");
     fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "input:" + JSON.stringify(request.params.input) + "\\n");
+    fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "turnThread:" + request.params.threadId + "\\n");
     fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "outputSchema:" + JSON.stringify(request.params.outputSchema) + "\\n");
     send({ jsonrpc: "2.0", id: request.id, result: { turn: { id: turnId } } });
-    if (process.env.TIDU_CODEX_PROVIDER_DELAY_FIRST_TURN === "true" && turnCount === 1) return;
-    if (request.params.input.some((item) => item.type === "image" || item.type === "localImage")) {
-      const userMessage = { type: "userMessage", id: "user-" + turnId, clientId: null, content: request.params.input };
-      send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, startedAtMs: Date.now(), item: userMessage } });
-      send({ jsonrpc: "2.0", method: "item/completed", params: { threadId: "thread-1", turnId, completedAtMs: Date.now(), item: userMessage } });
+    send({ method: "turn/started", params: { threadId: request.params.threadId, turn: { id: turnId, status: "inProgress", items: [] } } });
+    if (process.env.TIDU_CODEX_PROVIDER_CALLER_MATRIX_TEST === "true" && request.params.input?.[0]?.text?.startsWith('{"fixture":"caller-matrix"')) {
+      const spec = JSON.parse(request.params.input[0].text);
+      const identity = { threadId: request.params.threadId, turnId };
+      const state = { spec, results: [] };
+      const definition = (matrixTools.get(request.params.threadId) || [])[0];
+      const argumentsValue = definition?.inputSchema?.properties?.input ? { input: "fixture input" } : { query: "fixture query" };
+      for (let index = 0; index < spec.batch; index += 1) {
+        const callId = "matrix-native-" + spec.case + "-" + index;
+        const rpcId = "matrix-rpc-" + spec.case + "-" + index;
+        matrixCalls.set(rpcId, { identity, state, callId });
+        send({ method: "rawResponseItem/completed", params: { ...identity, item: { type: "function_call", name: "tidu_caller_tool_0", call_id: callId, arguments: JSON.stringify(argumentsValue) } } });
+      }
+      if (spec.terminal) {
+        for (const [rpcId, pending] of matrixCalls) if (pending.state === state) matrixCalls.delete(rpcId);
+        send({ method: "thread/tokenUsage/updated", params: { ...identity, tokenUsage: { last: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } } } });
+        send({ method: "turn/completed", params: { threadId: identity.threadId, turn: { id: turnId, status: spec.terminal, error: { message: "Fixture terminal failure." } } } });
+        return;
+      }
+      send({ method: "rawResponse/completed", params: { ...identity, usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 } } });
+      for (const [rpcId, pending] of matrixCalls) {
+        if (pending.state !== state) continue;
+        send({ id: rpcId, method: "item/tool/call", params: { ...identity, callId: pending.callId, tool: "tidu_caller_tool_0", arguments: argumentsValue } });
+      }
+      return;
     }
-    if (request.params.summary === "auto") send({ jsonrpc: "2.0", method: "item/reasoning/summaryTextDelta", params: { threadId: "thread-1", turnId, itemId: "reasoning-1", summaryIndex: 0, delta: "reasoning-" } });
-    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, item: { type: "commandExecution", id: "command-1", command: "npm test" } } });
-    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, item: { type: "fileChange", id: "file-1", changes: [{ path: "src/index.ts" }] } } });
-    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, item: { type: "webSearch", id: "search-1", query: "official docs" } } });
-    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, startedAtMs: Date.now(), item: { type: "agentMessage", id: "commentary-1", text: "", phase: "commentary", memoryCitation: null, delivery: null, questions: null } } });
-    send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId, itemId: "commentary-1", delta: "working-" } });
+    if (process.env.TIDU_CODEX_PROVIDER_TOOL_DISCOVERY_TEST === "true" && request.params.input.length === 0 && (matrixTools.get(request.params.threadId) || []).length > 1) {
+      const pending = { threadId: request.params.threadId, turnId, prompt: "Discovered tool." };
+      const definition = matrixTools.get(request.params.threadId)[1];
+      const argumentsValue = definition.inputSchema?.properties?.input ? { input: "new custom input" } : { query: "new function input" };
+      const rpcId = "discovered-" + turnId;
+      const callId = "discovered-call-" + turnId;
+      callerToolTurns.set(rpcId, pending);
+      send({ method: "rawResponseItem/completed", params: { ...pending, item: { type: "function_call", name: "tidu_caller_tool_1", call_id: callId, arguments: JSON.stringify(argumentsValue) } } });
+      send({ method: "rawResponse/completed", params: { ...pending, usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 } } });
+      send({ id: rpcId, method: "item/tool/call", params: { ...pending, callId, tool: "tidu_caller_tool_1", arguments: argumentsValue } });
+      return;
+    }
+    if (process.env.TIDU_CODEX_PROVIDER_CALLER_CONTINUATION_TEST === "true" && !replayThreads.has(request.params.threadId) && (matrixTools.get(request.params.threadId) || []).length > 0) {
+      const pending = { threadId: request.params.threadId, turnId, prompt: request.params.input[0].text };
+      const rpcId = "dynamic-" + turnId;
+      callerToolTurns.set(rpcId, pending);
+      fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "turnStart:" + JSON.stringify(pending) + "\\n");
+      send({ method: "rawResponseItem/completed", params: { ...pending, item: { type: "function_call", name: "tidu_caller_tool_0", call_id: "shared-native-call", arguments: "{}" } } });
+      send({ method: "rawResponse/completed", params: { ...pending, usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 } } });
+      send({ id: rpcId, method: "item/tool/call", params: { ...pending, callId: "shared-native-call", tool: "tidu_caller_tool_0", arguments: {} } });
+      if (pending.prompt.startsWith('{"endYielded":')) {
+        pending.endStatus = JSON.parse(pending.prompt).endYielded;
+      }
+      return;
+    }
+    if (process.env.TIDU_CODEX_PROVIDER_DELAY_FIRST_TURN === "true" && turnCount === 1) return;
+    if (request.params.input?.some((item) => item.type === "image" || item.type === "localImage")) {
+      const userMessage = { type: "userMessage", id: "user-" + turnId, clientId: null, content: request.params.input };
+      send({ jsonrpc: "2.0", method: "item/started", params: { threadId: request.params.threadId, turnId, startedAtMs: Date.now(), item: userMessage } });
+      send({ jsonrpc: "2.0", method: "item/completed", params: { threadId: request.params.threadId, turnId, completedAtMs: Date.now(), item: userMessage } });
+    }
+    if (request.params.summary === "auto") send({ jsonrpc: "2.0", method: "item/reasoning/summaryTextDelta", params: { threadId: request.params.threadId, turnId, itemId: "reasoning-1", summaryIndex: 0, delta: "reasoning-" } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: request.params.threadId, turnId, item: { type: "commandExecution", id: "command-1", command: "npm test" } } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: request.params.threadId, turnId, item: { type: "fileChange", id: "file-1", changes: [{ path: "src/index.ts" }] } } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: request.params.threadId, turnId, item: { type: "webSearch", id: "search-1", query: "official docs" } } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: request.params.threadId, turnId, startedAtMs: Date.now(), item: { type: "agentMessage", id: "commentary-1", text: "", phase: "commentary", memoryCitation: null, delivery: null, questions: null } } });
+    send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: request.params.threadId, turnId, itemId: "commentary-1", delta: "working-" } });
     if (process.env.TIDU_CODEX_PROVIDER_NATIVE_PROGRESS_TEST === "true") {
       const reasoning = { type: "reasoning", id: "reasoning-1", summary: [{ type: "summary_text", text: "reasoning-" }, { type: "summary_text", text: "Verify the result.\\n\\nKeep the same summary." }] };
       for (const item of [reasoning, reasoning, { ...reasoning, id: "reasoning-2" }]) {
-        send({ jsonrpc: "2.0", method: "rawResponseItem/completed", params: { threadId: "thread-1", turnId, item } });
+        send({ jsonrpc: "2.0", method: "rawResponseItem/completed", params: { threadId: request.params.threadId, turnId, item } });
       }
     }
-    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: "thread-1", turnId, startedAtMs: Date.now(), item: { type: "agentMessage", id: "final-1", text: "", phase: "final_answer", memoryCitation: null, delivery: null, questions: null } } });
-    send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId, itemId: "final-1", delta: finalText } });
-    send({ jsonrpc: "2.0", method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId, tokenUsage: { last: { inputTokens: 11, cachedInputTokens: 3, cacheWriteInputTokens: 2, outputTokens: 4, reasoningOutputTokens: 1, totalTokens: 15 } } } });
+    send({ jsonrpc: "2.0", method: "item/started", params: { threadId: request.params.threadId, turnId, startedAtMs: Date.now(), item: { type: "agentMessage", id: "final-1", text: "", phase: "final_answer", memoryCitation: null, delivery: null, questions: null } } });
+    send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: request.params.threadId, turnId, itemId: "final-1", delta: finalText } });
+    send({ jsonrpc: "2.0", method: "thread/tokenUsage/updated", params: { threadId: request.params.threadId, turnId, tokenUsage: { last: { inputTokens: 11, cachedInputTokens: 3, cacheWriteInputTokens: 2, outputTokens: 4, reasoningOutputTokens: 1, totalTokens: 15 } } } });
     const terminalStatus = process.env.TIDU_CODEX_PROVIDER_TURN_STATUS || "completed";
     const terminalError = process.env.TIDU_CODEX_PROVIDER_TURN_ERROR || "Fixture upstream stream disconnected";
-    send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: "thread-1", turn: { id: turnId, status: terminalStatus, ...(terminalStatus === "failed" ? { error: { message: terminalError } } : {}) } } });
+    send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: request.params.threadId, turn: { id: turnId, status: terminalStatus, ...(terminalStatus === "failed" ? { error: { message: terminalError } } : {}) } } });
+  }
+  else if (request.method === "turn/steer" && process.env.TIDU_CODEX_PROVIDER_REJECT_FIRST_STEER === "true" && !rejectedSteer) {
+    rejectedSteer = true;
+    fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "steerRejected\\n");
+    send({ jsonrpc: "2.0", id: request.id, error: { code: -32602, message: "Fixture steer rejected." } });
+  }
+  else if (request.method === "turn/steer") {
+    matrixGuidance.set(request.params.threadId, [...(matrixGuidance.get(request.params.threadId) || []), ...request.params.input]);
+    send({ jsonrpc: "2.0", id: request.id, result: {} });
   }
   else if (request.method === "turn/interrupt") {
+    if (process.env.TIDU_CODEX_PROVIDER_CALLER_CONTINUATION_TEST === "true") fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "interrupted\\n");
     send({ jsonrpc: "2.0", id: request.id, result: {} });
+    if (process.env.TIDU_CODEX_PROVIDER_TOOL_DISCOVERY_TEST === "true") {
+      for (const [rpcId, pending] of callerToolTurns) if (pending.turnId === request.params.turnId) callerToolTurns.delete(rpcId);
+      send({ method: "turn/completed", params: { threadId: request.params.threadId, turn: { id: request.params.turnId, status: "interrupted" } } });
+    }
   }
   else send({ jsonrpc: "2.0", id: request.id, result: {} });
 });
@@ -670,13 +805,7 @@ test("does not replay an old user message when Responses continuation items foll
     body: { input: conversation },
   });
 
-  assert.deepEqual(turn.input, [
-    {
-      type: "text",
-      text: "Continue from the supplied conversation.",
-      text_elements: [],
-    },
-  ]);
+  assert.deepEqual(turn.input, []);
   assert.equal(turn.historyItems.length, conversation.length);
   assert.equal(turn.historyItems[1]?.phase, "commentary");
   assert.equal(turn.historyItems.at(-1)?.type, "function_call_output");
@@ -891,6 +1020,1286 @@ test("reuses one Codex model session while forwarding effort and live deltas per
   } finally {
     await provider?.close?.();
     rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("continues concurrent caller tools on their original turns despite identical native call IDs", {
+  timeout: 5000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-continuation-"));
+  const processLog = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_CALLER_CONTINUATION_TEST: "true",
+    },
+  });
+  try {
+    assert.ok(provider);
+    const tools = [
+      { type: "function", name: "inspect", parameters: { type: "object", properties: {} } },
+    ];
+    const labels = ["first request", "second request"];
+    const initial = await Promise.all(
+      labels.map((label) =>
+        provider.execute({
+          protocol: "responses",
+          virtualModelId: "ai-tidu9-config",
+          body: { model: "ai-tidu9-config", input: label, tools },
+        }),
+      ),
+    );
+    const calls = initial.map((result) => {
+      assert.equal(result.kind, "json");
+      if (result.kind !== "json") throw new Error("Expected caller tool output.");
+      const output = (result.body as { output: Record<string, unknown>[] }).output;
+      const call = output.find((item) => item.type === "function_call");
+      assert.ok(call);
+      assert.equal(typeof call.call_id, "string");
+      assert.equal(call.name, "inspect");
+      assert.notEqual(call.call_id, "shared-native-call");
+      return call;
+    });
+    assert.notEqual(calls[0]?.call_id, calls[1]?.call_id);
+    const completed = await Promise.all(
+      calls.map((call, index) =>
+        provider.execute({
+          protocol: "responses",
+          virtualModelId: "ai-tidu9-config",
+          body: {
+            model: "ai-tidu9-config",
+            tools,
+            input: [
+              {
+                type: "function_call_output",
+                call_id: call.call_id,
+                output: `result for ${labels[index]}`,
+              },
+            ],
+          },
+        }),
+      ),
+    );
+    const nativeResults = completed.map((result, index) => {
+      assert.equal(result.kind, "json");
+      if (result.kind !== "json") throw new Error("Expected completed caller result.");
+      const output = (result.body as { output: { type: string; content?: { text: string }[] }[] })
+        .output;
+      const message = output.find((item) => item.type === "message");
+      const native = JSON.parse(message?.content?.[0]?.text ?? "") as {
+        threadId: string;
+        turnId: string;
+        prompt: string;
+        result: { contentItems: { type: string; text: string }[]; success: boolean };
+      };
+      assert.equal(native.prompt, labels[index]);
+      assert.deepEqual(native.result, {
+        contentItems: [{ type: "inputText", text: `result for ${labels[index]}` }],
+        success: true,
+      });
+      return native;
+    });
+    assert.notEqual(nativeResults[0]?.threadId, nativeResults[1]?.threadId);
+    assert.notEqual(nativeResults[0]?.turnId, nativeResults[1]?.turnId);
+    const log = readFileSync(processLog, "utf8");
+    assert.equal(log.split("\n").filter((line) => line.startsWith("turnStart:")).length, 2);
+    assert.equal(log.split("\n").filter((line) => line.startsWith("nativeResult:")).length, 2);
+    assert.doesNotMatch(log, /interrupted|Continue from the supplied conversation/u);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("covers all 576 caller-delivery combinations on one shared native connection", {
+  timeout: 120_000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-delivery-matrix-"));
+  const processLog = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_CALLER_MATRIX_TEST: "true",
+    },
+  });
+  let verified = 0;
+  let activeCombination = "initialization";
+  const responseBody = async (request: ProviderExecutionRequest) => {
+    assert.ok(provider);
+    try {
+      return await readCodexResponseBody(
+        await provider.execute({ ...request, signal: AbortSignal.timeout(5000) }),
+      );
+    } catch (error) {
+      throw new Error(
+        `${activeCombination}: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+  };
+  try {
+    assert.ok(provider);
+    for (const stream of [false, true])
+      for (const kind of ["function", "custom", "search"] as const)
+        for (const batch of [1, 2])
+          for (const delivery of ["once", "duplicate", "conflict", "concurrent"])
+            for (const guidance of ["none", "text", "image"])
+              for (const history of ["full", "output-only"])
+                for (const bootstrap of [false, true]) {
+                  const caseId = verified + 1;
+                  const label = JSON.stringify({
+                    stream,
+                    kind,
+                    batch,
+                    delivery,
+                    guidance,
+                    history,
+                    bootstrap,
+                  });
+                  activeCombination = label;
+                  const tool =
+                    kind === "search"
+                      ? { type: "tool_search" }
+                      : {
+                          type: "namespace",
+                          name: "fixture",
+                          tools: [{ type: kind, name: "inspect" }],
+                        };
+                  const originalInput = JSON.stringify({
+                    fixture: "caller-matrix",
+                    case: caseId,
+                    batch,
+                  });
+                  const initial = await responseBody({
+                    protocol: "responses",
+                    virtualModelId: "tidu",
+                    body: { model: "tidu", tools: [tool], input: originalInput, stream },
+                  });
+                  const calls = initial.output.filter((item) =>
+                    ["function_call", "custom_tool_call", "tool_search_call"].includes(
+                      String(item.type),
+                    ),
+                  );
+                  assert.equal(calls.length, batch, label);
+                  assert.equal(new Set(calls.map((item) => item.call_id)).size, batch, label);
+                  const results = calls.map((call, index) =>
+                    kind === "search"
+                      ? {
+                          type: "tool_search_output",
+                          call_id: call.call_id,
+                          tools: [
+                            {
+                              type: "function",
+                              name: "discovered",
+                              description: "Returned definition.",
+                              parameters: { type: "object" },
+                            },
+                          ],
+                        }
+                      : {
+                          type:
+                            kind === "custom" ? "custom_tool_call_output" : "function_call_output",
+                          call_id: call.call_id,
+                          output: `matrix-result-${caseId}-${index}`,
+                        },
+                  );
+                  const appended: Record<string, unknown>[] =
+                    guidance === "none"
+                      ? []
+                      : [
+                          {
+                            role: "user",
+                            content: [
+                              { type: "input_text", text: `matrix-guidance-${caseId}` },
+                              ...(guidance === "image"
+                                ? [
+                                    {
+                                      type: "input_image",
+                                      image_url: `data:image/png;base64,matrix${caseId}`,
+                                    },
+                                  ]
+                                : []),
+                            ],
+                          },
+                        ];
+                  const context = {
+                    type: "function_call_output",
+                    name: "bootstrap",
+                    namespace: "context",
+                    retain: true,
+                    output: `matrix-bootstrap-${caseId}`,
+                  };
+                  const prefix =
+                    history === "full" ? [{ role: "user", content: originalInput }, ...calls] : [];
+                  const input = [
+                    ...prefix,
+                    ...results,
+                    ...(delivery === "duplicate" ? results : []),
+                    ...appended,
+                    { role: "developer", content: `matrix-developer-${caseId}` },
+                    ...(bootstrap ? [context] : []),
+                  ];
+                  const request: ProviderExecutionRequest = {
+                    protocol: "responses",
+                    virtualModelId: "tidu",
+                    body: { model: "tidu", tools: [tool], input, stream },
+                  };
+                  if (delivery === "conflict")
+                    await assert.rejects(
+                      responseBody({
+                        ...request,
+                        body: {
+                          ...request.body,
+                          input: [
+                            ...input,
+                            {
+                              ...results[0],
+                              ...(kind === "search" ? { tools: [] } : { output: "conflict" }),
+                            },
+                          ],
+                        },
+                      }),
+                      /Conflicting caller tool results/u,
+                      label,
+                    );
+                  const responses =
+                    delivery === "concurrent"
+                      ? await Promise.all([responseBody(request), responseBody(request)])
+                      : [
+                          await responseBody(request),
+                          ...(delivery === "duplicate" ? [await responseBody(request)] : []),
+                        ];
+                  for (const response of responses) {
+                    const message = response.output.find((item) => item.type === "message");
+                    const content = message?.content as { text?: string }[] | undefined;
+                    assert.ok(content?.[0]?.text, label + JSON.stringify(response));
+                    const completed = JSON.parse(content?.[0]?.text ?? "") as {
+                      case: number;
+                      results: { callId: string; result: { contentItems: { text: string }[] } }[];
+                      history: Record<string, unknown>[];
+                      guidance: unknown[];
+                    };
+                    assert.equal(completed.case, caseId, label);
+                    assert.equal(completed.results.length, batch, label);
+                    completed.results.forEach((result, index) => {
+                      assert.equal(result.callId, `matrix-native-${caseId}-${index}`, label);
+                      assert.equal(
+                        result.result.contentItems[0]?.text,
+                        kind === "search"
+                          ? JSON.stringify(results[index]?.tools)
+                          : results[index]?.output,
+                        label,
+                      );
+                    });
+                    const forwarded = JSON.stringify({
+                      history: completed.history,
+                      guidance: completed.guidance,
+                    });
+                    assert.ok(forwarded.includes(`matrix-developer-${caseId}`), label);
+                    if (guidance !== "none")
+                      assert.ok(forwarded.includes(`matrix-guidance-${caseId}`), label);
+                    if (guidance === "image")
+                      assert.ok(forwarded.includes(`data:image/png;base64,matrix${caseId}`), label);
+                    assert.deepEqual(
+                      completed.history.filter((item) => item.name === "bootstrap"),
+                      bootstrap ? [context] : [],
+                      label,
+                    );
+                  }
+                  verified += 1;
+                }
+    assert.equal(verified, 576);
+    const lines = readFileSync(processLog, "utf8").split("\n");
+    assert.equal(lines.filter((line) => line === "start").length, 1);
+    assert.equal(lines.filter((line) => line.startsWith("turnThread:")).length, 576);
+    assert.equal(lines.filter((line) => line.startsWith("matrixResult:")).length, 864);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("preserves owner models across 24 continuation and genuine-new-turn combinations", {
+  timeout: 20_000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-model-matrix-"));
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: join(directory, "provider.log"),
+      TIDU_CODEX_PROVIDER_CALLER_MATRIX_TEST: "true",
+    },
+  });
+  let verified = 0;
+  try {
+    assert.ok(provider);
+    for (const owner of ["gpt-test", "gpt-other"])
+      for (const stream of [false, true])
+        for (const kind of ["function", "custom", "tool_search"])
+          for (const fullHistory of [false, true]) {
+            const selected = owner === "gpt-test" ? "gpt-other" : "gpt-test";
+            const tool = kind === "tool_search" ? { type: kind } : { type: kind, name: "inspect" };
+            const initialInput = JSON.stringify({
+              fixture: "caller-matrix",
+              case: ++verified,
+              batch: 1,
+            });
+            const initial = await readCodexResponseBody(
+              await provider.execute({
+                protocol: "responses",
+                virtualModelId: "tidu",
+                routing: { targetModel: owner },
+                body: { model: "tidu", tools: [tool], input: initialInput, stream },
+              }),
+            );
+            const call = initial.output.find((item) =>
+              ["function_call", "custom_tool_call", "tool_search_call"].includes(String(item.type)),
+            );
+            assert.ok(call);
+            const output =
+              kind === "tool_search"
+                ? { type: "tool_search_output", call_id: call.call_id, tools: [] }
+                : {
+                    type: kind === "custom" ? "custom_tool_call_output" : "function_call_output",
+                    call_id: call.call_id,
+                    output: "Owned result.",
+                  };
+            const history = [{ role: "user", content: initialInput }, call, output];
+            const confirmed: string[] = [];
+            const receipts: string[] = [];
+            const continued = await provider.execute({
+              protocol: "responses",
+              virtualModelId: "tidu",
+              routing: { targetModel: selected },
+              body: {
+                model: "tidu",
+                tools: [tool],
+                input: fullHistory ? history : [output],
+                stream,
+              },
+              onModelConfirmed: (model) => confirmed.push(model),
+              onExecutionReceipt: (receipt) => receipts.push(receipt.model),
+            });
+            assert.equal(continued.upstreamModel, owner);
+            await readCodexResponseBody(continued);
+            assert.deepEqual(confirmed, [owner]);
+            assert.ok(receipts.length > 0 && receipts.every((model) => model === owner));
+            const fresh = await provider.execute({
+              protocol: "responses",
+              virtualModelId: "tidu",
+              routing: { targetModel: selected },
+              body: {
+                model: "tidu",
+                tools: [tool],
+                input: [...history, { role: "user", content: "A genuine new user request." }],
+                stream,
+              },
+            });
+            assert.equal(fresh.upstreamModel, selected);
+            const body = await readCodexResponseBody(fresh);
+            assert.match(JSON.stringify(body), /medium-result/u);
+          }
+    assert.equal(verified, 24);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("never exposes caller tools from 24 failed or interrupted terminal combinations", {
+  timeout: 20_000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-terminal-matrix-"));
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: join(directory, "provider.log"),
+      TIDU_CODEX_PROVIDER_CALLER_MATRIX_TEST: "true",
+    },
+  });
+  let verified = 0;
+  try {
+    assert.ok(provider);
+    for (const stream of [false, true])
+      for (const kind of ["function", "custom", "tool_search"])
+        for (const batch of [1, 2])
+          for (const terminal of ["failed", "interrupted"]) {
+            const request: ProviderExecutionRequest = {
+              protocol: "responses",
+              virtualModelId: "tidu",
+              body: {
+                model: "tidu",
+                stream,
+                tools:
+                  kind === "tool_search" ? [{ type: kind }] : [{ type: kind, name: "inspect" }],
+                input: JSON.stringify({
+                  fixture: "caller-matrix",
+                  case: ++verified,
+                  batch,
+                  terminal,
+                }),
+              },
+            };
+            if (stream) {
+              const result = await provider.execute(request);
+              assert.equal(result.kind, "stream");
+              if (result.kind !== "stream") throw new Error("Expected terminal stream.");
+              const events = await readStreamText(result.stream);
+              assert.match(events, /response\.failed/u);
+              assert.doesNotMatch(
+                events,
+                /"type":"(?:function_call|custom_tool_call|tool_search_call)"/u,
+              );
+            } else
+              await assert.rejects(
+                provider.execute(request),
+                terminal === "interrupted" ? /Codex turn cancelled/u : /Fixture terminal failure/u,
+              );
+          }
+    assert.equal(verified, 24);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("preserves 16 search-to-new-function or custom catalog recovery combinations", {
+  timeout: 20_000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-discovered-tools-"));
+  const processLog = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_CALLER_CONTINUATION_TEST: "true",
+      TIDU_CODEX_PROVIDER_TOOL_DISCOVERY_TEST: "true",
+    },
+  });
+  let verified = 0;
+  try {
+    assert.ok(provider);
+    for (const stream of [false, true])
+      for (const kind of ["function", "custom"])
+        for (const fullHistory of [false, true])
+          for (const bootstrap of [false, true]) {
+            const originalInput = "Discover a tool then use its real result.";
+            const initial = await readCodexResponseBody(
+              await provider.execute({
+                protocol: "responses",
+                virtualModelId: "tidu",
+                body: {
+                  model: "tidu",
+                  tools: [{ type: "tool_search" }],
+                  input: originalInput,
+                  stream,
+                },
+              }),
+            );
+            const search = initial.output.find((item) => item.type === "tool_search_call");
+            assert.ok(search);
+            const unlocked = {
+              type: "namespace",
+              name: "unlocked",
+              tools: [{ type: kind, name: "inspect" }],
+            };
+            const searchResult = {
+              type: "tool_search_output",
+              call_id: search.call_id,
+              tools: [unlocked],
+            };
+            const context = {
+              type: "function_call_output",
+              name: "bootstrap",
+              namespace: "context",
+              retain: true,
+              output: "Discovery context.",
+            };
+            const history = [
+              { role: "user", content: originalInput },
+              search,
+              searchResult,
+              ...(bootstrap ? [context] : []),
+            ];
+            const tools = [{ type: "tool_search" }, unlocked];
+            const next = await readCodexResponseBody(
+              await provider.execute({
+                protocol: "responses",
+                virtualModelId: "tidu",
+                body: {
+                  model: "tidu",
+                  tools,
+                  input: fullHistory ? history : [searchResult, ...(bootstrap ? [context] : [])],
+                  stream,
+                },
+              }),
+            );
+            const discovered = next.output.find((item) =>
+              ["function_call", "custom_tool_call"].includes(String(item.type)),
+            );
+            assert.ok(discovered);
+            assert.equal(discovered.name, "inspect");
+            assert.equal(discovered.namespace, "unlocked");
+            assert.equal(discovered.type, kind === "custom" ? "custom_tool_call" : "function_call");
+            const finalResult = {
+              type: kind === "custom" ? "custom_tool_call_output" : "function_call_output",
+              call_id: discovered.call_id,
+              output: "New tool result.",
+            };
+            const final = await readCodexResponseBody(
+              await provider.execute({
+                protocol: "responses",
+                virtualModelId: "tidu",
+                body: {
+                  model: "tidu",
+                  tools,
+                  input: fullHistory ? [...history, discovered, finalResult] : [finalResult],
+                  stream,
+                },
+              }),
+            );
+            assert.match(JSON.stringify(final), /New tool result\./u);
+            verified += 1;
+          }
+    assert.equal(verified, 16);
+    const lines = readFileSync(processLog, "utf8").split("\n");
+    assert.equal(lines.filter((line) => line.startsWith("turnThread:")).length, 32);
+    assert.equal(lines.filter((line) => line.startsWith("nativeResult:")).length, 16);
+    assert.equal(lines.filter((line) => line === "interrupted").length, 16);
+    assert.doesNotMatch(lines.join("\n"), /Continue from the supplied conversation/u);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("keeps the surviving subscriber alive in all six shared-stream cancellation combinations", {
+  timeout: 20_000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-subscriber-cancellation-"));
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: join(directory, "provider.log"),
+      TIDU_CODEX_PROVIDER_CALLER_MATRIX_TEST: "true",
+    },
+  });
+  let verified = 0;
+  try {
+    assert.ok(provider);
+    for (const cancelledIndex of [0, 1])
+      for (const kind of ["function", "custom", "tool_search"]) {
+        const tools = kind === "tool_search" ? [{ type: kind }] : [{ type: kind, name: "inspect" }];
+        const initial = await readCodexResponseBody(
+          await provider.execute({
+            protocol: "responses",
+            virtualModelId: "tidu",
+            body: {
+              model: "tidu",
+              tools,
+              input: JSON.stringify({ fixture: "caller-matrix", case: ++verified, batch: 2 }),
+            },
+          }),
+        );
+        const outputs = initial.output.map((call) =>
+          kind === "tool_search"
+            ? { type: "tool_search_output", call_id: call.call_id, tools: [] }
+            : {
+                type: kind === "custom" ? "custom_tool_call_output" : "function_call_output",
+                call_id: call.call_id,
+                output: "Surviving result.",
+              },
+        );
+        const request: ProviderExecutionRequest = {
+          protocol: "responses",
+          virtualModelId: "tidu",
+          body: { model: "tidu", tools, input: outputs, stream: true },
+        };
+        const subscribers: ProviderExecutionResult[] = await Promise.all([
+          provider.execute(request),
+          provider.execute(request),
+        ]);
+        const cancelled = subscribers[cancelledIndex];
+        assert.equal(cancelled?.kind, "stream");
+        if (cancelled?.kind !== "stream") throw new Error("Expected cancelled subscriber.");
+        await cancelled.stream.cancel();
+        const surviving = subscribers[1 - cancelledIndex];
+        assert.ok(surviving);
+        const completed = await readCodexResponseBody(surviving);
+        assert.match(JSON.stringify(completed), /"type":"message"/u);
+        const unrelated = await readCodexResponseBody(
+          await provider.execute({
+            protocol: "responses",
+            virtualModelId: "tidu",
+            body: { model: "tidu", input: "An unrelated request remains usable." },
+          }),
+        );
+        assert.match(JSON.stringify(unrelated), /medium-result/u);
+      }
+    assert.equal(verified, 6);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("restores full or output-only caller history after connection loss in both transports", {
+  timeout: 20_000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-result-disconnect-"));
+  const processLog = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_CALLER_MATRIX_TEST: "true",
+    },
+  });
+  let verified = 0;
+  try {
+    assert.ok(provider);
+    for (const stream of [false, true])
+      for (const fullHistory of [false, true])
+        for (const concurrent of [false, true]) {
+          const tools = [{ type: "function", name: "inspect" }];
+          const originalInput = JSON.stringify({
+            fixture: "caller-matrix",
+            case: ++verified,
+            batch: 2,
+            disconnect: true,
+          });
+          const initial = await readCodexResponseBody(
+            await provider.execute({
+              protocol: "responses",
+              virtualModelId: "tidu",
+              body: { model: "tidu", tools, input: originalInput, stream },
+            }),
+          );
+          assert.equal(initial.output.length, 2);
+          const outputs = initial.output.map((call, index) => ({
+            type: "function_call_output",
+            call_id: call.call_id,
+            output: `Completed before disconnection ${index}`,
+          }));
+          const request: ProviderExecutionRequest = {
+            protocol: "responses",
+            virtualModelId: "tidu",
+            body: {
+              model: "tidu",
+              tools,
+              input: fullHistory
+                ? [{ role: "user", content: originalInput }, ...initial.output, ...outputs]
+                : outputs,
+              stream,
+            },
+          };
+          const recoveries = await Promise.all(
+            (concurrent ? [request, request] : [request]).map(async (item) =>
+              readCodexResponseBody(await provider.execute(item)),
+            ),
+          );
+          for (const recovered of recoveries)
+            assert.match(JSON.stringify(recovered), /medium-result/u);
+        }
+    assert.equal(verified, 8);
+    const lines = readFileSync(processLog, "utf8").split("\n");
+    assert.equal(lines.filter((line) => line === "start").length, 9);
+    const histories = lines
+      .filter((line) => line.startsWith("history:"))
+      .map((line) => JSON.parse(line.slice("history:".length)) as Record<string, unknown>[]);
+    assert.equal(histories.length, 8);
+    for (const history of histories) {
+      assert.equal(history.filter((item) => item.role === "user").length, 1);
+      assert.equal(history.filter((item) => item.type === "function_call").length, 2);
+      assert.equal(history.filter((item) => item.type === "function_call_output").length, 2);
+    }
+    assert.doesNotMatch(lines.join("\n"), /Continue from the supplied conversation/u);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("restores a fresh native thread after four late terminal caller-batch combinations", {
+  timeout: 10_000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-retired-batches-"));
+  const processLog = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_CALLER_CONTINUATION_TEST: "true",
+    },
+  });
+  let verified = 0;
+  try {
+    assert.ok(provider);
+    for (const stream of [false, true])
+      for (const status of ["failed", "interrupted"]) {
+        const tools = [{ type: "function", name: "inspect" }];
+        const initial = await readCodexResponseBody(
+          await provider.execute({
+            protocol: "responses",
+            virtualModelId: "tidu",
+            body: {
+              model: "tidu",
+              tools,
+              input: JSON.stringify({ endYielded: status }),
+              stream,
+            },
+          }),
+        );
+        const call = initial.output.find((item) => item.type === "function_call");
+        assert.ok(call);
+        // A standard request on the same ordered connection observes the preceding terminal event.
+        await readCodexResponseBody(
+          await provider.execute({
+            protocol: "responses",
+            virtualModelId: "tidu",
+            body: { model: "tidu", input: "Connection barrier." },
+          }),
+        );
+        const fresh = await provider.execute({
+          protocol: "responses",
+          virtualModelId: "tidu",
+          routing: { targetModel: "gpt-other" },
+          body: {
+            model: "tidu",
+            tools,
+            input: [
+              { role: "user", content: JSON.stringify({ endYielded: status }) },
+              call,
+              { type: "function_call_output", call_id: call.call_id, output: "Completed result." },
+              { role: "user", content: "A new request after the old turn ended." },
+            ],
+            stream,
+          },
+        });
+        assert.equal(fresh.upstreamModel, "gpt-other");
+        assert.match(JSON.stringify(await readCodexResponseBody(fresh)), /medium-result/u);
+        const restored = await readCodexResponseBody(
+          await provider.execute({
+            protocol: "responses",
+            virtualModelId: "tidu",
+            body: {
+              model: "tidu",
+              tools,
+              stream,
+              input: [
+                {
+                  type: "function_call_output",
+                  call_id: call.call_id,
+                  output: "Completed result.",
+                },
+              ],
+            },
+          }),
+        );
+        assert.match(JSON.stringify(restored), /medium-result/u);
+        verified += 1;
+      }
+    assert.equal(verified, 4);
+    const lines = readFileSync(processLog, "utf8").split("\n");
+    assert.equal(lines.filter((line) => line.startsWith("turnThread:")).length, 16);
+    assert.equal(lines.filter((line) => line.startsWith("history:")).length, 8);
+    assert.equal(lines.filter((line) => line.startsWith("nativeResult:")).length, 0);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("shares identical concurrent caller-result deliveries without restarting the native turn", {
+  timeout: 5000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-concurrent-retry-"));
+  const processLog = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_CALLER_CONTINUATION_TEST: "true",
+    },
+  });
+  try {
+    assert.ok(provider);
+    const tools = [{ type: "function", name: "inspect" }];
+    const initial = await provider.execute({
+      protocol: "responses",
+      virtualModelId: "tidu",
+      body: { model: "tidu", tools, input: "Inspect once." },
+    });
+    assert.equal(initial.kind, "json");
+    if (initial.kind !== "json") throw new Error("Expected caller tools.");
+    const call = (initial.body as { output: Record<string, unknown>[] }).output.find(
+      (item) => item.type === "function_call",
+    );
+    assert.ok(call);
+    const request: ProviderExecutionRequest = {
+      protocol: "responses",
+      virtualModelId: "tidu",
+      body: {
+        model: "tidu",
+        tools,
+        input: [{ type: "function_call_output", call_id: call.call_id, output: "Only result." }],
+      },
+    };
+    const deliveries = await Promise.all([provider.execute(request), provider.execute(request)]);
+    assert.equal(deliveries[0]?.kind, "json");
+    assert.equal(deliveries[1]?.kind, "json");
+    assert.match(JSON.stringify(deliveries[0]), /Only result\./u);
+    assert.match(JSON.stringify(deliveries[1]), /Only result\./u);
+    const lines = readFileSync(processLog, "utf8").split("\n");
+    assert.equal(lines.filter((line) => line.startsWith("turnThread:")).length, 1);
+    assert.equal(lines.filter((line) => line.startsWith("nativeResult:")).length, 1);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("keeps caller results available after a rejected steer so a retry resumes the original turn", {
+  timeout: 5000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-result-retry-"));
+  const processLog = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_CALLER_CONTINUATION_TEST: "true",
+      TIDU_CODEX_PROVIDER_REJECT_FIRST_STEER: "true",
+    },
+  });
+  try {
+    assert.ok(provider);
+    const tools = [
+      { type: "function", name: "inspect", parameters: { type: "object", properties: {} } },
+    ];
+    const initial = await provider.execute({
+      protocol: "responses",
+      virtualModelId: "ai-tidu9-config",
+      body: { model: "ai-tidu9-config", input: "Inspect the fixture once.", tools },
+    });
+    assert.equal(initial.kind, "json");
+    if (initial.kind !== "json") throw new Error("Expected caller tool output.");
+    const output = (initial.body as { output: Record<string, unknown>[] }).output;
+    const call = output.find((item) => item.type === "function_call");
+    assert.ok(call);
+    const toolResult = {
+      type: "function_call_output",
+      call_id: call.call_id,
+      output: "Inspection result delivered once.",
+    };
+    await assert.rejects(
+      provider.execute({
+        protocol: "responses",
+        virtualModelId: "ai-tidu9-config",
+        body: {
+          model: "ai-tidu9-config",
+          tools,
+          input: [toolResult, { role: "user", content: "Also include a short explanation." }],
+        },
+      }),
+      /Fixture steer rejected\./u,
+    );
+    assert.doesNotMatch(readFileSync(processLog, "utf8"), /nativeResult:/u);
+    const result = await provider.execute({
+      protocol: "responses",
+      virtualModelId: "ai-tidu9-config",
+      body: { model: "ai-tidu9-config", tools, input: [toolResult] },
+    });
+    assert.equal(result.kind, "json");
+    assert.match(JSON.stringify(result), /Inspection result delivered once\./u);
+    const lines = readFileSync(processLog, "utf8").split("\n");
+    assert.equal(lines.filter((line) => line === "steerRejected").length, 1);
+    assert.equal(lines.filter((line) => line.startsWith("turnStart:")).length, 1);
+    const nativeResults = lines.filter((line) => line.startsWith("nativeResult:"));
+    assert.equal(nativeResults.length, 1);
+    assert.match(nativeResults[0] ?? "", /"prompt":"Inspect the fixture once\."/u);
+    assert.doesNotMatch(lines.join("\n"), /interrupted|Continue from the supplied conversation/u);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("replays complete history on a new thread after aborting a caller continuation", {
+  timeout: 5000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-aborted-continuation-"));
+  const processLog = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_CALLER_CONTINUATION_TEST: "true",
+    },
+  });
+  try {
+    assert.ok(provider);
+    const tools = [
+      { type: "function", name: "inspect", parameters: { type: "object", properties: {} } },
+    ];
+    const originalInput = "Inspect the fixture once before reporting.";
+    const initial = await provider.execute({
+      protocol: "responses",
+      virtualModelId: "ai-tidu9-config",
+      body: { model: "ai-tidu9-config", input: originalInput, tools },
+    });
+    assert.equal(initial.kind, "json");
+    if (initial.kind !== "json") throw new Error("Expected caller tool output.");
+    const output = (initial.body as { output: Record<string, unknown>[] }).output;
+    const call = output.find((item) => item.type === "function_call");
+    assert.ok(call);
+    const toolResult = {
+      type: "function_call_output",
+      call_id: call.call_id,
+      output: "Previously completed inspection.",
+    };
+    await assert.rejects(
+      provider.execute({
+        protocol: "responses",
+        virtualModelId: "ai-tidu9-config",
+        signal: AbortSignal.abort(),
+        body: { model: "ai-tidu9-config", tools, input: [toolResult] },
+      }),
+      { name: "AbortError" },
+    );
+    const result = await provider.execute({
+      protocol: "responses",
+      virtualModelId: "ai-tidu9-config",
+      body: {
+        model: "ai-tidu9-config",
+        tools,
+        input: [{ role: "user", content: originalInput }, call, toolResult],
+      },
+    });
+    assert.equal(result.kind, "json");
+    assert.match(JSON.stringify(result), /medium-result/u);
+    const lines = readFileSync(processLog, "utf8").split("\n");
+    const threads = lines.filter((line) => line.startsWith("turnThread:"));
+    assert.equal(threads.length, 2);
+    assert.notEqual(threads[0], threads[1]);
+    const historyLines = lines.filter((line) => line.startsWith("history:"));
+    assert.equal(historyLines.length, 1);
+    const history = JSON.parse(historyLines[0]?.slice("history:".length) ?? "") as Record<
+      string,
+      unknown
+    >[];
+    assert.deepEqual(
+      history.filter((item) => item.role === "user"),
+      [{ type: "message", role: "user", content: [{ type: "input_text", text: originalInput }] }],
+    );
+    assert.equal(history.filter((item) => item.type === "function_call").length, 1);
+    assert.deepEqual(
+      history.filter((item) => item.type === "function_call_output"),
+      [{ ...toolResult, name: "tidu_caller_tool_0" }],
+    );
+    assert.equal(lines.filter((line) => line.startsWith("nativeResult:")).length, 0);
+    assert.equal(lines.filter((line) => line.startsWith("turnStart:")).length, 1);
+    assert.doesNotMatch(lines.join("\n"), /Continue from the supplied conversation/u);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("rejects an orphan caller result without a matching call in the supplied history", {
+  timeout: 5000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-orphan-result-"));
+  const processLog = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: { TIDU_CODEX_PROVIDER_TEST_LOG: processLog },
+  });
+  try {
+    assert.ok(provider);
+    await assert.rejects(
+      provider.execute({
+        protocol: "responses",
+        virtualModelId: "ai-tidu9-config",
+        body: {
+          model: "ai-tidu9-config",
+          input: [
+            { type: "function_call_output", call_id: "orphan-call", output: "Unowned result." },
+          ],
+        },
+      }),
+      (error: unknown) =>
+        error instanceof TiduError &&
+        error.code === "CONFIGURATION_CONFLICT" &&
+        /native turn.*no longer available/u.test(error.message),
+    );
+    assert.doesNotMatch(readFileSync(processLog, "utf8"), /input:|history:|turnStart:/u);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("preserves bootstrap tool output without a call ID after the real user input", {
+  timeout: 10_000,
+}, async (context) => {
+  for (const stream of [false, true]) {
+    await context.test(stream ? "streaming response" : "JSON response", async () => {
+      const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-bootstrap-"));
+      const processLog = join(directory, "provider.log");
+      const provider = await createCodexHostModelProvider("gpt-test", {
+        command: createFakeCodexProviderCommand(directory),
+        codexHomeDirectory: directory,
+        environment: { TIDU_CODEX_PROVIDER_TEST_LOG: processLog },
+      });
+      try {
+        assert.ok(provider);
+        const bootstrapOutput = {
+          name: "bootstrap",
+          namespace: "context",
+          output: [
+            { type: "input_text", text: "Supplied image context." },
+            { type: "input_image", image_url: "data:image/png;base64,context" },
+          ],
+          retain: true,
+        };
+        const result = await provider.execute({
+          protocol: "responses",
+          virtualModelId: "ai-tidu9-config",
+          body: {
+            model: "ai-tidu9-config",
+            stream,
+            input: [
+              {
+                role: "user",
+                content: [
+                  { type: "input_text", text: "What is shown in this image?" },
+                  { type: "input_image", image_url: "data:image/png;base64,fixture" },
+                ],
+              },
+              { type: "function_call_output", ...bootstrapOutput },
+            ],
+          },
+        });
+        if (stream) {
+          assert.equal(result.kind, "stream");
+          if (result.kind !== "stream") throw new Error("Expected streaming bootstrap response.");
+          const events = await readStreamText(result.stream);
+          assert.match(events, /response\.completed/u);
+          assert.match(events, /medium-result/u);
+          assert.doesNotMatch(events, /response\.failed/u);
+        } else {
+          assert.equal(result.kind, "json");
+          assert.match(JSON.stringify(result), /medium-result/u);
+        }
+        const log = readFileSync(processLog, "utf8");
+        const activeInputs = log.split("\n").filter((line) => line.startsWith("input:"));
+        assert.equal(activeInputs.length, 1);
+        assert.deepEqual(JSON.parse(activeInputs[0]?.slice("input:".length) ?? ""), []);
+        const historyLines = log.split("\n").filter((line) => line.startsWith("history:"));
+        assert.equal(historyLines.length, 1);
+        const history = JSON.parse(historyLines[0]?.slice("history:".length) ?? "") as Record<
+          string,
+          unknown
+        >[];
+        assert.deepEqual(
+          history.filter((item) => item.role === "user"),
+          [
+            {
+              type: "message",
+              role: "user",
+              content: [
+                { type: "input_text", text: "What is shown in this image?" },
+                { type: "input_image", image_url: "data:image/png;base64,fixture" },
+              ],
+            },
+          ],
+        );
+        assert.deepEqual(
+          history.filter((item) => item.type === "function_call_output"),
+          [{ type: "function_call_output", ...bootstrapOutput }],
+        );
+        assert.doesNotMatch(log, /Continue from the supplied conversation/u);
+      } finally {
+        await provider?.close?.();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("recovers caller tool results from full history after the provider restarts", {
+  timeout: 10_000,
+}, async (context) => {
+  for (const stream of [false, true]) {
+    await context.test(stream ? "streaming response" : "JSON response", async () => {
+      const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-history-recovery-"));
+      const processLog = join(directory, "provider.log");
+      const command = createFakeCodexProviderCommand(directory);
+      const options = {
+        command,
+        codexHomeDirectory: directory,
+        environment: { TIDU_CODEX_PROVIDER_TEST_LOG: processLog },
+      };
+      const tools = [
+        { type: "function", name: "inspect", parameters: { type: "object", properties: {} } },
+      ];
+      let provider = await createCodexHostModelProvider("gpt-test", {
+        ...options,
+        environment: {
+          ...options.environment,
+          TIDU_CODEX_PROVIDER_CALLER_CONTINUATION_TEST: "true",
+        },
+      });
+      try {
+        assert.ok(provider);
+        const originalInput = "Read the fixture once and explain the inspection result.";
+        const initial = await provider.execute({
+          protocol: "responses",
+          virtualModelId: "ai-tidu9-config",
+          body: { model: "ai-tidu9-config", input: originalInput, tools },
+        });
+        assert.equal(initial.kind, "json");
+        if (initial.kind !== "json") throw new Error("Expected caller tool output.");
+        const output = (initial.body as { output: Record<string, unknown>[] }).output;
+        const call = output.find((item) => item.type === "function_call");
+        assert.ok(call);
+        await provider.close?.();
+        provider = await createCodexHostModelProvider("gpt-test", options);
+        assert.ok(provider);
+        const result = await provider.execute({
+          protocol: "responses",
+          virtualModelId: "ai-tidu9-config",
+          body: {
+            model: "ai-tidu9-config",
+            tools,
+            stream,
+            input: [
+              { role: "user", content: originalInput },
+              call,
+              {
+                type: "function_call_output",
+                call_id: call.call_id,
+                output: "Saved inspection result.",
+              },
+            ],
+          },
+        });
+        if (stream) {
+          assert.equal(result.kind, "stream");
+          if (result.kind !== "stream") throw new Error("Expected streaming recovery.");
+          const events = await readStreamText(result.stream);
+          assert.match(events, /response\.completed/u);
+          assert.match(events, /medium-result/u);
+          assert.doesNotMatch(events, /response\.failed|"type":"function_call"/u);
+        } else {
+          assert.equal(result.kind, "json");
+          assert.match(JSON.stringify(result), /medium-result/u);
+          assert.doesNotMatch(JSON.stringify(result), /"type":"function_call"/u);
+        }
+        const log = readFileSync(processLog, "utf8");
+        const lines = log.split("\n");
+        const activeInputs = lines.filter((line) => line.startsWith("input:"));
+        assert.equal(activeInputs.length, 2);
+        assert.equal(activeInputs[1], "input:[]");
+        assert.equal(lines.filter((line) => line.startsWith("turnStart:")).length, 1);
+        const historyLines = lines.filter((line) => line.startsWith("history:"));
+        assert.equal(historyLines.length, 1);
+        const history = JSON.parse(historyLines[0]?.slice("history:".length) ?? "") as Record<
+          string,
+          unknown
+        >[];
+        assert.equal(history.filter((item) => item.role === "user").length, 1);
+        assert.deepEqual(
+          history.filter((item) => item.type === "function_call_output"),
+          [
+            {
+              type: "function_call_output",
+              call_id: call.call_id,
+              name: "tidu_caller_tool_0",
+              output: "Saved inspection result.",
+            },
+          ],
+        );
+        assert.doesNotMatch(log, /Continue from the supplied conversation/u);
+      } finally {
+        await provider?.close?.();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("retains the latest user input followed by developer context despite older tool results", {
+  timeout: 5000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-trailing-context-"));
+  const processLog = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: { TIDU_CODEX_PROVIDER_TEST_LOG: processLog },
+  });
+  try {
+    assert.ok(provider);
+    const result = await provider.execute({
+      protocol: "responses",
+      virtualModelId: "ai-tidu9-config",
+      body: {
+        model: "ai-tidu9-config",
+        input: [
+          { role: "user", content: "Earlier inspection request." },
+          { type: "function_call", call_id: "older-call", name: "inspect", arguments: "{}" },
+          { type: "function_call_output", call_id: "older-call", output: "Older result." },
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: "What is shown in this image?" },
+              { type: "input_image", image_url: "data:image/png;base64,fixture" },
+            ],
+          },
+          { role: "developer", content: "Answer briefly using the supplied image." },
+        ],
+      },
+    });
+    assert.equal(result.kind, "json");
+    assert.match(JSON.stringify(result), /medium-result/u);
+    const log = readFileSync(processLog, "utf8");
+    const activeInputs = log.split("\n").filter((line) => line.startsWith("input:"));
+    assert.equal(activeInputs.length, 1);
+    assert.deepEqual(JSON.parse(activeInputs[0]?.slice("input:".length) ?? ""), [
+      { type: "text", text: "What is shown in this image?", text_elements: [] },
+      { type: "image", url: "data:image/png;base64,fixture" },
+    ]);
+    const histories = log.split("\n").filter((line) => line.startsWith("history:"));
+    assert.equal(histories.length, 1);
+    const history = JSON.parse(histories[0]?.slice("history:".length) ?? "") as Record<
+      string,
+      unknown
+    >[];
+    assert.equal(history.filter((item) => item.role === "user").length, 1);
+    assert.match(JSON.stringify(history), /Earlier inspection request\./u);
+    assert.match(JSON.stringify(history), /Older result\./u);
+    assert.match(JSON.stringify(history), /Answer briefly using the supplied image\./u);
+    assert.doesNotMatch(JSON.stringify(history), /What is shown in this image/u);
+    assert.doesNotMatch(log, /Continue from the supplied conversation/u);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 

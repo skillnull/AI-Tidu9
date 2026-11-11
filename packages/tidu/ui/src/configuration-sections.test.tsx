@@ -8,6 +8,7 @@ import {
   capabilityCompletionModelOutcomeLabel,
   capabilityCompletionOutcomeLabel,
   capabilityCompletionRecordOutcomeLabel,
+  capabilityHistoryModelName,
   capabilityIdsForPicker,
   catalogNeedsConfiguredSpecialistRecovery,
   defaultModelCapabilities,
@@ -77,7 +78,7 @@ test("distinguishes cancellation from failure in both usage-history languages", 
   assert.equal(capabilityCompletionOutcomeLabel("not-run", true), "Not called");
 });
 
-test("shows tool continuations as waiting instead of permanently not called", () => {
+test("shows actual historical outcomes during tool handoffs", () => {
   const waitingResult = {
     modelId: "secondary",
     host: "cursor" as const,
@@ -91,17 +92,14 @@ test("shows tool continuations as waiting instead of permanently not called", ()
     durationMilliseconds: null,
     message: "Waiting for the client to execute a tool and return its result.",
   };
-  assert.equal(capabilityCompletionModelOutcomeLabel(waitingResult, false), "等待工具结果");
-  assert.equal(
-    capabilityCompletionModelOutcomeLabel(waitingResult, true),
-    "Waiting for tool results",
-  );
+  assert.equal(capabilityCompletionModelOutcomeLabel(waitingResult, false), "未调用");
+  assert.equal(capabilityCompletionModelOutcomeLabel(waitingResult, true), "Not called");
   assert.equal(
     capabilityCompletionRecordOutcomeLabel(
       { outcome: "succeeded", mainResult: waitingResult, secondaryResults: [] },
       false,
     ),
-    "等待工具结果",
+    "成功",
   );
 });
 
@@ -215,6 +213,44 @@ test("shows the provider model name instead of its parameterized execution ident
     }),
     "custom-model[variant=test]",
   );
+});
+
+test("keeps historical execution models when the current default changes", () => {
+  const currentModel = { id: "new-default", name: "New default model", isDefault: true };
+  const catalog = {
+    companyConfigured: false,
+    companyProviderType: null,
+    company: [],
+    official: [currentModel],
+    hosts: {
+      codex: { available: true, models: [currentModel] },
+      cursor: { available: false, models: [] },
+      ollama: { available: false, models: [] },
+      "openai-compatible": { available: false, models: [] },
+    },
+  };
+  const result = {
+    modelId: "main:codex:official",
+    host: "codex" as const,
+    model: "current",
+    executedModel: "historical-model",
+  };
+  for (const english of [false, true]) {
+    assert.equal(capabilityHistoryModelName(result, catalog, english), "historical-model");
+    assert.equal(capabilityHistoryModelName(result, undefined, english), "historical-model");
+    assert.equal(
+      capabilityHistoryModelName({ ...result, executedModel: null }, catalog, english),
+      "New default model",
+    );
+    assert.equal(
+      capabilityHistoryModelName(
+        { ...result, model: "configured-model", executedModel: null },
+        undefined,
+        english,
+      ),
+      "configured-model",
+    );
+  }
 });
 
 test("offers only capabilities implemented by the model-routing contract", () => {

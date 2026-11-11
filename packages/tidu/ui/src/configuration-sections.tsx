@@ -195,24 +195,27 @@ export const capabilityCompletionOutcomeLabel = (
 export const capabilityCompletionModelOutcomeLabel = (
   result: Pick<CapabilityCompletionModelResultView, "outcome" | "skipReason">,
   english: boolean,
-): string =>
-  result.skipReason === "awaiting-tool-results"
-    ? english
-      ? "Waiting for tool results"
-      : "等待工具结果"
-    : capabilityCompletionOutcomeLabel(result.outcome, english);
+): string => capabilityCompletionOutcomeLabel(result.outcome, english);
 
 export const capabilityCompletionRecordOutcomeLabel = (
   record: Pick<CapabilityCompletionUsageRecordView, "mainResult" | "outcome" | "secondaryResults">,
   english: boolean,
+): string => capabilityCompletionOutcomeLabel(record.outcome, english);
+
+export const capabilityHistoryModelName = (
+  result: Pick<CapabilityCompletionModelResultView, "executedModel" | "host" | "model" | "modelId">,
+  catalog: UpstreamModelCatalog | undefined,
+  english: boolean,
 ): string =>
-  [record.mainResult, ...record.secondaryResults].some(
-    (result) => result.skipReason === "awaiting-tool-results",
-  )
-    ? english
-      ? "Waiting for tool results"
-      : "等待工具结果"
-    : capabilityCompletionOutcomeLabel(record.outcome, english);
+  modelDisplayName({
+    catalog,
+    currentName: result.host === "cursor" ? "auto" : english ? "Default" : "默认模型",
+    host: result.host,
+    selection: {
+      source: result.modelId.endsWith(":custom") ? "custom" : modelSourceForHost(result.host),
+      model: result.executedModel ?? result.model,
+    },
+  });
 
 export const normalizeCapabilityCompletionCancellation = (
   record: CapabilityCompletionUsageRecordView,
@@ -512,9 +515,12 @@ export const CapabilityCompletionPanel = ({
       selection,
     });
   const displayResultMessage = (result: CapabilityCompletionModelResultView): string => {
+    if (result.skipReason === "awaiting-tool-results")
+      return english
+        ? "This model was not called in this tool handoff."
+        : "本次工具交接未调用该模型。";
     if (english) return result.message;
     if (result.outcome === "cancelled") return "请求已取消。";
-    if (result.skipReason === "awaiting-tool-results") return "等待客户端执行工具并回传结果。";
     if (result.skipReason === "blocked-by-cancellation") return "请求已取消，该模型未执行。";
     if (result.skipReason === "not-selected")
       return "本次请求按动态路由规则由其他模型执行，当前模型未被选中。";
@@ -820,22 +826,16 @@ export const CapabilityCompletionPanel = ({
                         >
                           <div className="capability-record-summary">
                             <strong>{english ? "Combined result" : "组合结果"}</strong>
-                            <small
-                              className={
-                                [record.mainResult, ...record.secondaryResults].some(
-                                  (result) => result.skipReason === "awaiting-tool-results",
-                                )
-                                  ? "record-waiting"
-                                  : `record-${record.outcome}`
-                              }
-                            >
+                            <small className={`record-${record.outcome}`}>
                               {capabilityCompletionRecordOutcomeLabel(record, english)}
                             </small>
                             <span>{new Date(record.occurredAt).toLocaleString()}</span>
                           </div>
                           <p className="capability-record-detail">
                             {english ? "Required" : "所需能力"}：
-                            {record.requiredCapabilities.join(" / ")}
+                            {record.requiredCapabilities
+                              .map((capability) => capabilityLabel(capability, english))
+                              .join(" / ")}
                             {` · ${english ? "Route" : "路由原因"}：${routingReasonLabel(record.reason)}`}
                           </p>
                           <div className="capability-model-results">
@@ -850,11 +850,7 @@ export const CapabilityCompletionPanel = ({
                                 modelUsage.totalTokens === 0;
                               return (
                                 <div
-                                  className={`capability-model-result ${
-                                    modelResult.skipReason === "awaiting-tool-results"
-                                      ? "waiting"
-                                      : modelResult.outcome
-                                  }`}
+                                  className={`capability-model-result ${modelResult.outcome}`}
                                   key={modelResult.modelId}
                                 >
                                   <div>
@@ -873,12 +869,7 @@ export const CapabilityCompletionPanel = ({
                                   </div>
                                   <p>
                                     {modelResult.host}：
-                                    {displayModel(modelResult.host, {
-                                      source: modelResult.modelId.endsWith(":custom")
-                                        ? "custom"
-                                        : modelSourceForHost(modelResult.host),
-                                      model: modelResult.model,
-                                    })}
+                                    {capabilityHistoryModelName(modelResult, catalog, english)}
                                   </p>
                                   <div className="capability-model-result-meta">
                                     <span>

@@ -110,6 +110,148 @@ test("accumulates each model across three rounds without counting parallel tool 
   assert.equal(ledger.begin(outputs).snapshot(null).usage, null);
 });
 
+test("usage history combinations retain every round without counting ancestors twice", () => {
+  let combinations = 0;
+  for (const fullHistory of [false, true])
+    for (const kind of ["function", "custom_tool", "tool_search"])
+      for (const batch of [1, 2])
+        for (const rounds of [1, 2, 3, 5])
+          for (const availability of ["known", "missing", "zero"]) {
+            const ledger = createResponseUsageLedger();
+            const original = [{ role: "user", content: "fixture" }];
+            const history: Record<string, unknown>[] = [...original];
+            let pending: Record<string, unknown>[] = [];
+            for (let round = 0; round < rounds; round += 1) {
+              const current =
+                availability === "missing" && round === 0
+                  ? null
+                  : availability === "zero"
+                    ? { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+                    : usage;
+              const modelUsage: ResponseModelUsage[] = [
+                { ...models[1], usage: current, complete: current !== null },
+              ];
+              const turn = ledger.begin(fullHistory || round === 0 ? history : pending);
+              const snapshot = turn.snapshot(current, modelUsage);
+              const expectedRounds = availability === "missing" ? round : round + 1;
+              assert.equal(
+                snapshot.usage?.totalTokens ?? 0,
+                availability === "zero" ? 0 : expectedRounds * usage.totalTokens,
+                JSON.stringify({ fullHistory, kind, batch, rounds, availability, round }),
+              );
+              assert.equal(snapshot.complete, availability !== "missing");
+              assert.equal(snapshot.models?.[0]?.complete, availability !== "missing");
+              if (round === rounds - 1) turn.finish([], current, modelUsage);
+              else {
+                const calls = Array.from({ length: batch }, (_unused, index) => ({
+                  type: kind === "custom_tool" ? "custom_tool_call" : `${kind}_call`,
+                  call_id: `call-${round}-${index}`,
+                }));
+                turn.finish(calls, current, modelUsage);
+                pending = calls.map((call) => ({
+                  type: kind === "tool_search" ? "tool_search_output" : `${call.type}_output`,
+                  call_id: call.call_id,
+                  output: "fixture result",
+                }));
+                history.push(...calls, ...pending);
+              }
+            }
+            assert.equal(ledger.begin(pending).snapshot(null).usage, null);
+            combinations += 1;
+          }
+  assert.equal(combinations, 144);
+});
+
+test("late duplicate batches cannot change ancestry or revive a completed turn", () => {
+  let combinations = 0;
+  for (const fullHistory of [false, true])
+    for (const kind of ["function", "custom_tool", "tool_search"])
+      for (const batch of [1, 2])
+        for (const timing of ["before-next", "after-next", "after-final"]) {
+          const ledger = createResponseUsageLedger();
+          const calls = (round: number) =>
+            Array.from({ length: batch }, (_unused, index) => ({
+              type: `${kind}_call`,
+              call_id: `${round}-${index}`,
+            }));
+          const outputs = (round: number) =>
+            calls(round).map((call) => ({
+              type: kind === "tool_search" ? "tool_search_output" : `${call.type}_output`,
+              call_id: call.call_id,
+            }));
+          ledger.begin([]).finish(calls(0), usage, models);
+          const first = ledger.begin(outputs(0));
+          const duplicate = ledger.begin(outputs(0));
+          first.finish(calls(1), usage, models);
+          if (timing === "before-next") duplicate.finish([...calls(1)].reverse(), usage, models);
+          ledger.begin(outputs(1)).finish(calls(2), usage, models);
+          if (timing === "after-next") duplicate.finish([...calls(1)].reverse(), usage, models);
+          const final = ledger.begin(
+            fullHistory ? [...outputs(0), ...outputs(1), ...outputs(2)] : outputs(2),
+          );
+          assert.equal(
+            final.snapshot(usage, models).usage?.totalTokens,
+            usage.totalTokens * 4,
+            JSON.stringify({ fullHistory, kind, batch, timing }),
+          );
+          assert.equal(final.snapshot(usage, models).complete, true);
+          final.finish([], usage, models);
+          if (timing === "after-final") duplicate.finish(calls(1), usage, models);
+          assert.equal(ledger.begin(outputs(1)).snapshot(null).usage, null);
+          combinations += 1;
+        }
+  assert.equal(combinations, 36);
+});
+
+test("a failed or cancelled duplicate cannot release another delivery's usage ancestry", () => {
+  let combinations = 0;
+  for (const fullHistory of [false, true])
+    for (const batch of [1, 2])
+      for (const cancelFirst of [false, true])
+        for (const partialUsage of [null, usage]) {
+          const ledger = createResponseUsageLedger();
+          const first = Array.from({ length: batch }, (_unused, index) => ({
+            type: "function_call",
+            call_id: `first-${index}`,
+          }));
+          const outputs = first.map((call) => ({
+            type: "function_call_output",
+            call_id: call.call_id,
+          }));
+          ledger.begin([]).finish(first, usage, models);
+          const successful = ledger.begin(outputs);
+          const cancelled = ledger.begin(outputs);
+          if (cancelFirst) cancelled.finish([], partialUsage, models, false);
+          successful.finish([{ type: "function_call", call_id: "second" }], usage, models);
+          if (!cancelFirst) cancelled.finish([], partialUsage, models, false);
+          const finalOutput = { type: "function_call_output", call_id: "second" };
+          const final = ledger.begin(fullHistory ? [...outputs, finalOutput] : [finalOutput]);
+          assert.equal(final.snapshot(usage, models).usage?.totalTokens, usage.totalTokens * 3);
+          assert.equal(final.snapshot(usage, models).complete, true);
+          final.finish([], usage, models);
+          assert.equal(ledger.begin(outputs).snapshot(null).usage, null);
+          combinations += 1;
+        }
+  assert.equal(combinations, 16);
+});
+
+test("long output-only chains retain totals when older correlations leave the bounded window", () => {
+  const ledger = createResponseUsageLedger();
+  const history: Record<string, unknown>[] = [];
+  let pending: Record<string, unknown>[] = [];
+  for (let round = 0; round < 2_010; round += 1) {
+    const turn = ledger.begin(pending);
+    const call = { type: "function_call", call_id: `long-${round}` };
+    turn.finish([call], usage);
+    pending = [{ type: "function_call_output", call_id: call.call_id }];
+    history.push(...pending);
+  }
+  assert.equal(ledger.begin(pending).snapshot(usage).usage?.totalTokens, usage.totalTokens * 2_011);
+  const replay = ledger.begin(history).snapshot(usage);
+  assert.equal(replay.usage?.totalTokens, usage.totalTokens * 2_011);
+  assert.equal(replay.complete, false);
+});
+
 test("formats host totals before the overall total without model names or roles", () => {
   const snapshot = createResponseUsageLedger()
     .begin([])

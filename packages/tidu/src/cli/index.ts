@@ -674,7 +674,13 @@ const runClientConfiguration = async (argumentsList: readonly string[]): Promise
     if (!confirmed) {
       return `${style("Cancelled.", "yellow")} No client configuration was changed.`;
     }
-    const result = await switchCodexClientConfiguration({ mode });
+    const endpoint = readOption(argumentsList, "--endpoint") ?? process.env.TIDU_ENDPOINT;
+    const result = await switchCodexClientConfiguration({
+      mode,
+      ...(mode === "ai-tidu9" && endpoint !== undefined
+        ? { endpoint: normalizeManagementEndpoint(endpoint) }
+        : {}),
+    });
     return result.activeMode === "official"
       ? `${style("✓", "green")} Official Codex configuration restored.`
       : `${style("✓", "green")} AI-Tidu9 inference verified and Codex configuration switched.`;

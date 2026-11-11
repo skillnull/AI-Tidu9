@@ -2187,7 +2187,7 @@ export const createCapabilityCompletionProvider = (
           );
         }
         const mainSucceeded = result.statusCode >= 200 && result.statusCode < 300;
-        const mainTokenUsage = extractTokenUsage(result);
+        const mainTokenUsage = extractTokenUsage(result) ?? reportedUsage;
         recordMainResult(
           {
             modelId: mainId,

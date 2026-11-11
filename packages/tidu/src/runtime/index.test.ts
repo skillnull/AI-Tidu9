@@ -550,10 +550,12 @@ test("configures the complete Codex dual-channel entry through the browser devel
   process.env.CODEX_HOME = codexHomeDirectory;
   process.env.PATH = `${executableDirectory}:${originalEnvironment.executablePath ?? ""}`;
   let providerFailure: Error | undefined;
+  let pauseProbe: ((signal?: AbortSignal) => Promise<void>) | undefined;
   const provider: ModelProvider = {
     descriptor: { type: "codex-host", model: "official-test" },
     execute: async (request) => {
       if (providerFailure !== undefined) throw providerFailure;
+      await pauseProbe?.(request.signal);
       return {
         kind: "json",
         statusCode: 200,
@@ -647,6 +649,54 @@ test("configures the complete Codex dual-channel entry through the browser devel
     assert.match(officialConfiguration, /^model = "official-test"/u);
     assert.match(officialConfiguration, /\[model_providers\.ai_tidu9\]/u);
     assert.doesNotMatch(officialConfiguration, /AI-Tidu9 managed default:start/u);
+    for (const cancellation of ["superseded", "disconnect"]) {
+      let markStarted: (() => void) | undefined;
+      let markAborted: (() => void) | undefined;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      const aborted = new Promise<void>((resolve) => {
+        markAborted = resolve;
+      });
+      pauseProbe = (signal) =>
+        new Promise<void>((_resolve, reject) => {
+          const abort = () => {
+            markAborted?.();
+            reject(new Error("fixture cancelled"));
+          };
+          if (signal?.aborted) abort();
+          else signal?.addEventListener("abort", abort, { once: true });
+          markStarted?.();
+        });
+      const controller = new AbortController();
+      const pending = fetch(`${browserOrigin}/api/clients/codex/configuration`, {
+        method: "POST",
+        headers: browserHeaders,
+        body: JSON.stringify({ mode: "ai-tidu9" }),
+        signal: controller.signal,
+      }).then(
+        (response) => response.status,
+        () => "disconnected",
+      );
+      await started;
+      if (cancellation === "disconnect") controller.abort();
+      else {
+        const restored = await fetch(`${browserOrigin}/api/clients/codex/configuration`, {
+          method: "POST",
+          headers: browserHeaders,
+          body: JSON.stringify({ mode: "official" }),
+        });
+        assert.equal(restored.status, 200);
+      }
+      assert.notEqual(await pending, 200);
+      await aborted;
+      pauseProbe = undefined;
+      const configurationStatus = await fetch(`${browserOrigin}/api/clients/codex/configuration`);
+      assert.equal(
+        ((await configurationStatus.json()) as { activeMode: string }).activeMode,
+        "official",
+      );
+    }
     for (const browserRequest of [
       { origin: browserOrigin, headers: new Headers({ "content-type": "application/json" }) },
       {
@@ -2515,6 +2565,327 @@ test("cancels upstream streaming work when the client disconnects", async () => 
     }
   } finally {
     clientController.abort();
+    await runtime.close();
+  }
+});
+
+for (const stream of [false, true])
+  for (const kind of ["function", "custom", "search"])
+    for (const history of ["full", "outputs-only"])
+      for (const termination of ["cancel", "complete"])
+        test(`HTTP caller lifecycle matrix: stream=${stream} kind=${kind} history=${history} termination=${termination}`, {
+          timeout: 4000,
+        }, async () => {
+          const output =
+            kind === "search"
+              ? { type: "tool_search_output", call_id: "pending-call", tools: [] }
+              : {
+                  type: kind === "custom" ? "custom_tool_call_output" : "function_call_output",
+                  call_id: "pending-call",
+                  output:
+                    kind === "custom"
+                      ? [{ type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" }]
+                      : "completed result",
+                };
+          const input =
+            history === "full"
+              ? [{ role: "user", content: "inspect the result" }, output]
+              : [output];
+          let started: (() => void) | undefined;
+          let cancelled: (() => void) | undefined;
+          let release: (() => void) | undefined;
+          let providerSignal: AbortSignal | undefined;
+          const providerStarted = new Promise<void>((resolve) => {
+            started = resolve;
+          });
+          const providerCancelled = new Promise<void>((resolve) => {
+            cancelled = resolve;
+          });
+          const provider: ModelProvider = {
+            descriptor: { type: "codex-host", model: "fixture-model" },
+            execute: async (request) => {
+              providerSignal = request.signal;
+              const items = request.body.input as Record<string, unknown>[];
+              assert.deepEqual(
+                items.filter((item) => item.type === output.type),
+                [output],
+              );
+              assert.equal(
+                items.filter((item) => item.role === "user").length,
+                history === "full" ? 1 : 0,
+              );
+              started?.();
+              return new Promise((resolve, reject) => {
+                release = () =>
+                  resolve({
+                    kind: "json",
+                    statusCode: 200,
+                    body: { output_text: "completed" },
+                  });
+                const abort = () => {
+                  cancelled?.();
+                  reject(new DOMException("Fixture cancelled.", "AbortError"));
+                };
+                if (request.signal?.aborted) abort();
+                else request.signal?.addEventListener("abort", abort, { once: true });
+              });
+            },
+          };
+          const runtime = await startLocalRuntime({
+            databasePath: IN_MEMORY_DATABASE_PATH,
+            port: 0,
+            provider,
+            discoverHostProvider: false,
+          });
+          const controller = new AbortController();
+          const response = fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ model: "ai-tidu9-config", stream, input }),
+            signal: controller.signal,
+          }).catch(() => undefined);
+          const withinDeadline = async (operation: Promise<void>, label: string) => {
+            let timeout: NodeJS.Timeout | undefined;
+            try {
+              await Promise.race([
+                operation,
+                new Promise<never>((_resolve, reject) => {
+                  timeout = setTimeout(() => reject(new Error(label)), 800);
+                }),
+              ]);
+            } finally {
+              clearTimeout(timeout);
+            }
+          };
+          try {
+            await withinDeadline(
+              providerStarted,
+              "Caller continuation did not reach the provider.",
+            );
+            if (termination === "cancel") {
+              controller.abort();
+              await withinDeadline(providerCancelled, "Caller continuation cancellation was lost.");
+            } else {
+              release?.();
+              const completed = await response;
+              assert.equal(completed?.status, 200);
+              await completed?.text();
+              await new Promise<void>((resolve) => setImmediate(resolve));
+              assert.equal(providerSignal?.aborted, false);
+            }
+          } finally {
+            controller.abort();
+            release?.();
+            await response;
+            await runtime.close();
+          }
+        });
+
+for (const stream of [false, true])
+  for (const name of ["bootstrap_tool", "", undefined])
+    test(`HTTP named bootstrap-only: stream=${stream} name=${String(name)}`, async () => {
+      const input = [
+        {
+          type: "function_call_output",
+          ...(name === undefined ? {} : { name }),
+          output: "bootstrap result",
+        },
+      ];
+      let providerCalls = 0;
+      const runtime = await startLocalRuntime({
+        databasePath: IN_MEMORY_DATABASE_PATH,
+        discoverHostProvider: false,
+        port: 0,
+        provider: {
+          descriptor: { type: "codex-host", model: "fixture-model" },
+          execute: async (request) => {
+            providerCalls += 1;
+            assert.deepEqual(request.body.input, input);
+            return { kind: "json", statusCode: 200, body: { output_text: "bootstrap complete" } };
+          },
+        },
+      });
+      try {
+        const response = await fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "ai-tidu9-config", input, stream }),
+        });
+        const body = await response.text();
+        if (name === "bootstrap_tool") {
+          assert.equal(response.status, 200);
+          assert.match(body, /bootstrap complete/u);
+          assert.equal(providerCalls, 1);
+          if (stream) assert.match(body, /event: response\.completed/u);
+        } else {
+          assert.equal(response.status, stream ? 200 : 502);
+          assert.match(body, /does not contain a usable goal/u);
+          assert.equal(providerCalls, 0);
+          if (stream) assert.match(body, /event: response\.failed/u);
+        }
+      } finally {
+        await runtime.close();
+      }
+    });
+
+for (const stream of [false, true])
+  test(`keeps shared caller usage when a concurrent HTTP continuation cancels: stream=${stream}`, {
+    timeout: 4000,
+  }, async () => {
+    let firstStarted: (() => void) | undefined;
+    let secondStarted: (() => void) | undefined;
+    let cancelled: (() => void) | undefined;
+    let releaseSuccess: (() => void) | undefined;
+    const firstReady = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+    const secondReady = new Promise<void>((resolve) => {
+      secondStarted = resolve;
+    });
+    const abortObserved = new Promise<void>((resolve) => {
+      cancelled = resolve;
+    });
+    const successGate = new Promise<void>((resolve) => {
+      releaseSuccess = resolve;
+    });
+    let continuationRequests = 0;
+    const provider: ModelProvider = {
+      descriptor: { type: "codex-host", model: "fixture" },
+      execute: async (request) => {
+        const input = Array.isArray(request.body.input)
+          ? (request.body.input as Record<string, unknown>[])
+          : [];
+        const isContinuation = input.some((item) => item.call_id === "first");
+        if (isContinuation) {
+          continuationRequests += 1;
+          if (continuationRequests === 1) {
+            firstStarted?.();
+            return new Promise((_resolve, reject) => {
+              const abort = () => {
+                cancelled?.();
+                reject(new DOMException("Fixture request cancelled.", "AbortError"));
+              };
+              if (request.signal?.aborted) abort();
+              else request.signal?.addEventListener("abort", abort, { once: true });
+            });
+          }
+          secondStarted?.();
+          await successGate;
+        }
+        request.onExecutionReceipt?.({
+          host: "codex",
+          model: "fixture",
+          role: "worker",
+          capabilities: ["text"],
+          usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 },
+        });
+        const final = input.some((item) => item.call_id === "second");
+        return {
+          kind: "json",
+          statusCode: 200,
+          body: {
+            output: final
+              ? [{ type: "message", content: [{ type: "output_text", text: "结果完成" }] }]
+              : [
+                  {
+                    type: "function_call",
+                    call_id: isContinuation ? "second" : "first",
+                    name: "inspect",
+                    arguments: "{}",
+                  },
+                ],
+          },
+        };
+      },
+    };
+    const runtime = await startLocalRuntime({
+      databasePath: IN_MEMORY_DATABASE_PATH,
+      discoverHostProvider: false,
+      port: 0,
+      provider,
+    });
+    const cancelController = new AbortController();
+    const post = (input: unknown, signal?: AbortSignal) =>
+      fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "ai-tidu9-config", input, stream }),
+        signal,
+      });
+    try {
+      await (await post([{ role: "user", content: "检查结果" }])).text();
+      const firstOutput = [{ type: "function_call_output", call_id: "first", output: "第一步" }];
+      const cancelledResponse = post(firstOutput, cancelController.signal).catch(() => undefined);
+      await firstReady;
+      const successfulResponse = post(firstOutput);
+      await secondReady;
+      cancelController.abort();
+      await abortObserved;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      releaseSuccess?.();
+      await cancelledResponse;
+      await (await successfulResponse).text();
+      const response = await post([
+        { type: "function_call_output", call_id: "second", output: "第二步" },
+      ]);
+      const body = await response.text();
+      assert.equal(response.status, 200);
+      assert.match(body, /Total: input 21 · output 9 · total 30/u);
+      assert.match(body, /"total_tokens":10/u);
+      assert.doesNotMatch(body, /partial|部分统计/u);
+      assert.equal(continuationRequests, 2);
+    } finally {
+      cancelController.abort();
+      releaseSuccess?.();
+      await runtime.close();
+    }
+  });
+
+test("stops a runtime with an unfinished upstream stream without waiting for its client", {
+  timeout: 5000,
+}, async () => {
+  let providerClosed = false;
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    discoverHostProvider: false,
+    port: 0,
+    provider: {
+      descriptor: { type: "openai-compatible", model: "fixture" },
+      execute: async () => ({
+        kind: "stream",
+        statusCode: 200,
+        stream: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode('data: {"choices":[{"delta":{"content":"waiting"}}]}\n\n'),
+            );
+          },
+        }),
+      }),
+      close: async () => {
+        providerClosed = true;
+      },
+    },
+  });
+  const controller = new AbortController();
+  try {
+    const response = await fetch(`${runtime.origin}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "ai-tidu9-config",
+        messages: [{ role: "user", content: "hello" }],
+        metadata: { ai_tidu9_probe: true },
+        stream: true,
+      }),
+      signal: controller.signal,
+    });
+    await response.body?.getReader().read();
+    await runtime.close();
+    assert.equal(providerClosed, true);
+    await assert.rejects(fetch(`${runtime.origin}/health`));
+  } finally {
+    controller.abort();
     await runtime.close();
   }
 });

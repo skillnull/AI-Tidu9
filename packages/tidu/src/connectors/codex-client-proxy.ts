@@ -21,18 +21,25 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
+import { refreshManagedCodexCatalog } from "../clients/codex-model-catalog.js";
 import {
   indexCodexRecoveryRecords,
   readCodexRecoveryRecords,
   recoverCodexTurn,
 } from "../clients/codex-recovery.js";
-import {
-  createStdioJsonRpcClient,
-  type JsonRpcClient,
-  type JsonRpcProcessLaunch,
-} from "./json-rpc.js";
+import { createCodexThreadLinks } from "./codex-thread-links.js";
+import type { JsonRpcProcessLaunch } from "./json-rpc.js";
 
 type JsonObject = Record<string, unknown>;
+interface NativeChannel {
+  process: ChildProcessWithoutNullStreams;
+  ready?: Promise<void>;
+  /** Prevents completed turns or stale approvals from moving to a replacement worker. */
+  failed?: boolean;
+  /** Compatible managed catalog loaded when this worker was created. */
+  catalogFingerprint?: string | null;
+  terminate: () => Promise<void>;
+}
 const isRecord = (value: unknown): value is JsonObject =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 const idKey = (id: unknown): string => JSON.stringify(id);
@@ -68,6 +75,8 @@ export interface CodexClientProxyOptions {
   resolveActiveSelection?: () => CodexActiveSelection;
   /** Bounded wait for proxy-only official requests; defaults to five seconds. */
   internalRequestTimeoutMs?: number;
+  /** Confirmed executable version for embedded hosts; otherwise inspected from launch.command. */
+  hostVersion?: string;
 }
 
 export interface CodexActiveSelection {
@@ -231,6 +240,44 @@ export const readCodexActiveSelection = (
   };
 };
 
+const readOfficialBootstrapSelection = (
+  codexHome: string,
+  selection: CodexActiveSelection,
+  managedProvider: string,
+): CodexActiveSelection => {
+  if (selection.modelProvider !== managedProvider) return selection;
+  const path = join(codexHome, ".ai-tidu9-profile-state.json");
+  try {
+    const status = lstatSync(path);
+    if (!status.isFile() || status.isSymbolicLink() || status.size > 1024 * 1024)
+      return { modelProvider: "openai" };
+    const state: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (isRecord(state) && state.owner === "AI-Tidu9") {
+      const original = readTopLevelSelection(
+        Array.isArray(state.officialDefaultLines)
+          ? state.officialDefaultLines
+              .filter((line): line is string => typeof line === "string")
+              .join("\n")
+          : "",
+      );
+      return {
+        modelProvider:
+          original.modelProvider !== undefined && original.modelProvider !== managedProvider
+            ? original.modelProvider
+            : "openai",
+        ...(original.model !== undefined
+          ? { model: original.model }
+          : typeof state.officialModel === "string"
+            ? { model: state.officialModel }
+            : {}),
+      };
+    }
+  } catch {
+    /* Missing recovery metadata must not disable native authentication. */
+  }
+  return { modelProvider: "openai" };
+};
+
 const applyActiveSelection = (
   params: JsonObject,
   selection: CodexActiveSelection,
@@ -313,6 +360,7 @@ const readActiveModelList = (
         (params.includeHidden === true || model.visibility === "list"),
     )
     .map((model) => ({
+      ...(selection.modelProvider === managedProvider ? {} : model),
       id: model.slug,
       model: model.slug,
       displayName: model.display_name,
@@ -325,12 +373,19 @@ const readActiveModelList = (
             .filter(isRecord)
             .filter((level) => typeof level.effort === "string")
             .map((level) => ({
+              ...(selection.modelProvider === managedProvider ? {} : level),
               reasoningEffort: level.effort,
               description: typeof level.description === "string" ? level.description : "",
             }))
         : [],
       ...(Array.isArray(model.input_modalities) ? { inputModalities: model.input_modalities } : {}),
-      supportsPersonality: false,
+      ...(selection.modelProvider === managedProvider
+        ? { supportsPersonality: false }
+        : typeof model.supports_personality === "boolean"
+          ? { supportsPersonality: model.supports_personality }
+          : typeof model.supportsPersonality === "boolean"
+            ? { supportsPersonality: model.supportsPersonality }
+            : {}),
     }));
   if (models.length === 0) return undefined;
   const offset =
@@ -354,49 +409,123 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
   if (!Number.isSafeInteger(internalRequestTimeoutMs) || internalRequestTimeoutMs <= 0) {
     throw new Error("Codex proxy internal request timeout must be a positive safe integer.");
   }
-  const child = spawn(options.launch.command, [...options.launch.arguments], {
-    env: options.launch.environment,
-    cwd: options.launch.workingDirectory,
-    stdio: "pipe",
-  });
   const codexHome = options.launch.environment.CODEX_HOME ?? join(homedir(), ".codex");
   const provider = options.managedProvider ?? "ai_tidu9";
   const resolveActiveSelection =
     options.resolveActiveSelection ??
     (() => readCodexActiveSelection(codexHome, options.launch.arguments));
   const launchSelection = resolveActiveSelection();
-  let accountClient: JsonRpcClient | undefined;
-  let accountReady: Promise<void> | undefined;
-  const readOfficialAccount = async (method: string, params: unknown): Promise<unknown> => {
-    if (accountClient === undefined) {
-      accountClient = createStdioJsonRpcClient(
-        {
-          ...options.launch,
-          arguments: [...options.launch.arguments, "-c", 'model_provider="openai"'],
-        },
-        { requestTimeoutMilliseconds: internalRequestTimeoutMs },
-      );
-      const client = accountClient;
-      accountReady = client
-        .request("initialize", {
-          clientInfo: { name: "ai_tidu9_account", version: "1" },
-          capabilities: { experimentalApi: true },
-        })
-        .then(() => client.notify("initialized"));
-    }
-    const client = accountClient;
+  const bootstrap = readOfficialBootstrapSelection(codexHome, launchSelection, provider);
+  let managedCatalogFingerprint: string | null = null;
+  let inspectedHost: { revision: string; version: Promise<string | undefined> } | undefined;
+  const hostVersion = (): Promise<string | undefined> => {
+    if (options.hostVersion !== undefined) return Promise.resolve(options.hostVersion);
+    let revision: string;
     try {
-      await accountReady;
-      return await client.request(method, params);
-    } catch (error) {
-      if (accountClient === client) {
-        accountClient = undefined;
-        accountReady = undefined;
-      }
-      await client.close();
-      throw error;
+      const status = statSync(options.launch.command);
+      revision = `${status.dev}:${status.ino}:${status.size}:${status.mtimeMs}`;
+    } catch {
+      return Promise.resolve(undefined);
     }
+    if (inspectedHost?.revision === revision) return inspectedHost.version;
+    const version = new Promise<string | undefined>((resolve) => {
+      const probe = spawn(options.launch.command, ["--version"], {
+        env: options.launch.environment,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      let output = "";
+      let settled = false;
+      const finish = (value?: string): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve(value);
+      };
+      const timeout = setTimeout(() => {
+        probe.kill("SIGTERM");
+        finish();
+      }, internalRequestTimeoutMs);
+      probe.stdout.on("data", (chunk: Buffer) => {
+        if (output.length < 4096) output += chunk.toString("utf8");
+      });
+      probe.once("error", () => finish());
+      probe.once("close", () => finish(/^codex(?:-cli)?\s+([^\s]+)/u.exec(output.trim())?.[1]));
+    });
+    inspectedHost = { revision, version };
+    return version;
   };
+  const spawnNative = (selection: CodexActiveSelection): NativeChannel => {
+    const process = spawn(
+      options.launch.command,
+      [
+        "-c",
+        `model_provider=${JSON.stringify(selection.modelProvider)}`,
+        ...(selection.model === undefined
+          ? []
+          : ["-c", `model=${JSON.stringify(selection.model)}`]),
+        ...options.launch.arguments,
+      ],
+      {
+        env: options.launch.environment,
+        cwd: options.launch.workingDirectory,
+        stdio: "pipe",
+      },
+    );
+    const childEnded = new Promise<void>((resolve) => process.once("close", () => resolve()));
+    let termination: Promise<void> | undefined;
+    const terminateChild = (): Promise<void> => {
+      termination ??= (async () => {
+        if (process.exitCode !== null || process.signalCode !== null) return childEnded;
+        const force = setTimeout(() => process.kill("SIGKILL"), 1000);
+        force.unref();
+        try {
+          process.kill("SIGTERM");
+          await childEnded;
+        } finally {
+          clearTimeout(force);
+        }
+      })();
+      return termination;
+    };
+    return {
+      process,
+      terminate: terminateChild,
+      ...(selection.modelProvider === provider
+        ? { catalogFingerprint: managedCatalogFingerprint }
+        : {}),
+    };
+  };
+  // The desktop login remains in its original official process. Execution workers never receive it.
+  const primary = spawnNative(bootstrap);
+  const child = primary.process;
+  const channels = new Map<string, NativeChannel>([[bootstrap.modelProvider, primary]]);
+  const retiredChannels = new Set<NativeChannel>();
+  const threadOwners = new Map<string, NativeChannel>();
+  const turnOwners = new Map<
+    string,
+    {
+      threadId: string;
+      logicalThreadId: string;
+      turnId: string;
+      channel: NativeChannel;
+      active: boolean;
+      failed?: boolean;
+    }
+  >();
+  const serverRequests = new Map<string, { id: unknown; channel: NativeChannel }>();
+  const serverReaders = new Set<ReturnType<typeof createInterface>>();
+  let initializationParams: unknown;
+  const terminateChildren = async (): Promise<void> => {
+    await Promise.all(
+      [...new Set([...channels.values(), ...retiredChannels])].map((channel) =>
+        channel.terminate(),
+      ),
+    );
+  };
+  const threadLinks = createCodexThreadLinks(codexHome);
+  const migrations = new Map<string, string>();
+  let emptyContinuation: Promise<unknown> | undefined;
+  const emptyContinuationIds = new Set<string>();
   const requests = new Map<
     string,
     {
@@ -406,6 +535,9 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
       itemIds?: string[];
       cursor?: unknown;
       sortDirection?: unknown;
+      startParams?: JsonObject;
+      channel?: NativeChannel;
+      received?: boolean;
     }
   >();
   const internal = new Map<
@@ -414,6 +546,8 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
       resolve: (value: unknown) => void;
       reject: (error: Error) => void;
       timeout: ReturnType<typeof setTimeout>;
+      method: string;
+      channel?: NativeChannel;
     }
   >();
   const turnSelections = new Map<
@@ -443,15 +577,95 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
   let sequence = Promise.resolve();
   let closed = false;
   const send = (message: unknown): void => {
-    if (!closed && options.output.writable) options.output.write(`${JSON.stringify(message)}\n`);
+    if (!closed && options.output.writable)
+      options.output.write(
+        `${JSON.stringify(isRecord(message) ? threadLinks.toClient(message) : message)}\n`,
+      );
   };
-  const writeChild = (message: unknown): void => {
-    if (!closed && child.stdin.writable) child.stdin.write(`${JSON.stringify(message)}\n`);
+  const getChannel = (selection: CodexActiveSelection): NativeChannel => {
+    const existing = channels.get(selection.modelProvider);
+    if (existing !== undefined) return existing;
+    const channel = spawnNative(selection);
+    channels.set(selection.modelProvider, channel);
+    attachNative(channel);
+    if (initializationParams !== undefined) {
+      channel.ready = request("initialize", initializationParams, channel, false).then(() => {
+        writeChild({ method: "initialized" }, channel, false);
+      });
+    }
+    return channel;
+  };
+  const writeChild = (message: JsonObject, target?: NativeChannel, waitForReady = true): void => {
+    const originalParams = isRecord(message.params) ? message.params : {};
+    const turnId =
+      message.method === "turn/interrupt"
+        ? originalParams.turnId
+        : message.method === "turn/steer"
+          ? originalParams.expectedTurnId
+          : undefined;
+    const turnOwner =
+      typeof originalParams.threadId === "string" && typeof turnId === "string"
+        ? turnOwners.get(`${threadLinks.logical(originalParams.threadId)}:${turnId}`)
+        : undefined;
+    const forwarded =
+      turnOwner === undefined
+        ? threadLinks.toServer(message)
+        : { ...message, params: { ...originalParams, threadId: turnOwner.threadId } };
+    const params = isRecord(forwarded.params) ? forwarded.params : {};
+    const method = typeof forwarded.method === "string" ? forwarded.method : "";
+    let channel = target ?? turnOwner?.channel;
+    if (channel === undefined && method === "" && "id" in forwarded) {
+      const pending = serverRequests.get(idKey(forwarded.id));
+      if (pending !== undefined) {
+        channel = pending.channel;
+        forwarded.id = pending.id;
+        serverRequests.delete(idKey(message.id));
+      }
+    }
+    channel ??=
+      ["thread/start", "thread/resume", "thread/fork"].includes(method) &&
+      typeof params.modelProvider === "string"
+        ? getChannel({
+            modelProvider: params.modelProvider,
+            ...(typeof params.model === "string" ? { model: params.model } : {}),
+          })
+        : typeof params.threadId === "string"
+          ? (threadOwners.get(params.threadId) ?? getChannel(resolveActiveSelection()))
+          : ["thread/list", "model/list", "config/read"].includes(method)
+            ? getChannel(resolveActiveSelection())
+            : primary;
+    const destination = channel;
+    const requestKey = idKey(message.id);
+    const pendingInternal = internal.get(requestKey);
+    if (pendingInternal !== undefined) pendingInternal.channel = destination;
+    const pendingClient = requests.get(requestKey);
+    if (pendingClient !== undefined) pendingClient.channel = destination;
+    if (destination.failed) {
+      if (method === "") return;
+      throw new Error("Native execution worker connection closed.");
+    }
+    const write = (): void => {
+      if (closed || destination.failed || !destination.process.stdin.writable)
+        throw new Error("Native Codex connection is unavailable.");
+      destination.process.stdin.write(`${JSON.stringify(forwarded)}\n`);
+    };
+    if (!waitForReady || destination.ready === undefined) write();
+    else
+      void destination.ready.then(write).catch((error: unknown) => {
+        const pending = internal.get(idKey(message.id));
+        const failure = error instanceof Error ? error : new Error("Native initialization failed.");
+        if (pending !== undefined) {
+          internal.delete(idKey(message.id));
+          pending.reject(failure);
+        } else if ("id" in message && requests.delete(idKey(message.id))) {
+          send({ id: message.id, error: { code: -32_001, message: failure.message } });
+        }
+      });
   };
   let rateLimitsRefresh: Promise<void> | undefined;
   const refreshOfficialRateLimits = (): void => {
     if (rateLimitsRefresh !== undefined) return;
-    rateLimitsRefresh = readOfficialAccount("account/rateLimits/read", undefined)
+    rateLimitsRefresh = request("account/rateLimits/read", undefined)
       .then((result) => {
         if (closed || resolveActiveSelection().modelProvider !== provider) return;
         if (isRecord(result) && isRecord(result.rateLimits))
@@ -463,7 +677,12 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
         rateLimitsRefresh = undefined;
       });
   };
-  const request = (method: string, params: unknown): Promise<unknown> =>
+  const request = (
+    method: string,
+    params: unknown,
+    channel?: NativeChannel,
+    waitForReady = true,
+  ): Promise<unknown> =>
     new Promise((resolve, reject) => {
       if (closed || !child.stdin.writable) {
         reject(new Error("Official Codex connection is unavailable."));
@@ -476,6 +695,7 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
         reject(new Error(`Official Codex did not answer ${method} in time.`));
       }, internalRequestTimeoutMs);
       internal.set(requestKey, {
+        method,
         resolve: (value) => {
           clearTimeout(timeout);
           resolve(value);
@@ -486,17 +706,31 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
         },
         timeout,
       });
-      writeChild({ jsonrpc: "2.0", id, method, params });
+      try {
+        writeChild({ jsonrpc: "2.0", id, method, params }, channel, waitForReady);
+      } catch (error) {
+        clearTimeout(timeout);
+        internal.delete(requestKey);
+        reject(error);
+      }
     });
-  const rememberThread = (thread: JsonObject, settings?: JsonObject): void => {
+  const rememberThread = (thread: JsonObject, settings?: JsonObject, loaded?: boolean): void => {
     if (typeof thread.id !== "string") return;
-    const previous = threads.get(thread.id);
-    threads.set(thread.id, {
-      id: thread.id,
+    const threadId = threadLinks.logical(thread.id);
+    const continuationId = threadLinks.current(threadId);
+    const previous = threads.get(threadId);
+    threads.set(threadId, {
+      id: threadId,
+      continuationId,
+      loaded: loaded ?? (previous?.continuationId === continuationId && previous?.loaded === true),
       modelProvider: settings?.modelProvider ?? thread.modelProvider ?? previous?.modelProvider,
       model: settings?.model ?? thread.model ?? previous?.model,
       collaborationMode:
         settings?.collaborationMode ?? thread.collaborationMode ?? previous?.collaborationMode,
+      empty: previous?.empty,
+      approvalPolicy: settings?.approvalPolicy ?? previous?.approvalPolicy,
+      sandbox: settings?.sandbox ?? previous?.sandbox,
+      startParams: previous?.startParams,
       path: thread.path ?? previous?.path,
       cwd: thread.cwd ?? previous?.cwd,
     });
@@ -505,31 +739,153 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
       if (oldest !== undefined) threads.delete(oldest);
     }
   };
-  const ensureActiveThreadSelection = async (
+  const resumeThread = async (
     threadId: string,
-    activeSelection: CodexActiveSelection,
-  ): Promise<JsonObject | undefined> => {
-    const known = threads.get(threadId);
-    const selection = activeSelection;
-    const providerMatches = known?.modelProvider === selection.modelProvider;
-    const modelMatches = selection.model === undefined || known?.model === selection.model;
-    if (providerMatches && modelMatches) return;
-    if (known !== undefined && !providerMatches) {
-      await request("thread/unsubscribe", { threadId });
+    selection: CodexActiveSelection,
+    params: JsonObject = { threadId, excludeTurns: true },
+  ): Promise<JsonObject> => {
+    const cached = threads.get(threadId);
+    const known = cached?.continuationId === threadLinks.current(threadId) ? cached : undefined;
+    if (known !== cached) threads.delete(threadId);
+    const sourceThreadId = threadLinks.current(threadId);
+    const previousOwner = threadOwners.get(sourceThreadId);
+    const targetChannel =
+      runningThreads.has(threadId) && previousOwner !== undefined
+        ? previousOwner
+        : getChannel(selection);
+    const changedWorker = previousOwner !== undefined && previousOwner !== targetChannel;
+    const changedProvider = known !== undefined && known.modelProvider !== selection.modelProvider;
+    if ((changedProvider || changedWorker) && previousOwner !== undefined) {
+      await request("thread/unsubscribe", { threadId }, previousOwner);
+      if (threadOwners.get(sourceThreadId) === previousOwner) threadOwners.delete(sourceThreadId);
     }
-    const result = await request("thread/resume", {
-      threadId,
-      excludeTurns: true,
-      ...applyActiveSelection(
-        {},
-        selection,
-        typeof known?.modelProvider === "string" ? known.modelProvider : undefined,
-      ),
-    });
+    const updatedParams = applyActiveSelection(
+      params,
+      selection,
+      typeof known?.modelProvider === "string" ? known.modelProvider : undefined,
+    );
+    let result: unknown;
+    if (
+      (changedProvider || changedWorker) &&
+      known?.empty === true &&
+      isRecord(known.startParams)
+    ) {
+      const source = threadLinks.current(threadId);
+      const startParams = { ...known.startParams, ...updatedParams };
+      delete startParams.threadId;
+      delete startParams.excludeTurns;
+      if (selection.model === undefined) delete startParams.model;
+      const pending = request("thread/start", startParams, targetChannel).then((response) => {
+        if (
+          !isRecord(response) ||
+          !isRecord(response.thread) ||
+          typeof response.thread.id !== "string"
+        )
+          throw new Error("Official Codex did not return the empty continued chat.");
+        threadLinks.record(threadId, response.thread.id, source);
+        emptyContinuationIds.add(response.thread.id);
+        return threadLinks.toClient({ result: response }).result;
+      });
+      emptyContinuation = pending;
+      try {
+        result = await pending;
+      } finally {
+        if (emptyContinuation === pending) emptyContinuation = undefined;
+      }
+    } else {
+      // Unsubscription does not immediately release the previous process's history writer.
+      let requiresFork = changedProvider || changedWorker;
+      if (!requiresFork) {
+        try {
+          result = await request("thread/resume", updatedParams, targetChannel);
+        } catch (error) {
+          if (
+            !isRecord(error) ||
+            !isRecord(error.data) ||
+            error.data.type !== "modelProviderMismatch"
+          )
+            throw error;
+          requiresFork = true;
+        }
+      }
+      if (requiresFork) {
+        const source = threadLinks.current(threadId);
+        migrations.set(source, threadId);
+        try {
+          // A provider change requires an official continuation, never a rewritten rollout.
+          result = await request("thread/fork", updatedParams, targetChannel);
+          if (!isRecord(result) || !isRecord(result.thread) || typeof result.thread.id !== "string")
+            throw new Error("Official Codex did not return the continued chat.");
+          threadLinks.record(threadId, result.thread.id, source);
+          result = threadLinks.toClient({ result }).result;
+        } finally {
+          migrations.delete(source);
+        }
+      }
+    }
+    result = threadLinks.toClient({ result }).result;
     if (!isRecord(result) || !isRecord(result.thread))
       throw new Error("Official Codex did not return the resumed chat.");
-    rememberThread(result.thread, result);
+    rememberThread(result.thread, result, true);
     return result;
+  };
+  const ensureActiveThreadSelection = async (
+    threadId: string,
+    selection: CodexActiveSelection,
+  ): Promise<JsonObject | undefined> => {
+    const known = threads.get(threadId);
+    if (
+      known?.modelProvider === selection.modelProvider &&
+      known.loaded === true &&
+      known.continuationId === threadLinks.current(threadId) &&
+      (runningThreads.has(threadId) ||
+        threadOwners.get(threadLinks.current(threadId)) ===
+          channels.get(selection.modelProvider)) &&
+      (selection.model === undefined || known.model === selection.model)
+    )
+      return;
+    return resumeThread(threadId, selection);
+  };
+  const reapRetiredChannels = (): void => {
+    for (const channel of retiredChannels) {
+      if (
+        [...threadOwners.values()].includes(channel) ||
+        [...turnOwners.values()].some((owner) => owner.channel === channel && owner.active) ||
+        [...serverRequests.values()].some((pending) => pending.channel === channel) ||
+        [...requests.values(), ...internal.values()].some((pending) => pending.channel === channel)
+      )
+        continue;
+      retiredChannels.delete(channel);
+      void channel.terminate().catch(() => undefined);
+    }
+  };
+  const refreshCatalogForNewTurn = async (selection: CodexActiveSelection): Promise<void> => {
+    if (
+      selection.modelProvider !== provider ||
+      !existsSync(join(codexHome, "models_cache.json")) ||
+      !existsSync(join(codexHome, ".ai-tidu9-model-catalog.json"))
+    )
+      return;
+    try {
+      const refreshed = refreshManagedCodexCatalog({
+        codexHomeDirectory: codexHome,
+        hostVersion: await hostVersion(),
+      });
+      if (refreshed.fingerprint === null) return;
+      managedCatalogFingerprint = refreshed.fingerprint;
+      const previous = channels.get(provider);
+      if (
+        previous === undefined ||
+        previous === primary ||
+        previous.catalogFingerprint === refreshed.fingerprint
+      )
+        return;
+      channels.delete(provider);
+      retiredChannels.add(previous);
+      reapRetiredChannels();
+    } catch {
+      // Optional metadata refresh cannot replace the last compatible native catalog with unverified data.
+    }
   };
   const loadLiveTurn = async (threadId: string, turn: JsonObject, managedTurnConfirmed = false) => {
     const metadata = await request("thread/read", {
@@ -604,6 +960,11 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
   };
   const processMessage = async (message: JsonObject, receivedAt: number): Promise<void> => {
     const params = isRecord(message.params) ? message.params : undefined;
+    if (message.method === "thread/closed" && typeof params?.threadId === "string") {
+      const thread = threads.get(params.threadId);
+      if (thread !== undefined) thread.loaded = false;
+      runningThreads.delete(params.threadId);
+    }
     if (
       message.method === "account/rateLimits/updated" &&
       resolveActiveSelection().modelProvider === provider
@@ -706,6 +1067,7 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
     ) {
       runningThreads.add(params.threadId);
       const thread = threads.get(params.threadId);
+      if (thread !== undefined) thread.empty = false;
       if (typeof thread?.modelProvider === "string") {
         const key = `${params.threadId}:${params.turn.id}`;
         turnSelections.set(key, {
@@ -731,7 +1093,12 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
       isRecord(params.turn)
     ) {
       const threadId = params.threadId;
-      runningThreads.delete(threadId);
+      if (
+        ![...turnOwners.values()].some(
+          (owner) => owner.logicalThreadId === threadId && owner.active,
+        )
+      )
+        runningThreads.delete(threadId);
       synchronizeSelection();
       const key = `${threadId}:${String(params.turn.id)}`;
       const turnSelection = turnSelections.get(key);
@@ -832,12 +1199,31 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
       const method = context?.method;
       requests.delete(idKey(message.id));
       if (
+        method === "thread/unsubscribe" &&
+        context?.threadId !== undefined &&
+        isRecord(message.result)
+      ) {
+        const thread = threads.get(context.threadId);
+        if (thread !== undefined) thread.loaded = false;
+      }
+      if (
         method !== undefined &&
         ["thread/start", "thread/read", "thread/resume", "thread/fork"].includes(method) &&
         isRecord(message.result) &&
         isRecord(message.result.thread)
       ) {
-        rememberThread(message.result.thread, message.result);
+        rememberThread(
+          message.result.thread,
+          message.result,
+          method === "thread/read" ? undefined : context?.channel?.failed !== true,
+        );
+        if (method === "thread/start" && context?.startParams !== undefined) {
+          const thread = threads.get(String(message.result.thread.id));
+          if (thread !== undefined) {
+            thread.startParams = context.startParams;
+            thread.empty = true;
+          }
+        }
         try {
           send({
             ...message,
@@ -974,7 +1360,6 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
     send(message);
   };
   const fromClient = createInterface({ input: options.input });
-  const fromServer = createInterface({ input: child.stdout });
   let clientSequence = Promise.resolve();
   let observedSelection = JSON.stringify(resolveActiveSelection());
   const synchronizeSelection = (): void => {
@@ -1042,25 +1427,65 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
       writeChild(parsedMessage);
       return;
     }
+    if (isRecord(parsedMessage) && parsedMessage.method === "initialize") {
+      initializationParams = parsedMessage.params;
+    }
+    if (isRecord(parsedMessage) && parsedMessage.method === "turn/interrupt") {
+      // Stopping active work must not wait for another chat's mode synchronization.
+      try {
+        writeChild(parsedMessage);
+      } catch (error) {
+        if ("id" in parsedMessage)
+          send({
+            id: parsedMessage.id,
+            error: {
+              code: -32_600,
+              message: error instanceof Error ? error.message : "Native interruption failed.",
+            },
+          });
+      }
+      return;
+    }
+    if (
+      isRecord(parsedMessage) &&
+      typeof parsedMessage.method === "string" &&
+      (parsedMessage.method === "getAuthStatus" || parsedMessage.method.startsWith("account/"))
+    ) {
+      // Desktop credentials may exist only in this app-server's memory.
+      writeChild(parsedMessage, primary);
+      return;
+    }
     clientSequence = clientSequence
       .then(async () => {
         const parsed = parsedMessage;
         if (!isRecord(parsed)) return;
         const params = isRecord(parsed.params) ? parsed.params : {};
         if (
-          "id" in parsed &&
-          resolveActiveSelection().modelProvider === provider &&
-          ["account/read", "account/rateLimits/read", "account/usage/read"].includes(
-            String(parsed.method),
-          )
-        ) {
-          try {
-            const result = await readOfficialAccount(String(parsed.method), parsed.params);
-            send({ id: parsed.id, result });
-            return;
-          } catch {
-            // Let the native process report its own account result when metadata is unavailable.
-          }
+          [
+            "thread/start",
+            "thread/fork",
+            "turn/start",
+            "review/start",
+            "thread/compact/start",
+            "thread/queue/start",
+            "thread/realtime/start",
+          ].includes(String(parsed.method)) &&
+          (typeof params.threadId !== "string" || !runningThreads.has(params.threadId))
+        )
+          await refreshCatalogForNewTurn(resolveActiveSelection());
+        if (parsed.method === "thread/loaded/list" && "id" in parsed) {
+          const results = await Promise.all(
+            [...new Set([...channels.values(), ...retiredChannels])].map((channel) =>
+              request("thread/loaded/list", params, channel),
+            ),
+          );
+          const ids = results.flatMap((result) =>
+            isRecord(result) && Array.isArray(result.data)
+              ? result.data.filter((id): id is string => typeof id === "string")
+              : [],
+          );
+          send({ id: parsed.id, result: { data: [...new Set(ids.map(threadLinks.logical))] } });
+          return;
         }
         if (parsed.method === "model/list" && "id" in parsed) {
           const selection = resolveActiveSelection();
@@ -1076,19 +1501,19 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
         let message = parsed;
         if (parsed.method === "thread/resume" && typeof params.threadId === "string") {
           const known = threads.get(params.threadId);
-          const selection = resolveActiveSelection();
-          if (known !== undefined && known.modelProvider !== selection.modelProvider) {
-            await request("thread/unsubscribe", { threadId: params.threadId });
-          }
-          if (known?.modelProvider !== selection.modelProvider || selection.model !== undefined)
-            message = {
-              ...parsed,
-              params: applyActiveSelection(
-                params,
-                selection,
-                typeof known?.modelProvider === "string" ? known.modelProvider : undefined,
-              ),
-            };
+          const selection =
+            runningThreads.has(params.threadId) && typeof known?.modelProvider === "string"
+              ? {
+                  modelProvider: known.modelProvider,
+                  ...(typeof known.model === "string" ? { model: known.model } : {}),
+                }
+              : resolveActiveSelection();
+          const result = await resumeThread(params.threadId, selection, params);
+          send({
+            id: parsed.id,
+            result: { ...result, thread: await recoverThread(result.thread as JsonObject) },
+          });
+          return;
         } else if (parsed.method === "thread/fork" && typeof params.threadId === "string") {
           const known = threads.get(params.threadId);
           const selection = resolveActiveSelection();
@@ -1128,14 +1553,18 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
                 ),
               };
             }
-          } catch {
+          } catch (error) {
             if ("id" in parsed)
               send({
                 jsonrpc: "2.0",
                 id: parsed.id,
                 error: {
-                  code: -32_001,
-                  message: "Codex could not resume this chat with the currently selected mode.",
+                  code: isRecord(error) && typeof error.code === "number" ? error.code : -32_001,
+                  message:
+                    error instanceof Error
+                      ? error.message
+                      : "Codex could not resume this chat with the currently selected mode.",
+                  ...(isRecord(error) && error.data !== undefined ? { data: error.data } : {}),
                 },
               });
             options.errorOutput.write(
@@ -1148,6 +1577,7 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
           const forwardedParams = isRecord(message.params) ? message.params : {};
           requests.set(idKey(message.id), {
             method: message.method,
+            ...(message.method === "thread/start" ? { startParams: forwardedParams } : {}),
             ...(typeof forwardedParams.threadId === "string"
               ? { threadId: forwardedParams.threadId }
               : {}),
@@ -1168,7 +1598,7 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
         // Server-initiated approval requests and the user's exact decisions pass unchanged.
         writeChild(message);
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         let failedRequest: unknown;
         try {
           failedRequest = JSON.parse(line) as unknown;
@@ -1180,25 +1610,125 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
             jsonrpc: "2.0",
             id: failedRequest.id,
             error: {
-              code: -32_600,
-              message: "AI-Tidu9 could not process this Codex request.",
+              code: isRecord(error) && typeof error.code === "number" ? error.code : -32_600,
+              message:
+                error instanceof Error
+                  ? error.message
+                  : "AI-Tidu9 could not process this Codex request.",
+              ...(isRecord(error) && error.data !== undefined ? { data: error.data } : {}),
             },
           });
         }
         options.errorOutput.write("AI-Tidu9 could not process client JSON-RPC.\n");
       });
   });
-  fromServer.on("line", (line) => {
+  const receiveNative = (channel: NativeChannel, line: string): void => {
+    if (channel.failed) return;
     try {
-      const message: unknown = JSON.parse(line);
-      if (!isRecord(message)) return;
+      const received: unknown = JSON.parse(line);
+      if (!isRecord(received)) return;
+      const message = received;
+      if (
+        (message.method === "turn/started" || message.method === "turn/completed") &&
+        isRecord(message.params) &&
+        typeof message.params.threadId === "string" &&
+        isRecord(message.params.turn) &&
+        typeof message.params.turn.id === "string"
+      ) {
+        const threadId = message.params.threadId;
+        const turnId = message.params.turn.id;
+        const logicalThreadId = threadLinks.logical(threadId);
+        turnOwners.set(`${logicalThreadId}:${turnId}`, {
+          threadId,
+          logicalThreadId,
+          turnId,
+          channel,
+          active: message.method === "turn/started",
+        });
+        for (const [key, owner] of turnOwners) {
+          if (turnOwners.size <= MAXIMUM_TURN_PROVIDER_ENTRIES) break;
+          if (!owner.active) turnOwners.delete(key);
+        }
+      }
+      if (
+        channel !== primary &&
+        typeof message.method === "string" &&
+        message.method.startsWith("account/")
+      ) {
+        // Worker auth is deliberately empty; it must never replace the desktop's identity.
+        if (message.method === "account/rateLimits/updated") refreshOfficialRateLimits();
+        if ("id" in message)
+          writeChild(
+            {
+              id: message.id,
+              error: {
+                code: -32_001,
+                message: "Execution workers do not own desktop authentication.",
+              },
+            },
+            channel,
+            false,
+          );
+        return;
+      }
       const responseKey = idKey(message.id);
       const pending = message.method === undefined ? internal.get(responseKey) : undefined;
+      const context = message.method === undefined ? requests.get(responseKey) : undefined;
+      if (context !== undefined) context.received = true;
+      const method = pending?.method ?? context?.method;
+      if (
+        ["thread/start", "thread/resume", "thread/fork"].includes(method ?? "") &&
+        isRecord(message.result) &&
+        isRecord(message.result.thread) &&
+        typeof message.result.thread.id === "string"
+      )
+        threadOwners.set(message.result.thread.id, channel);
+      if (
+        message.method === "thread/started" &&
+        isRecord(message.params) &&
+        isRecord(message.params.thread) &&
+        typeof message.params.thread.id === "string"
+      )
+        threadOwners.set(message.params.thread.id, channel);
+      if (
+        message.method === "thread/closed" &&
+        isRecord(message.params) &&
+        typeof message.params.threadId === "string" &&
+        threadOwners.get(message.params.threadId) === channel
+      )
+        threadOwners.delete(message.params.threadId);
+      if (typeof message.method === "string" && "id" in message) {
+        const originalId = message.id;
+        if (serverRequests.has(responseKey)) message.id = `tidu_server_${randomUUID()}`;
+        serverRequests.set(idKey(message.id), { id: originalId, channel });
+      }
       if (pending !== undefined) {
         internal.delete(responseKey);
-        if ("error" in message) pending.reject(new Error("Official session read failed."));
+        if ("error" in message)
+          pending.reject(
+            Object.assign(
+              new Error(
+                isRecord(message.error) && typeof message.error.message === "string"
+                  ? message.error.message
+                  : "Official session read failed.",
+              ),
+              isRecord(message.error) ? { code: message.error.code, data: message.error.data } : {},
+            ),
+          );
         else pending.resolve(message.result);
         return;
+      }
+      if (
+        message.method === "thread/started" &&
+        isRecord(message.params) &&
+        isRecord(message.params.thread) &&
+        typeof message.params.thread.forkedFromId === "string"
+      ) {
+        const root = migrations.get(message.params.thread.forkedFromId);
+        if (root !== undefined && typeof message.params.thread.id === "string") {
+          threadLinks.record(root, message.params.thread.id, message.params.thread.forkedFromId);
+          return;
+        }
       }
       if (
         message.method === undefined &&
@@ -1208,18 +1738,40 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
         return;
       const receivedAt = Date.now();
       sequence = sequence
-        .then(() => processMessage(message, receivedAt))
+        .then(async () => {
+          const params = isRecord(message.params) ? message.params : {};
+          const turnId = isRecord(params.turn) ? params.turn.id : params.turnId;
+          if (
+            typeof params.threadId === "string" &&
+            typeof turnId === "string" &&
+            turnOwners.get(`${threadLinks.logical(params.threadId)}:${turnId}`)?.failed === true
+          )
+            return;
+          if (message.method === "thread/started" && emptyContinuation !== undefined) {
+            await emptyContinuation.catch(() => undefined);
+          }
+          if (
+            message.method === "thread/started" &&
+            isRecord(message.params) &&
+            isRecord(message.params.thread) &&
+            typeof message.params.thread.id === "string" &&
+            emptyContinuationIds.delete(message.params.thread.id)
+          )
+            return;
+          await processMessage(threadLinks.toClient(message, context?.method), receivedAt);
+        })
         .catch(() => {
           send(message);
-        });
+        })
+        .finally(reapRetiredChannels);
     } catch {
       options.errorOutput.write("AI-Tidu9 received invalid official JSON-RPC.\n");
     }
-  });
-  child.stderr.pipe(options.errorOutput, { end: false });
+  };
   const disconnected = (): void => {
+    if (closed) return;
     closed = true;
-    void accountClient?.close();
+    void terminateChildren();
     unwatchFile(configurationPath, synchronizeSelection);
     internal.forEach((pending) => {
       clearTimeout(pending.timeout);
@@ -1230,25 +1782,79 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
     turnSelections.clear();
     threads.clear();
     terminalTurns.clear();
+    threadOwners.clear();
+    turnOwners.clear();
+    serverRequests.clear();
     fromClient.close();
-    fromServer.close();
+    serverReaders.forEach((reader) => {
+      reader.close();
+    });
   };
-  child.on("error", disconnected);
-  child.stdin.on("error", disconnected);
-  child.on("close", disconnected);
+  const attachNative = (channel: NativeChannel): void => {
+    const reader = createInterface({ input: channel.process.stdout });
+    serverReaders.add(reader);
+    reader.on("line", (line) => receiveNative(channel, line));
+    channel.process.stderr.pipe(options.errorOutput, { end: false });
+    const channelDisconnected = (): void => {
+      if (closed || channel.failed) return;
+      if (channel === primary) {
+        disconnected();
+        return;
+      }
+      channel.failed = true;
+      retiredChannels.delete(channel);
+      reader.close();
+      serverReaders.delete(reader);
+      for (const [name, current] of channels) if (current === channel) channels.delete(name);
+      const failure = new Error("Native execution worker connection closed.");
+      for (const [key, pending] of internal)
+        if (pending.channel === channel) {
+          internal.delete(key);
+          pending.reject(failure);
+        }
+      for (const [key, pending] of requests)
+        if (pending.channel === channel && !pending.received) {
+          requests.delete(key);
+          send({ id: JSON.parse(key), error: { code: -32_001, message: failure.message } });
+        }
+      for (const [threadId, owner] of threadOwners)
+        if (owner === channel) {
+          threadOwners.delete(threadId);
+          const known = threads.get(threadLinks.logical(threadId));
+          if (known?.continuationId === threadId) known.loaded = false;
+        }
+      for (const owner of turnOwners.values())
+        if (owner.channel === channel && owner.active) {
+          owner.active = false;
+          owner.failed = true;
+          send({
+            method: "turn/completed",
+            params: {
+              threadId: owner.logicalThreadId,
+              turn: { id: owner.turnId, status: "failed", error: { message: failure.message } },
+            },
+          });
+          if (
+            ![...turnOwners.values()].some(
+              (other) => other.logicalThreadId === owner.logicalThreadId && other.active,
+            )
+          )
+            runningThreads.delete(owner.logicalThreadId);
+        }
+      void channel.terminate().catch(() => undefined);
+    };
+    channel.process.on("error", channelDisconnected);
+    channel.process.stdin.on("error", channelDisconnected);
+    channel.process.on("close", channelDisconnected);
+  };
+  attachNative(primary);
   fromClient.on("close", () => {
-    if (!closed) child.kill("SIGTERM");
+    void terminateChildren();
   });
   return {
     process: child,
     close: async () => {
-      if (!closed) {
-        const ended = new Promise<void>((resolve) => {
-          child.once("close", () => resolve());
-        });
-        child.kill("SIGTERM");
-        await ended;
-      }
+      await terminateChildren();
     },
   };
 };

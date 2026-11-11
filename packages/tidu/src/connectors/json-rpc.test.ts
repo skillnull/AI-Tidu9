@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { createStdioJsonRpcClient } from "./json-rpc.js";
 
@@ -25,6 +26,43 @@ setTimeout(() => undefined, 10_000);
 const EXITING_CHILD_SOURCE = `
 process.exit(7);
 `;
+
+test("cleans owned descendants after their protocol parent exits", {
+  skip: process.platform === "win32",
+  timeout: 5000,
+}, async () => {
+  const descendantSource =
+    "process.on('SIGTERM',()=>{});process.send('ready');setInterval(()=>{},1000);";
+  const parentSource = `const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(descendantSource)}],{stdio:['ignore','inherit','inherit','ipc']});const ready=new Promise(resolve=>child.once('message',resolve));require('node:readline').createInterface({input:process.stdin}).on('line',async line=>{const message=JSON.parse(line);await ready;process.stdout.write(JSON.stringify({id:message.id,result:{processId:child.pid}})+'\\n');if(message.method==='exit')process.exit(0);});`;
+  const client = createStdioJsonRpcClient({
+    command: process.execPath,
+    arguments: ["-e", parentSource],
+    environment: { PATH: process.env.PATH },
+  });
+  let descendantId: number | undefined;
+  try {
+    descendantId = (await client.request<{ processId: number }>("initialize", {})).processId;
+    await client.request("exit", {});
+    await client.close();
+    const deadline = Date.now() + 1000;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(descendantId, 0);
+      } catch {
+        break;
+      }
+      await delay(5);
+    }
+    assert.throws(() => process.kill(descendantId as number, 0), /ESRCH/u);
+  } finally {
+    if (descendantId !== undefined) {
+      try {
+        process.kill(descendantId, "SIGKILL");
+      } catch {}
+    }
+    await client.close();
+  }
+});
 
 test("stdio JSON-RPC correlates requests and notifications", async () => {
   const notifications: string[] = [];

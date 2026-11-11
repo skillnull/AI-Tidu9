@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { createServer as createViteServer, type ViteDevServer } from "vite";
 
 import { CONFIG_SCHEMA_VERSION } from "../config/index.js";
 import { startLocalRuntime } from "../runtime/index.js";
@@ -26,6 +27,12 @@ const packageVersion = (
     version: string;
   }
 ).version;
+
+const source = import.meta.url.endsWith(".ts");
+const executableArguments = [
+  ...(source ? ["--import", import.meta.resolve("tsx")] : []),
+  fileURLToPath(new URL(`./index.${source ? "ts" : "js"}`, import.meta.url)),
+];
 
 const cliTestDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-cli-suite-"));
 const originalCodexHome = process.env.CODEX_HOME;
@@ -118,8 +125,7 @@ test("keeps installed edition commands mutually exclusive", () => {
 });
 
 test("prints subcommand help from the executable without starting the command", () => {
-  const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
-  const result = spawnSync(process.execPath, [executablePath, "start", "--help"], {
+  const result = spawnSync(process.execPath, [...executableArguments, "start", "--help"], {
     encoding: "utf8",
   });
 
@@ -146,8 +152,7 @@ test("rejects unsupported commands", () => {
 });
 
 test("runs as an executable entry point", () => {
-  const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
-  const result = spawnSync(process.execPath, [executablePath, "--version"], {
+  const result = spawnSync(process.execPath, [...executableArguments, "--version"], {
     encoding: "utf8",
   });
 
@@ -159,13 +164,21 @@ test("runs as an executable entry point", () => {
 test("configures and rolls back a dedicated Codex profile through the CLI", async () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-cli-codex-"));
   const codexHomeDirectory = join(temporaryDirectory, ".codex");
-  const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
   const runtime = await startLocalRuntime({
     databasePath: ":memory:",
     port: 0,
+    discoverHostProvider: false,
+    provider: {
+      descriptor: { type: "codex-host", model: "fixture" },
+      execute: async (request) => ({
+        kind: "json",
+        statusCode: 200,
+        body: { id: "fixture", object: "response", model: request.virtualModelId, output: [] },
+      }),
+    },
   });
   const runCommand = async (commandArguments: readonly string[]) => {
-    const child = spawn(process.execPath, [executablePath, ...commandArguments], {
+    const child = spawn(process.execPath, [...executableArguments, ...commandArguments], {
       env: { ...process.env, CODEX_HOME: codexHomeDirectory },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -200,6 +213,22 @@ test("configures and rolls back a dedicated Codex profile through the CLI", asyn
     assert.equal(rolledBack.standardError, "");
     assert.match(rolledBack.standardOutput, /restored/u);
     assert.equal(existsSync(join(codexHomeDirectory, "ai-tidu9.config.toml")), false);
+    const switched = await runCommand([
+      "clients",
+      "switch",
+      "codex",
+      "ai-tidu9",
+      "--yes",
+      "--endpoint",
+      runtime.origin,
+    ]);
+    assert.equal(switched.exitCode, 0, switched.standardError);
+    assert.match(
+      readFileSync(join(codexHomeDirectory, "config.toml"), "utf8"),
+      /model_provider = "ai_tidu9"/u,
+    );
+    const restored = await runCommand(["clients", "switch", "codex", "official", "--yes"]);
+    assert.equal(restored.exitCode, 0, restored.standardError);
   } finally {
     await runtime.close();
     rmSync(temporaryDirectory, { force: true, recursive: true });
@@ -210,7 +239,6 @@ test("setup preserves official Codex defaults without requiring a running runtim
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-cli-setup-"));
   const codexHomeDirectory = join(temporaryDirectory, ".codex");
   const binaryDirectory = join(temporaryDirectory, "bin");
-  const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
   try {
     mkdirSync(binaryDirectory, { recursive: true });
     const fakeCodex = join(binaryDirectory, "codex");
@@ -226,7 +254,7 @@ test("setup preserves official Codex defaults without requiring a running runtim
     };
     const configured = spawnSync(
       process.execPath,
-      [executablePath, "setup", "--endpoint", "http://127.0.0.1:9639", "--no-restart"],
+      [...executableArguments, "setup", "--endpoint", "http://127.0.0.1:9639", "--no-restart"],
       { encoding: "utf8", env: environment },
     );
 
@@ -248,7 +276,6 @@ test("reuses, refreshes, and switches host-owned Codex and Cursor logins through
   const fakeBinDirectory = join(temporaryDirectory, "bin");
   const commandLogPath = join(temporaryDirectory, "commands.log");
   const cursorCommandLogPath = join(temporaryDirectory, "cursor-commands.log");
-  const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
   try {
     mkdirSync(codexHomeDirectory, { mode: 0o700 });
     mkdirSync(fakeBinDirectory, { mode: 0o700 });
@@ -297,7 +324,7 @@ test("reuses, refreshes, and switches host-owned Codex and Cursor logins through
       PATH: `${fakeBinDirectory}:${process.env.PATH ?? ""}`,
     };
 
-    const status = spawnSync(process.execPath, [executablePath, "account"], {
+    const status = spawnSync(process.execPath, [...executableArguments, "account"], {
       encoding: "utf8",
       env: environment,
     });
@@ -306,16 +333,20 @@ test("reuses, refreshes, and switches host-owned Codex and Cursor logins through
     assert.match(status.stdout, /Cursor account: signed in/u);
     assert.match(status.stdout, /does not read, copy, store, or print tokens/u);
 
-    const relogin = spawnSync(process.execPath, [executablePath, "account", "relogin"], {
+    const relogin = spawnSync(process.execPath, [...executableArguments, "account", "relogin"], {
       encoding: "utf8",
       env: environment,
     });
     assert.equal(relogin.status, 0);
 
-    const switched = spawnSync(process.execPath, [executablePath, "account", "switch", "--yes"], {
-      encoding: "utf8",
-      env: environment,
-    });
+    const switched = spawnSync(
+      process.execPath,
+      [...executableArguments, "account", "switch", "--yes"],
+      {
+        encoding: "utf8",
+        env: environment,
+      },
+    );
     assert.equal(switched.status, 0);
     assert.deepEqual(readFileSync(commandLogPath, "utf8").trim().split("\n"), [
       "login",
@@ -325,13 +356,13 @@ test("reuses, refreshes, and switches host-owned Codex and Cursor logins through
 
     const cursorRelogin = spawnSync(
       process.execPath,
-      [executablePath, "account", "relogin", "cursor"],
+      [...executableArguments, "account", "relogin", "cursor"],
       { encoding: "utf8", env: environment },
     );
     assert.equal(cursorRelogin.status, 0);
     const cursorSwitched = spawnSync(
       process.execPath,
-      [executablePath, "account", "switch", "cursor", "--yes"],
+      [...executableArguments, "account", "switch", "cursor", "--yes"],
       { encoding: "utf8", env: environment },
     );
     assert.equal(cursorSwitched.status, 0);
@@ -349,10 +380,9 @@ test("refuses to remove a custom database path", () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-cli-uninstall-"));
   const databasePath = join(temporaryDirectory, "shared.db");
   writeFileSync(databasePath, "preserve-me", { mode: 0o600 });
-  const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
 
   try {
-    const result = spawnSync(process.execPath, [executablePath, "uninstall", "--yes"], {
+    const result = spawnSync(process.execPath, [...executableArguments, "uninstall", "--yes"], {
       encoding: "utf8",
       env: {
         ...process.env,
@@ -370,7 +400,6 @@ test("refuses to remove a custom database path", () => {
 
 test("completely removes owned connectors, profiles, data, and snapshots", () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "ai-tidu9-cli-complete-uninstall-"));
-  const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
   const binaryDirectory = join(temporaryDirectory, "bin");
   const cursorCommand = join(binaryDirectory, "cursor");
   const cursorConfiguration = join(temporaryDirectory, ".cursor", "mcp.json");
@@ -402,7 +431,7 @@ test("completely removes owned connectors, profiles, data, and snapshots", () =>
 
     const result = spawnSync(
       process.execPath,
-      [executablePath, "uninstall", "--complete", "--confirm", "DELETE"],
+      [...executableArguments, "uninstall", "--complete", "--confirm", "DELETE"],
       {
         encoding: "utf8",
         env: {
@@ -429,8 +458,7 @@ test("completely removes owned connectors, profiles, data, and snapshots", () =>
 });
 
 test("starts the local runtime from the executable entry point", async () => {
-  const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
-  const child = spawn(process.execPath, [executablePath, "start"], {
+  const child = spawn(process.execPath, [...executableArguments, "start"], {
     env: {
       ...process.env,
       TIDU_DATABASE_PATH: ":memory:",
@@ -474,10 +502,9 @@ test("starts and stops the local runtime automatically with the MCP host session
   reservation.close();
   await once(reservation, "close");
 
-  const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
   const child = spawn(
     process.execPath,
-    [executablePath, "mcp", "--endpoint", `http://127.0.0.1:${port}`],
+    [...executableArguments, "mcp", "--endpoint", `http://127.0.0.1:${port}`],
     {
       env: { ...process.env, TIDU_DATABASE_PATH: ":memory:" },
       stdio: ["pipe", "pipe", "pipe"],
@@ -518,8 +545,30 @@ test("diagnoses and configures a running runtime through the public API", async 
     discoverHostProvider: false,
     port: 0,
   });
+  let frontend: ViteDevServer | undefined;
+  const originalNodeEnvironment = process.env.NODE_ENV;
   try {
-    const report = await diagnoseEndpoint(runtime.origin);
+    let endpoint = runtime.origin;
+    if (source) {
+      frontend = await createViteServer({
+        configFile: false,
+        root: fileURLToPath(new URL("../../ui/", import.meta.url)),
+        logLevel: "silent",
+        optimizeDeps: { noDiscovery: true, include: [] },
+        server: {
+          host: "127.0.0.1",
+          port: 0,
+          watch: null,
+          ws: false,
+          proxy: { "/api": runtime.origin, "/health": runtime.origin },
+        },
+      });
+      await frontend.listen();
+      const address = frontend.httpServer?.address();
+      assert.ok(address !== undefined && address !== null && typeof address !== "string");
+      endpoint = `http://127.0.0.1:${address.port}`;
+    }
+    const report = await diagnoseEndpoint(endpoint);
     assert.equal(report.healthy, true);
     assert.deepEqual(
       report.checks.map((check) => check.name),
@@ -531,10 +580,9 @@ test("diagnoses and configures a running runtime through the public API", async 
     assert.equal("endpoint" in safeReport, false);
     assert.doesNotMatch(JSON.stringify(safeReport), /127\.0\.0\.1/u);
 
-    const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
     const doctorProcess = spawn(
       process.execPath,
-      [executablePath, "doctor", "--json", "--endpoint", runtime.origin],
+      [...executableArguments, "doctor", "--json", "--endpoint", endpoint],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
     let doctorOutput = "";
@@ -583,7 +631,9 @@ test("diagnoses and configures a running runtime through the public API", async 
       "CLI专家入口",
     );
   } finally {
-    await runtime.close();
+    if (originalNodeEnvironment === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnvironment;
+    await Promise.all([frontend?.close(), runtime.close()]);
   }
 });
 
@@ -592,10 +642,13 @@ test("offers a simple interactive configuration fallback", async () => {
     databasePath: ":memory:",
     port: 0,
   });
-  const executablePath = fileURLToPath(new URL("./index.js", import.meta.url));
-  const child = spawn(process.execPath, [executablePath, "config", "--endpoint", runtime.origin], {
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+  const child = spawn(
+    process.execPath,
+    [...executableArguments, "config", "--endpoint", runtime.origin],
+    {
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
 
   try {
     let standardOutput = "";

@@ -4,7 +4,82 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { createStdioJsonRpcClient } from "./json-rpc.js";
+
+test("closing the full relay does not orphan a native child that ignores termination", {
+  timeout: 10000,
+  skip: process.platform === "win32",
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "native-relay-process-tree-"));
+  const fixture = join(directory, "native-fixture");
+  writeFileSync(
+    join(directory, "config.toml"),
+    'model_provider = "ai_tidu9"\nmodel = "ai-tidu9-config"\n',
+  );
+  writeFileSync(
+    fixture,
+    `#!${process.execPath}\nprocess.on('SIGTERM',()=>{});setInterval(()=>{},1000);require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const message=JSON.parse(line);process.stdout.write(JSON.stringify({id:message.id,result:{processId:process.pid}})+'\\n');});`,
+    { mode: 0o700 },
+  );
+  const source = import.meta.url.endsWith(".ts");
+  const client = createStdioJsonRpcClient({
+    command: process.execPath,
+    arguments: [
+      ...(source ? ["--import", import.meta.resolve("tsx")] : []),
+      fileURLToPath(new URL(`./codex-client-cli.${source ? "ts" : "js"}`, import.meta.url)),
+      "app-server",
+    ],
+    environment: {
+      PATH: process.env.PATH,
+      CODEX_HOME: directory,
+      TIDU_CODEX_REAL_COMMAND: fixture,
+    },
+  });
+  let nativeProcessId: number | undefined;
+  let accountProcessId: number | undefined;
+  let workerProcessId: number | undefined;
+  try {
+    const initialized = await client.request<{ processId: number }>("initialize", {});
+    nativeProcessId = initialized.processId;
+    accountProcessId = (await client.request<{ processId: number }>("account/read", {})).processId;
+    assert.equal(accountProcessId, nativeProcessId);
+    workerProcessId = (await client.request<{ processId: number }>("config/read", {})).processId;
+    assert.notEqual(workerProcessId, nativeProcessId);
+    await client.close();
+    const deadline = Date.now() + 1000;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(initialized.processId, 0);
+      } catch {
+        break;
+      }
+      await delay(5);
+    }
+    assert.throws(() => process.kill(initialized.processId, 0), /ESRCH/u);
+    assert.throws(() => process.kill(accountProcessId as number, 0), /ESRCH/u);
+    assert.throws(() => process.kill(workerProcessId as number, 0), /ESRCH/u);
+  } finally {
+    if (workerProcessId !== undefined) {
+      try {
+        process.kill(workerProcessId, "SIGKILL");
+      } catch {}
+    }
+    if (accountProcessId !== undefined) {
+      try {
+        process.kill(accountProcessId, "SIGKILL");
+      } catch {}
+    }
+    if (nativeProcessId !== undefined) {
+      try {
+        process.kill(nativeProcessId, "SIGKILL");
+      } catch {}
+    }
+    await client.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("preserves one-shot desktop startup checks with closed stdin and exact official results", {
   timeout: 30_000,

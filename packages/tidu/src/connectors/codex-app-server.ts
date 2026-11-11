@@ -6,6 +6,7 @@ import { TiduError } from "../core/index.js";
 import {
   createStdioJsonRpcClient,
   type JsonRpcClient,
+  type JsonRpcClientOptions,
   type JsonRpcNotification,
   type JsonRpcServerRequest,
 } from "./json-rpc.js";
@@ -30,6 +31,8 @@ export interface CodexAgentEvent {
 }
 
 export interface CodexAgentOptions extends CodexHostInspectionOptions {
+  /** Optional transport adapter; the native stdio transport remains the default. */
+  transportFactory?: (handlers: JsonRpcClientOptions) => JsonRpcClient;
   /** Working directory used for new Codex threads. */
   workingDirectory: string;
   /** Whether new threads should remain ephemeral and out of host history. */
@@ -200,17 +203,30 @@ export interface CodexAgentClient {
 }
 
 interface TurnState {
+  /** Thread owning the live native turn. */
+  threadId: string;
+  /** Native turn retained while caller tools execute. */
+  turnId: string;
+  /** Whether this response has already been handed to the caller. */
+  yielded: boolean;
+  /** Claimed caller batches, retained while their native turn remains active. */
+  resumes: Map<string, CallerResume>;
+  /** Unanswered native RPCs indexed by the caller's stable call ID. */
+  toolReplies: Map<
+    string,
+    { resolve: (reply: CodexToolReply) => void; reject: (error: Error) => void }
+  >;
+  /** Real caller results retained until sequential native tool requests consume them. */
+  toolResults: Map<string, CodexToolReply>;
   /** Whether the current model response reached its official completion boundary. */
   modelResponseCompleted: boolean;
   /** Dynamic requests waiting for the complete model response and its usage. */
   responseWaiters: Array<() => void>;
-  /** One shared interruption after all model-emitted calls have been collected. */
-  toolInterruption?: Promise<unknown>;
   /** Streams completed native progress before subsequent text or tool requests. */
   onNativeItem?: (item: Record<string, unknown>) => void;
   /** Completed model items that can be durably forwarded without flattening their phase. */
   progressItems: Record<string, unknown>[];
-  /** Caller-owned tool requests captured before interrupting delegated execution. */
+  /** Caller-owned tool requests emitted by the current model response. */
   toolCalls: CodexCallerToolCall[];
   /** Assistant text accumulated from streaming notifications. */
   text: string;
@@ -238,6 +254,30 @@ interface TurnState {
   usageWaitTimer?: NodeJS.Timeout;
 }
 
+interface CallerResume {
+  /** Canonical caller payload used to distinguish retries from conflicting results. */
+  key: string;
+  /** Shared outcome for all concurrent deliveries of this batch. */
+  promise: Promise<CodexTurnResult>;
+  /** Whether a rejected attempt may be resumed without repeating accepted input. */
+  failed?: boolean;
+  /** Whether the original additional user input was already accepted. */
+  steered?: boolean;
+  /** Whether the original additional context was already accepted. */
+  injected?: boolean;
+}
+
+interface CodexToolReply {
+  /** Actual caller output in the native dynamic-tool response format. */
+  contentItems: Array<
+    | { type: "inputText"; text: string }
+    | { type: "inputImage"; imageUrl: string }
+    | { type: "inputAudio"; audioUrl: string }
+  >;
+  /** Whether the caller reported successful execution. */
+  success: boolean;
+}
+
 interface BufferedTurnNotifications {
   /** A model response boundary received before local turn registration. */
   modelResponseCompleted?: boolean;
@@ -246,6 +286,7 @@ interface BufferedTurnNotifications {
     | { type: "native"; item: Record<string, unknown> }
     | { type: "text"; delta: string }
     | { type: "process"; itemKey: string; delta: string; separator?: boolean }
+    | { type: "tool"; call: CodexCallerToolCall }
   >;
   /** Terminal result received before the turn was registered locally. */
   completion?: Omit<CodexTurnResult, "text" | "usage">;
@@ -257,6 +298,15 @@ interface BufferedTurnNotifications {
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+const callerPayloadKey = (value: unknown): string =>
+  JSON.stringify(value, (_key, child: unknown) =>
+    isRecord(child)
+      ? Object.fromEntries(
+          Object.entries(child).sort(([left], [right]) => left.localeCompare(right)),
+        )
+      : child,
+  );
 
 const readString = (value: unknown, key: string): string | undefined =>
   isRecord(value) && typeof value[key] === "string" ? value[key] : undefined;
@@ -435,6 +485,68 @@ const defaultServerRequest = async (
 
 export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentClient => {
   const activeTurns = new Map<string, TurnState>();
+  const startingTurns = new Set<{
+    threadId: string;
+    reject: (error: Error) => void;
+    cleanup: () => void;
+  }>();
+  const registrations = new Map<
+    string,
+    { threadId: string; ready: Promise<void>; resolve: () => void }
+  >();
+  const finishedTurns = new Set<string>();
+  let connectionFailure: Error | undefined;
+  const retireTurn = (turnId: string): void => {
+    finishedTurns.add(turnId);
+    bufferedTurnNotifications.delete(turnId);
+    registrations.get(turnId)?.resolve();
+    registrations.delete(turnId);
+    if (finishedTurns.size > 256) {
+      const oldest = finishedTurns.values().next().value;
+      if (oldest !== undefined) finishedTurns.delete(oldest);
+    }
+  };
+  const registerIncomingTurn = (turnId: string, threadId: string): void => {
+    if (activeTurns.has(turnId) || finishedTurns.has(turnId) || registrations.has(turnId)) return;
+    if (![...startingTurns].some((pending) => pending.threadId === threadId)) return;
+    if (registrations.size >= startingTurns.size) {
+      const error = new TiduError(
+        "INTERNAL_ERROR",
+        "Native notifications exceeded pending turn registrations.",
+      );
+      failActiveTurns(error);
+      void client.close();
+      return;
+    }
+    let resolve!: () => void;
+    const ready = new Promise<void>((accept) => {
+      resolve = accept;
+    });
+    registrations.set(turnId, { threadId, ready, resolve });
+  };
+  const yieldCallerTools = (state: TurnState): void => {
+    setImmediate(() => {
+      if (
+        state.yielded ||
+        !state.modelResponseCompleted ||
+        state.toolCalls.length === 0 ||
+        state.toolReplies.size === 0 ||
+        activeTurns.get(state.turnId) !== state
+      )
+        return;
+      state.yielded = true;
+      state.cleanup();
+      state.resolve({
+        threadId: state.threadId,
+        turnId: state.turnId,
+        status: "completed",
+        text: state.text,
+        toolCalls: [...state.toolCalls],
+        progressItems: [...state.progressItems],
+        usage: state.usage,
+      });
+    });
+  };
   const bufferedTurnNotifications = new Map<string, BufferedTurnNotifications>();
   const messagePhases = new Map<string, CodexMessagePhase>();
   const forwardedMessageText = new Map<string, string>();
@@ -446,15 +558,12 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     turnId: string,
     update: (buffer: BufferedTurnNotifications) => void,
   ): void => {
+    if (!registrations.has(turnId)) return;
     const buffer = bufferedTurnNotifications.get(turnId) ?? {
       notifications: [],
     };
     update(buffer);
     bufferedTurnNotifications.set(turnId, buffer);
-    if (bufferedTurnNotifications.size > 32) {
-      const oldestTurnId = bufferedTurnNotifications.keys().next().value;
-      if (oldestTurnId !== undefined) bufferedTurnNotifications.delete(oldestTurnId);
-    }
   };
 
   const processDeltaSource = (itemKey: string): CodexProcessDeltaSource | undefined => {
@@ -552,6 +661,11 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     state.pendingCompletion = undefined;
     state.usageWaitTimer = undefined;
     activeTurns.delete(completion.turnId);
+    retireTurn(completion.turnId);
+    for (const reply of state.toolReplies.values())
+      reply.reject(new Error("Native turn ended before tool completion."));
+    state.toolReplies.clear();
+    state.toolResults.clear();
     clearTurnProcessItems(completion.turnId);
     state.cleanup();
     state.resolve({
@@ -588,7 +702,6 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
         if (buffer.hasTurnAggregateUsage === true && !turnAggregate) return;
         buffer.usage = usage;
         buffer.hasTurnAggregateUsage = turnAggregate;
-        if (turnAggregate) buffer.modelResponseCompleted = true;
       });
       return;
     }
@@ -598,12 +711,6 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       if (usageChanged) state.onUsageUpdate?.(usage);
     }
     if (turnAggregate) state.hasTurnAggregateUsage = true;
-    if (turnAggregate) {
-      state.modelResponseCompleted = true;
-      state.responseWaiters.splice(0).forEach((resolve) => {
-        resolve();
-      });
-    }
     if (state.pendingCompletion !== undefined && state.hasTurnAggregateUsage) {
       completeTurn(state.pendingCompletion, state);
     }
@@ -612,6 +719,16 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
   const onNotification = (notification: JsonRpcNotification): void => {
     options.onEvent?.(notification);
     const turnId = readString(notification.params, "turnId");
+    const incomingTurnId =
+      turnId ??
+      (isRecord(notification.params) ? readString(notification.params.turn, "id") : undefined);
+    const incomingThreadId = readString(notification.params, "threadId");
+    if (incomingTurnId !== undefined) {
+      if (finishedTurns.has(incomingTurnId)) return;
+      // History injection also emits raw items with non-running turn IDs; only a native lifecycle start claims a registration.
+      if (notification.method === "turn/started" && incomingThreadId !== undefined)
+        registerIncomingTurn(incomingTurnId, incomingThreadId);
+    }
     if (
       notification.method === "rawResponseItem/completed" &&
       turnId !== undefined &&
@@ -626,17 +743,25 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
         typeof item.arguments === "string"
       ) {
         const state = activeTurns.get(turnId);
-        if (state !== undefined && !state.toolCalls.some((call) => call.callId === item.call_id)) {
-          try {
-            state.toolCalls.push({
-              callId: item.call_id,
-              tool: item.name,
-              namespace: readString(item, "namespace") ?? null,
-              arguments: JSON.parse(item.arguments) as unknown,
-            });
-          } catch {
-            /* The official tool handler reports malformed arguments as a failure. */
-          }
+        try {
+          const call = {
+            callId: item.call_id,
+            tool: item.name,
+            namespace: readString(item, "namespace") ?? null,
+            arguments: JSON.parse(item.arguments) as unknown,
+          };
+          if (state !== undefined) {
+            if (
+              !state.resumes.has(call.callId) &&
+              !state.toolCalls.some((existing) => existing.callId === call.callId)
+            )
+              state.toolCalls.push(call);
+          } else
+            bufferTurnNotification(turnId, (buffer) =>
+              buffer.notifications.push({ type: "tool", call }),
+            );
+        } catch {
+          /* The official tool handler reports malformed arguments as a failure. */
         }
       }
       if (
@@ -678,11 +803,17 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       turnId !== undefined &&
       isRecord(notification.params)
     ) {
+      const state = activeTurns.get(turnId);
+      if (state !== undefined) state.hasTurnAggregateUsage = false;
+      else {
+        const buffered = bufferedTurnNotifications.get(turnId);
+        if (buffered !== undefined) buffered.hasTurnAggregateUsage = false;
+      }
       const usage = readTurnTokenUsage(notification.params.usage);
       if (usage !== null) updateTurnUsage(turnId, usage, false);
-      const state = activeTurns.get(turnId);
       if (state !== undefined) {
         state.modelResponseCompleted = true;
+        yieldCallerTools(state);
         state.responseWaiters.splice(0).forEach((resolve) => {
           resolve();
         });
@@ -816,68 +947,84 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     scheduleTurnCompletion(completion, state);
   };
 
-  const launch = createCodexAppServerLaunch(options);
   const failActiveTurns = (error: Error): void => {
+    connectionFailure = error;
     for (const state of activeTurns.values()) {
       if (state.usageWaitTimer !== undefined) clearTimeout(state.usageWaitTimer);
       state.cleanup();
+      for (const reply of state.toolReplies.values()) reply.reject(error);
+      state.toolReplies.clear();
+      state.toolResults.clear();
       state.reject(error);
     }
     activeTurns.clear();
+    for (const pending of startingTurns) {
+      pending.cleanup();
+      pending.reject(error);
+    }
+    startingTurns.clear();
+    for (const registration of registrations.values()) registration.resolve();
+    registrations.clear();
     bufferedTurnNotifications.clear();
     messagePhases.clear();
     forwardedMessageText.clear();
     forwardedProcessItems.clear();
   };
-  const client: JsonRpcClient = createStdioJsonRpcClient(
-    { ...launch, workingDirectory: options.workingDirectory },
-    {
-      onNotification,
-      onRequest: async (request) => {
-        if (request.method !== "item/tool/call")
-          return defaultServerRequest(request, options.onApproval);
-        await Promise.resolve();
-        const params = request.params;
-        const turnId = readString(params, "turnId");
-        const threadId = readString(params, "threadId");
-        const callId = readString(params, "callId");
-        const tool = readString(params, "tool");
-        const state = turnId === undefined ? undefined : activeTurns.get(turnId);
-        if (
-          state === undefined ||
-          threadId === undefined ||
-          callId === undefined ||
-          tool === undefined ||
-          !isRecord(params)
-        ) {
-          throw new TiduError("INTERNAL_ERROR", "Invalid caller tool request from Codex.");
-        }
-        if (!state.toolCalls.some((call) => call.callId === callId))
-          state.toolCalls.push({
-            callId,
-            tool,
-            namespace: readString(params, "namespace") ?? null,
-            arguments: params.arguments,
-          });
-        // Yield the request to the caller. Never acknowledge it as executed or run it here.
-        if (!state.modelResponseCompleted)
-          await new Promise<void>((resolve) => {
-            state.responseWaiters.push(resolve);
-          });
-        if (activeTurns.get(turnId as string) !== state)
-          return { contentItems: [], success: false };
-        state.toolInterruption ??= client.request("turn/interrupt", {
-          threadId,
-          turnId,
+  const handlers: JsonRpcClientOptions = {
+    onNotification,
+    onRequest: async (request) => {
+      if (request.method !== "item/tool/call")
+        return defaultServerRequest(request, options.onApproval);
+      await Promise.resolve();
+      const params = request.params;
+      const turnId = readString(params, "turnId");
+      const threadId = readString(params, "threadId");
+      const callId = readString(params, "callId");
+      const tool = readString(params, "tool");
+      if (turnId !== undefined && threadId !== undefined && !activeTurns.has(turnId)) {
+        registerIncomingTurn(turnId, threadId);
+        await registrations.get(turnId)?.ready;
+      }
+      const state = turnId === undefined ? undefined : activeTurns.get(turnId);
+      if (
+        state === undefined ||
+        state.threadId !== threadId ||
+        threadId === undefined ||
+        callId === undefined ||
+        tool === undefined ||
+        !isRecord(params)
+      ) {
+        throw new TiduError("INTERNAL_ERROR", "Invalid caller tool request from Codex.");
+      }
+      const completed = state.toolResults.get(callId);
+      if (completed !== undefined) {
+        state.toolResults.delete(callId);
+        return completed;
+      }
+      if (!state.resumes.has(callId) && !state.toolCalls.some((call) => call.callId === callId))
+        state.toolCalls.push({
+          callId,
+          tool,
+          namespace: readString(params, "namespace") ?? null,
+          arguments: params.arguments,
         });
-        await state.toolInterruption;
-        return { contentItems: [], success: false };
-      },
-      onClose: failActiveTurns,
+      return new Promise<CodexToolReply>((resolve, reject) => {
+        state.toolReplies.set(callId, { resolve, reject });
+        yieldCallerTools(state);
+      });
     },
-  );
+    onClose: failActiveTurns,
+  };
+  const client: JsonRpcClient =
+    options.transportFactory === undefined
+      ? createStdioJsonRpcClient(
+          { ...createCodexAppServerLaunch(options), workingDirectory: options.workingDirectory },
+          handlers,
+        )
+      : options.transportFactory(handlers);
 
   const requireInitialized = (): void => {
+    if (connectionFailure !== undefined) throw connectionFailure;
     if (!initialized) {
       throw new TiduError("CONFIGURATION_CONFLICT", "Codex app-server is not initialized.");
     }
@@ -1021,96 +1168,378 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       onNativeItem?: (item: Record<string, unknown>) => void,
     ): Promise<CodexTurnResult> => {
       requireInitialized();
+      const outputsById = new Map<string, Record<string, unknown>>();
+      const outputTypes = new Set([
+        "function_call_output",
+        "custom_tool_call_output",
+        "tool_search_output",
+      ]);
+      for (const item of historyItems) {
+        if (!outputTypes.has(String(item.type))) continue;
+        if (typeof item.call_id !== "string") {
+          if (
+            item.type !== "function_call_output" ||
+            typeof item.name !== "string" ||
+            item.name.trim() === ""
+          )
+            throw new TiduError(
+              "CONFIGURATION_INVALID",
+              "Standalone caller results require their original function name.",
+            );
+          continue;
+        }
+        const previous = outputsById.get(item.call_id);
+        if (previous !== undefined && callerPayloadKey(previous) !== callerPayloadKey(item))
+          throw new TiduError(
+            "CONFIGURATION_CONFLICT",
+            "Conflicting caller results use the same call ID.",
+          );
+        outputsById.set(item.call_id, item);
+      }
+      const outputs = [...outputsById.values()];
+      const context = historyItems.filter(
+        (item) => !outputTypes.has(String(item.type)) || typeof item.call_id !== "string",
+      );
+      const key = callerPayloadKey({
+        input,
+        outputs: [...outputs].sort((left, right) =>
+          String(left.call_id).localeCompare(String(right.call_id)),
+        ),
+        context,
+        reasoningEffort,
+        outputSchema,
+        reasoningSummary,
+      });
+      const threadStates = [...activeTurns.values()].filter((state) => state.threadId === threadId);
+      const claims = new Set(
+        threadStates.flatMap((state) =>
+          outputs.flatMap((item) => {
+            const claimed = state.resumes.get(String(item.call_id));
+            return claimed === undefined ? [] : [claimed];
+          }),
+        ),
+      );
+      if (claims.size > 1)
+        throw new TiduError(
+          "CONFIGURATION_CONFLICT",
+          "Caller results belong to different batches.",
+        );
+      const previousClaim = [...claims][0];
+      if (previousClaim !== undefined) {
+        if (
+          previousClaim.key !== key &&
+          (!previousClaim.failed || previousClaim.steered || previousClaim.injected)
+        )
+          throw new TiduError(
+            "CONFIGURATION_CONFLICT",
+            "Caller results conflict with a batch already being resumed.",
+          );
+        if (!previousClaim.failed) return previousClaim.promise;
+      }
+      const pending = threadStates.find(
+        (state) =>
+          state.yielded &&
+          outputs.some((item) => state.toolCalls.some((call) => call.callId === item.call_id)),
+      );
+      if (pending !== undefined) {
+        const matched = outputsById;
+        if (
+          matched.size !== pending.toolCalls.length ||
+          !pending.toolCalls.every((call) => matched.has(call.callId))
+        )
+          throw new TiduError(
+            "CONFIGURATION_INVALID",
+            "All pending caller tool results are required, without results from other batches.",
+          );
+        const replies = [...matched].map(([callId, item]) => {
+          const output =
+            item.type === "tool_search_output" ? JSON.stringify(item.tools ?? []) : item.output;
+          const contentItems: CodexToolReply["contentItems"] = Array.isArray(output)
+            ? output.map((part: unknown) => {
+                if (
+                  isRecord(part) &&
+                  part.type === "input_image" &&
+                  typeof part.image_url === "string"
+                )
+                  return {
+                    type: "inputImage" as const,
+                    imageUrl: part.image_url,
+                  };
+                if (
+                  isRecord(part) &&
+                  part.type === "input_audio" &&
+                  typeof part.audio_url === "string"
+                )
+                  return {
+                    type: "inputAudio" as const,
+                    audioUrl: part.audio_url,
+                  };
+                return {
+                  type: "inputText" as const,
+                  text:
+                    isRecord(part) && typeof part.text === "string"
+                      ? part.text
+                      : JSON.stringify(part),
+                };
+              })
+            : [
+                {
+                  type: "inputText",
+                  text: typeof output === "string" ? output : (JSON.stringify(output) ?? ""),
+                },
+              ];
+          return {
+            callId,
+            value: { contentItems, success: item.is_error !== true },
+          };
+        });
+        const snapshot = { ...pending };
+        let accept!: (result: CodexTurnResult) => void;
+        let decline!: (error: Error) => void;
+        const promise = new Promise<CodexTurnResult>((resolve, reject) => {
+          accept = resolve;
+          decline = reject;
+        });
+        const claim: CallerResume = {
+          key,
+          promise,
+          steered: previousClaim?.key === key && previousClaim.steered === true,
+          injected: previousClaim?.key === key && previousClaim.injected === true,
+        };
+        const abort = (): void => {
+          if (activeTurns.get(pending.turnId) !== pending) return;
+          activeTurns.delete(pending.turnId);
+          retireTurn(pending.turnId);
+          clearTurnProcessItems(pending.turnId);
+          if (pending.usageWaitTimer !== undefined) clearTimeout(pending.usageWaitTimer);
+          pending.cleanup();
+          const error = new DOMException("Codex turn cancelled.", "AbortError");
+          for (const reply of pending.toolReplies.values()) reply.reject(error);
+          pending.toolReplies.clear();
+          pending.toolResults.clear();
+          void client
+            .request("turn/interrupt", { threadId, turnId: pending.turnId })
+            .catch(() => undefined);
+          decline(error);
+        };
+        pending.cleanup();
+        Object.assign(pending, {
+          resolve: accept,
+          reject: decline,
+          text: "",
+          toolCalls: [],
+          progressItems: [],
+          usage: null,
+          yielded: false,
+          modelResponseCompleted: false,
+          hasTurnAggregateUsage: false,
+          processItemKey: undefined,
+          onTextDelta,
+          onProcessDelta,
+          onNativeItem,
+          onUsageUpdate,
+          cleanup: () => signal?.removeEventListener("abort", abort),
+        });
+        for (const call of snapshot.toolCalls) pending.resumes.set(call.callId, claim);
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) {
+          abort();
+          return promise;
+        }
+        void (async () => {
+          if (input.length > 0 && !claim.steered) {
+            await client.request(
+              "turn/steer",
+              { threadId, expectedTurnId: pending.turnId, input },
+              signal,
+            );
+            claim.steered = true;
+          }
+          if (activeTurns.get(pending.turnId) !== pending) return;
+          if (context.length > 0 && !claim.injected) {
+            await client.request("thread/inject_items", { threadId, items: context }, signal);
+            claim.injected = true;
+          }
+          if (activeTurns.get(pending.turnId) !== pending) return;
+          for (const { callId, value } of replies) {
+            const reply = pending.toolReplies.get(callId);
+            if (reply === undefined) pending.toolResults.set(callId, value);
+            else {
+              pending.toolReplies.delete(callId);
+              reply.resolve(value);
+            }
+          }
+        })().catch((error: Error) => {
+          if (activeTurns.get(pending.turnId) !== pending) return;
+          pending.cleanup();
+          Object.assign(pending, snapshot);
+          claim.failed = true;
+          decline(error);
+        });
+        return promise;
+      }
+      if (threadStates.length > 0)
+        throw new TiduError(
+          "CONFIGURATION_CONFLICT",
+          "The native thread already has an active turn; caller results must match its pending batch.",
+        );
       if (
-        input.length === 0 ||
-        input.every((item) => item.type === "text" && item.text.trim() === "")
+        outputs.some(
+          (output) =>
+            !historyItems.some(
+              (item) =>
+                item.call_id === output.call_id &&
+                ["function_call", "custom_tool_call", "tool_search_call"].includes(
+                  String(item.type),
+                ),
+            ),
+        )
+      )
+        throw new TiduError(
+          "CONFIGURATION_CONFLICT",
+          "Caller tool results require their matching calls in the supplied history.",
+        );
+      // An idle thread can sample restored history without adding another user message.
+      if (
+        (input.length === 0 && historyItems.length === 0) ||
+        (input.length > 0 && input.every((item) => item.type === "text" && item.text.trim() === ""))
       ) {
         throw new TiduError("CONFIGURATION_INVALID", "Codex turn input cannot be empty.");
       }
       if (historyItems.length > 0) {
         await client.request("thread/inject_items", { threadId, items: historyItems }, signal);
       }
-      const response = await client.request<Record<string, unknown>>(
-        "turn/start",
-        {
-          threadId,
-          input,
-          approvalPolicy: "on-request",
-          effort: reasoningEffort ?? options.reasoningEffort ?? null,
-          summary: reasoningSummary,
-          outputSchema: outputSchema ?? null,
-        },
-        signal,
-      );
-      const turn = response.turn;
-      const turnId = readString(turn, "id");
-      if (turnId === undefined) {
-        throw new TiduError("INTERNAL_ERROR", "Codex returned an invalid turn response.");
-      }
+      if (signal?.aborted) throw new DOMException("Codex turn cancelled.", "AbortError");
       return new Promise<CodexTurnResult>((resolve, reject) => {
+        let cancelled = false;
+        let registeredState: TurnState | undefined;
         const abort = (): void => {
-          const active = activeTurns.get(turnId);
-          if (active === undefined) return;
-          activeTurns.delete(turnId);
-          clearTurnProcessItems(turnId);
-          if (active.usageWaitTimer !== undefined) clearTimeout(active.usageWaitTimer);
-          active.cleanup();
-          void client.request("turn/interrupt", { threadId, turnId }).catch(() => undefined);
-          active.reject(new DOMException("Codex turn cancelled.", "AbortError"));
-        };
-        signal?.addEventListener("abort", abort, { once: true });
-        const state: TurnState = {
-          modelResponseCompleted: false,
-          responseWaiters: [],
-          progressItems: [],
-          onNativeItem,
-          toolCalls: [],
-          text: "",
-          resolve,
-          reject,
-          cleanup: () => {
-            signal?.removeEventListener("abort", abort);
-            state.responseWaiters.splice(0).forEach((resolve) => {
-              resolve();
-            });
-          },
-          onTextDelta,
-          onProcessDelta,
-          usage: null,
-          hasTurnAggregateUsage: false,
-          onUsageUpdate,
-        };
-        activeTurns.set(turnId, state);
-        if (signal?.aborted) {
-          abort();
-          return;
-        }
-        const buffered = bufferedTurnNotifications.get(turnId);
-        if (buffered === undefined) return;
-        bufferedTurnNotifications.delete(turnId);
-        state.modelResponseCompleted = buffered.modelResponseCompleted === true;
-        for (const notification of buffered.notifications) {
-          if (notification.type === "native") {
-            state.progressItems.push(notification.item);
-            state.onNativeItem?.(notification.item);
-          } else if (notification.type === "text") {
-            state.text += notification.delta;
-            state.onTextDelta?.(notification.delta);
-          } else {
-            forwardProcessDelta(
-              turnId,
-              notification.itemKey,
-              notification.delta,
-              notification.separator,
-            );
+          cancelled = true;
+          const active = registeredState;
+          if (active !== undefined && activeTurns.get(active.turnId) === active) {
+            activeTurns.delete(active.turnId);
+            retireTurn(active.turnId);
+            clearTurnProcessItems(active.turnId);
+            if (active.usageWaitTimer !== undefined) clearTimeout(active.usageWaitTimer);
+            active.cleanup();
+            for (const reply of active.toolReplies.values())
+              reply.reject(new DOMException("Codex turn cancelled.", "AbortError"));
+            active.toolReplies.clear();
+            active.toolResults.clear();
+            void client
+              .request("turn/interrupt", { threadId, turnId: active.turnId })
+              .catch(() => undefined);
           }
-        }
-        if (buffered.usage !== undefined) {
-          state.usage = buffered.usage;
-          state.hasTurnAggregateUsage = buffered.hasTurnAggregateUsage === true;
-          state.onUsageUpdate?.(buffered.usage);
-        }
-        if (buffered.completion !== undefined) scheduleTurnCompletion(buffered.completion, state);
+          reject(new DOMException("Codex turn cancelled.", "AbortError"));
+        };
+        const pendingStart = {
+          threadId,
+          reject,
+          cleanup: () => signal?.removeEventListener("abort", abort),
+        };
+        startingTurns.add(pendingStart);
+        signal?.addEventListener("abort", abort, { once: true });
+        // Keep observing the native acknowledgement after local cancellation so its turn can be interrupted.
+        void client
+          .request<Record<string, unknown>>("turn/start", {
+            threadId,
+            input,
+            approvalPolicy: "on-request",
+            effort: reasoningEffort ?? options.reasoningEffort ?? null,
+            summary: reasoningSummary,
+            outputSchema: outputSchema ?? null,
+          })
+          .then((response) => {
+            const turnId = readString(response.turn, "id");
+            if (turnId === undefined)
+              throw new TiduError("INTERNAL_ERROR", "Codex returned an invalid turn response.");
+            if (cancelled || connectionFailure !== undefined) {
+              retireTurn(turnId);
+              void client.request("turn/interrupt", { threadId, turnId }).catch(() => undefined);
+              return;
+            }
+            const state: TurnState = {
+              threadId,
+              turnId,
+              yielded: false,
+              resumes: new Map(),
+              toolReplies: new Map(),
+              toolResults: new Map(),
+              modelResponseCompleted: false,
+              responseWaiters: [],
+              progressItems: [],
+              onNativeItem,
+              toolCalls: [],
+              text: "",
+              resolve,
+              reject,
+              cleanup: () => {
+                signal?.removeEventListener("abort", abort);
+                state.responseWaiters.splice(0).forEach((resolve) => {
+                  resolve();
+                });
+              },
+              onTextDelta,
+              onProcessDelta,
+              usage: null,
+              hasTurnAggregateUsage: false,
+              onUsageUpdate,
+            };
+            registeredState = state;
+            activeTurns.set(turnId, state);
+            registrations.get(turnId)?.resolve();
+            registrations.delete(turnId);
+            if (signal?.aborted) {
+              abort();
+              return;
+            }
+            const buffered = bufferedTurnNotifications.get(turnId);
+            if (buffered === undefined) return;
+            bufferedTurnNotifications.delete(turnId);
+            state.modelResponseCompleted = buffered.modelResponseCompleted === true;
+            for (const notification of buffered.notifications) {
+              if (notification.type === "native") {
+                state.progressItems.push(notification.item);
+                state.onNativeItem?.(notification.item);
+              } else if (notification.type === "text") {
+                state.text += notification.delta;
+                state.onTextDelta?.(notification.delta);
+              } else if (notification.type === "tool") {
+                if (!state.toolCalls.some((call) => call.callId === notification.call.callId))
+                  state.toolCalls.push(notification.call);
+              } else {
+                forwardProcessDelta(
+                  turnId,
+                  notification.itemKey,
+                  notification.delta,
+                  notification.separator,
+                );
+              }
+            }
+            if (buffered.usage !== undefined) {
+              state.usage = buffered.usage;
+              state.hasTurnAggregateUsage = buffered.hasTurnAggregateUsage === true;
+              state.onUsageUpdate?.(buffered.usage);
+            }
+            if (buffered.completion !== undefined)
+              scheduleTurnCompletion(buffered.completion, state);
+          })
+          .catch((error: Error) => {
+            pendingStart.cleanup();
+            reject(error);
+          })
+          .finally(() => {
+            startingTurns.delete(pendingStart);
+            if (registeredState === undefined) pendingStart.cleanup();
+            if (![...startingTurns].some((pending) => pending.threadId === threadId)) {
+              for (const [turnId, registration] of registrations) {
+                if (registration.threadId !== threadId) continue;
+                registration.resolve();
+                registrations.delete(turnId);
+                bufferedTurnNotifications.delete(turnId);
+              }
+            }
+          });
       });
     },
     cancel: async (threadId: string, turnId: string): Promise<void> => {

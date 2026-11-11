@@ -1,7 +1,69 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { requestTurnInput } from "./codex-host.js";
+import { createPortableCodexResponsesInput, requestTurnInput } from "./codex-host.js";
+
+test("preserves caller tool results through the runtime privacy boundary", () => {
+  const outputs = [
+    { type: "function_call_output", call_id: "function-call", output: "function result" },
+    { type: "custom_tool_call_output", call_id: "custom-call", output: "custom result" },
+    { type: "tool_search_output", call_id: "search-call", tools: [] },
+  ];
+  assert.deepEqual(
+    createPortableCodexResponsesInput(
+      outputs.map((item) => ({ ...item, encrypted_content: "fixture-private-state" })),
+    ),
+    outputs,
+  );
+});
+
+test("preserves structured caller tool pairs when replaying complete portable history", () => {
+  const callerItems = [
+    {
+      type: "function_call",
+      call_id: "function-call",
+      name: "inspect",
+      arguments: "{}",
+    },
+    { type: "function_call_output", call_id: "function-call", output: "function result" },
+    {
+      type: "custom_tool_call",
+      call_id: "custom-call",
+      name: "inspect_custom",
+      input: "inspect",
+    },
+    { type: "custom_tool_call_output", call_id: "custom-call", output: "custom result" },
+    {
+      type: "tool_search_call",
+      call_id: "search-call",
+      execution: "client",
+      arguments: { queries: ["inspect"] },
+    },
+    {
+      type: "tool_search_output",
+      call_id: "search-call",
+      tools: [{ type: "function", name: "inspect", parameters: { type: "object" } }],
+    },
+  ];
+  const portableItems = createPortableCodexResponsesInput(
+    callerItems.map((item) => ({ ...item, encrypted_content: "fixture-private-state" })),
+  );
+  assert.ok(Array.isArray(portableItems));
+  const turn = requestTurnInput({
+    protocol: "responses",
+    virtualModelId: "ai-tidu9-config",
+    body: {
+      input: [
+        { role: "user", content: [{ type: "input_text", text: "original request" }] },
+        ...portableItems,
+      ],
+    },
+  });
+
+  assert.deepEqual(turn.input, []);
+  assert.deepEqual(turn.historyItems.slice(1), callerItems);
+  assert.doesNotMatch(JSON.stringify(turn.historyItems), /fixture-private-state/u);
+});
 
 test("preserves phased Responses history when a user steers the same turn", () => {
   const turn = requestTurnInput({
@@ -389,14 +451,101 @@ test("does not replay an old user message when Responses continuation items foll
     body: { input: conversation },
   });
 
-  assert.deepEqual(turn.input, [
-    {
-      type: "text",
-      text: "Continue from the supplied conversation.",
-      text_elements: [],
-    },
-  ]);
+  assert.deepEqual(turn.input, []);
   assert.equal(turn.historyItems.length, conversation.length);
   assert.equal(turn.historyItems[1]?.phase, "commentary");
   assert.equal(turn.historyItems.at(-1)?.type, "function_call_output");
+});
+
+test("keeps new user text and images active when non-execution context follows them", () => {
+  const previousItems = [
+    { type: "function_call", call_id: "earlier-call", name: "inspect", arguments: "{}" },
+    { type: "function_call_output", call_id: "earlier-call", output: "earlier result" },
+  ];
+  const currentUser = {
+    role: "user",
+    content: [
+      { type: "input_text", text: "inspect this image" },
+      { type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" },
+    ],
+  };
+  const contextCases = [
+    {
+      suffix: [{ role: "developer", content: "current context" }],
+      history: [
+        {
+          type: "message",
+          role: "developer",
+          content: [{ type: "input_text", text: "current context" }],
+        },
+      ],
+    },
+    {
+      suffix: [{ role: "system", content: "current context" }],
+      history: [
+        {
+          type: "message",
+          role: "system",
+          content: [{ type: "input_text", text: "current context" }],
+        },
+      ],
+    },
+    {
+      suffix: [{ type: "compaction", encrypted_content: "fixture-private-compaction" }],
+      history: [],
+    },
+    {
+      suffix: [{ type: "context_compaction", encrypted_content: "fixture-private-compaction" }],
+      history: [],
+    },
+  ];
+
+  for (const context of contextCases) {
+    const turn = requestTurnInput({
+      protocol: "responses",
+      virtualModelId: "ai-tidu9-config",
+      body: { input: [...previousItems, currentUser, ...context.suffix] },
+    });
+
+    assert.deepEqual(turn.input, [
+      { type: "text", text: "inspect this image", text_elements: [] },
+      { type: "image", url: "data:image/png;base64,aW1hZ2U=" },
+    ]);
+    assert.deepEqual(turn.historyItems, [...previousItems, ...context.history]);
+    assert.doesNotMatch(JSON.stringify(turn.historyItems), /fixture-private-compaction/u);
+  }
+});
+
+test("does not reactivate a user after execution evidence followed by client context", () => {
+  const executionItems = [
+    {
+      type: "message",
+      role: "assistant",
+      phase: "commentary",
+      content: [{ type: "output_text", text: "existing progress" }],
+    },
+    { type: "function_call", call_id: "function-call", name: "inspect", arguments: "{}" },
+    { type: "custom_tool_call", call_id: "custom-call", name: "inspect", input: "inspect" },
+    { type: "function_call_output", call_id: "function-call", output: "existing result" },
+    { type: "custom_tool_call_output", call_id: "custom-call", output: "existing result" },
+    { type: "tool_search_output", call_id: "search-call", tools: [] },
+  ];
+
+  for (const execution of executionItems) {
+    const turn = requestTurnInput({
+      protocol: "responses",
+      virtualModelId: "ai-tidu9-config",
+      body: {
+        input: [
+          { role: "user", content: "original request" },
+          execution,
+          { role: "developer", content: "current context" },
+        ],
+      },
+    });
+
+    assert.deepEqual(turn.input, []);
+    assert.equal(turn.historyItems[0]?.role, "user");
+    assert.equal(turn.historyItems.at(-1)?.role, "developer");
+  }
 });

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { CodexCallerToolCall } from "../connectors/codex-app-server.js";
 import { TiduError } from "../core/index.js";
 import type { ProviderExecutionRequest } from "./index.js";
@@ -6,7 +6,58 @@ import type { ProviderExecutionRequest } from "./index.js";
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
+const canonicalCallerValue = (value: unknown): unknown =>
+  Array.isArray(value)
+    ? value.map(canonicalCallerValue)
+    : isRecord(value)
+      ? Object.fromEntries(
+          Object.keys(value)
+            .sort()
+            .filter((key) => value[key] !== undefined)
+            .map((key) => [key, canonicalCallerValue(value[key])]),
+        )
+      : (value ?? null);
+
+/** Bounded comparison key for JSON payloads, independent of object field order. */
+export const callerToolPayloadKey = (value: unknown): string =>
+  createHash("sha256")
+    .update(JSON.stringify(canonicalCallerValue(value)))
+    .digest("hex");
+
+/** Coalesces identical results and rejects ambiguous or unowned result records. */
+export const normalizeCallerToolInput = (input: unknown): unknown => {
+  if (!Array.isArray(input)) return input;
+  const results = new Map<string, string>();
+  return input.filter((item) => {
+    if (
+      !isRecord(item) ||
+      !["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(
+        String(item.type),
+      )
+    )
+      return true;
+    if (typeof item.call_id !== "string" || item.call_id === "") {
+      if (
+        item.type === "function_call_output" &&
+        (item.call_id === undefined || item.call_id === null) &&
+        typeof item.name === "string" &&
+        item.name.trim() !== ""
+      )
+        return true;
+      throw new TiduError("CONFIGURATION_INVALID", "Caller tool results require a valid call_id.");
+    }
+    const key = callerToolPayloadKey(item);
+    const previous = results.get(item.call_id);
+    if (previous !== undefined && previous !== key)
+      throw new TiduError("CONFIGURATION_CONFLICT", "Conflicting caller tool results.");
+    results.set(item.call_id, key);
+    return previous === undefined;
+  });
+};
+
 export interface CallerToolCatalog {
+  /** Public definitions retained to restore a native connection without client replay. */
+  sourceTools: readonly unknown[];
   /** Caller-authorized server-side search mode, independent of local command tools. */
   webSearchMode: "disabled" | "cached" | "live";
   /** Official dynamic-tool definitions exposed to delegated inference. */
@@ -108,6 +159,7 @@ export const createCallerToolCatalog = (
     }
   }
   return {
+    sourceTools: request.body.tools,
     webSearchMode,
     definitions,
     historyItems: (items) => {
@@ -141,9 +193,10 @@ export const createCallerToolCatalog = (
           type === "custom_tool_call_output" ||
           type === "tool_search_output"
         ) {
-          const { namespace: _namespace, ...fields } = item;
           const alias =
             typeof item.call_id === "string" ? aliasesByCall.get(item.call_id) : undefined;
+          const { namespace: _namespace, ...aliasedFields } = item;
+          const fields = alias === undefined ? item : aliasedFields;
           return {
             ...fields,
             type: "function_call_output",

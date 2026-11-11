@@ -615,7 +615,23 @@ const createAgentObjective = (body: Record<string, unknown>): string => {
     : undefined;
   collectAgentInputText(currentUser ?? conversation, inputParts);
   const instructions = typeof body.instructions === "string" ? body.instructions.trim() : "";
-  const objective = inputParts.join("\n\n") || instructions;
+  const callerContinuation =
+    Array.isArray(conversation) &&
+    conversation.some(
+      (item) =>
+        isRecord(item) &&
+        ["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(
+          String(item.type),
+        ) &&
+        ((typeof item.call_id === "string" && item.call_id.trim() !== "") ||
+          (item.type === "function_call_output" &&
+            typeof item.name === "string" &&
+            item.name.trim() !== "")),
+    );
+  const objective =
+    inputParts.join("\n\n") ||
+    instructions ||
+    (callerContinuation ? "Continue processing the caller tool results." : "");
   // Task metadata stays bounded; the complete request is independently scanned and sent below.
   return objective.slice(0, MAXIMUM_JSON_BODY_BYTES);
 };
@@ -786,7 +802,7 @@ const createAgentResponsesStream = (
     /** Reads user-turn totals without changing per-response wire usage. */
     snapshot: () => ResponseUsageSnapshot;
     /** Correlates yielded tool requests or releases a finished user turn. */
-    finish: (items: readonly Record<string, unknown>[]) => void;
+    finish: (items: readonly Record<string, unknown>[], completed?: boolean) => void;
   },
   nativeProcessEvents = false,
 ): ReadableStream<Uint8Array> => {
@@ -1126,7 +1142,7 @@ const createAgentResponsesStream = (
               item: incompleteMessage,
             });
           }
-          usageDisplay?.finish([]);
+          usageDisplay?.finish([], false);
           write("response.failed", {
             response: {
               id: responseId,
@@ -1492,10 +1508,14 @@ const handleOpenAiInference = async (
       const usageTurn = ledger.begin(requestBody.input);
       usageDisplay = {
         snapshot: () => usageTurn.snapshot(usageCollector.read(), usageCollector.readModels()),
-        finish: (items) =>
-          usageTurn.finish(items, usageCollector.read(), usageCollector.readModels()),
+        finish: (items, completed = true) =>
+          usageTurn.finish(items, usageCollector.read(), usageCollector.readModels(), completed),
       };
     }
+    const controller = new AbortController();
+    const cancelAgent = () => controller.abort();
+    request.once("aborted", cancelAgent);
+    response.once("close", cancelAgent);
     const run = async (
       signal?: AbortSignal,
       onProcessDelta?: (delta: string) => void,
@@ -1508,7 +1528,7 @@ const handleOpenAiInference = async (
         requestBody,
         protocol,
         originHost,
-        signal,
+        signal === undefined ? controller.signal : AbortSignal.any([signal, controller.signal]),
         onProcessDelta,
         onOutputDelta,
         usageCollector.record,
@@ -1571,13 +1591,16 @@ const handleOpenAiInference = async (
       }
     } catch (error) {
       const failure = resolveAgentFailure(error);
-      usageDisplay?.finish([]);
+      usageDisplay?.finish([], false);
       sendOpenAiJson(
         response,
         failure.code === "server_is_overloaded" ? 503 : 502,
         createOpenAiError(failure.code, failure.message, failure.type),
         requestId,
       );
+    } finally {
+      request.off("aborted", cancelAgent);
+      response.off("close", cancelAgent);
     }
     return;
   }
@@ -2615,6 +2638,10 @@ const handleRequest = async (
       sendJson(response, 403, { error: "PERSONAL_EDITION_ONLY" });
       return;
     }
+    const controller = new AbortController();
+    const cancelSwitch = () => controller.abort();
+    request.once("aborted", cancelSwitch);
+    response.once("close", cancelSwitch);
     try {
       validateMutationRequest(request);
       const body = await readJsonBody(request);
@@ -2632,27 +2659,23 @@ const handleRequest = async (
           : configuredHost;
       const addressHost = clientHost.includes(":") ? `[${clientHost}]` : clientHost;
       const endpoint = `http://${addressHost}:${runtimeNetwork.port}`;
-      if (mode === "ai-tidu9") {
-        await configureCodexClient({
-          endpoint,
-        });
-        setupConnectors({
-          action: "uninstall",
-          endpoint,
-          targets: ["codex"],
-          cliEntry: process.env.TIDU_CONNECTOR_CLI_ENTRY,
-        });
-      } else {
-        setupConnectors({
-          action: "uninstall",
-          endpoint,
-          targets: ["codex"],
-          cliEntry: process.env.TIDU_CONNECTOR_CLI_ENTRY,
-        });
-      }
-      sendJson(response, 200, await switchCodexClientConfiguration({ mode }));
+      const configured = await switchCodexClientConfiguration({
+        mode,
+        signal: controller.signal,
+        ...(mode === "ai-tidu9" ? { endpoint } : {}),
+      });
+      setupConnectors({
+        action: "uninstall",
+        endpoint,
+        targets: ["codex"],
+        cliEntry: process.env.TIDU_CONNECTOR_CLI_ENTRY,
+      });
+      sendJson(response, 200, configured);
     } catch (error) {
       handleConfigurationMutationError(response, error);
+    } finally {
+      request.off("aborted", cancelSwitch);
+      response.off("close", cancelSwitch);
     }
     return;
   }
@@ -3780,7 +3803,10 @@ export const startLocalRuntime = async (
         if (deployment === "personal" && port !== 0) {
           await switchCodexClientConfiguration({ mode: "official" }).catch(() => undefined);
         }
-        await close(server);
+        const serverClosing = close(server);
+        // Active HTTP streams must release their cancellation handlers before provider cleanup.
+        server.closeAllConnections();
+        await serverClosing;
       } finally {
         await runtimeLogger.close();
         storage.close();
