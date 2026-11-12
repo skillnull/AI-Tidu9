@@ -48,18 +48,23 @@ test("closing the full relay does not orphan a native child that ignores termina
     workerProcessId = (await client.request<{ processId: number }>("config/read", {})).processId;
     assert.notEqual(workerProcessId, nativeProcessId);
     await client.close();
+    const ownedProcessIds = new Set([nativeProcessId, accountProcessId, workerProcessId]);
+    const remainingProcessIds = new Set(ownedProcessIds);
     const deadline = Date.now() + 1000;
-    while (Date.now() < deadline) {
-      try {
-        process.kill(initialized.processId, 0);
-      } catch {
-        break;
+    while (remainingProcessIds.size > 0 && Date.now() < deadline) {
+      for (const processId of remainingProcessIds) {
+        try {
+          process.kill(processId, 0);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+          remainingProcessIds.delete(processId);
+        }
       }
-      await delay(5);
+      if (remainingProcessIds.size > 0) await delay(5);
     }
-    assert.throws(() => process.kill(initialized.processId, 0), /ESRCH/u);
-    assert.throws(() => process.kill(accountProcessId as number, 0), /ESRCH/u);
-    assert.throws(() => process.kill(workerProcessId as number, 0), /ESRCH/u);
+    for (const processId of ownedProcessIds) {
+      assert.throws(() => process.kill(processId, 0), /ESRCH/u);
+    }
   } finally {
     if (workerProcessId !== undefined) {
       try {

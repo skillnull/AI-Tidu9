@@ -34,6 +34,7 @@ Allowed types are `feat`, `fix`, `docs`, `refactor`, `perf`, `test`, `build`, `c
 - A major has exactly one active owner: `main` or its `support` line, never both. Keep at most two active support lines.
 - Protected release lines never merge into each other. Move applicable fixes through focused backport or forward-port PRs.
 - Use lowercase branch names no longer than 80 characters. Delete merged work branches. Never force-push or rewrite protected history.
+- An automated agent must obtain explicit user confirmation before creating any branch. Permission to fix, commit, or push does not include permission to create a branch.
 
 Validate the branch with `npm run policy -- branch`.
 
@@ -73,6 +74,8 @@ npm run policy -- commit "feat(scope): description"
 Run `npm run check` before submitting. It covers version policy, linting, Node tests, workspace tests, and Python SDK tests. Passing tests are the baseline; changes involving clients, databases, networking, or upgrade paths also require recorded real-environment validation.
 
 Local checks keep a validation digest in Git's local directory. Pushes still check branch and release-line policy. A successful result is reused only when the pushed content matches the clean working tree and the source, installed dependency files, and runtime environment match that result. Missing evidence, changed inputs, or failed checks require full validation. Concurrent checks in one repository share one execution, including its failure. A standalone `npm run check` and CI still run all checks. Commit hooks invoke the same policy scripts directly to avoid repeated npm startup.
+
+A local success covers only the reported Node version and operating environment. A successful Git commit or push does not mean remote `Quality` passed. Check the remote result for the same commit after pushing; a failure does not undo the completed commit or push.
 
 Never commit credentials, personal data, private machine paths, account identifiers, internal domains, confidential artifacts, conversation bodies, unredacted diagnostics, irreproducible generated files, or unapproved large binaries.
 

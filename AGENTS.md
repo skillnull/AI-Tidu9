@@ -20,6 +20,7 @@ These rules apply to the entire repository.
 - Keep public repository content free of personal paths, accounts, company-confidential data, and secrets.
 - Keep Chinese and English public documentation synchronized.
 - Follow `docs/CONTRIBUTING.md` for branch, commit, pull-request, version, and release rules.
+- Create any branch only after the user explicitly confirms that branch creation. Permission to fix, commit, or push does not imply permission to create a branch.
 - Treat `main` as the sole future-facing integration trunk. A major version has exactly one active owner: either `main` or `support/<major>.x`, never both.
 - Never merge protected release lines into each other. Synchronize applicable fixes through focused backport or forward-port pull requests.
 - Release only from an immutable `v<version>` tag whose version matches the repository version.

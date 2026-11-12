@@ -12,7 +12,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -97,6 +97,17 @@ export const validationFingerprint = (root, environment = process.env) => {
       hash.update("missing\0");
       return;
     }
+    const entries =
+      dependency && status.isDirectory()
+        ? readdirSync(path)
+            .filter((entry) => ![".cache", ".vite", ".vite-temp"].includes(entry))
+            .sort()
+        : undefined;
+    // Hoisted workspaces can acquire a cache-only container during their first build.
+    if (basename(path) === "node_modules" && entries?.length === 0) {
+      hash.update("missing\0");
+      return;
+    }
     hash.update(`${status.mode & 0o777}\0`);
     if (status.isSymbolicLink()) {
       const target = readlinkSync(path);
@@ -107,10 +118,8 @@ export const validationFingerprint = (root, environment = process.env) => {
     } else if (status.isFile()) {
       hash.update(`${status.size}\0`);
       hash.update(readFileSync(path));
-    } else if (dependency && status.isDirectory()) {
-      for (const entry of readdirSync(path).sort()) {
-        if (![".cache", ".vite", ".vite-temp"].includes(entry)) add(join(path, entry), true);
-      }
+    } else if (entries !== undefined) {
+      for (const entry of entries) add(join(path, entry), true);
     } else {
       throw new Error("Validation reuse requires regular repository inputs.");
     }
@@ -277,6 +286,7 @@ export const runProjectCheck = async ({
 }) => {
   if (prePush && refs.trim() === "") return 0;
   const started = performance.now();
+  const validationScope = `local Node ${process.version}, ${process.platform}/${process.arch}; remote GitHub Quality not checked`;
   const run = async (label, command, args) => {
     const begin = performance.now();
     const code = await execute(command, args, { cwd: repositoryRoot, env: environment });
@@ -334,7 +344,7 @@ export const runProjectCheck = async ({
         ? ` at ${prior.failedStage}`
         : "";
       output(
-        `[check] ${prior.status === 0 ? "Reused successful validation" : `Shared validation failed${failedStage}`}: ${((performance.now() - started) / 1000).toFixed(2)}s\n`,
+        `[check] ${prior.status === 0 ? "Reused successful validation" : `Shared validation failed${failedStage}`} (${validationScope}): ${((performance.now() - started) / 1000).toFixed(2)}s\n`,
       );
       return prior.status;
     }
@@ -356,7 +366,7 @@ export const runProjectCheck = async ({
     record({ fingerprint: after, status });
     output(
       status === 0
-        ? `[check] Full validation passed: ${((performance.now() - started) / 1000).toFixed(2)}s\n`
+        ? `[check] Full validation passed (${validationScope}): ${((performance.now() - started) / 1000).toFixed(2)}s\n`
         : "[check] Inputs changed during validation; a fresh check is required.\n",
     );
     return status;

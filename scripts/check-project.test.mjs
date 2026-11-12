@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -71,9 +73,15 @@ test("reuses only an exact successful checkout while refreshing push policies", 
   assert.match(state.commands[3], /project-policy\.mjs branch$/u);
   assert.match(state.commands[4], /project-policy\.mjs release-lines$/u);
   assert.match(state.messages.join(""), /Reused successful/u);
+  const reused = state.messages.at(-1);
+  assert.match(reused, /local Node/u);
+  assert.ok(reused.includes(process.version));
+  assert.ok(reused.includes(`${process.platform}/${process.arch}`));
+  assert.match(reused, /remote GitHub Quality not checked/u);
   // A direct check remains a full validation, including in CI.
   assert.equal(await runProjectCheck(state.options), 0);
   assert.equal(state.commands.length, 8);
+  assert.match(state.messages.at(-1), /local Node.*remote GitHub Quality not checked/u);
   rmSync(join(state.root, "source.txt"));
   assert.equal(await runProjectCheck(state.options), 0);
   state.commit();
@@ -88,6 +96,100 @@ test("reuses only an exact successful checkout while refreshing push policies", 
     }),
     9,
   );
+});
+
+for (const target of ["root", "workspace"])
+  test(`keeps cache-only dependency containers stable for ${target}`, (context) => {
+    const state = fixture(context);
+    const packageRoot = target === "root" ? state.root : join(state.root, "packages", "workspace");
+    const modules = join(packageRoot, "node_modules");
+    if (target === "root") rmSync(modules, { recursive: true, force: true });
+    else {
+      mkdirSync(packageRoot, { recursive: true });
+      writeFileSync(join(packageRoot, "package.json"), '{"name":"workspace-fixture"}\n');
+      state.commit();
+    }
+    const original = validationFingerprint(state.root, state.options.environment);
+    mkdirSync(modules);
+    assert.equal(validationFingerprint(state.root, state.options.environment), original);
+    for (const cache of [".cache", ".vite", ".vite-temp"]) {
+      mkdirSync(join(modules, cache));
+      writeFileSync(join(modules, cache, "generated.js"), "generated cache\n");
+      assert.equal(validationFingerprint(state.root, state.options.environment), original);
+    }
+    const unknown = join(modules, ".unknown-cache");
+    mkdirSync(unknown);
+    assert.notEqual(validationFingerprint(state.root, state.options.environment), original);
+    rmSync(unknown, { recursive: true });
+    assert.equal(validationFingerprint(state.root, state.options.environment), original);
+
+    const dependencyDirectory = join(modules, "dependency");
+    const dependency = join(dependencyDirectory, "index.js");
+    mkdirSync(dependencyDirectory);
+    writeFileSync(dependency, "export default 1;\n");
+    const installed = validationFingerprint(state.root, state.options.environment);
+    assert.notEqual(installed, original);
+    writeFileSync(dependency, "export default 2;\n");
+    assert.notEqual(validationFingerprint(state.root, state.options.environment), installed);
+    writeFileSync(dependency, "export default 1;\n");
+    assert.equal(validationFingerprint(state.root, state.options.environment), installed);
+    if (process.platform !== "win32") {
+      for (const path of [dependencyDirectory, dependency]) {
+        const mode = lstatSync(path).mode & 0o777;
+        try {
+          chmodSync(path, mode ^ 0o020);
+          assert.notEqual(validationFingerprint(state.root, state.options.environment), installed);
+        } finally {
+          chmodSync(path, mode);
+        }
+        assert.equal(validationFingerprint(state.root, state.options.environment), installed);
+      }
+    }
+    rmSync(dependencyDirectory, { recursive: true });
+    assert.equal(validationFingerprint(state.root, state.options.environment), original);
+    assert.notEqual(validationFingerprint(state.root, state.options.environment), installed);
+  });
+
+test("accepts generated dependency caches while rejecting dependency changes during validation", async (context) => {
+  const state = fixture(context);
+  const workspace = join(state.root, "packages", "workspace");
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(join(workspace, "package.json"), '{"name":"workspace-fixture"}\n');
+  state.commit();
+  rmSync(join(state.root, "node_modules"), { recursive: true, force: true });
+  assert.equal(
+    await runProjectCheck({
+      ...state.options,
+      execute: async (_command, args) => {
+        if (args[0] === "test")
+          for (const packageRoot of [state.root, workspace]) {
+            const cache = join(packageRoot, "node_modules", ".vite", "deps");
+            mkdirSync(cache, { recursive: true });
+            writeFileSync(join(cache, "generated.js"), "generated cache\n");
+          }
+        return 0;
+      },
+    }),
+    0,
+  );
+  assert.equal(await runProjectCheck({ ...state.options, prePush: true, refs: state.refs() }), 0);
+  assert.match(state.messages.at(-1), /Reused successful validation/u);
+  const dependency = join(workspace, "node_modules", "dependency.js");
+  writeFileSync(dependency, "export default 1;\n");
+  assert.equal(
+    await runProjectCheck({
+      ...state.options,
+      execute: async (_command, args) => {
+        if (args[0] === "test") writeFileSync(dependency, "export default 2;\n");
+        return 0;
+      },
+    }),
+    1,
+  );
+  const receipt = JSON.parse(
+    readFileSync(join(state.root, ".git", "tidu-validation", "result.json"), "utf8"),
+  );
+  assert.equal(receipt.status, 1);
 });
 
 test("invalidates source, untracked inputs, dependency bytes and runtime changes", async (context) => {
