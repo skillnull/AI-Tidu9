@@ -1886,13 +1886,14 @@ test("official caller executes delegated commands as native command items and re
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR4nGNgQAYAAA4AAamRc7EAAAAASUVORK5CYII=";
   const agentMessageText = "The independent audit is complete.";
   const agentContinuationAnswer = "The audit result reached the resumed model.";
+  const fixtureAnswer = "Native fixture verified.";
   let modelRequests = 0;
   let receivedToolOutput = false;
   let cancelFixture = false;
   let waitingFixture = false;
   let cancellationRequests = 0;
   let activeAgentFixture = false;
-  let finishActiveReasoning: (() => void) | undefined;
+  let finishActiveResponse: (() => void) | undefined;
   let closeActiveResponse: (() => void) | undefined;
   const modelServer = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
@@ -1956,6 +1957,7 @@ test("official caller executes delegated commands as native command items and re
     }
     const holdForAgent = activeAgentFixture && receivedFollowupOutput && !receivedAgentMessage;
     if (waitingFixture || holdForAgent) {
+      const responseId = holdForAgent ? "resp_fixture_agent_pending" : "waiting_response";
       const reasoningText = holdForAgent
         ? "Checking the pending audit."
         : "Waiting for the fixture model.";
@@ -1966,7 +1968,7 @@ test("official caller executes delegated commands as native command items and re
       };
       send("response.created", {
         response: {
-          id: holdForAgent ? "resp_fixture_agent_pending" : "waiting_response",
+          id: responseId,
           object: "response",
           status: "in_progress",
           output: [],
@@ -1985,7 +1987,28 @@ test("official caller executes delegated commands as native command items and re
         send("response.output_item.done", { output_index: 0, item });
       };
       if (holdForAgent) {
-        finishActiveReasoning = finishReasoning;
+        const answer = {
+          type: "message",
+          id: "msg_fixture_before_agent_update",
+          role: "assistant",
+          phase: "final_answer",
+          content: [{ type: "output_text", text: fixtureAnswer, annotations: [] }],
+        };
+        finishActiveResponse = () => {
+          finishReasoning();
+          send("response.output_item.added", { output_index: 1, item: answer });
+          send("response.output_item.done", { output_index: 1, item: answer });
+          send("response.completed", {
+            response: {
+              id: responseId,
+              object: "response",
+              status: "completed",
+              output: [item, answer],
+              usage: { input_tokens: 12, output_tokens: 3, total_tokens: 15 },
+            },
+          });
+          response.end();
+        };
         closeActiveResponse = () => response.destroy();
       } else finishReasoning();
       return;
@@ -2001,7 +2024,7 @@ test("official caller executes delegated commands as native command items and re
               content: [
                 {
                   type: "output_text",
-                  text: receivedAgentMessage ? agentContinuationAnswer : "Native fixture verified.",
+                  text: receivedAgentMessage ? agentContinuationAnswer : fixtureAnswer,
                   annotations: [],
                 },
               ],
@@ -2532,7 +2555,8 @@ process.on("SIGTERM",()=>child.kill("SIGTERM"));child.on("exit",code=>process.ex
       threadId: pendingThread.thread.id,
       input: [{ type: "text", text: "Read the fixture while the audit runs." }],
     });
-    await waitFor(() => finishActiveReasoning !== undefined);
+    await waitFor(() => finishActiveResponse !== undefined);
+    assert.ok(!notifications.some((notification) => notification.method === "turn/completed"));
     await caller.request("thread/inject_items", {
       threadId: pendingThread.thread.id,
       items: [
@@ -2545,11 +2569,11 @@ process.on("SIGTERM",()=>child.kill("SIGTERM"));child.on("exit",code=>process.ex
         },
       ],
     });
-    finishActiveReasoning?.();
+    assert.ok(finishActiveResponse);
+    finishActiveResponse();
     await waitFor(() =>
       notifications.some((notification) => notification.method === "turn/completed"),
     );
-    closeActiveResponse?.();
     const activeTerminal = notifications.find(
       (notification) => notification.method === "turn/completed",
     )?.params as { turn?: { id?: string; status?: string } } | undefined;
