@@ -5,7 +5,6 @@ import type {
   CapabilityAssetPrivacy,
   CapabilityRegistry,
 } from "../capabilities/index.js";
-import type { AgentHostId } from "../config/index.js";
 import { ProviderError } from "../core/index.js";
 import {
   type AgentEvent,
@@ -16,6 +15,7 @@ import {
   createTask,
   type TaskStatus,
 } from "../protocol/index.js";
+import type { ProviderExecutionReceipt, ScopedVisualEvidence } from "../providers/index.js";
 import { createSecretGate, type SecretGate } from "../security/index.js";
 
 export const TASK_CAPSULE_VERSION = "tidu-task-capsule/1" as const;
@@ -52,6 +52,10 @@ export interface AgentModelPreferences {
 }
 
 export interface AgentModelRequest {
+  /** Scoped observations of a historical image, kept in memory by the local gateway. */
+  visualEvidence?: ScopedVisualEvidence;
+  /** The native gateway inferred vision from image parts in this transcript. */
+  inferredImageCapability?: boolean;
   /** OpenAI-compatible protocol used by the caller. */
   protocol: "chat-completions" | "responses";
   /** Validated request body retained only for the active in-memory execution. */
@@ -67,31 +71,7 @@ export interface AgentModelRequest {
   /** Caller-owned tool requests returned without execution by the Agent worker. */
   onOutputItem?: (item: Record<string, unknown>) => void;
   /** Actual per-model execution receipts retained only for the active caller. */
-  onExecutionReceipt?: (receipt: {
-    /** Host that executed this model call. */
-    host: AgentHostId;
-    /** Exact upstream model confirmed for this call. */
-    model: string;
-    /** Semantic role performed by this model call. */
-    role: "main" | "planning" | "specialist" | "verification" | "worker";
-    /** Configured capabilities assigned to this model call. */
-    capabilities: readonly string[];
-    /** Provider-authoritative token usage, or null when unavailable. */
-    usage: {
-      /** Input tokens consumed by this call. */
-      inputTokens: number;
-      /** Output tokens consumed by this call. */
-      outputTokens: number;
-      /** Total tokens consumed by this call. */
-      totalTokens: number;
-      /** Cached input tokens, when reported by the provider. */
-      cachedInputTokens?: number;
-      /** Cache-write input tokens, when reported by the provider. */
-      cacheWriteInputTokens?: number;
-      /** Reasoning output tokens, when reported by the provider. */
-      reasoningTokens?: number;
-    } | null;
-  }) => void;
+  onExecutionReceipt?: (receipt: ProviderExecutionReceipt) => void;
 }
 
 export interface TaskBudgetLimits {

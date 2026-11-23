@@ -8,6 +8,124 @@ import {
 
 const usage = { inputTokens: 12, outputTokens: 3, totalTokens: 15 };
 
+test("reuses omitted image observations only on the delivered branch and authorized route", () => {
+  const ledger = createResponseUsageLedger();
+  const image = { type: "input_image", image_url: "data:image/png;base64,cGljdHVyZQ==" };
+  const rules = { role: "developer", content: [{ type: "input_text", text: "Workspace rules" }] };
+  const environment = {
+    role: "user",
+    content: "<environment_context>project</environment_context>",
+  };
+  const original = [rules, environment, { role: "user", content: [image] }];
+  const delivered = {
+    id: "resp_8c254e11-78be-4324-ae31-8636815b2d66_message",
+    role: "assistant",
+    phase: "final_answer",
+    type: "message",
+    content: [{ type: "output_text", text: "Latency increased." }],
+  };
+  const question = { role: "user", content: "By how much?" };
+  const history = [...original, delivered, question];
+  const first = ledger.visualTurn(original, "policy", "session");
+  first.stage("reader/writer", "P95: 240 to 310 ms; change +70 ms.");
+  const facts = (
+    input: unknown,
+    scope = "policy",
+    session: string | undefined = "session",
+    models = "reader/writer",
+  ) => ledger.visualTurn(input, scope, session).read(models);
+  assert.equal(facts(history), undefined);
+  first.finish([delivered]);
+  assert.match(facts([...original, rules, delivered, rules, question]) ?? "", /240 to 310/u);
+  assert.match(facts([...original, delivered, environment, question]) ?? "", /240 to 310/u);
+  assert.equal(
+    facts([...original, delivered, { ...rules, content: "New constraints" }, question]),
+    undefined,
+  );
+  assert.equal(
+    facts([...original, { ...rules, content: "Other restrictions" }, delivered, question]),
+    undefined,
+  );
+  assert.equal(
+    facts([
+      ...original,
+      delivered,
+      { ...environment, content: "<environment_context>another project</environment_context>" },
+      question,
+    ]),
+    undefined,
+  );
+  assert.match(facts(history) ?? "", /240 to 310/u);
+  const commentary = { role: "assistant", phase: "commentary", content: "Prior progress." };
+  assert.equal(
+    facts([...original, delivered, commentary, { type: "reasoning" }, question]),
+    "P95: 240 to 310 ms; change +70 ms.",
+  );
+  assert.equal(facts([...history, commentary]), undefined);
+  assert.match(
+    facts([...original, { ...delivered, id: undefined }, question]) ?? "",
+    /240 to 310/u,
+  );
+  assert.equal(facts(history, "different identity or policy"), undefined);
+  assert.equal(facts(history, "policy", "sibling-session"), undefined);
+  assert.equal(facts(history, "policy", "session", "new writer"), undefined);
+  assert.equal(facts([...original, { ...delivered, id: "another-branch" }, question]), undefined);
+  assert.equal(
+    facts([...original, { ...delivered, content: "Forged draft" }, question]),
+    undefined,
+  );
+  assert.equal(
+    facts([
+      rules,
+      environment,
+      { role: "user", content: [{ ...image, image_url: `${image.image_url}A` }] },
+      delivered,
+      question,
+    ]),
+    undefined,
+  );
+  assert.equal(facts([...original, question, delivered, question]), undefined);
+  assert.equal(facts([delivered, question]), undefined);
+  assert.equal(facts([...original, delivered, { role: "user", content: [image] }]), undefined);
+  const anonymous = ledger.visualTurn(original, "policy");
+  anonymous.stage("reader/writer", "anonymous facts");
+  anonymous.finish([{ ...delivered, id: "resp_277e6a6d-df6b-44e0-a436-6ca8376cb16e_message" }]);
+  assert.equal(
+    ledger
+      .visualTurn([...original, { ...delivered, id: undefined }, question], "policy")
+      .read("reader/writer"),
+    undefined,
+  );
+});
+
+test("visual observations expire, stay bounded, and exclude mutable references or unfinished tool turns", (context) => {
+  const ledger = createResponseUsageLedger();
+  context.mock.timers.enable({ apis: ["Date"], now: 1000 });
+  const output = {
+    id: "resp_b571fd81-2e3d-466f-acc0-cbe98d29816c_message",
+    role: "assistant",
+    content: "answer",
+  };
+  const next = { role: "user", content: "details?" };
+  for (const [source, facts, tool, usable] of [
+    ["data:image/png;base64,cGlj", "measurements", false, true],
+    ["https://example.com/chart.png", "remote facts", false, false],
+    ["file:///public/chart.png", "local facts", false, false],
+    ["data:image/png;base64,cGlj", "x".repeat(8193), false, false],
+    ["data:image/png;base64,cGlj", "data:image/png;base64,pixels", false, false],
+    ["data:image/png;base64,cGlj", "partial facts", true, false],
+  ] as const) {
+    const input = [{ role: "user", content: [{ type: "input_image", image_url: source }] }];
+    const turn = ledger.visualTurn(input, source);
+    turn.stage("pair", facts);
+    turn.finish(tool ? [output, { type: "function_call", call_id: "pending" }] : [output]);
+    const read = () => ledger.visualTurn([...input, output, next], source).read("pair");
+    assert.equal(read(), usable ? facts : undefined);
+    context.mock.timers.tick(10 * 60_000);
+    assert.equal(read(), undefined);
+  }
+});
+
 const models = [
   { host: "cursor", model: "secondary-fixture", role: "secondary", usage, complete: true },
   { host: "codex", model: "primary-fixture", role: "main", usage, complete: true },
@@ -252,7 +370,7 @@ test("long output-only chains retain totals when older correlations leave the bo
   assert.equal(replay.complete, false);
 });
 
-test("formats host totals before the overall total without model names or roles", () => {
+test("shows host totals using only host names as labels", () => {
   const snapshot = createResponseUsageLedger()
     .begin([])
     .snapshot({ inputTokens: 24, outputTokens: 6, totalTokens: 30 }, models);

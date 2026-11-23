@@ -12,6 +12,7 @@ import type {
 } from "../../src/config/index.js";
 import { isValidModelIdentifier, MODEL_ROUTING_CAPABILITIES } from "../../src/config/index.js";
 import type { ConfigCenterBootstrap } from "../../src/config-center/contracts.js";
+import type { CapabilityCompletionUsageRecord } from "../../src/routing/index.js";
 import {
   type CatalogModel,
   modelDisplayName,
@@ -182,6 +183,8 @@ interface CapabilityCompletionUsageRecordView {
     outputTokens: number;
     totalTokens: number;
   }[];
+  /** Individual calls, when recorded by the runtime that served this request. */
+  observation?: CapabilityCompletionUsageRecord["observation"];
 }
 
 export const capabilityCompletionOutcomeLabel = (
@@ -388,6 +391,202 @@ export const updateSpecialistModelSelection = (
 const capabilityLabel = (capability: string, english: boolean): string => {
   const item = MODEL_CAPABILITIES.find((candidate) => candidate.id === capability);
   return item ? (english ? item.en : item.zh) : capability;
+};
+
+export const capabilityModelUsage = (
+  record: Pick<CapabilityCompletionUsageRecordView, "observation" | "modelTokenUsage">,
+  modelId: string,
+) => {
+  if (!record.observation)
+    return {
+      usage: record.modelTokenUsage.find((entry) => entry.modelId === modelId),
+      partial: false,
+    };
+  const calls = record.observation.calls.filter((call) => call.modelId === modelId);
+  const reported = calls.flatMap((call) => (call.usage ? [call.usage] : []));
+  const usage =
+    reported.length === 0
+      ? undefined
+      : reported.reduce(
+          (sum, entry) => ({
+            inputTokens: sum.inputTokens + entry.inputTokens,
+            outputTokens: sum.outputTokens + entry.outputTokens,
+            totalTokens: sum.totalTokens + entry.totalTokens,
+          }),
+          { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        );
+  return { usage, partial: reported.length > 0 && reported.length < calls.length };
+};
+
+export const CapabilityCallUsage = ({
+  record,
+  english,
+  catalog,
+}: {
+  record: Pick<CapabilityCompletionUsageRecordView, "observation" | "tokenUsage">;
+  english: boolean;
+  catalog?: UpstreamModelCatalog;
+}) => {
+  const { observation, tokenUsage } = record;
+  if (observation === undefined) {
+    if (
+      tokenUsage &&
+      tokenUsage.inputTokens === 0 &&
+      tokenUsage.outputTokens === 0 &&
+      tokenUsage.totalTokens === 0
+    )
+      return null;
+    return (
+      <p className="capability-record-token-usage">
+        {english ? "Tokens: " : "Token 统计："}
+        {tokenUsage === null
+          ? english
+            ? "Not retrieved"
+            : "未获取到"
+          : english
+            ? `input ${tokenUsage.inputTokens} · output ${tokenUsage.outputTokens} · total ${tokenUsage.totalTokens}`
+            : `输入 ${tokenUsage.inputTokens} · 输出 ${tokenUsage.outputTokens} · 合计 ${tokenUsage.totalTokens}`}
+      </p>
+    );
+  }
+  const unknown = english ? "Unknown" : "未知";
+  const subtotal = !observation.complete && observation.measuredTotalTokens !== null;
+  const totalLabel = subtotal
+    ? english
+      ? "Reported subtotal (partial)"
+      : "已报告小计（部分调用）"
+    : english
+      ? "Total tokens"
+      : "整次 Token 合计";
+  return (
+    <>
+      <p className="capability-record-token-usage">
+        {totalLabel} {observation.measuredTotalTokens ?? unknown}
+      </p>
+      {observation.calls.length === 0 ? (
+        <p className="capability-record-detail">{english ? "No model calls" : "未发起模型调用"}</p>
+      ) : (
+        <details className="capability-call-history">
+          <summary>
+            {english ? "Model calls" : "逐次模型调用"} ({observation.calls.length})
+          </summary>
+          <ol>
+            {observation.calls.map((call, index) => (
+              <li key={`${call.modelId}:${index}`}>
+                <strong>
+                  {call.role === "main"
+                    ? english
+                      ? "Primary"
+                      : "主模型"
+                    : english
+                      ? "Secondary"
+                      : "副模型"}
+                </strong>
+                {" · "}
+                {call.host}
+                {" · "}
+                {english
+                  ? call.executionRole
+                  : {
+                      main: "主执行",
+                      specialist: "专项",
+                      planning: "规划",
+                      worker: "执行",
+                      verification: "验证",
+                    }[call.executionRole]}
+                {" · "}
+                {capabilityCompletionOutcomeLabel(call.outcome, english)}
+                <p>
+                  {english ? "Configured model" : "配置模型"}{" "}
+                  <span title={call.model}>
+                    {call.model === "current"
+                      ? english
+                        ? "Default"
+                        : "默认模型"
+                      : capabilityHistoryModelName(
+                          { ...call, executedModel: null },
+                          catalog,
+                          english,
+                        )}
+                  </span>
+                </p>
+                <p>
+                  {english ? "Confirmed model" : "实际执行模型"}{" "}
+                  <span title={call.executedModel ?? undefined}>
+                    {call.executedModel
+                      ? capabilityHistoryModelName(call, catalog, english)
+                      : english
+                        ? "Unconfirmed"
+                        : "未确认"}
+                  </span>
+                </p>
+                <p>
+                  {english ? "Capabilities" : "承担能力"}{" "}
+                  {call.capabilities
+                    .map((capability) => capabilityLabel(capability, english))
+                    .join(" / ") || "—"}
+                </p>
+                {call.usage === null ? (
+                  <p>{english ? "Token usage unknown" : "Token 用量未知"}</p>
+                ) : (
+                  <>
+                    <p>
+                      {english ? "Input" : "输入"} {call.usage.inputTokens} ·{" "}
+                      {english ? "Fresh" : "未缓存"} {call.usage.freshInputTokens ?? unknown} ·{" "}
+                      {english ? "Cache read" : "缓存读取"}{" "}
+                      {call.usage.cachedInputTokens ?? unknown} ·{" "}
+                      {english ? "Cache write" : "缓存写入"}{" "}
+                      {call.usage.cacheWriteInputTokens ?? unknown}
+                    </p>
+                    <p>
+                      {english ? "Output" : "输出"} {call.usage.outputTokens} (
+                      {english ? "including reasoning" : "含推理"}{" "}
+                      {call.usage.reasoningTokens ?? unknown}) · {english ? "Total" : "合计"}{" "}
+                      {call.usage.totalTokens}
+                    </p>
+                  </>
+                )}
+              </li>
+            ))}
+          </ol>
+        </details>
+      )}
+    </>
+  );
+};
+
+export const SplitVisionUsageNote = ({
+  policy,
+  english,
+}: {
+  policy: HostCapabilityCompletionPolicy;
+  english: boolean;
+}) => {
+  const primary = policy.mainCapabilities;
+  const models = [
+    primary,
+    ...policy.specialists
+      .filter(({ model }) => model.trim() !== "")
+      .map(({ capabilities }) => capabilities),
+  ];
+  if (
+    policy.mainModel.model.trim() === "" ||
+    policy.maximumSpecialists < (primary.includes("text") || primary.includes("vision") ? 1 : 2) ||
+    models.some(
+      (capabilities) => capabilities.includes("text") && capabilities.includes("vision"),
+    ) ||
+    !models.some((capabilities) => capabilities.includes("text")) ||
+    !models.some((capabilities) => capabilities.includes("vision"))
+  ) {
+    return null;
+  }
+  return (
+    <p>
+      {english
+        ? "Reading and writing use separate models. Both count toward the token total. Revisions can reuse an earlier draft and verified observations. A new image, an explicit recheck, or a missing visual detail calls for an image read. If a model supports both Text and Vision, selecting both allows a single call."
+        : "读图和写稿分属不同模型，两端实际用量都计入总 Token。改稿可复用前文和经核实的读图事实。新增图片、明确要求复核或缺少视觉细节时，需要读图。若同一模型支持这两项能力，可同时勾选，以便一次完成。"}
+    </p>
+  );
 };
 
 const CapabilityPicker = ({
@@ -702,6 +901,9 @@ export const CapabilityCompletionPanel = ({
                       </button>
                     </div>
                   </div>
+                  {operational && policy ? (
+                    <SplitVisionUsageNote policy={policy} english={english} />
+                  ) : null}
                   {configured && policy ? (
                     <div className="capability-host-policy-details">
                       <div className="capability-host-model primary">
@@ -840,8 +1042,9 @@ export const CapabilityCompletionPanel = ({
                           </p>
                           <div className="capability-model-results">
                             {[record.mainResult, ...record.secondaryResults].map((modelResult) => {
-                              const modelUsage = record.modelTokenUsage.find(
-                                (usage) => usage.modelId === modelResult.modelId,
+                              const { usage: modelUsage, partial } = capabilityModelUsage(
+                                record,
+                                modelResult.modelId,
                               );
                               const zeroUsage =
                                 modelUsage !== undefined &&
@@ -890,9 +1093,14 @@ export const CapabilityCompletionPanel = ({
                                         ? ""
                                         : ` · HTTP ${modelResult.statusCode}`}
                                     </span>
-                                    {modelResult.outcome === "not-run" || zeroUsage ? null : (
+                                    {modelResult.outcome === "not-run" ||
+                                    (zeroUsage && !partial) ? null : (
                                       <span className="capability-model-result-tokens">
-                                        Token：
+                                        {partial
+                                          ? english
+                                            ? "Tokens (partial): "
+                                            : "Token（部分调用）："
+                                          : "Token："}
                                         {modelUsage === undefined ? (
                                           english ? (
                                             "Not retrieved"
@@ -919,27 +1127,11 @@ export const CapabilityCompletionPanel = ({
                               );
                             })}
                           </div>
-                          {record.tokenUsage !== null &&
-                          record.tokenUsage.inputTokens === 0 &&
-                          record.tokenUsage.outputTokens === 0 &&
-                          record.tokenUsage.totalTokens === 0 ? null : (
-                            <p className="capability-record-token-usage">
-                              {record.tokenUsage === null ? (
-                                english ? (
-                                  "Tokens: Not retrieved"
-                                ) : (
-                                  "Token 统计：未获取到"
-                                )
-                              ) : (
-                                <>
-                                  {english ? "Tokens" : "Token 统计"}：{english ? "input" : "输入"}{" "}
-                                  {record.tokenUsage.inputTokens} · {english ? "output" : "输出"}{" "}
-                                  {record.tokenUsage.outputTokens} · {english ? "total" : "合计"}{" "}
-                                  {record.tokenUsage.totalTokens}
-                                </>
-                              )}
-                            </p>
-                          )}
+                          <CapabilityCallUsage
+                            record={record}
+                            english={english}
+                            catalog={catalog}
+                          />
                         </article>
                       ))
                   )}
@@ -3192,6 +3384,7 @@ export const QuickStartWizard = ({
                               ? "Each secondary model shows only capabilities routable through its own host and adapter path. Selecting at most two usually minimizes cost."
                               : "每个副模型只展示其所属宿主、模型与适配器链路可调度的能力；建议最多选择 2 个。"}
                           </p>
+                          <SplitVisionUsageNote policy={activeHostPolicy} english={english} />
                         </div>
                       </div>
                       {upstreamCatalogStatus === "loading" ? (

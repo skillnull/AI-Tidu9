@@ -1,8 +1,11 @@
+import { readFile } from "node:fs/promises";
+import { basename, isAbsolute } from "node:path";
 import {
   type CodexHostInspectionOptions,
   createCodexAppServerLaunch,
 } from "../accounts/codex-host.js";
 import { TiduError } from "../core/index.js";
+import { verifiedVisionHistory } from "./codex-vision-context.js";
 import {
   createStdioJsonRpcClient,
   type JsonRpcClient,
@@ -54,6 +57,8 @@ export interface CodexThread {
   id: string;
   /** Model selected by Codex for this thread. */
   model: string;
+  /** Initial replay after matching the native visual evidence thread's own context. */
+  visionHistory?: readonly Record<string, unknown>[];
 }
 
 export interface CodexAccountSummary {
@@ -114,6 +119,8 @@ export interface CodexTurnResult {
   /** Per-turn token usage reported by the official app-server. */
   usage: {
     inputTokens: number;
+    /** Input outside cache reads and separately reported writes, when the counters permit it. */
+    freshInputTokens?: number;
     outputTokens: number;
     totalTokens: number;
     cachedInputTokens?: number;
@@ -175,16 +182,18 @@ export interface CodexAgentClient {
   /** Starts a persistent Codex thread under the configured workspace. */
   startThread: (
     model?: string,
-    callerTools?: readonly Record<string, unknown>[],
+    callerTools?: readonly Record<string, unknown>[] | "vision-evidence",
     webSearchMode?: "disabled" | "cached" | "live",
+    visionTaskText?: string,
+    visionReplay?: { history: readonly Record<string, unknown>[]; signal?: AbortSignal },
   ) => Promise<CodexThread>;
   /** Reads non-secret account metadata through the official app-server. */
   readAccount: () => Promise<CodexAccountSummary | null>;
   /** Reads account quota and token totals without running a model turn. */
   readUsage: () => Promise<CodexUsageSummary>;
-  /** Sends one user turn, streams text deltas, and resolves after a terminal notification. */
+  /** Sends one user turn, retaining caller-tool registration when given a started thread. */
   prompt: (
-    threadId: string,
+    thread: string | CodexThread,
     input: readonly CodexTurnInput[],
     signal?: AbortSignal,
     onTextDelta?: (delta: string) => void,
@@ -205,10 +214,12 @@ export interface CodexAgentClient {
 interface TurnState {
   /** Thread owning the live native turn. */
   threadId: string;
+  /** Dynamic tool names declared by the caller on this native thread. */
+  callerToolNames?: ReadonlySet<string>;
   /** Native turn retained while caller tools execute. */
   turnId: string;
-  /** Whether this response has already been handed to the caller. */
-  yielded: boolean;
+  /** Fixed membership of the batch already handed to the caller. */
+  yieldedCalls?: readonly CodexCallerToolCall[];
   /** Claimed caller batches, retained while their native turn remains active. */
   resumes: Map<string, CallerResume>;
   /** Unanswered native RPCs indexed by the caller's stable call ID. */
@@ -323,17 +334,36 @@ const readNumber = (value: unknown, key: string): number | null => {
 };
 
 const readTurnTokenUsage = (value: unknown): NonNullable<CodexTurnResult["usage"]> | null => {
-  const inputTokens = readNumber(value, "inputTokens");
-  const outputTokens = readNumber(value, "outputTokens");
-  const totalTokens = readNumber(value, "totalTokens");
+  const count = (field: string): number | null => {
+    const tokens = readNumber(value, field);
+    return tokens !== null && Number.isSafeInteger(tokens) && tokens >= 0 ? tokens : null;
+  };
+  const inputTokens = count("inputTokens");
+  const outputTokens = count("outputTokens");
+  const totalTokens = count("totalTokens");
   if (inputTokens === null || outputTokens === null || totalTokens === null) return null;
-  const cachedInputTokens = readNumber(value, "cachedInputTokens");
-  const cacheWriteInputTokens = readNumber(value, "cacheWriteInputTokens");
-  const reasoningTokens = readNumber(value, "reasoningOutputTokens");
+  const cachedInputTokens = count("cachedInputTokens");
+  const reportedWrite = count("cacheWriteInputTokens");
+  // Native Codex input includes cached reads. Its standard breakdown has no separate write bucket.
+  const cacheWriteInputTokens =
+    reportedWrite === null &&
+    cachedInputTokens !== null &&
+    isRecord(value) &&
+    value.cacheWriteInputTokens === undefined
+      ? 0
+      : reportedWrite;
+  const freshInputTokens =
+    cachedInputTokens !== null && cacheWriteInputTokens !== null
+      ? inputTokens - cachedInputTokens - cacheWriteInputTokens
+      : null;
+  const reasoningTokens = count("reasoningOutputTokens");
   return {
     inputTokens,
     outputTokens,
     totalTokens,
+    ...(freshInputTokens !== null && Number.isSafeInteger(freshInputTokens) && freshInputTokens >= 0
+      ? { freshInputTokens }
+      : {}),
     ...(cachedInputTokens === null ? {} : { cachedInputTokens }),
     ...(cacheWriteInputTokens === null ? {} : { cacheWriteInputTokens }),
     ...(reasoningTokens === null ? {} : { reasoningTokens }),
@@ -484,15 +514,23 @@ const defaultServerRequest = async (
 };
 
 export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentClient => {
+  let instructionSources: readonly string[] | undefined;
+  const callerToolsByThread = new WeakMap<CodexThread, ReadonlySet<string>>();
   const activeTurns = new Map<string, TurnState>();
   const startingTurns = new Set<{
     threadId: string;
+    callerToolNames?: ReadonlySet<string>;
     reject: (error: Error) => void;
     cleanup: () => void;
   }>();
   const registrations = new Map<
     string,
-    { threadId: string; ready: Promise<void>; resolve: () => void }
+    {
+      threadId: string;
+      callerToolNames?: ReadonlySet<string>;
+      ready: Promise<void>;
+      resolve: () => void;
+    }
   >();
   const finishedTurns = new Set<string>();
   let connectionFailure: Error | undefined;
@@ -508,7 +546,8 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
   };
   const registerIncomingTurn = (turnId: string, threadId: string): void => {
     if (activeTurns.has(turnId) || finishedTurns.has(turnId) || registrations.has(turnId)) return;
-    if (![...startingTurns].some((pending) => pending.threadId === threadId)) return;
+    const pending = [...startingTurns].find((entry) => entry.threadId === threadId);
+    if (pending === undefined) return;
     if (registrations.size >= startingTurns.size) {
       const error = new TiduError(
         "INTERNAL_ERROR",
@@ -522,29 +561,34 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     const ready = new Promise<void>((accept) => {
       resolve = accept;
     });
-    registrations.set(turnId, { threadId, ready, resolve });
+    registrations.set(turnId, {
+      threadId,
+      callerToolNames: pending.callerToolNames,
+      ready,
+      resolve,
+    });
   };
   const yieldCallerTools = (state: TurnState): void => {
-    setImmediate(() => {
-      if (
-        state.yielded ||
-        !state.modelResponseCompleted ||
-        state.toolCalls.length === 0 ||
-        state.toolReplies.size === 0 ||
-        activeTurns.get(state.turnId) !== state
-      )
-        return;
-      state.yielded = true;
-      state.cleanup();
-      state.resolve({
-        threadId: state.threadId,
-        turnId: state.turnId,
-        status: "completed",
-        text: state.text,
-        toolCalls: [...state.toolCalls],
-        progressItems: [...state.progressItems],
-        usage: state.usage,
-      });
+    if (
+      state.yieldedCalls !== undefined ||
+      !state.modelResponseCompleted ||
+      !state.toolCalls.some((call) => state.toolReplies.has(call.callId)) ||
+      activeTurns.get(state.turnId) !== state
+    )
+      return;
+    const toolCalls = state.toolCalls;
+    state.yieldedCalls = toolCalls;
+    state.toolCalls = [];
+    state.modelResponseCompleted = false;
+    state.cleanup();
+    state.resolve({
+      threadId: state.threadId,
+      turnId: state.turnId,
+      status: "completed",
+      text: state.text,
+      toolCalls: [...toolCalls],
+      progressItems: [...state.progressItems],
+      usage: state.usage,
     });
   };
   const bufferedTurnNotifications = new Map<string, BufferedTurnNotifications>();
@@ -736,13 +780,17 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       isRecord(notification.params.item)
     ) {
       const item = notification.params.item;
+      const state = activeTurns.get(turnId);
+      const callerToolNames = (state ?? registrations.get(turnId))?.callerToolNames;
+      // Raw responses also contain calls executed entirely inside the native host.
       if (
         item.type === "function_call" &&
         typeof item.call_id === "string" &&
         typeof item.name === "string" &&
-        typeof item.arguments === "string"
+        typeof item.arguments === "string" &&
+        (callerToolNames === undefined ||
+          (item.namespace == null && callerToolNames.has(item.name)))
       ) {
-        const state = activeTurns.get(turnId);
         try {
           const call = {
             callId: item.call_id,
@@ -751,7 +799,9 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
             arguments: JSON.parse(item.arguments) as unknown,
           };
           if (state !== undefined) {
+            // Raw items cannot change the batch once the caller has received it.
             if (
+              state.yieldedCalls === undefined &&
               !state.resumes.has(call.callId) &&
               !state.toolCalls.some((existing) => existing.callId === call.callId)
             )
@@ -769,7 +819,6 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
         item.type === "web_search_call" ||
         (item.type === "message" && item.phase === "commentary")
       ) {
-        const state = activeTurns.get(turnId);
         if (state !== undefined) {
           state.progressItems.push(item);
           state.onNativeItem?.(item);
@@ -813,7 +862,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       if (usage !== null) updateTurnUsage(turnId, usage, false);
       if (state !== undefined) {
         state.modelResponseCompleted = true;
-        yieldCallerTools(state);
+        setImmediate(() => yieldCallerTools(state));
         state.responseWaiters.splice(0).forEach((resolve) => {
           resolve();
         });
@@ -1001,32 +1050,100 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
         state.toolResults.delete(callId);
         return completed;
       }
-      if (!state.resumes.has(callId) && !state.toolCalls.some((call) => call.callId === callId))
+      if (
+        !state.resumes.has(callId) &&
+        !state.yieldedCalls?.some((call) => call.callId === callId) &&
+        !state.toolCalls.some((call) => call.callId === callId)
+      ) {
+        // An RPC received while the prior batch is published already belongs to completed sampling.
+        if (state.yieldedCalls !== undefined) state.modelResponseCompleted = true;
         state.toolCalls.push({
           callId,
           tool,
           namespace: readString(params, "namespace") ?? null,
           arguments: params.arguments,
         });
+      }
       return new Promise<CodexToolReply>((resolve, reject) => {
         state.toolReplies.set(callId, { resolve, reject });
-        yieldCallerTools(state);
+        setImmediate(() => yieldCallerTools(state));
       });
     },
     onClose: failActiveTurns,
   };
+  const transportFactory = options.transportFactory;
+  const launch = transportFactory ? undefined : createCodexAppServerLaunch(options);
   const client: JsonRpcClient =
-    options.transportFactory === undefined
+    launch !== undefined
       ? createStdioJsonRpcClient(
-          { ...createCodexAppServerLaunch(options), workingDirectory: options.workingDirectory },
+          { ...launch, workingDirectory: options.workingDirectory },
           handlers,
         )
-      : options.transportFactory(handlers);
+      : (transportFactory as NonNullable<typeof transportFactory>)(handlers);
 
   const requireInitialized = (): void => {
     if (connectionFailure !== undefined) throw connectionFailure;
     if (!initialized) {
       throw new TiduError("CONFIGURATION_CONFLICT", "Codex app-server is not initialized.");
+    }
+  };
+
+  const canLimitVisionSkillCatalog = async (taskText: string): Promise<boolean> => {
+    if (instructionSources === undefined) return false;
+    try {
+      const [listing, ...rules] = await Promise.all([
+        client.request<Record<string, unknown>>("skills/list", {
+          cwds: [options.workingDirectory],
+        }),
+        ...instructionSources.map((path) => readFile(path, "utf8")),
+      ] as const);
+      const entry = Array.isArray(listing.data)
+        ? listing.data.find((item: unknown) => readString(item, "cwd") === options.workingDirectory)
+        : undefined;
+      if (
+        !isRecord(entry) ||
+        !Array.isArray(entry.skills) ||
+        !Array.isArray(entry.errors) ||
+        entry.errors.length !== 0
+      )
+        return false;
+      // A code-formatted example of a skill name does not request that skill.
+      // Strip examples only in host-discovered AGENTS files, never in task text.
+      const policyText = rules.map((rule) =>
+        rule.replace(/(?:for example|e\.g\.|例如)[ \t]+`[^\n`]+`[.。]?[ \t]*$/gimu, ""),
+      );
+      // The outer Codex may also send these same workspace rules as native
+      // user-context messages. Classify their text as policy in both places.
+      const taskWithoutRepeatedRules = rules.reduce(
+        (text, rule) => (rule.trim() ? text.replaceAll(rule.trim(), "") : text),
+        taskText,
+      );
+      const mentioned = new Set(
+        [taskWithoutRepeatedRules, ...policyText]
+          .join("\n")
+          .toLowerCase()
+          .match(/[a-z0-9_-]+/gu),
+      );
+      return entry.skills.every((skill: unknown) => {
+        if (!isRecord(skill)) return false;
+        if (skill.enabled === false) return true;
+        if (skill.enabled !== true || (skill.scope !== "user" && skill.scope !== "system"))
+          return false;
+        // Native plugins may advertise namespace:name. Both the namespace and
+        // the short name can be requested. Unrecognized names keep full discovery.
+        if (
+          typeof skill.name !== "string" ||
+          !/^[a-zA-Z0-9_-]+(?::[a-zA-Z0-9_-]+)?$/u.test(skill.name)
+        )
+          return false;
+        return skill.name
+          .toLowerCase()
+          .split(":")
+          .every((name) => !mentioned.has(name));
+      });
+    } catch {
+      // Older hosts and incomplete discovery retain their normal skill catalog.
+      return false;
     }
   };
 
@@ -1052,24 +1169,35 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
     },
     startThread: async (
       modelOverride?: string,
-      callerTools?: readonly Record<string, unknown>[],
+      callerTools?: readonly Record<string, unknown>[] | "vision-evidence",
       webSearchMode: "disabled" | "cached" | "live" = "disabled",
+      visionTaskText?: string,
+      visionReplay?: { history: readonly Record<string, unknown>[]; signal?: AbortSignal },
     ): Promise<CodexThread> => {
       requireInitialized();
       const requestedModel = modelOverride ?? options.model;
-      const response = await client.request<Record<string, unknown>>("thread/start", {
+      const visionEvidenceOnly = callerTools === "vision-evidence";
+      const limitSkillCatalog =
+        visionEvidenceOnly &&
+        visionTaskText !== undefined &&
+        (await canLimitVisionSkillCatalog(visionTaskText));
+      const threadSettings = {
         cwd: options.workingDirectory,
         model: requestedModel ?? null,
         approvalPolicy: "on-request",
-        sandbox: options.sandbox ?? "workspace-write",
-        ephemeral: options.ephemeral ?? false,
+        sandbox: visionEvidenceOnly ? "read-only" : (options.sandbox ?? "workspace-write"),
+        ephemeral: visionEvidenceOnly || (options.ephemeral ?? false),
         ...(callerTools === undefined
           ? {}
           : {
-              dynamicTools: callerTools,
-              experimentalRawEvents: true,
-              developerInstructions:
-                "Use the registered tidu_caller_tool_* tools to carry out the user's task, including reading workspace files, running commands, editing files, and verifying changes when those tools are available. Each tool description identifies its original caller name. These are executable tools: the calling client performs each requested action in its workspace under its current permissions, sandbox, and approval rules, then returns the real result. Request the registered alias instead of the original name. The inference process's local tools are disabled because execution belongs to the calling client; this does not prohibit using the registered tools. Report a permission restriction only when the caller's current policy or a real tool result establishes it.",
+              dynamicTools: visionEvidenceOnly ? [] : callerTools,
+              ...(visionEvidenceOnly
+                ? {}
+                : {
+                    experimentalRawEvents: true,
+                    developerInstructions:
+                      "Use the registered tidu_caller_tool_* tools to carry out the user's task, including reading workspace files, running commands, editing files, and verifying changes when those tools are available. Each tool description identifies its original caller name. These are executable tools: the calling client performs each requested action in its workspace under its current permissions, sandbox, and approval rules, then returns the real result. Request the registered alias instead of the original name. The inference process's local tools are disabled because execution belongs to the calling client; this does not prohibit using the registered tools. Report a permission restriction only when the caller's current policy or a real tool result establishes it.",
+                  }),
               config: {
                 "features.shell_tool": false,
                 "features.apply_patch_freeform": false,
@@ -1079,10 +1207,25 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
                 "features.goals": false,
                 "features.apps": false,
                 "agents.enabled": false,
-                web_search: webSearchMode,
+                web_search: visionEvidenceOnly ? "disabled" : webSearchMode,
+                ...(visionEvidenceOnly
+                  ? {
+                      "features.browser_use": false,
+                      "features.code_mode": false,
+                      "features.code_mode_host": false,
+                      "features.computer_use": false,
+                      "features.image_generation": false,
+                      ...(limitSkillCatalog ? { "skills.max_context_tokens": 160 } : {}),
+                    }
+                  : {}),
               },
             }),
-      });
+      };
+      const response = await client.request<Record<string, unknown>>(
+        "thread/start",
+        threadSettings,
+        visionReplay?.signal,
+      );
       const thread = response.thread;
       const id = readString(thread, "id");
       const model =
@@ -1096,7 +1239,40 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           "Codex did not report the active model configuration.",
         );
       }
-      return { id, model };
+      const sources = response.instructionSources;
+      instructionSources =
+        Array.isArray(sources) &&
+        sources.every(
+          (path: unknown) =>
+            typeof path === "string" &&
+            isAbsolute(path) &&
+            /^AGENTS(?:\.override)?\.md$/iu.test(basename(path)),
+        )
+          ? (sources as string[])
+          : undefined;
+      const visionHistory =
+        visionEvidenceOnly &&
+        visionReplay &&
+        launch &&
+        threadSettings.config &&
+        model === requestedModel &&
+        instructionSources !== undefined
+          ? await verifiedVisionHistory(
+              options,
+              launch,
+              response,
+              threadSettings.config,
+              visionReplay.history,
+              visionTaskText ?? "",
+              visionReplay.signal,
+            )
+          : undefined;
+      const startedThread = { id, model, ...(visionHistory ? { visionHistory } : {}) };
+      if (callerTools !== undefined && !visionEvidenceOnly) {
+        const names = callerTools.map((tool) => readString(tool, "name"));
+        callerToolsByThread.set(startedThread, new Set(names.filter((name) => name !== undefined)));
+      }
+      return startedThread;
     },
     readAccount: async (): Promise<CodexAccountSummary | null> => {
       requireInitialized();
@@ -1155,7 +1331,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       };
     },
     prompt: async (
-      threadId: string,
+      thread: string | CodexThread,
       input: readonly CodexTurnInput[],
       signal?: AbortSignal,
       onTextDelta?: (delta: string) => void,
@@ -1168,6 +1344,9 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
       onNativeItem?: (item: Record<string, unknown>) => void,
     ): Promise<CodexTurnResult> => {
       requireInitialized();
+      const threadId = typeof thread === "string" ? thread : thread.id;
+      const callerToolNames =
+        typeof thread === "string" ? undefined : callerToolsByThread.get(thread);
       const outputsById = new Map<string, Record<string, unknown>>();
       const outputTypes = new Set([
         "function_call_output",
@@ -1236,16 +1415,15 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           );
         if (!previousClaim.failed) return previousClaim.promise;
       }
-      const pending = threadStates.find(
-        (state) =>
-          state.yielded &&
-          outputs.some((item) => state.toolCalls.some((call) => call.callId === item.call_id)),
+      const pending = threadStates.find((state) =>
+        state.yieldedCalls?.some((call) => outputsById.has(call.callId)),
       );
-      if (pending !== undefined) {
+      const yieldedCalls = pending?.yieldedCalls;
+      if (pending !== undefined && yieldedCalls !== undefined) {
         const matched = outputsById;
         if (
-          matched.size !== pending.toolCalls.length ||
-          !pending.toolCalls.every((call) => matched.has(call.callId))
+          matched.size !== yieldedCalls.length ||
+          !yieldedCalls.every((call) => matched.has(call.callId))
         )
           throw new TiduError(
             "CONFIGURATION_INVALID",
@@ -1327,11 +1505,8 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           resolve: accept,
           reject: decline,
           text: "",
-          toolCalls: [],
           progressItems: [],
           usage: null,
-          yielded: false,
-          modelResponseCompleted: false,
           hasTurnAggregateUsage: false,
           processItemKey: undefined,
           onTextDelta,
@@ -1340,7 +1515,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
           onUsageUpdate,
           cleanup: () => signal?.removeEventListener("abort", abort),
         });
-        for (const call of snapshot.toolCalls) pending.resumes.set(call.callId, claim);
+        for (const call of yieldedCalls) pending.resumes.set(call.callId, claim);
         signal?.addEventListener("abort", abort, { once: true });
         if (signal?.aborted) {
           abort();
@@ -1361,6 +1536,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
             claim.injected = true;
           }
           if (activeTurns.get(pending.turnId) !== pending) return;
+          pending.yieldedCalls = undefined;
           for (const { callId, value } of replies) {
             const reply = pending.toolReplies.get(callId);
             if (reply === undefined) pending.toolResults.set(callId, value);
@@ -1369,6 +1545,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
               reply.resolve(value);
             }
           }
+          yieldCallerTools(pending);
         })().catch((error: Error) => {
           if (activeTurns.get(pending.turnId) !== pending) return;
           pending.cleanup();
@@ -1434,6 +1611,7 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
         };
         const pendingStart = {
           threadId,
+          callerToolNames,
           reject,
           cleanup: () => signal?.removeEventListener("abort", abort),
         };
@@ -1460,8 +1638,8 @@ export const createCodexAgentClient = (options: CodexAgentOptions): CodexAgentCl
             }
             const state: TurnState = {
               threadId,
+              callerToolNames,
               turnId,
-              yielded: false,
               resumes: new Map(),
               toolReplies: new Map(),
               toolResults: new Map(),

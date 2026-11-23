@@ -12,9 +12,43 @@ import {
   type ModelRouteProfile,
   type RoutableModel,
 } from "./index.js";
+import { inspectVisualAnswer } from "./visual-answer.js";
 
 const waitForMilliseconds = async (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+test("preserves a long heartbeat-only preamble without waiting for or cancelling the answer", async () => {
+  const encoder = new TextEncoder();
+  const heartbeat = `:${" ".repeat(8190)}\n\n`;
+  const count = 65;
+  let source: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let cancelled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      source = controller;
+      for (let index = 0; index < count; index++) controller.enqueue(encoder.encode(heartbeat));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const inspected = await inspectVisualAnswer(
+    { kind: "stream", statusCode: 200, stream },
+    "responses",
+    "NEEDS_IMAGE",
+  );
+  assert.equal(inspected.needsImage, false);
+  assert.equal(inspected.result.kind, "stream");
+  assert.ok(source);
+  const answer = 'data: {"type":"response.output_text.delta","delta":"正文"}\n\n';
+  source.enqueue(encoder.encode(answer));
+  source.close();
+  assert.equal(
+    await new Response(inspected.result.stream).text(),
+    heartbeat.repeat(count) + answer,
+  );
+  assert.equal(cancelled, false);
+});
 
 test("keeps the final upstream retry category after capability routes are exhausted", async () => {
   const provider = createDynamicModelRouter(
@@ -142,6 +176,44 @@ test("treats auto tools as optional and infers capabilities only from required e
 });
 
 test("infers workspace and web capabilities from explicit user actions only", () => {
+  const nativePrelude = {
+    role: "user",
+    content:
+      "# AGENTS.md instructions for /workspace/project\n\n<INSTRUCTIONS>Review repo files. Search the web when required.</INSTRUCTIONS>\n<environment_context>workspace</environment_context>",
+  };
+  const input = [nativePrelude, { role: "user", content: "Write a release note." }];
+  assert.deepEqual(
+    inferModelRequestCapabilities({
+      protocol: "responses",
+      virtualModelId: "fixture",
+      body: { input },
+    }),
+    ["text"],
+  );
+  assert.deepEqual(
+    inferModelRequestCapabilities({
+      protocol: "responses",
+      virtualModelId: "fixture",
+      body: {
+        input: [...input, { role: "user", content: "Review the local file." }],
+      },
+    }),
+    ["code", "text"],
+  );
+  assert.deepEqual(
+    inferModelRequestCapabilities({
+      protocol: "responses",
+      virtualModelId: "fixture",
+      body: {
+        input: [
+          { role: "user", content: "Review the local file." },
+          { role: "assistant", content: "Reviewed." },
+          ...input,
+        ],
+      },
+    }),
+    ["code", "text"],
+  );
   assert.deepEqual(
     inferModelRequestCapabilities({
       protocol: "responses",
@@ -197,6 +269,28 @@ test("infers long context only when textual input reaches 100000 characters", ()
             ],
           },
         ],
+      },
+    }),
+    ["text", "vision"],
+  );
+});
+
+test("distinguishes image attachments in tool results from examples in optional tool definitions", () => {
+  const image = { type: "input_image", image_url: "data:image/png;base64,example" };
+  const body = {
+    input: [{ role: "user", content: "Summarize the supplied material." }],
+    tools: [
+      { type: "function", name: "read_asset", parameters: { type: "object", examples: [image] } },
+    ],
+  };
+  const request = { protocol: "responses" as const, virtualModelId: "tidu", body };
+  assert.deepEqual(inferModelRequestCapabilities(request), ["text"]);
+  assert.deepEqual(
+    inferModelRequestCapabilities({
+      ...request,
+      body: {
+        ...body,
+        input: [...body.input, { type: "function_call_output", call_id: "asset", output: [image] }],
       },
     }),
     ["text", "vision"],
@@ -969,6 +1063,16 @@ test("records streaming latency only after the stream completes", async (context
     outputTokens: 6,
     totalTokens: 23,
   });
+  const observation = completedStatus.records[0]?.observation;
+  assert.equal(observation?.complete, false);
+  assert.equal(observation?.measuredTotalTokens, 23);
+  assert.deepEqual(
+    observation?.calls.map((call) => [call.model, call.usage?.totalTokens ?? null]),
+    [
+      ["secondary", null],
+      ["main", 23],
+    ],
+  );
 
   await completion.execute({
     protocol: "responses",
@@ -1272,6 +1376,108 @@ test("returns specialist native tool requests before asking the text model for a
   assert.equal(status.records[0]?.tokenUsage?.totalTokens, 15);
 });
 
+test("routes an explicit auto tool request and its active continuation to the tool owner", async () => {
+  const calls: string[] = [];
+  const tool = { type: "function", name: "inspect", parameters: { type: "object" } };
+  const toolCall = {
+    type: "function_call",
+    name: tool.name,
+    call_id: "first-inspection",
+    arguments: "{}",
+  };
+  const continuationCall = { ...toolCall, call_id: "second-inspection" };
+  const codex = jsonProvider("codex-fixture", async (request) => {
+    calls.push("codex");
+    assert.ok(request.routing?.availableCapabilities?.includes("tool-use"));
+    assert.equal(request.body.tool_choice, "auto");
+    return {
+      statusCode: 200,
+      body: {
+        output: [
+          Array.isArray(request.body.input) &&
+          request.body.input.some((item) => item.type === "agent_message")
+            ? continuationCall
+            : toolCall,
+        ],
+      },
+    };
+  });
+  const cursor = jsonProvider("cursor-fixture", async (request) => {
+    calls.push("cursor");
+    assert.deepEqual(request.routing?.availableCapabilities, ["text"]);
+    return { statusCode: 200, body: { output_text: "Hello." } };
+  });
+  const completion = createCapabilityCompletionProvider(
+    codex,
+    async () => ({
+      modelSelection: { source: "official", model: "codex-fixture" },
+      capabilityCompletion: {
+        enabled: true,
+        mainCapabilities: ["code", "tool-use"],
+        specialists: [
+          { host: "cursor", source: "official", model: "cursor-fixture", capabilities: ["text"] },
+        ],
+        maximumSpecialists: 1,
+      },
+    }),
+    { resolveProviderForHost: async (host) => (host === "codex" ? codex : cursor) },
+  );
+  const execute = (
+    input: unknown,
+    options: { tools?: readonly unknown[]; toolChoice?: "auto" | "none" } = {},
+  ) =>
+    completion.execute({
+      protocol: "responses",
+      virtualModelId: "tidu",
+      body: { input, tools: options.tools ?? [tool], tool_choice: options.toolChoice ?? "auto" },
+      routing: { host: "codex" },
+    });
+
+  await execute("Write a short greeting.");
+  assert.deepEqual(calls.splice(0), ["cursor"]);
+
+  const initialUser = {
+    role: "user",
+    content:
+      "Call the inspect tool now with empty arguments. I need the result from the tool before continuing.",
+  };
+  const initial = await execute([initialUser]);
+  assert.deepEqual(calls.splice(0), ["codex"]);
+  assert.equal(initial.kind, "json");
+  assert.deepEqual(initial.body, { output: [toolCall] });
+
+  await execute(initialUser.content, { toolChoice: "none" });
+  assert.deepEqual(calls.splice(0), ["cursor"]);
+  await execute("Call `workspace.inspect` with empty arguments.", {
+    tools: [{ type: "namespace", name: "workspace", tools: [tool] }],
+  });
+  assert.deepEqual(calls.splice(0), ["codex"]);
+
+  const continuation = [
+    { type: "function_call_output", call_id: toolCall.call_id, output: "Inspected." },
+    {
+      type: "agent_message",
+      id: "review-note",
+      author: "reviewer",
+      recipient: "parent",
+      content: [{ type: "input_text", text: "Continue the inspection." }],
+    },
+  ];
+  const continued = await execute(continuation);
+  assert.deepEqual(calls.splice(0), ["codex"]);
+  assert.equal(continued.kind, "json");
+  assert.deepEqual(continued.body, { output: [continuationCall] });
+
+  await execute([
+    initialUser,
+    toolCall,
+    ...continuation,
+    { role: "assistant", phase: "final_answer", content: "The inspection is complete." },
+    { role: "user", content: "Write a short greeting." },
+  ]);
+  assert.deepEqual(calls, ["cursor"]);
+});
+
 test("sends image inputs only to the model assigned vision and shares its result with text", async () => {
   for (const protocol of ["responses", "chat-completions"] as const) {
     for (const visionOwner of ["main", "specialist"] as const) {
@@ -1361,6 +1567,392 @@ test("sends image inputs only to the model assigned vision and shares its result
   }
 });
 
+test("keeps the writing contract on the final call and sends a scoped visual evidence request", async () => {
+  for (const protocol of ["responses", "chat-completions"] as const) {
+    const requests: ProviderExecutionRequest[] = [];
+    const provider: ModelProvider = {
+      descriptor: { type: "codex-host", model: "reader" },
+      execute: async (request) => {
+        requests.push(request);
+        return {
+          kind: "json",
+          statusCode: 200,
+          upstreamModel: request.routing?.targetModel,
+          body:
+            requests.length === 1
+              ? {
+                  output: [
+                    {
+                      type: "reasoning",
+                      content: [{ type: "reasoning_text", text: "Private reasoning." }],
+                    },
+                    {
+                      type: "message",
+                      phase: "commentary",
+                      content: [{ type: "output_text", text: "Inspecting the chart." }],
+                    },
+                    {
+                      type: "message",
+                      phase: "final_answer",
+                      content: [{ type: "output_text", text: "P95: 150 ms → 170 ms" }],
+                    },
+                  ],
+                }
+              : { output_text: "Brief" },
+        };
+      },
+    };
+    const completion = createCapabilityCompletionProvider(provider, async () => ({
+      modelSelection: { source: "official", model: "reader" },
+      capabilityCompletion: {
+        enabled: true,
+        mainCapabilities: ["vision"],
+        maximumSpecialists: 1,
+        specialists: [
+          {
+            host: "cursor",
+            source: "official",
+            model: "writer",
+            capabilities: ["text", "structured-output"],
+          },
+        ],
+      },
+    }));
+    const image = "data:image/png;base64,chart";
+    const format = { type: "json_object" };
+    const messages = [
+      { role: "system", content: "Use only supplied evidence." },
+      {
+        role: "user",
+        content:
+          protocol === "responses"
+            ? [
+                { type: "input_text", text: "Write a release brief." },
+                { type: "input_image", image_url: image },
+              ]
+            : [
+                { type: "text", text: "Write a release brief." },
+                { type: "image_url", image_url: { url: image } },
+              ],
+      },
+    ];
+    const body = {
+      ...(protocol === "responses"
+        ? { input: messages, instructions: "Keep the units.", text: { format } }
+        : { messages, response_format: format }),
+      tools: [
+        { type: "function", name: "optional_lookup", description: "catalog entry ".repeat(400) },
+      ],
+      tool_choice: "auto",
+    };
+    const original = structuredClone(body);
+    await completion.execute({
+      protocol,
+      virtualModelId: "tidu",
+      body,
+      routing: { host: "codex" },
+    });
+    assert.equal(requests.length, 2);
+    const [reader, writer] = requests;
+    assert.equal(reader?.routing?.visionEvidenceOnly, true);
+    assert.deepEqual(reader.routing.availableCapabilities, ["vision"]);
+    assert.equal(reader.body.stream, false);
+    assert.equal(reader.body.tools, undefined);
+    assert.equal(reader.body.tool_choice, undefined);
+    assert.equal(reader.body.text, undefined);
+    assert.equal(reader.body.response_format, undefined);
+    const readerInput = JSON.stringify(reader.body);
+    assert.match(readerInput, /Extract the image evidence/u);
+    assert.match(readerInput, /Use only supplied evidence/u);
+    assert.ok(readerInput.includes(image));
+    assert.equal(writer?.routing?.visionEvidenceOnly, undefined);
+    assert.deepEqual(writer?.body.tools, body.tools);
+    assert.deepEqual(
+      writer?.body[protocol === "responses" ? "text" : "response_format"],
+      protocol === "responses" ? { format } : format,
+    );
+    const writerInput = JSON.stringify(writer?.body);
+    assert.match(writerInput, /P95: 150 ms → 170 ms/u);
+    assert.doesNotMatch(writerInput, /Inspecting the chart|Private reasoning/u);
+    assert.match(writerInput, /Write a release brief/u);
+    assert.ok(!writerInput.includes(image));
+    if (protocol === "responses") {
+      assert.match(readerInput, /Keep the units/u);
+      assert.equal(writer?.body.instructions, "Keep the units.");
+    }
+    assert.deepEqual(body, original);
+  }
+});
+
+test("reuses an answered historical image and reads the original only when needed", async () => {
+  const image = { type: "input_image", image_url: "data:image/png;base64,original" };
+  const history = [
+    { role: "user", content: [image] },
+    {
+      role: "assistant",
+      phase: "final_answer",
+      content: [{ type: "output_text", text: "P95 rose to 310 ms" }],
+    },
+  ];
+  const calls: string[] = [];
+  let askReader = false;
+  const requests: ProviderExecutionRequest[] = [];
+  const provider: ModelProvider = {
+    descriptor: { type: "codex-host", model: "reader" },
+    execute: async (request) => {
+      const model = request.routing?.targetModel ?? "unknown";
+      calls.push(model);
+      requests.push(request);
+      const instructions = String(request.body.instructions);
+      const marker = /<inspect_image_[\da-f-]+>/u.exec(instructions)?.[0];
+      const answer = model === "reader" ? "white text" : askReader && marker ? marker : "Answer";
+      return {
+        kind: "json",
+        statusCode: 200,
+        upstreamModel: model,
+        body: {
+          status: "completed",
+          output_text: answer,
+          usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+        },
+      };
+    },
+  };
+  const completion = createCapabilityCompletionProvider(provider, async () => ({
+    modelSelection: { source: "official", model: "reader" },
+    capabilityCompletion: {
+      enabled: true,
+      mainCapabilities: ["code", "reasoning", "vision"],
+      maximumSpecialists: 1,
+      specialists: [
+        { host: "cursor", source: "official", model: "writer", capabilities: ["text"] },
+      ],
+    },
+  }));
+  const run = async (input: unknown[], routing?: ProviderExecutionRequest["routing"]) => {
+    calls.length = 0;
+    requests.length = 0;
+    const receipts = new Map<string, number>();
+    const result = await completion.execute({
+      protocol: "responses",
+      virtualModelId: "tidu",
+      body: { input },
+      routing,
+      onExecutionReceipt(receipt) {
+        if (receipt.usage) receipts.set(receipt.model, receipt.usage.totalTokens);
+      },
+    });
+    assert.equal(result.kind, "json");
+    assert.doesNotMatch(JSON.stringify(result), /inspect_image_/u);
+    for (const request of requests) {
+      assert.equal(
+        JSON.stringify(request.body.input).includes(image.image_url),
+        request.routing?.targetModel === "reader",
+      );
+    }
+    return receipts;
+  };
+  const retitle = { role: "user", content: "Give this report a shorter title." };
+  await run([...history, retitle], {
+    requiredCapabilities: ["text", "vision"],
+    inferredImageCapability: true,
+  });
+  assert.deepEqual(calls, ["writer"]);
+  const reasoning = {
+    type: "reasoning",
+    id: "rs_previous_answer",
+    summary: [{ type: "summary_text", text: "The report contains three figures." }],
+  };
+  const tool = {
+    type: "function_call",
+    name: "view_image",
+    call_id: "call_image",
+    arguments: "{}",
+  };
+  const toolResult = { type: "function_call_output", call_id: tool.call_id, output: [image] };
+  const answeredToolImage = [
+    { role: "user", content: "Describe the attachment." },
+    tool,
+    toolResult,
+    history[1],
+    reasoning,
+  ];
+  for (const answered of [[...history, reasoning], answeredToolImage]) {
+    await run([...answered, retitle]);
+    assert.deepEqual(calls, ["writer"]);
+  }
+  assert.ok(requests[0]);
+  assert.match(JSON.stringify(requests[0].body.input), /function_call_output/u);
+  const recheck = { role: "user", content: "Inspect the image again." };
+  await run([...answeredToolImage, recheck]);
+  assert.deepEqual(calls, ["reader", "writer"]);
+  const [evidenceRequest, writerRequest] = requests;
+  assert.ok(evidenceRequest && writerRequest);
+  assert.doesNotMatch(
+    JSON.stringify(evidenceRequest.body.input),
+    /function_call|rs_previous_answer/u,
+  );
+  assert.match(JSON.stringify(writerRequest.body.input), /function_call_output/u);
+  for (const continuing of [
+    [...history, tool],
+    [...history, tool, toolResult, reasoning],
+    [...history, tool, toolResult, { ...history[1], status: "in_progress" }],
+    [...history, toolResult],
+  ]) {
+    await run(continuing);
+    assert.deepEqual(calls, ["reader", "writer"]);
+    const [originalRoute] = requests;
+    assert.ok(originalRoute);
+    assert.equal(originalRoute.routing?.visionEvidenceOnly, undefined);
+    assert.match(JSON.stringify(originalRoute.body.input), /call_image/u);
+  }
+  await run([...history, retitle], { requiredCapabilities: ["vision"] });
+  assert.deepEqual(calls, ["reader", "writer"]);
+  await run([...history, { role: "user", content: "请重新看同一张截图，复核表头。" }]);
+  assert.deepEqual(calls, ["reader", "writer"]);
+  await run([...history, { role: "user", content: [image] }, retitle]);
+  assert.deepEqual(calls, ["reader", "writer"]);
+  await run([history[0], { ...history[1], phase: "commentary" }, retitle]);
+  assert.deepEqual(calls, ["reader", "writer"]);
+  calls.length = 0;
+  requests.length = 0;
+  const lowReasoning: ProviderExecutionRequest = {
+    protocol: "responses",
+    virtualModelId: "tidu",
+    body: { input: [...answeredToolImage, retitle], reasoning: { effort: "low" } },
+  };
+  await completion.execute(lowReasoning);
+  assert.deepEqual(calls, ["reader", "writer"]);
+  const [reasoningRequest, titleRequest] = requests;
+  assert.ok(reasoningRequest && titleRequest);
+  assert.deepEqual(reasoningRequest.routing?.requiredCapabilities, ["reasoning"]);
+  assert.equal(reasoningRequest.routing?.visionEvidenceOnly, undefined);
+  assert.deepEqual(reasoningRequest.body.reasoning, { effort: "low" });
+  assert.doesNotMatch(JSON.stringify(reasoningRequest.body.input), /data:image/u);
+  assert.doesNotMatch(JSON.stringify(titleRequest.body.input), /data:image/u);
+  calls.length = 0;
+  requests.length = 0;
+  await completion.execute({ ...lowReasoning, routing: { requiredCapabilities: ["code"] } });
+  assert.deepEqual(calls, ["reader", "writer"]);
+  const [codeRequest] = requests;
+  assert.ok(codeRequest);
+  assert.deepEqual(codeRequest.routing?.requiredCapabilities, ["code", "reasoning", "vision"]);
+  assert.match(JSON.stringify(codeRequest.body.input), /data:image/u);
+  const historicalCode = [
+    { role: "user", content: "检查本地文件并说明生产和测试的差异。" },
+    ...answeredToolImage.slice(1),
+  ];
+  calls.length = 0;
+  requests.length = 0;
+  await completion.execute({
+    ...lowReasoning,
+    body: {
+      input: [...historicalCode, { role: "user", content: "为什么这个问题测试环境没有？" }],
+      tools: [{ type: "function", name: "view_image" }],
+    },
+  });
+  assert.deepEqual(calls, ["reader", "writer"]);
+  assert.deepEqual(requests[0]?.routing?.requiredCapabilities, ["code"]);
+  assert.ok(
+    requests.every((request) => !JSON.stringify(request.body.input).includes(image.image_url)),
+  );
+  assert.match(JSON.stringify(requests[1]?.body.input), /P95 rose to 310 ms/u);
+  await run([...historicalCode, { role: "user", content: "检查本地文件并确认表中的数值。" }]);
+  assert.deepEqual(calls, ["reader", "writer"]);
+  await run([...historicalCode, recheck]);
+  assert.deepEqual(calls, ["reader", "writer"]);
+  askReader = true;
+  calls.length = 0;
+  requests.length = 0;
+  await completion.execute(lowReasoning);
+  assert.deepEqual(calls, ["reader", "writer", "reader", "writer"]);
+  assert.deepEqual(
+    requests.map((request) => JSON.stringify(request.body.input).includes(image.image_url)),
+    [false, false, true, false],
+  );
+  const receipts = await run([
+    ...history,
+    { role: "user", content: "Which font color did the label have?" },
+  ]);
+  assert.deepEqual(calls, ["writer", "reader", "writer"]);
+  const observation = (await completion.inspectCapabilityCompletion()).records[0]?.observation;
+  assert.equal(observation?.complete, true);
+  assert.equal(observation?.measuredTotalTokens, 39);
+  assert.deepEqual(
+    observation?.calls.map((call) => call.executedModel),
+    calls,
+  );
+  assert.deepEqual(Object.fromEntries(receipts), { writer: 26, reader: 13 });
+  assert.ok(requests[2]);
+  assert.match(JSON.stringify(requests[2].body.input), /white text/u);
+  assert.doesNotMatch(JSON.stringify(requests[2].body), /inspect_image_/u);
+});
+
+test("attributes shared vision to the model that received the image", async () => {
+  const requests: ProviderExecutionRequest[] = [];
+  const provider = jsonProvider("host", async (request) => {
+    requests.push(request);
+    return { statusCode: 200, body: { output_text: "observations" } };
+  });
+  const completion = createCapabilityCompletionProvider(provider, async () => ({
+    modelSelection: { source: "official", model: "writer" },
+    capabilityCompletion: {
+      enabled: true,
+      mainCapabilities: ["text", "vision"],
+      maximumSpecialists: 1,
+      specialists: [
+        { host: "cursor", source: "official", model: "review", capabilities: ["code", "vision"] },
+      ],
+    },
+  }));
+  await completion.execute({
+    protocol: "responses",
+    virtualModelId: "tidu",
+    body: { input: [{ role: "user", content: [{ type: "input_image", image_url: "chart.png" }] }] },
+    routing: { host: "codex", requiredCapabilities: ["code"] },
+  });
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0]?.routing?.visionEvidenceOnly, undefined);
+  assert.match(JSON.stringify(requests[0]?.body), /chart\.png/u);
+  assert.doesNotMatch(JSON.stringify(requests[1]?.body), /chart\.png/u);
+  const record = (await completion.inspectCapabilityCompletion()).records[0];
+  assert.deepEqual(record?.secondaryResults[0]?.capabilities, ["code", "vision"]);
+  assert.deepEqual(record?.mainResult.capabilities, ["text"]);
+});
+
+test("keeps image and tool continuations on the original capability route", async () => {
+  const requests: ProviderExecutionRequest[] = [];
+  const provider = jsonProvider("host", async (request) => {
+    requests.push(request);
+    return { statusCode: 200, body: { output_text: "result" } };
+  });
+  const router = createDynamicModelRouter(
+    [
+      { profile: profile({ id: "cheap-main", capabilities: ["text"] }), provider },
+      { profile: profile({ id: "vision-specialist", capabilities: ["text", "vision"] }), provider },
+    ],
+    policy,
+  );
+  const tools = [{ type: "function", name: "lookup" }];
+  await router.execute({
+    protocol: "responses",
+    virtualModelId: "tidu",
+    body: {
+      input: [
+        { role: "user", content: [{ type: "input_image", image_url: "chart.png" }] },
+        { type: "function_call", name: "lookup", call_id: "call-1", arguments: "{}" },
+        { type: "function_call_output", call_id: "call-1", output: "result" },
+      ],
+      tools,
+    },
+  });
+  assert.deepEqual(router.inspect()?.specialistModelIds, ["vision-specialist"]);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0]?.routing?.visionEvidenceOnly, undefined);
+  assert.deepEqual(requests[0]?.body.tools, tools);
+  assert.match(JSON.stringify(requests[0]?.body.input), /function_call_output/u);
+});
+
 test("records a routed stream only after live output reaches a successful terminal", async () => {
   let upstreamController: ReadableStreamDefaultController<Uint8Array> | undefined;
   const provider: ModelProvider = {
@@ -1418,6 +2010,7 @@ test("records a routed stream only after live output reaches a successful termin
   assert.deepEqual(router.inspectAttempts(), [
     {
       modelId: "cheap-main",
+      capabilities: ["text"],
       role: "main",
       outcome: "succeeded",
       executedModel: "streaming",
@@ -1762,6 +2355,10 @@ test("records an aborted routed stream in capability-completion history", async 
   assert.equal(status.records.length, 1);
   assert.equal(status.records[0]?.outcome, "cancelled");
   assert.equal(status.records[0]?.mainResult.outcome, "cancelled");
+  assert.deepEqual(
+    status.records[0]?.observation.calls.map((call) => call.outcome),
+    ["cancelled"],
+  );
   assert.match(status.records[0]?.mainResult.message ?? "", /aborted/u);
 });
 
@@ -1855,6 +2452,98 @@ test("retains execution-receipt usage when a primary JSON response omits usage",
   assert.equal(record?.outcome, "succeeded");
   assert.deepEqual(record?.tokenUsage, usage);
   assert.deepEqual(record?.modelTokenUsage, [{ modelId: "main:codex:official", ...usage }]);
+  assert.deepEqual(record?.observation.calls[0]?.usage, {
+    ...usage,
+    freshInputTokens: null,
+    cachedInputTokens: null,
+    cacheWriteInputTokens: null,
+    reasoningTokens: null,
+  });
+});
+
+test("observes multiple capability owners and host retries separately from receipt updates", async () => {
+  const provider: ModelProvider = {
+    descriptor: { type: "openai-compatible", model: "fixture" },
+    execute: async (request) => {
+      const model = request.routing?.targetModel ?? "main";
+      if (model === "searcher") {
+        const receipt = {
+          host: "cursor" as const,
+          model,
+          role: "specialist" as const,
+          capabilities: ["web-research"],
+          usage: {
+            inputTokens: 12,
+            cachedInputTokens: 3,
+            cacheWriteInputTokens: 2,
+            outputTokens: 4,
+            reasoningTokens: 1,
+            totalTokens: 16,
+          },
+        };
+        request.onExecutionReceipt?.(receipt);
+        request.onExecutionRetry?.();
+        request.onExecutionReceipt?.(receipt);
+        request.onExecutionReceipt?.(receipt);
+      }
+      return {
+        kind: "json",
+        statusCode: 200,
+        upstreamModel: model,
+        body: {
+          output_text: "completed",
+          ...(model === "main"
+            ? { usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } }
+            : {}),
+        },
+      };
+    },
+  };
+  const completion = createCapabilityCompletionProvider(provider, async () => ({
+    modelSelection: { source: "official", model: "main" },
+    capabilityCompletion: {
+      enabled: true,
+      mainCapabilities: ["text"],
+      maximumSpecialists: 2,
+      specialists: [
+        { host: "cursor", source: "official", model: "searcher", capabilities: ["web-research"] },
+        { host: "ollama", source: "official", model: "coder", capabilities: ["code"] },
+      ],
+    },
+  }));
+  await completion.execute({
+    protocol: "responses",
+    virtualModelId: "fixture",
+    body: { input: "complete task" },
+    routing: { host: "codex", requiredCapabilities: ["web-research", "code", "text"] },
+  });
+  const record = (await completion.inspectCapabilityCompletion()).records[0];
+  const observation = record?.observation;
+  assert.ok(observation);
+  assert.equal(observation.calls.length, 4);
+  assert.equal(observation.complete, false);
+  assert.equal(observation.measuredTotalTokens, 32);
+  assert.equal(record?.tokenUsage?.totalTokens, 32);
+  assert.equal(
+    record?.modelTokenUsage.find((usage) => usage.modelId.startsWith("specialist-0:"))?.totalTokens,
+    32,
+  );
+  assert.deepEqual(
+    observation.calls
+      .filter((call) => call.model === "searcher")
+      .map((call) => [
+        call.outcome,
+        call.usage?.freshInputTokens,
+        call.usage?.totalTokens,
+        call.capabilities,
+      ]),
+    [
+      ["failed", 7, 16, ["web-research"]],
+      ["succeeded", 7, 16, ["web-research"]],
+    ],
+  );
+  assert.equal(observation.calls.find((call) => call.model === "coder")?.usage, null);
+  assert.equal(observation.calls.find((call) => call.model === "main")?.usage?.totalTokens, 0);
 });
 
 test("retains usage on failed and incomplete stream terminal events", async () => {
@@ -1951,7 +2640,7 @@ test("uses an opt-in specialist to complete a cheap main model capability", asyn
   assert.ok(Math.abs((router.inspect()?.estimatedCostPerMillionTokens ?? 0) - 0.6) < 0.000001);
 });
 
-test("waits for the required specialist's official terminal response", async () => {
+test("uses one fully capable model for an image and waits for both models in an explicit diagnostic", async () => {
   const calls: string[] = [];
   const router = createDynamicModelRouter(
     [
@@ -1986,25 +2675,39 @@ test("waits for the required specialist's official terminal response", async () 
     policy,
   );
 
-  await router.execute({
-    protocol: "responses",
-    virtualModelId: "tidu",
-    body: {
-      input: [
-        {
-          role: "user",
-          content: [{ type: "input_image", image_url: "local" }],
-        },
-      ],
-    },
-  });
-
-  assert.deepEqual(calls, ["vision-specialist", "cheap-main"]);
-  assert.deepEqual(
-    router.inspectAttempts().map((attempt) => attempt.outcome),
-    ["succeeded", "succeeded"],
-  );
-  assert.equal(router.inspectAttempts()[0]?.executedModel, "vision-model[reasoning_effort=high]");
+  for (const protocol of ["responses", "chat-completions"] as const) {
+    const image =
+      protocol === "responses"
+        ? { type: "input_image", image_url: "local" }
+        : { type: "image_url", image_url: { url: "local" } };
+    const messages = [{ role: "user", content: [image] }];
+    const body = protocol === "responses" ? { input: messages } : { messages };
+    for (const requireSpecialist of [false, true]) {
+      calls.length = 0;
+      await router.execute({
+        protocol,
+        virtualModelId: "tidu",
+        body,
+        routing: { requireSpecialist },
+      });
+      assert.deepEqual(
+        calls,
+        requireSpecialist ? ["vision-specialist", "cheap-main"] : ["vision-specialist"],
+      );
+      assert.deepEqual(
+        router.inspect()?.specialistModelIds,
+        requireSpecialist ? ["vision-specialist"] : [],
+      );
+      assert.deepEqual(
+        router.inspectAttempts().map((attempt) => attempt.outcome),
+        requireSpecialist ? ["succeeded", "succeeded"] : ["succeeded"],
+      );
+      assert.equal(
+        router.inspectAttempts()[0]?.executedModel,
+        "vision-model[reasoning_effort=high]",
+      );
+    }
+  }
 });
 
 test("routes an explicit local-file request to a code-capable secondary model", async () => {

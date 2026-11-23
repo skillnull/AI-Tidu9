@@ -2682,6 +2682,36 @@ h2 {
     color: #69c8ba;
   }
 
+  .capability-call-history {
+    margin-top: 8px;
+    color: #cbd5de;
+    font-size: 12px;
+
+    summary {
+      width: fit-content;
+      cursor: pointer;
+    }
+
+    ol {
+      margin: 6px 0 0;
+      padding-inline-start: 26px;
+    }
+
+    li {
+      padding: 6px 0;
+      overflow-wrap: anywhere;
+    }
+
+    li + li {
+      border-top: 1px solid #29343e;
+    }
+
+    p {
+      margin: 3px 0 0;
+      color: #9aa6b4;
+    }
+  }
+
   .capability-model-results {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));

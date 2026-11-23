@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ProviderExecutionReceipt } from "../providers/index.js";
 
 type TokenUsage = NonNullable<ProviderExecutionReceipt["usage"]>;
@@ -58,7 +59,108 @@ const combineModels = (models: readonly ResponseModelUsage[]): ResponseModelUsag
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
+const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
+const visualMessage = (item: unknown): item is Record<string, unknown> =>
+  isRecord(item) &&
+  item.role === "assistant" &&
+  item.phase !== "commentary" &&
+  (item.status === undefined || item.status === "completed");
+
+const messageDigest = (item: Record<string, unknown>): string | undefined => {
+  const content = item.content;
+  if (typeof content === "string") return digest(content);
+  if (
+    !Array.isArray(content) ||
+    !content.every((part) => isRecord(part) && typeof part.text === "string")
+  )
+    return undefined;
+  return digest(content.map((part) => part.text).join(""));
+};
+
+const instructionBlocks = (item: unknown): string[] => {
+  if (!isRecord(item)) return [];
+  if (item.role === "developer" || item.role === "system")
+    return [JSON.stringify([item.role, item.content])];
+  if (item.role !== "user") return [];
+  const parts = Array.isArray(item.content) ? item.content : [item.content];
+  return parts.flatMap((part) => {
+    const text = typeof part === "string" ? part : isRecord(part) ? part.text : undefined;
+    if (typeof text !== "string") return [];
+    return [
+      ...text.matchAll(
+        /^# AGENTS\.md instructions for [^\n]+\s*<INSTRUCTIONS>[\s\S]*?<\/INSTRUCTIONS>|<environment_context>[\s\S]*?<\/environment_context>/gu,
+      ),
+    ].map((match) => JSON.stringify(["user", match[0]]));
+  });
+};
+
+// Mutable files and remote URLs cannot prove that the bytes are the same on a later turn.
+const visualPrefixDigest = (items: readonly unknown[]): string | undefined => {
+  let hasImage = false;
+  const hash = createHash("sha256");
+  for (const item of items) {
+    if (!isRecord(item)) return undefined;
+    for (const part of Array.isArray(item.content) ? item.content : []) {
+      if (
+        !isRecord(part) ||
+        !["input_image", "image", "image_url", "localImage"].includes(String(part.type))
+      )
+        continue;
+      if (
+        part.type !== "input_image" ||
+        typeof part.image_url !== "string" ||
+        !/^data:image\/[\w.+-]+;base64,/iu.test(part.image_url)
+      )
+        return undefined;
+      hasImage = true;
+    }
+    const serialized = JSON.stringify(item, (_field, value: unknown) => {
+      if (typeof value === "string" && value.startsWith("data:image/")) return digest(value);
+      if (isRecord(value))
+        return Object.fromEntries(
+          Object.keys(value)
+            .sort()
+            .map((key) => [key, value[key]]),
+        );
+      return value;
+    });
+    hash.update(serialized).update("\n");
+  }
+  return hasImage ? hash.digest("hex") : undefined;
+};
+
+interface DeliveredVisualEvidence {
+  /** Native session identifier when supplied by the caller. */
+  session?: string;
+  /** Runtime identity, request constraints and active policy revision. */
+  scope: string;
+  /** Reader and writer assignments still approved on this request. */
+  models: string;
+  /** SHA-256 of the request prefix containing the original embedded image. */
+  prefix: string;
+  /** Number of items in that exact input prefix. */
+  items: number;
+  /** SHA-256 of the final answer actually delivered on this branch. */
+  answer: string;
+  /** Unmodified observations from the visual step. */
+  facts: string;
+  /** Absolute expiry retained across subsequent edits. */
+  expires: number;
+}
+
 export const createResponseUsageLedger = () => {
+  const visualAnswers = new Map<string, DeliveredVisualEvidence>();
+  let visualExpiry: NodeJS.Timeout | undefined;
+  const expireVisualAnswers = (): void => {
+    clearTimeout(visualExpiry);
+    let next = Infinity;
+    const now = Date.now();
+    for (const [id, entry] of visualAnswers) {
+      if (visualAnswers.size > 128 || entry.expires <= now) visualAnswers.delete(id);
+      else next = Math.min(next, entry.expires);
+    }
+    if (Number.isFinite(next)) visualExpiry = setTimeout(expireVisualAnswers, next - now).unref();
+  };
   const pendingCalls = new Map<
     string,
     {
@@ -71,6 +173,124 @@ export const createResponseUsageLedger = () => {
     }
   >();
   return {
+    /** Binds a bounded observation to the original image, delivered answer and routing policy. */
+    visualTurn: (input: unknown, scope: string, session?: string) => {
+      const items: unknown[] = Array.isArray(input) ? input : [];
+      let staged: { models: string; facts: string; expires: number } | undefined;
+      let inherited: DeliveredVisualEvidence | undefined;
+      const read = (models: string): string | undefined => {
+        let position = items.length - 1;
+        while (position >= 0 && !visualMessage(items[position])) position--;
+        const prior = items[position];
+        const followup = items.slice(position + 1);
+        const firstUser = followup.findIndex((item) => isRecord(item) && item.role === "user");
+        if (
+          !visualMessage(prior) ||
+          firstUser < 0 ||
+          followup.some((item, index) => {
+            if (!isRecord(item)) return true;
+            if (
+              index < firstUser &&
+              (item.status === undefined || item.status === "completed") &&
+              (item.type === "reasoning" ||
+                (item.role === "assistant" &&
+                  item.phase === "commentary" &&
+                  messageDigest(item) !== undefined))
+            )
+              return false;
+            return (
+              !["user", "system", "developer"].includes(String(item.role)) ||
+              (Array.isArray(item.content) &&
+                item.content.some(
+                  (part) => !isRecord(part) || !["input_text", "text"].includes(String(part.type)),
+                ))
+            );
+          })
+        )
+          return undefined;
+        const deliveredId = typeof prior.id === "string" ? prior.id : undefined;
+        const candidates =
+          deliveredId !== undefined
+            ? [visualAnswers.get(deliveredId)]
+            : session
+              ? [...visualAnswers.values()]
+              : [];
+        const answer = messageDigest(prior);
+        const matches = candidates.filter(
+          (entry): entry is DeliveredVisualEvidence =>
+            entry !== undefined &&
+            entry.scope === scope &&
+            entry.session === session &&
+            entry.models === models &&
+            entry.expires > Date.now() &&
+            entry.answer === answer &&
+            entry.items <= position &&
+            items
+              .slice(entry.items, position)
+              .every(
+                (item) =>
+                  isRecord(item) &&
+                  (item.type === "reasoning" ||
+                    item.role === "system" ||
+                    item.role === "developer" ||
+                    (item.role === "assistant" && item.phase === "commentary")),
+              ),
+        );
+        if (matches.length !== 1) return undefined;
+        const entry = matches[0];
+        if (!entry) return undefined;
+        const prefix = items.slice(0, entry.items);
+        if (visualPrefixDigest(prefix) !== entry.prefix) return undefined;
+        const knownInstructions = new Set(prefix.flatMap(instructionBlocks));
+        if (
+          items
+            .slice(entry.items)
+            .flatMap(instructionBlocks)
+            .some((block) => !knownInstructions.has(block))
+        )
+          return undefined;
+        inherited = entry;
+        return entry.facts;
+      };
+      return {
+        read,
+        stage: (models: string, facts: string): void => {
+          if (facts && Buffer.byteLength(facts, "utf8") <= 8192 && !/data:image\//iu.test(facts))
+            staged = {
+              models,
+              facts,
+              expires: inherited?.facts === facts ? inherited.expires : Date.now() + 10 * 60_000,
+            };
+        },
+        finish: (output: readonly Record<string, unknown>[]): void => {
+          if (
+            !staged ||
+            staged.expires <= Date.now() ||
+            output.some((item) => /call/u.test(String(item.type)))
+          )
+            return;
+          const message = [...output].reverse().find(visualMessage);
+          if (
+            !message ||
+            typeof message.id !== "string" ||
+            !/^resp_[\da-f-]{36}_message$/iu.test(message.id)
+          )
+            return;
+          const answer = messageDigest(message);
+          const prefix = visualPrefixDigest(items);
+          if (!answer || !prefix) return;
+          visualAnswers.set(message.id, {
+            ...staged,
+            scope,
+            ...(session ? { session } : {}),
+            answer,
+            prefix,
+            items: items.length,
+          });
+          expireVisualAnswers();
+        },
+      };
+    },
     /** Correlates only tool outputs after the latest user message, without retaining prompt text. */
     begin: (input: unknown) => {
       const items = Array.isArray(input) ? input.filter(isRecord) : [];

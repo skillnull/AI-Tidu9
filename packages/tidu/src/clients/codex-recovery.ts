@@ -8,6 +8,28 @@ const isRecord = (value: unknown): value is JsonObject =>
 const number = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 const MAXIMUM_HISTORY_BYTES = 8 * 1024 * 1024;
+const totalUsageLine =
+  /^(?:总：入 \d+ · 出 \d+ · 合 \d+(?:（部分统计）)?|Total: input \d+ · output \d+ · total \d+(?: \(partial\))?)$/u;
+const hostUsageLine =
+  /^(?:Codex|Cursor|Ollama|OpenAI-compatible)(?:：(?:入 \d+ · 出 \d+ · 合 \d+(?:（部分统计）)?|未获取到)|: (?:input \d+ · output \d+ · total \d+(?: \(partial\))?|not retrieved)) {2}$/u;
+const tokenFooterStart = (text: string): number | undefined => {
+  const divider = text.lastIndexOf("\n\n");
+  const lines = text.slice(divider === -1 ? 0 : divider + 2).split("\n");
+  const total = lines.pop();
+  return total !== undefined &&
+    totalUsageLine.test(total) &&
+    lines.length <= 4 &&
+    lines.every((line) => hostUsageLine.test(line))
+    ? Math.max(0, divider)
+    : undefined;
+};
+
+/** Keeps the upstream failure detail while hiding measured usage during a native reconnect. */
+export const stripCodexFailureTokenFooter = (message: string): string => {
+  const start = tokenFooterStart(message);
+  return start === undefined || start === 0 ? message : message.slice(0, start);
+};
+
 let cachedHistory:
   | {
       path: string;
@@ -18,7 +40,7 @@ let cachedHistory:
   | undefined;
 
 export interface CodexRecoveredTurn {
-  /** Official turn with missing cancelled commands, footer, and timing restored. */
+  /** Official turn with missing interrupted activities, terminal usage, and timing restored. */
   turn: JsonObject;
   /** Derived items that a live native client has not received as completed items. */
   completedItems: readonly JsonObject[];
@@ -178,8 +200,23 @@ export const recoverCodexTurn = (
     completedAt !== undefined
   )
     durationMs = Math.max(0, completedAt - startedAt);
-  if (turn.status === "interrupted") {
-    const footer = formatResponseTokenFooter({ usage, complete: usage !== null }, true);
+  const recoverFailedUsage =
+    turn.status === "failed" &&
+    managedProvider !== undefined &&
+    usage !== null &&
+    (!isRecord(turn.error) ||
+      typeof turn.error.message !== "string" ||
+      tokenFooterStart(turn.error.message) === undefined) &&
+    !items.some(
+      (item) =>
+        item.type === "agentMessage" &&
+        item.phase === "final_answer" &&
+        typeof item.text === "string" &&
+        tokenFooterStart(item.text) !== undefined,
+    );
+  if (turn.status === "interrupted" || recoverFailedUsage) {
+    const formatted = formatResponseTokenFooter({ usage, complete: usage !== null }, true);
+    const footer = recoverFailedUsage && formatted !== "" ? `${formatted}（部分统计）` : formatted;
     const footerId = `tidu_usage_${String(turn.id)}`;
     let finalIndex = -1;
     for (let index = recovered.length - 1; index >= 0; index -= 1) {

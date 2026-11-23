@@ -32,6 +32,8 @@ const createFixture = async (holdSteer = false, holdContext = false) => {
           if (method === "turn/start") starts.push(pending);
           else if (method === "turn/steer" && holdSteer) steers.push(pending);
           else if (method === "thread/inject_items" && holdContext) contexts.push(pending);
+          else if (method === "thread/start")
+            pending.resolve({ thread: { id: "thread" }, model: "fixture" });
           else pending.resolve({});
           if (signal?.aborted) pending.reject(new Error("Agent protocol request cancelled."));
           else
@@ -211,6 +213,178 @@ test("collects complete caller batches received before the turn start acknowledg
     await fixture.tool("second");
     fixture.finish();
     await continuation;
+  } finally {
+    await fixture.client.close();
+  }
+});
+
+test("keeps an image continuation on its published caller batch when native events arrive late", {
+  timeout: 2000,
+}, async () => {
+  const fixture = await createFixture();
+  try {
+    const thread = await fixture.client.startThread("fixture", [{ name: "inspect" }]);
+    const imageUrl = "data:image/png;base64,YXR0YWNobWVudA==";
+    const input = [
+      { type: "text" as const, text: "Inspect the attachment." },
+      { type: "image" as const, url: imageUrl },
+    ];
+    const resume = (results: Record<string, unknown>[]) =>
+      fixture.client.prompt(thread, [], undefined, undefined, undefined, undefined, results);
+    const initial = fixture.client.prompt(thread, input);
+    fixture.starts[0]?.resolve({ turn: { id: "turn" } });
+    await nextTick();
+    fixture.call("read-attachment");
+    fixture.boundary();
+    const attachmentReply = fixture.tool("read-attachment");
+    const firstBatch = await initial;
+    assert.deepEqual(
+      firstBatch.toolCalls?.map((call) => call.callId),
+      ["read-attachment"],
+    );
+
+    fixture.call("late-after-yield");
+    fixture.call("next-call");
+    const nextReply = fixture.tool("next-call");
+    const attachmentResult = {
+      type: "function_call_output",
+      call_id: "read-attachment",
+      output: [{ type: "input_image", image_url: imageUrl }],
+    };
+    await assert.rejects(
+      resume([attachmentResult, resultFor("next-call")]),
+      /All pending caller tool results are required, without results from other batches/u,
+    );
+    const continuation = resume([attachmentResult]);
+    assert.deepEqual(await attachmentReply, {
+      contentItems: [{ type: "inputImage", imageUrl }],
+      success: true,
+    });
+    assert.deepEqual(
+      (await continuation).toolCalls?.map((call) => call.callId),
+      ["next-call"],
+    );
+
+    const nextContinuation = resume([resultFor("next-call")]);
+    await nextReply;
+    fixture.call("first-parallel-call");
+    fixture.call("second-parallel-call");
+    fixture.boundary();
+    const parallelReply = fixture.tool("first-parallel-call");
+    assert.deepEqual(
+      (await nextContinuation).toolCalls?.map((call) => call.callId),
+      ["first-parallel-call", "second-parallel-call"],
+    );
+
+    const completion = resume([
+      resultFor("first-parallel-call"),
+      resultFor("second-parallel-call"),
+    ]);
+    await parallelReply;
+    await fixture.tool("second-parallel-call");
+    fixture.finish();
+    assert.equal((await completion).status, "completed");
+    const inputRequests = fixture.requests.filter(({ method }) =>
+      ["turn/start", "turn/steer", "thread/inject_items"].includes(method),
+    );
+    assert.equal(inputRequests.length, 1);
+    const [startRequest] = inputRequests;
+    assert.equal(startRequest?.method, "turn/start");
+    assert.deepEqual((startRequest.params as { input: unknown }).input, input);
+  } finally {
+    await fixture.client.close();
+  }
+});
+
+test("only yields registered raw caller tools across native batches", {
+  timeout: 2000,
+}, async () => {
+  const fixture = await createFixture();
+  try {
+    const thread = await fixture.client.startThread("fixture", [{ name: "inspect" }]);
+    const initial = fixture.client.prompt(thread, [{ type: "text", text: "Inspect twice." }]);
+    fixture.started();
+    const rawNativeItems = (round: string) => {
+      const identity = { threadId: thread.id, turnId: "turn" };
+      const nativeCalls = [
+        { name: "native_search", call_id: `native-${round}` },
+        { namespace: "native", name: "inspect", call_id: `namespaced-${round}` },
+      ];
+      for (const call of nativeCalls) {
+        fixture.notify("rawResponseItem/completed", {
+          ...identity,
+          item: { type: "function_call", arguments: "{}", ...call },
+        });
+      }
+      fixture.notify("rawResponseItem/completed", {
+        ...identity,
+        item: {
+          id: `reasoning-${round}`,
+          type: "reasoning",
+          summary: [{ type: "summary_text", text: `Inspecting ${round}.` }],
+        },
+      });
+    };
+    const resume = (callIds: string[], input: { type: "text"; text: string }[] = []) =>
+      fixture.client.prompt(
+        thread,
+        input,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        callIds.map(resultFor),
+      );
+
+    rawNativeItems("first");
+    fixture.call("first");
+    fixture.call("second");
+    fixture.boundary();
+    const firstReply = fixture.tool("first");
+    fixture.starts[0]?.resolve({ turn: { id: "turn" } });
+    const firstBatch = await initial;
+    assert.deepEqual(
+      firstBatch.toolCalls?.map((call) => call.callId),
+      ["first", "second"],
+    );
+    assert.deepEqual(
+      firstBatch.progressItems?.map((item) => item.id),
+      ["reasoning-first"],
+    );
+    assert.equal(firstBatch.usage?.totalTokens, 2);
+
+    const continuation = resume(["first", "second"]);
+    await firstReply;
+    await fixture.tool("second");
+    rawNativeItems("second");
+    fixture.call("third");
+    fixture.call("fourth");
+    fixture.boundary();
+    const thirdReply = fixture.tool("third");
+    const secondBatch = await continuation;
+    assert.deepEqual(
+      secondBatch.toolCalls?.map((call) => call.callId),
+      ["third", "fourth"],
+    );
+    assert.deepEqual(
+      secondBatch.progressItems?.map((item) => item.id),
+      ["reasoning-second"],
+    );
+    assert.equal(secondBatch.usage?.totalTokens, 2);
+    assert.equal(await resume(["first", "second"]), secondBatch);
+    await assert.rejects(
+      resume(["first", "second"], [{ type: "text", text: "Change this accepted batch." }]),
+      /Caller results conflict with a batch already being resumed/u,
+    );
+
+    const completion = resume(["third", "fourth"]);
+    await thirdReply;
+    await fixture.tool("fourth");
+    fixture.finish("completed", "turn", thread.id, true, 7);
+    const result = await completion;
+    assert.equal(result.status, "completed");
+    assert.equal(result.usage?.totalTokens, 7);
+    assert.equal(fixture.starts.length, 1);
   } finally {
     await fixture.client.close();
   }

@@ -1677,7 +1677,7 @@ test("fails the public stream when Agent execution fails without hiding it behin
   }
 });
 
-test("Codex success shows host usage while failures stay concise", async () => {
+test("Codex terminal responses show reported usage without generating a failure answer", async () => {
   for (const failed of [false, true]) {
     for (const reported of [false, true]) {
       const provider: ModelProvider = {
@@ -1755,7 +1755,14 @@ test("Codex success shows host usage while failures stay concise", async () => {
           assert.equal(response.status, failed && !stream ? 502 : 200, body);
           if (failed) {
             assert.match(body, /Codex：Fixture failed/u);
-            assert.doesNotMatch(body, /总：|Codex：未获取到|未获取到/u);
+            assert.doesNotMatch(body, /未获取到|response\.output_text\.delta/u);
+            if (reported) {
+              assert.match(body, /Codex：入 12 · 出 3 · 合 15/u);
+              assert.equal([...body.matchAll(/总：入 12 · 出 3 · 合 15/gu)].length, 1);
+              if (stream) assert.match(body, /"total_tokens":15/u);
+            } else {
+              assert.doesNotMatch(body, /总：/u);
+            }
           } else {
             assert.match(body, reported ? /总：入 12 · 出 3 · 合 15/u : /总：未获取到/u);
             assert.match(body, reported ? /Codex：入 12 · 出 3 · 合 15/u : /Codex：未获取到/u);
@@ -1767,6 +1774,179 @@ test("Codex success shows host usage while failures stay concise", async () => {
         await runtime.close();
       }
     }
+  }
+});
+
+test("Codex tool continuation failure includes reported usage from earlier batches", async () => {
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    port: 0,
+    discoverHostProvider: false,
+    provider: {
+      descriptor: { type: "codex-host", model: "fixture" },
+      execute: async (request) => {
+        if (Array.isArray(request.body.input)) throw new Error("Fixture continuation failed.");
+        request.onExecutionReceipt?.({
+          host: "codex",
+          model: "fixture",
+          role: "worker",
+          capabilities: ["text"],
+          usage: { inputTokens: 12, outputTokens: 3, totalTokens: 15 },
+        });
+        return {
+          kind: "json",
+          statusCode: 200,
+          body: {
+            output: [
+              { type: "function_call", call_id: "inspect_once", name: "inspect", arguments: "{}" },
+            ],
+          },
+        };
+      },
+    },
+  });
+  const post = (input: unknown, stream: boolean) =>
+    fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "ai-tidu9-config", input, stream }),
+    });
+  try {
+    assert.match(await (await post("Inspect.", false)).text(), /inspect_once/u);
+    const input = [{ type: "function_call_output", call_id: "inspect_once", output: "Done" }];
+    const failed = await (await post(input, true)).text();
+    assert.match(failed, /event: response\.failed/u);
+    assert.match(failed, /Fixture continuation failed\./u);
+    assert.equal(
+      [...failed.matchAll(/Total: input 12 · output 3 · total 15 \(partial\)/gu)].length,
+      1,
+    );
+    assert.doesNotMatch(failed, /"total_tokens":15|response\.output_text\.delta/u);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("streams native progress and shows both host totals on Codex image turns and follow-ups", async () => {
+  let releaseWriter: (() => void) | undefined;
+  const runtime = await startLocalRuntime({
+    databasePath: IN_MEMORY_DATABASE_PATH,
+    port: 0,
+    discoverHostProvider: false,
+    provider: {
+      descriptor: { type: "codex-host", model: "reader" },
+      execute: async (request) => {
+        if (request.body.stream === true) {
+          const item = {
+            id: "msg_image_process",
+            type: "message",
+            role: "assistant",
+            phase: "commentary",
+            content: [{ type: "output_text", text: "正在核对图中数值。" }],
+          };
+          request.onProcessEvent?.({
+            type: "response.output_item.added",
+            item: { ...item, content: [], status: "in_progress" },
+          });
+          request.onProcessEvent?.({
+            type: "response.output_item.done",
+            item: { ...item, status: "completed" },
+          });
+          await new Promise<void>((resolve) => {
+            releaseWriter = resolve;
+          });
+        }
+        request.onExecutionReceipt?.({
+          host: "codex",
+          role: "specialist",
+          model: "reader",
+          capabilities: ["vision", "reasoning"],
+          usage: { inputTokens: 25, outputTokens: 5, totalTokens: 30 },
+        });
+        const writerReceipt = {
+          host: "cursor" as const,
+          role: "worker" as const,
+          model: "writer",
+          capabilities: ["text"],
+          usage: { inputTokens: 12, outputTokens: 3, totalTokens: 15 },
+          attemptId: Symbol(),
+        };
+        request.onExecutionReceipt?.({
+          ...writerReceipt,
+          usage: { inputTokens: 4, outputTokens: 1, totalTokens: 5 },
+          attemptId: Symbol(),
+        });
+        request.onExecutionReceipt?.(writerReceipt);
+        request.onExecutionReceipt?.(writerReceipt);
+        return {
+          kind: "json",
+          statusCode: 200,
+          body: { output_text: "P95 上升" },
+        };
+      },
+    },
+  });
+  try {
+    const image = {
+      role: "user",
+      content: [
+        { type: "input_text", text: "读图" },
+        { type: "input_image", image_url: "data:image/png;base64,AQ==" },
+      ],
+    };
+    const followUp = [
+      { role: "assistant", content: "P95 上升" },
+      { role: "user", content: "只返回标题" },
+    ];
+    const finalText = [
+      "P95 上升\n",
+      "Codex：入 25 · 出 5 · 合 30  ",
+      "Cursor：入 16 · 出 4 · 合 20  ",
+      "总：入 41 · 出 9 · 合 50",
+    ].join("\n");
+    for (const input of [[image], [image, ...followUp]]) {
+      for (const stream of [true, false]) {
+        const response = await fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "ai-tidu9-config", stream, input }),
+          signal: AbortSignal.timeout(5_000),
+        });
+        let wire: string;
+        if (stream) {
+          const reader = response.body?.getReader();
+          assert.ok(reader);
+          const decoder = new TextDecoder();
+          wire = "";
+          try {
+            while (!wire.includes("正在核对图中数值。")) {
+              const chunk = await reader.read();
+              assert.equal(chunk.done, false);
+              wire += decoder.decode(chunk.value, { stream: true });
+            }
+            assert.match(wire, /"id":"msg_image_process".*"phase":"commentary"/u);
+            assert.doesNotMatch(wire, /P95 上升|event: response\.completed/u);
+            releaseWriter?.();
+            for (;;) {
+              const chunk = await reader.read();
+              if (chunk.done) break;
+              wire += decoder.decode(chunk.value, { stream: true });
+            }
+            wire += decoder.decode();
+          } finally {
+            reader.releaseLock();
+          }
+        } else {
+          wire = await response.text();
+        }
+        assert.equal(response.status, 200, wire);
+        assert.ok(wire.includes(`"text":${JSON.stringify(finalText)}`), wire);
+        assert.match(wire, /"total_tokens":50/u);
+      }
+    }
+  } finally {
+    releaseWriter?.();
+    await runtime.close();
   }
 });
 

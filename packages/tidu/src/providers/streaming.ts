@@ -1,10 +1,14 @@
 import { randomUUID } from "node:crypto";
 
+type ResponseObserver = (body: Record<string, unknown>) => void;
+
 export interface OllamaStreamOptions {
   /** Client-facing OpenAI-compatible protocol. */
   protocol: "chat-completions" | "responses";
   /** Virtual model identifier returned to the client. */
   virtualModelId: string;
+  /** Reads native model identity and usage before virtual model translation. */
+  observeResponse?: ResponseObserver;
 }
 
 export interface NormalizedToolCall {
@@ -130,7 +134,11 @@ const replaceVirtualModel = (value: unknown, virtualModelId: string): unknown =>
   return rewritten;
 };
 
-const rewriteSseEvent = (event: string, virtualModelId: string): string =>
+const rewriteSseEvent = (
+  event: string,
+  virtualModelId: string,
+  observeResponse?: ResponseObserver,
+): string =>
   event
     .split(/\r?\n/u)
     .map((line) => {
@@ -141,17 +149,20 @@ const rewriteSseEvent = (event: string, virtualModelId: string): string =>
       if (data === "[DONE]") {
         return line;
       }
-      return `data: ${JSON.stringify(replaceVirtualModel(JSON.parse(data), virtualModelId))}`;
+      const body: unknown = JSON.parse(data);
+      if (isRecord(body)) observeResponse?.(isRecord(body.response) ? body.response : body);
+      return `data: ${JSON.stringify(replaceVirtualModel(body, virtualModelId))}`;
     })
     .join("\n");
 
 export const rewriteOpenAiSseStream = (
   source: ReadableStream<Uint8Array>,
   virtualModelId: string,
+  observeResponse?: ResponseObserver,
 ): ReadableStream<Uint8Array> => {
   async function* rewrite(): AsyncGenerator<string, void, undefined> {
     for await (const event of readDelimitedText(source, /\r?\n\r?\n/u)) {
-      yield `${rewriteSseEvent(event, virtualModelId)}\n\n`;
+      yield `${rewriteSseEvent(event, virtualModelId, observeResponse)}\n\n`;
     }
   }
   return createStreamFromIterator(rewrite());
@@ -174,9 +185,20 @@ const createChatChunk = (
     ...(usage === undefined ? {} : { usage }),
   })}\n\n`;
 
-const readUsage = (body: Record<string, unknown>): Record<string, number> => {
-  const promptTokens = typeof body.prompt_eval_count === "number" ? body.prompt_eval_count : 0;
-  const completionTokens = typeof body.eval_count === "number" ? body.eval_count : 0;
+/** Ollama reports these counts on final responses; an absent counter is unknown. */
+export const readOllamaUsage = (body: Record<string, unknown>) => {
+  const promptTokens = body.prompt_eval_count;
+  const completionTokens = body.eval_count;
+  if (
+    typeof promptTokens !== "number" ||
+    !Number.isSafeInteger(promptTokens) ||
+    promptTokens < 0 ||
+    typeof completionTokens !== "number" ||
+    !Number.isSafeInteger(completionTokens) ||
+    completionTokens < 0 ||
+    !Number.isSafeInteger(promptTokens + completionTokens)
+  )
+    return undefined;
   return {
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
@@ -186,7 +208,7 @@ const readUsage = (body: Record<string, unknown>): Record<string, number> => {
 
 async function* streamOllamaChat(
   source: ReadableStream<Uint8Array>,
-  virtualModelId: string,
+  { virtualModelId, observeResponse }: OllamaStreamOptions,
 ): AsyncGenerator<string, void, undefined> {
   const responseId = `chatcmpl_${randomUUID()}`;
   const created = Math.floor(Date.now() / 1_000);
@@ -197,6 +219,8 @@ async function* streamOllamaChat(
       continue;
     }
     const body = JSON.parse(line) as Record<string, unknown>;
+    const usage = body.done === true ? readOllamaUsage(body) : undefined;
+    observeResponse?.({ model: body.model, usage });
     const message = isRecord(body.message) ? body.message : {};
     const content = typeof message.content === "string" ? message.content : "";
     const toolCalls = normalizeOllamaToolCalls(message.tool_calls);
@@ -222,7 +246,7 @@ async function* streamOllamaChat(
         virtualModelId,
         {},
         toolCallSeen ? "tool_calls" : "stop",
-        readUsage(body),
+        usage,
       );
       yield "data: [DONE]\n\n";
     }
@@ -243,20 +267,22 @@ const responseEvent = (type: string, body: Record<string, unknown>): string =>
 
 async function* streamOllamaResponses(
   source: ReadableStream<Uint8Array>,
-  virtualModelId: string,
+  { virtualModelId, observeResponse }: OllamaStreamOptions,
 ): AsyncGenerator<string, void, undefined> {
   const responseId = `resp_${randomUUID()}`;
   const messageId = `msg_${randomUUID()}`;
   const response = createResponseState(responseId, virtualModelId);
   let messageStarted = false;
   let outputText = "";
-  let usage = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+  let usage: { input_tokens: number; output_tokens: number; total_tokens: number } | undefined;
   yield responseEvent("response.created", { response });
   for await (const line of readDelimitedText(source, /\r?\n/u)) {
     if (line.trim() === "") {
       continue;
     }
     const body = JSON.parse(line) as Record<string, unknown>;
+    const nativeUsage = body.done === true ? readOllamaUsage(body) : undefined;
+    observeResponse?.({ model: body.model, usage: nativeUsage });
     const message = isRecord(body.message) ? body.message : {};
     const content = typeof message.content === "string" ? message.content : "";
     if (content !== "" && !messageStarted) {
@@ -313,11 +339,10 @@ async function* streamOllamaResponses(
       yield responseEvent("response.output_item.done", { output_index: outputIndex, item });
     }
     if (body.done === true) {
-      const baseUsage = readUsage(body);
-      usage = {
-        input_tokens: baseUsage.prompt_tokens ?? 0,
-        output_tokens: baseUsage.completion_tokens ?? 0,
-        total_tokens: baseUsage.total_tokens ?? 0,
+      usage = nativeUsage && {
+        input_tokens: nativeUsage.prompt_tokens,
+        output_tokens: nativeUsage.completion_tokens,
+        total_tokens: nativeUsage.total_tokens,
       };
     }
   }
@@ -354,6 +379,6 @@ export const createOllamaSseStream = (
 ): ReadableStream<Uint8Array> =>
   createStreamFromIterator(
     options.protocol === "chat-completions"
-      ? streamOllamaChat(source, options.virtualModelId)
-      : streamOllamaResponses(source, options.virtualModelId),
+      ? streamOllamaChat(source, options)
+      : streamOllamaResponses(source, options),
   );

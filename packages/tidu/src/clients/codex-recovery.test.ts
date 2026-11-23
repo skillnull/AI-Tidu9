@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { formatResponseTokenFooter } from "../runtime/response-usage.js";
-import { readCodexRecoveryRecords, recoverCodexTurn } from "./codex-recovery.js";
+import {
+  readCodexRecoveryRecords,
+  recoverCodexTurn,
+  stripCodexFailureTokenFooter,
+} from "./codex-recovery.js";
 
 const turnId = "cancelled-fixture";
 const records = [
@@ -112,12 +116,33 @@ test("does not rewrite failed history with another error or token block", () => 
         },
       },
     ];
-    const recovered = recoverCodexTurn(turn, failureRecords, "/workspace");
+    const recovered = recoverCodexTurn(
+      turn,
+      failureRecords,
+      "/workspace",
+      "ai_tidu9",
+      undefined,
+      true,
+    );
     const text = (recovered.turn.items as Record<string, unknown>[])[0]?.text;
     assert.equal(text, `Partial answer\n\n${footer}`);
     assert.deepEqual(
-      recoverCodexTurn(recovered.turn, failureRecords, "/workspace").turn,
+      recoverCodexTurn(recovered.turn, failureRecords, "/workspace", "ai_tidu9", undefined, true)
+        .turn,
       recovered.turn,
+    );
+
+    const message = `Stream failed\n\nOriginal error detail.\n\n${footer}`;
+    assert.equal(stripCodexFailureTokenFooter(message), "Stream failed\n\nOriginal error detail.");
+    assert.equal(
+      stripCodexFailureTokenFooter(`${message}\nMore information`),
+      `${message}\nMore information`,
+    );
+    assert.equal(stripCodexFailureTokenFooter(footer), footer);
+    const terminal = { ...turn, durationMs: 1562, error: { message }, items: [] };
+    assert.deepEqual(
+      recoverCodexTurn(terminal, failureRecords, "/workspace", "ai_tidu9", undefined, true),
+      { turn: terminal, completedItems: [] },
     );
   }
 });
@@ -215,16 +240,49 @@ test("leaves failed provider errors to the native failed state", () => {
       },
     },
   ];
-  const recovered = recoverCodexTurn(
-    { id: turnId, status: "failed", items: [] },
-    failureRecords,
-    "/fixture",
+  const turn = {
+    id: turnId,
+    status: "failed",
+    error: { message: "Tools contains unsupported definitions." },
+    items: [],
+  };
+  const recovered = recoverCodexTurn(turn, failureRecords, "/fixture", "ai_tidu9", undefined, true);
+  assert.deepEqual(recovered.turn.error, turn.error);
+  assert.deepEqual(
+    recovered.completedItems.map((item) => item.text),
+    ["总：入 24 · 出 6 · 合 30（部分统计）"],
   );
-  const messages = (recovered.turn.items as Record<string, unknown>[]).filter(
-    (item) => item.type === "agentMessage",
+  assert.deepEqual(
+    recoverCodexTurn(recovered.turn, failureRecords, "/fixture", "ai_tidu9", undefined, true)
+      .completedItems,
+    [],
   );
-  assert.equal(messages.length, 0);
-  assert.deepEqual(recoverCodexTurn(recovered.turn, failureRecords, "/fixture").completedItems, []);
+  assert.deepEqual(
+    recoverCodexTurn(
+      turn,
+      failureRecords.filter((record) => record.type !== "token_usage_record"),
+      "/fixture",
+      "ai_tidu9",
+      undefined,
+      true,
+    ).completedItems,
+    [],
+  );
+  assert.deepEqual(
+    recoverCodexTurn(turn, failureRecords, "/fixture", "ai_tidu9").completedItems,
+    [],
+  );
+  assert.deepEqual(
+    recoverCodexTurn(
+      turn,
+      [{ type: "turn_context", payload: { model_provider: "openai" } }, ...failureRecords],
+      "/fixture",
+      "ai_tidu9",
+      undefined,
+      true,
+    ),
+    { turn, completedItems: [] },
+  );
 });
 
 test("does not add managed token presentation to an official turn in a mixed-mode chat", () => {

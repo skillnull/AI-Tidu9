@@ -5,16 +5,19 @@ import { MODEL_ROUTING_CAPABILITIES } from "../../src/config/index.js";
 import { HostUsagePanel, type HostUsageSnapshot } from "./components/host-usage-panel.js";
 
 import {
+  CapabilityCallUsage,
   capabilityCompletionModelOutcomeLabel,
   capabilityCompletionOutcomeLabel,
   capabilityCompletionRecordOutcomeLabel,
   capabilityHistoryModelName,
   capabilityIdsForPicker,
+  capabilityModelUsage,
   catalogNeedsConfiguredSpecialistRecovery,
   defaultModelCapabilities,
   normalizeCapabilityCompletionCancellation,
   resolveWizardAdvance,
   resolveWizardEntryState,
+  SplitVisionUsageNote,
   selectableModelCapabilityIds,
   selectedModelCapabilities,
   updateCapabilityCompletionEnabled,
@@ -76,6 +79,95 @@ test("distinguishes cancellation from failure in both usage-history languages", 
   assert.equal(capabilityCompletionOutcomeLabel("cancelled", true), "Cancelled");
   assert.equal(capabilityCompletionOutcomeLabel("failed", false), "失败");
   assert.equal(capabilityCompletionOutcomeLabel("not-run", true), "Not called");
+});
+
+test("renders repeated model calls in order and distinguishes partial, unknown, and zero usage", () => {
+  const reader = {
+    modelId: "secondary",
+    host: "codex" as const,
+    role: "secondary" as const,
+    executionRole: "verification" as const,
+    model: "configured-reader",
+    executedModel: null,
+    capabilities: ["vision"],
+    outcome: "failed" as const,
+    usage: null,
+  };
+  const writer = {
+    ...reader,
+    modelId: "primary",
+    host: "cursor" as const,
+    role: "main" as const,
+    executionRole: "main" as const,
+    model: "configured-writer",
+    executedModel: "confirmed-writer",
+    capabilities: ["text", "reasoning"],
+    outcome: "succeeded" as const,
+    usage: {
+      inputTokens: 17,
+      freshInputTokens: 10,
+      cachedInputTokens: 5,
+      cacheWriteInputTokens: 2,
+      outputTokens: 9,
+      reasoningTokens: 3,
+      totalTokens: 26,
+    },
+  };
+  const retry = { ...writer, outcome: "cancelled" as const, usage: null };
+  const zero = {
+    ...writer,
+    usage: {
+      inputTokens: 0,
+      freshInputTokens: null,
+      cachedInputTokens: null,
+      cacheWriteInputTokens: null,
+      outputTokens: 0,
+      reasoningTokens: null,
+      totalTokens: 0,
+    },
+  };
+  const observation = {
+    calls: [reader, writer, retry, zero],
+    measuredTotalTokens: 26,
+    complete: false,
+  };
+  const record = { observation, tokenUsage: null, modelTokenUsage: [] };
+  assert.deepEqual(capabilityModelUsage(record, "primary"), {
+    usage: { inputTokens: 17, outputTokens: 9, totalTokens: 26 },
+    partial: true,
+  });
+  assert.deepEqual(capabilityModelUsage(record, "secondary"), { usage: undefined, partial: false });
+  for (const english of [false, true]) {
+    const render = (observed: typeof observation | undefined) =>
+      renderToStaticMarkup(
+        CapabilityCallUsage({ record: { tokenUsage: null, observation: observed }, english }),
+      );
+    const markup = render(observation);
+    assert.equal(markup.match(/<li>/gu)?.length, 4);
+    assert.ok(markup.indexOf("configured-reader") < markup.indexOf("configured-writer"));
+    assert.match(
+      markup,
+      english ? /Reported subtotal \(partial\) 26/u : /已报告小计（部分调用） 26/u,
+    );
+    assert.match(markup, english ? /Unconfirmed/u : /未确认/u);
+    assert.match(markup, english ? /Cancelled/u : /已取消/u);
+    assert.match(markup, english ? /verification/u : /验证/u);
+    assert.match(markup, english ? /Cache read 5 · Cache write 2/u : /缓存读取 5 · 缓存写入 2/u);
+    assert.match(markup, english ? /including reasoning 3/u : /含推理 3/u);
+    assert.match(markup, english ? /Cache read Unknown/u : /缓存读取 未知/u);
+    const allMissing = { ...observation, calls: [reader], measuredTotalTokens: null };
+    const missing = renderToStaticMarkup(
+      CapabilityCallUsage({ record: { tokenUsage: null, observation: allMissing }, english }),
+    );
+    assert.match(missing, english ? /Total tokens Unknown/u : /整次 Token 合计 未知/u);
+    assert.doesNotMatch(missing, /(?:Total tokens|合计) 0/u);
+    const noCalls = render({ ...observation, calls: [], measuredTotalTokens: 0, complete: true });
+    assert.match(noCalls, english ? /Total tokens 0/u : /整次 Token 合计 0/u);
+    assert.match(noCalls, english ? /No model calls/u : /未发起模型调用/u);
+    const older = render(undefined);
+    assert.doesNotMatch(older, /<details/u);
+    assert.match(older, english ? /Not retrieved/u : /未获取到/u);
+  }
 });
 
 test("shows actual historical outcomes during tool handoffs", () => {
@@ -294,6 +386,53 @@ test("defaults a model to the host-published capability order without pruning", 
     ["vision", "text"],
   );
   assert.deepEqual(selectedModelCapabilities([], ["text", "code", "vision"]), []);
+});
+
+test("shows the token cost note in both languages only when selected models must split text and vision", () => {
+  const writer = {
+    host: "cursor" as const,
+    source: "official" as const,
+    model: "writer",
+    capabilities: ["text"],
+  };
+  const reader = { ...writer, model: "reader", capabilities: ["vision"] };
+  const policy = {
+    mainModel: { source: "official" as const, model: "primary" },
+    mainCapabilities: ["vision"],
+    maximumSpecialists: 1,
+    specialists: [writer],
+  };
+  for (const english of [false, true]) {
+    const renderNote = (selection: typeof policy) =>
+      renderToStaticMarkup(SplitVisionUsageNote({ policy: selection, english }));
+    const splitNote = renderNote(policy);
+    assert.match(
+      splitNote,
+      english ? /Both count toward the token total/u : /两端实际用量都计入总 Token/u,
+    );
+    assert.match(splitNote, english ? /reuse an earlier draft/u : /改稿可复用前文/u);
+    assert.match(
+      splitNote,
+      english
+        ? /new image, an explicit recheck, or a missing visual detail/u
+        : /新增图片、明确要求复核或缺少视觉细节/u,
+    );
+    assert.match(splitNote, english ? /If a model supports both/u : /若同一模型支持这两项能力/u);
+    assert.equal(renderNote({ ...policy, mainCapabilities: ["vision", "text"] }), "");
+    assert.equal(
+      renderNote({ ...policy, specialists: [{ ...reader, capabilities: ["text", "vision"] }] }),
+      "",
+    );
+    assert.equal(renderNote({ ...policy, specialists: [] }), "");
+    assert.equal(renderNote({ ...policy, specialists: [{ ...writer, model: "" }] }), "");
+    const secondaryOnly = {
+      ...policy,
+      mainCapabilities: [],
+      specialists: [...policy.specialists, reader],
+    };
+    assert.equal(renderNote(secondaryOnly), "");
+    assert.equal(renderNote({ ...secondaryOnly, maximumSpecialists: 2 }), splitNote);
+  }
 });
 
 test("retries a transiently missing configured secondary-model catalog", () => {

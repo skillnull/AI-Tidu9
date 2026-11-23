@@ -59,7 +59,7 @@ readline.on("line", (line) => {
     send({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId, itemId: "final-1", delta: request.params.effort + "-codex-result" } });
     send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: "thread-1", turn: { id: turnId, status: "completed" } } });
     process.stdout.uncork();
-    setTimeout(() => send({ jsonrpc: "2.0", method: "rawResponse/completed", params: { threadId: "thread-1", turnId, responseId: "response-1", usage: { inputTokens: 7, cachedInputTokens: 2, cacheWriteInputTokens: 1, outputTokens: 2, reasoningOutputTokens: 1, totalTokens: 9 }, usageMetadata: null } }), 5);
+    setTimeout(() => send({ jsonrpc: "2.0", method: "rawResponse/completed", params: { threadId: "thread-1", turnId, responseId: "response-1", usage: { inputTokens: 7, cachedInputTokens: 2, outputTokens: 2, reasoningOutputTokens: 1, totalTokens: 9 }, usageMetadata: null } }), 5);
     setTimeout(() => send({ jsonrpc: "2.0", method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId, tokenUsage: { last: { inputTokens: 11, cachedInputTokens: 3, cacheWriteInputTokens: 2, outputTokens: 4, reasoningOutputTokens: 1, totalTokens: 15 } } } }), 10);
   }
   else if (request.method === "session/new") send({ jsonrpc: "2.0", id: request.id, result: { sessionId: "session-1", configOptions: [{ configId: "model", category: "model", type: "select", currentValue: selectedModel, options: [{ value: "auto-smart", name: "Auto Balance" }, { value: "cursor-fast", name: "Cursor Fast" }, { value: "claude-opus-5[thinking=true,context=300k,effort=high,fast=false]", name: "claude-opus-5" }] }] } });
@@ -89,10 +89,20 @@ readline.on("line", (line) => {
 const createFakeCursorHeadlessAgent = (
   root: string,
   resultState: "success" | "error" = "success",
+  mode: "current" | "legacy" | "started" | "wait" = "current",
+  usageOverride?: Record<string, number>,
 ): string => {
   const executable = join(root, "fake-cursor-headless");
   const source = `#!/usr/bin/env node
 const args = process.argv.slice(2);
+const partial = args.includes("--stream-partial-output");
+const mode = ${JSON.stringify(mode)};
+if (partial && (mode === "legacy" || mode === "started")) {
+  if (mode === "started") process.stdout.write(JSON.stringify({ type: "system", subtype: "init" }) + "\\n");
+  console.error("error: unknown option '--stream-partial-output'");
+  process.exitCode = 1;
+  return;
+}
 if (!args.includes("--print") || !args.includes("--trust") || args[args.indexOf("--mode") + 1] !== "ask" || args[args.indexOf("--output-format") + 1] !== "stream-json" || args[args.indexOf("--model") + 1] !== "cursor-test-model") {
   console.error("unexpected Cursor headless arguments");
   process.exit(2);
@@ -102,11 +112,22 @@ process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => { prompt += chunk; });
 process.stdin.on("end", () => {
   const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+  const assistant = (text, fields) => send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] }, ...fields });
   send({ type: "thinking", subtype: "delta", text: "分析" });
   send({ type: "thinking", subtype: "delta", text: "请求" });
+  if (mode === "wait") { setInterval(() => {}, 1000); return; }
+  if (partial) {
+    assistant(prompt.trim(), { timestamp_ms: 1 });
+    assistant(prompt.trim(), { timestamp_ms: 2, model_call_id: "model-1" });
+  }
   send({ type: "tool_call", subtype: "started", call_id: "call-1", tool_call: { readToolCall: { args: { path: "README.md" } } } });
-  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: prompt.trim() + "：完成" }] } });
-  send({ type: "result", subtype: ${JSON.stringify(resultState)}, is_error: ${resultState === "error"}, result: prompt.trim() + "：完成", usage: { inputTokens: 21, outputTokens: 5, cacheReadTokens: 8, cacheWriteTokens: 2 } });
+  if (partial) {
+    for (const text of ["：", "：", "完成"]) assistant(text, { timestamp_ms: 3 });
+    assistant("：：完成", {});
+  } else {
+    assistant(prompt.trim() + "：：完成", {});
+  }
+  send({ type: "result", subtype: ${JSON.stringify(resultState)}, is_error: ${resultState === "error"}, result: prompt.trim() + "：：完成", usage: ${JSON.stringify(usageOverride)} ?? { inputTokens: 21, outputTokens: 5, cacheReadTokens: 8, cacheWriteTokens: 2, ...(mode === "legacy" ? { totalTokens: 26 } : {}), reasoningTokens: 2 } });
 });
 `;
   writeFileSync(executable, source);
@@ -181,6 +202,7 @@ test("Codex app-server adapter negotiates, streams, and completes a turn", async
         totalTokens: 15,
         cachedInputTokens: 3,
         cacheWriteInputTokens: 2,
+        freshInputTokens: 6,
         reasoningTokens: 1,
       },
     });
@@ -212,7 +234,8 @@ test("Codex app-server adapter negotiates, streams, and completes a turn", async
         outputTokens: 2,
         totalTokens: 9,
         cachedInputTokens: 2,
-        cacheWriteInputTokens: 1,
+        cacheWriteInputTokens: 0,
+        freshInputTokens: 5,
         reasoningTokens: 1,
       },
       {
@@ -221,6 +244,7 @@ test("Codex app-server adapter negotiates, streams, and completes a turn", async
         totalTokens: 15,
         cachedInputTokens: 3,
         cacheWriteInputTokens: 2,
+        freshInputTokens: 6,
         reasoningTokens: 1,
       },
     ]);
@@ -609,11 +633,13 @@ test("Cursor headless reports usage before rejecting a failed terminal", async (
     );
     assert.deepEqual(usageUpdates, [
       {
-        inputTokens: 21,
+        inputTokens: 31,
         outputTokens: 5,
-        totalTokens: 26,
+        totalTokens: 36,
         cachedInputTokens: 8,
         cacheWriteInputTokens: 2,
+        freshInputTokens: 21,
+        reasoningTokens: 2,
       },
     ]);
   } finally {
@@ -643,17 +669,108 @@ test("Cursor headless adapter preserves process boundaries and terminal token us
       "Cursor 正在调用 readToolCall：README.md",
       "\n\n",
     ]);
-    assert.deepEqual(textDeltas, ["测试请求：完成"]);
+    assert.deepEqual(textDeltas, ["测试请求", "：", "：", "完成"]);
     assert.deepEqual(result, {
-      text: "测试请求：完成",
+      text: "测试请求：：完成",
       usage: {
-        inputTokens: 21,
+        inputTokens: 31,
         outputTokens: 5,
-        totalTokens: 26,
+        totalTokens: 36,
         cachedInputTokens: 8,
         cacheWriteInputTokens: 2,
+        freshInputTokens: 21,
+        reasoningTokens: 2,
       },
     });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Cursor headless falls back only when an older CLI rejects partial output before execution", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tidu-cursor-legacy-"));
+  try {
+    const deltas: string[] = [];
+    const options = {
+      environment: process.env,
+      workingDirectory: root,
+      model: "cursor-test-model",
+      prompt: "message",
+      onTextDelta: (delta: string) => deltas.push(delta),
+    };
+    const result = await runCursorHeadless({
+      ...options,
+      command: createFakeCursorHeadlessAgent(root, "success", "legacy"),
+    });
+    assert.deepEqual(deltas, [result.text]);
+    assert.equal(result.usage?.totalTokens, 26);
+    assert.equal(result.usage?.inputTokens, 21);
+    assert.equal(result.usage?.freshInputTokens, 11);
+    await assert.rejects(
+      runCursorHeadless({
+        ...options,
+        command: createFakeCursorHeadlessAgent(root, "success", "started"),
+      }),
+      /unknown option/u,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Cursor headless distinguishes unreported cache details from native zero counts", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tidu-cursor-partial-usage-"));
+  try {
+    for (const [native, expected] of [
+      [{ inputTokens: 3, outputTokens: 1 }, null],
+      [
+        { inputTokens: 3, outputTokens: 1, totalTokens: 4 },
+        { inputTokens: 3, outputTokens: 1, totalTokens: 4 },
+      ],
+      [
+        { inputTokens: 3, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        {
+          inputTokens: 3,
+          outputTokens: 1,
+          totalTokens: 4,
+          freshInputTokens: 3,
+          cachedInputTokens: 0,
+          cacheWriteInputTokens: 0,
+        },
+      ],
+    ] as const) {
+      const result = await runCursorHeadless({
+        command: createFakeCursorHeadlessAgent(root, "success", "current", native),
+        workingDirectory: root,
+        environment: process.env,
+        model: "cursor-test-model",
+        prompt: "test",
+      });
+      assert.deepEqual(result.usage, expected);
+      assert.ok(result.text);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Cursor headless cancels the active process while waiting for a result", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tidu-cursor-cancel-"));
+  try {
+    const controller = new AbortController();
+    await assert.rejects(
+      runCursorHeadless({
+        command: createFakeCursorHeadlessAgent(root, "success", "wait"),
+        environment: process.env,
+        workingDirectory: root,
+        model: "cursor-test-model",
+        prompt: "message",
+        signal: controller.signal,
+        onTextDelta: () => assert.fail("Unexpected text after cancellation"),
+        onProcessDelta: () => controller.abort(),
+      }),
+      { name: "AbortError" },
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

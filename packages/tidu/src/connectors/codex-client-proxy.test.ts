@@ -78,6 +78,14 @@ else if(request.method==='fixture/emit'){for(const event of request.params.event
       futureItemFields: extension,
     });
     const events = [
+      notification("error", {
+        ...identity,
+        willRetry: true,
+        error: {
+          message: "Reconnecting... 1/1",
+          additionalDetails: "Fixture upstream detail\n\nTotal: input 12 · output 3 · total 15",
+        },
+      }),
       notification("item/started", {
         ...identity,
         item: {
@@ -1248,7 +1256,7 @@ else if(message.method==='thread/items/list')send({id:message.id,result:{data:[]
   }
 });
 
-test("refreshes late retrieved usage and removes the footer when a separate cancelled turn reports zero", {
+test("recovers terminal usage on managed turns without repeating stats during reconnect", {
   timeout: 10000,
 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "tidu-native-relay-usage-"));
@@ -1269,6 +1277,16 @@ else if(message.method==='fixture/cancel'){
  record({type:'event_msg',timestamp:new Date(Date.now()-1100).toISOString(),payload:{type:'task_started',turn_id:turn.id}});
  record({type:'event_msg',timestamp:new Date().toISOString(),payload:{type:'turn_aborted',turn_id:turn.id,duration_ms:1100}});
  send({method:'turn/started',params:{threadId:'managed',turn:{id:turn.id,status:'inProgress'}}});
+ send({method:'turn/completed',params:{threadId:'managed',turn}});send({id:message.id,result:{}});
+}else if(message.method==='fixture/fail'){
+ const error={message:params.details};
+ const turn={id:params.turnId,status:'failed',error,items:[]};turns.push(turn);
+ record({type:'event_msg',payload:{type:'task_started',turn_id:turn.id}});
+ record({type:'token_usage_record',payload:{turn_id:turn.id,turn_token_usage:{input_tokens:12,output_tokens:3,total_tokens:15}}});
+ record({type:'event_msg',payload:{type:'task_complete',turn_id:turn.id,error}});
+ send({method:'turn/started',params:{threadId:'managed',turn:{id:turn.id,status:'inProgress'}}});
+ send({method:'error',params:{threadId:'managed',turnId:turn.id,willRetry:true,error:{message:'Reconnecting... 1/1',additionalDetails:params.details}}});
+ send({method:'error',params:{threadId:'managed',turnId:turn.id,willRetry:false,error}});
  send({method:'turn/completed',params:{threadId:'managed',turn}});send({id:message.id,result:{}});
 }else if(message.method==='fixture/usage'){
  const usage=params.zero?{input_tokens:0,output_tokens:0,total_tokens:0}:{input_tokens:12,output_tokens:3,total_tokens:15};
@@ -1356,6 +1374,55 @@ else if(message.method==='fixture/cancel'){
       ],
     );
     assert.doesNotMatch(JSON.stringify(ownership), /Token|fixture\/cancel|private/u);
+    const failureReason = "stream disconnected before completion: Fixture failed";
+    const failureWithUsage = `${failureReason}\n\nCodex: input 12 · output 3 · total 15  \nTotal: input 12 · output 3 · total 15`;
+    send(6, "fixture/fail", { turnId: "failed-reported", details: failureWithUsage });
+    const reconnect = await until((message) => message.method === "error");
+    assert.deepEqual(reconnect.params, {
+      threadId: "managed",
+      turnId: "failed-reported",
+      willRetry: true,
+      error: { message: "Reconnecting... 1/1", additionalDetails: failureReason },
+    });
+    const finalError = await until((message) => message.method === "error");
+    assert.deepEqual(finalError.params, {
+      threadId: "managed",
+      turnId: "failed-reported",
+      willRetry: false,
+      error: { message: failureWithUsage },
+    });
+    const terminal = await until((message) => {
+      assert.notEqual(message.method, "item/completed");
+      return message.method === "turn/completed";
+    });
+    assert.equal(
+      (terminal.params as { turn: { error: { message: string } } }).turn.error.message,
+      failureWithUsage,
+    );
+    send(7, "fixture/fail", { turnId: "failed-recovered", details: failureReason });
+    const recovered = await until((message) => message.method === "item/completed");
+    assert.equal(
+      (recovered.params as { item: { text: string } }).item.text,
+      "总：入 12 · 出 3 · 合 15（部分统计）",
+    );
+    await until((message) => message.method === "turn/completed");
+    send(8, "thread/items/list", { threadId: "managed", turnId: "failed-recovered" });
+    const items = await until((message) => message.id === 8);
+    assert.match(JSON.stringify(items.result), /总：入 12 · 出 3 · 合 15（部分统计）/u);
+    send(9, "thread/read", { threadId: "managed", includeTurns: true });
+    const history = await until((message) => message.id === 9);
+    const savedTurns = (
+      history.result as {
+        thread: { turns: { id: string; items: unknown[]; error?: { message: string } }[] };
+      }
+    ).thread.turns;
+    const savedWithUsage = savedTurns.find((turn) => turn.id === "failed-reported");
+    assert.equal(savedWithUsage?.error?.message, failureWithUsage);
+    assert.deepEqual(savedWithUsage?.items, []);
+    assert.match(
+      JSON.stringify(savedTurns.find((turn) => turn.id === "failed-recovered")?.items),
+      /总：入 12 · 出 3 · 合 15（部分统计）/u,
+    );
     assert.equal(errorText, "");
   } finally {
     await proxy.close();

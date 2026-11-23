@@ -6,6 +6,7 @@ import { createOpenAiError } from "../openai/index.js";
 import {
   createOllamaSseStream,
   normalizeOllamaToolCalls,
+  readOllamaUsage,
   rewriteOpenAiSseStream,
 } from "./streaming.js";
 
@@ -23,10 +24,14 @@ export interface ProviderRoutingContext {
   host?: AgentHostId;
   /** Capabilities required by the caller in addition to those inferred from the request. */
   requiredCapabilities?: readonly string[];
+  /** True only when the gateway inferred vision from the supplied transcript. */
+  inferredImageCapability?: boolean;
   /** Capabilities available on the concrete model selected for this execution. */
   availableCapabilities?: readonly string[];
   /** Required capabilities already fulfilled by bounded secondary-model evidence. */
   completedCapabilities?: readonly string[];
+  /** This step only extracts evidence from supplied images and requires no tools. */
+  visionEvidenceOnly?: boolean;
   /** Diagnostic-only request that forces one configured secondary route without validating its semantic capability. */
   requireSpecialist?: boolean;
   /** Most permissive data boundary allowed for this request. */
@@ -48,6 +53,13 @@ export interface ProviderDescriptor {
   model: string;
 }
 
+export interface ScopedVisualEvidence {
+  /** Reads observations bound to the delivered answer and eligible reader/writer pair. */
+  read: (models: string) => string | undefined;
+  /** Stages observations until this request completes and its answer is delivered. */
+  stage: (models: string, facts: string) => void;
+}
+
 export interface ProviderExecutionRequest {
   /** OpenAI-compatible protocol received by the virtual model. */
   protocol: ProviderProtocol;
@@ -59,10 +71,16 @@ export interface ProviderExecutionRequest {
   signal?: AbortSignal;
   /** Live, truthful execution progress forwarded through the caller's native reasoning stream. */
   onProcessDelta?: (delta: string) => void;
+  /** Public native process events delivered independently of the answer body. */
+  onProcessEvent?: (event: Record<string, unknown>) => void;
   /** Reports the exact upstream model after the provider or host confirms selection. */
   onModelConfirmed?: (model: string) => void;
   /** Reports one actual model execution for the user-visible terminal summary. */
   onExecutionReceipt?: (receipt: ProviderExecutionReceipt) => void;
+  /** Starts a distinct upstream inference attempt inside this adapter's transparent retry. */
+  onExecutionRetry?: () => void;
+  /** Request-local access to verified earlier image observations, never sent on the wire. */
+  visualEvidence?: ScopedVisualEvidence;
   /** Optional routing and security constraints that never leave the local runtime. */
   routing?: ProviderRoutingContext;
 }
@@ -70,16 +88,22 @@ export interface ProviderExecutionRequest {
 export interface ProviderExecutionReceipt {
   /** Host that executed this model call. */
   host: AgentHostId;
-  /** Exact upstream model confirmed for this call. */
+  /** Confirmed upstream model, or the configured identifier when confirmation is unavailable. */
   model: string;
+  /** False when the host did not confirm its model. */
+  modelConfirmed?: false;
+  /** In-memory identity of one inference attempt, shared by its receipt updates. */
+  attemptId?: symbol;
   /** Semantic role performed by this model call. */
   role: NonNullable<ProviderRoutingContext["role"]>;
   /** Configured capabilities assigned to this model call. */
   capabilities: readonly string[];
   /** Provider-authoritative token usage, or null when the provider did not report it. */
   usage: {
-    /** Input tokens consumed by this call. */
+    /** All input tokens for this call, including any reported cache reads and writes. */
     inputTokens: number;
+    /** Input outside cache reads and separately counted writes, when established by the host. */
+    freshInputTokens?: number;
     /** Output tokens consumed by this call. */
     outputTokens: number;
     /** Total tokens consumed by this call. */
@@ -92,6 +116,71 @@ export interface ProviderExecutionReceipt {
     reasoningTokens?: number;
   } | null;
 }
+
+const readTokenCount = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+
+/** Reads native Responses or Chat usage, preserving any reported cache and reasoning detail. */
+export const extractProviderUsage = (value: unknown): ProviderExecutionReceipt["usage"] => {
+  if (!isRecord(value)) return null;
+  const inputTokens = readTokenCount(value.input_tokens ?? value.prompt_tokens);
+  const outputTokens = readTokenCount(value.output_tokens ?? value.completion_tokens);
+  if (inputTokens === undefined || outputTokens === undefined) return null;
+  const totalTokens = readTokenCount(value.total_tokens) ?? inputTokens + outputTokens;
+  const inputDetails = isRecord(value.input_tokens_details)
+    ? value.input_tokens_details
+    : isRecord(value.prompt_tokens_details)
+      ? value.prompt_tokens_details
+      : undefined;
+  const outputDetails = isRecord(value.output_tokens_details)
+    ? value.output_tokens_details
+    : isRecord(value.completion_tokens_details)
+      ? value.completion_tokens_details
+      : undefined;
+  const cachedInputTokens = readTokenCount(inputDetails?.cached_tokens);
+  const cacheWriteInputTokens = readTokenCount(inputDetails?.cache_write_tokens);
+  const reasoningTokens = readTokenCount(outputDetails?.reasoning_tokens);
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
+    ...(cacheWriteInputTokens === undefined ? {} : { cacheWriteInputTokens }),
+    ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
+  };
+};
+
+const createProviderResponseObserver = (
+  request: ProviderExecutionRequest,
+  host: "openai-compatible" | "ollama",
+  configuredModel: string,
+) => {
+  let model: string | undefined;
+  return (body: Record<string, unknown>): string | undefined => {
+    const confirmed =
+      typeof body.model === "string" && body.model.trim() !== "" ? body.model : undefined;
+    const changed = confirmed !== undefined && confirmed !== model;
+    if (changed) {
+      model = confirmed;
+      request.onModelConfirmed?.(confirmed);
+    }
+    if (request.onExecutionReceipt !== undefined) {
+      const usage = extractProviderUsage(body.usage);
+      if (changed || usage !== null) {
+        request.onExecutionReceipt({
+          host: request.routing?.host ?? host,
+          model: model ?? configuredModel,
+          ...(model === undefined ? { modelConfirmed: false } : {}),
+          role: request.routing?.role ?? "main",
+          capabilities:
+            request.routing?.availableCapabilities ?? request.routing?.requiredCapabilities ?? [],
+          usage,
+        });
+      }
+    }
+    return model;
+  };
+};
 
 export const formatModelFailureMessage = (
   body: ProviderExecutionRequest["body"],
@@ -119,6 +208,8 @@ export interface ProviderJsonExecutionResult {
   body: unknown;
   /** Upstream model explicitly confirmed by the provider or host for this execution. */
   upstreamModel?: string;
+  /** Host that produced this response, when established by the route. */
+  upstreamHost?: AgentHostId;
 }
 
 export interface ProviderStreamExecutionResult {
@@ -130,6 +221,8 @@ export interface ProviderStreamExecutionResult {
   stream: ReadableStream<Uint8Array>;
   /** Upstream model explicitly confirmed by the provider or host for this execution. */
   upstreamModel?: string;
+  /** Host that produced this response, when established by the route. */
+  upstreamHost?: AgentHostId;
 }
 
 export type ProviderExecutionResult = ProviderJsonExecutionResult | ProviderStreamExecutionResult;
@@ -139,6 +232,17 @@ export interface ModelProvider {
   descriptor: ProviderDescriptor;
   /** Executes one validated inference request as JSON or Server-Sent Events. */
   execute: (request: ProviderExecutionRequest) => Promise<ProviderExecutionResult>;
+  /** Prepares a verified continuation of tools requested by this primary model. */
+  prepareCallerContinuation?: (request: ProviderExecutionRequest) =>
+    | {
+        /** Input with the same historical image projection used by the original request. */
+        input: unknown;
+        /** Capabilities assigned to the primary model when it requested the tools. */
+        availableCapabilities: readonly string[];
+        /** Capabilities already covered by evidence in the native turn. */
+        completedCapabilities: readonly string[];
+      }
+    | undefined;
   /** Lists safe upstream model identifiers when the provider supports discovery. */
   listModels?: () => Promise<
     readonly {
@@ -365,6 +469,12 @@ export const createOpenAiCompatibleProvider = (
     },
     execute: async (request) => {
       const streaming = request.body.stream === true;
+      const configuredModel = request.routing?.targetModel ?? model;
+      const observeResponse = createProviderResponseObserver(
+        request,
+        "openai-compatible",
+        configuredModel,
+      );
       const endpoint = createEndpoint(
         baseUrl,
         request.protocol === "chat-completions" ? "/v1/chat/completions" : "/v1/responses",
@@ -381,7 +491,7 @@ export const createOpenAiCompatibleProvider = (
         headers,
         body: JSON.stringify({
           ...request.body,
-          model: request.routing?.targetModel ?? model,
+          model: configuredModel,
         }),
         signal: combineSignals(request.signal, timeoutMilliseconds),
       });
@@ -395,13 +505,16 @@ export const createOpenAiCompatibleProvider = (
         return {
           kind: "stream",
           statusCode: response.status,
-          stream: rewriteOpenAiSseStream(response.body, request.virtualModelId),
+          stream: rewriteOpenAiSseStream(response.body, request.virtualModelId, observeResponse),
         };
       }
       const responseBody = await readProviderJson(response);
+      const upstreamModel =
+        response.ok && isRecord(responseBody) ? observeResponse(responseBody) : undefined;
       return {
         kind: "json",
         statusCode: response.status,
+        ...(upstreamModel === undefined ? {} : { upstreamModel }),
         body:
           response.ok && isRecord(responseBody)
             ? { ...responseBody, model: request.virtualModelId }
@@ -570,16 +683,6 @@ const toOllamaTools = (request: ProviderExecutionRequest): unknown => {
       );
 };
 
-const readOllamaUsage = (body: Record<string, unknown>) => {
-  const promptTokens = typeof body.prompt_eval_count === "number" ? body.prompt_eval_count : 0;
-  const completionTokens = typeof body.eval_count === "number" ? body.eval_count : 0;
-  return {
-    prompt_tokens: promptTokens,
-    completion_tokens: completionTokens,
-    total_tokens: promptTokens + completionTokens,
-  };
-};
-
 const toOllamaError = (statusCode: number, body: unknown): ProviderExecutionResult => ({
   kind: "json",
   statusCode,
@@ -637,6 +740,8 @@ export const createOllamaProvider = (options: ProviderAdapterOptions): ModelProv
     },
     execute: async (request) => {
       const streaming = request.body.stream === true;
+      const configuredModel = request.routing?.targetModel ?? model;
+      const observeResponse = createProviderResponseObserver(request, "ollama", configuredModel);
       const tools = toOllamaTools(request);
       const response = await fetch(createEndpoint(baseUrl, "/api/chat"), {
         method: "POST",
@@ -645,7 +750,7 @@ export const createOllamaProvider = (options: ProviderAdapterOptions): ModelProv
           "content-type": "application/json",
         },
         body: JSON.stringify({
-          model: request.routing?.targetModel ?? model,
+          model: configuredModel,
           messages: toOllamaMessages(request),
           stream: streaming,
           ...(tools === undefined ? {} : { tools }),
@@ -662,6 +767,7 @@ export const createOllamaProvider = (options: ProviderAdapterOptions): ModelProv
           stream: createOllamaSseStream(response.body, {
             protocol: request.protocol,
             virtualModelId: request.virtualModelId,
+            observeResponse,
           }),
         };
       }
@@ -675,6 +781,7 @@ export const createOllamaProvider = (options: ProviderAdapterOptions): ModelProv
       const created = Math.floor(Date.now() / 1_000);
       const responseId = `${request.protocol === "responses" ? "resp" : "chatcmpl"}_${randomUUID()}`;
       const usage = readOllamaUsage(body);
+      const upstreamModel = observeResponse({ model: body.model, usage });
       const toolCalls = normalizeOllamaToolCalls(body.message.tool_calls);
       if (request.protocol === "responses") {
         const output = [
@@ -707,6 +814,7 @@ export const createOllamaProvider = (options: ProviderAdapterOptions): ModelProv
         return {
           kind: "json",
           statusCode: 200,
+          ...(upstreamModel === undefined ? {} : { upstreamModel }),
           body: {
             id: responseId,
             object: "response",
@@ -715,7 +823,7 @@ export const createOllamaProvider = (options: ProviderAdapterOptions): ModelProv
             status: "completed",
             output,
             output_text: body.message.content,
-            usage: {
+            usage: usage && {
               input_tokens: usage.prompt_tokens,
               output_tokens: usage.completion_tokens,
               total_tokens: usage.total_tokens,
@@ -726,6 +834,7 @@ export const createOllamaProvider = (options: ProviderAdapterOptions): ModelProv
       return {
         kind: "json",
         statusCode: 200,
+        ...(upstreamModel === undefined ? {} : { upstreamModel }),
         body: {
           id: responseId,
           object: "chat.completion",

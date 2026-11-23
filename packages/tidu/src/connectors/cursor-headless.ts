@@ -41,23 +41,27 @@ const toolDescription = (event: Record<string, unknown>): string => {
 };
 
 export interface CursorHeadlessUsage {
-  /** Input tokens reported by the Cursor CLI. */
+  /** Total input, including tokens read from and written to cache. */
   inputTokens: number;
+  /** Input outside disjoint cache reads and writes, when established by native counters. */
+  freshInputTokens?: number;
   /** Output tokens reported by the Cursor CLI. */
   outputTokens: number;
   /** Combined input and output tokens. */
   totalTokens: number;
   /** Cached input tokens reported separately by the Cursor CLI. */
-  cachedInputTokens: number;
+  cachedInputTokens?: number;
   /** Cache-write input tokens reported separately by the Cursor CLI. */
-  cacheWriteInputTokens: number;
+  cacheWriteInputTokens?: number;
+  /** Reasoning tokens already included in output, when reported. */
+  reasoningTokens?: number;
 }
 
 export interface CursorHeadlessResult {
   /** Complete assistant response from the terminal result event. */
   text: string;
-  /** Provider-authoritative token counts from the same completed run. */
-  usage: CursorHeadlessUsage;
+  /** Provider-authoritative token counts, or null when available counters cannot establish the total. */
+  usage: CursorHeadlessUsage | null;
 }
 
 export interface CursorHeadlessOptions {
@@ -83,7 +87,13 @@ export interface CursorHeadlessOptions {
 
 export const runCursorHeadless = async (
   options: CursorHeadlessOptions,
+): Promise<CursorHeadlessResult> => runCursorCommand(options, options.onTextDelta !== undefined);
+
+const runCursorCommand = async (
+  options: CursorHeadlessOptions,
+  partialOutput: boolean,
 ): Promise<CursorHeadlessResult> => {
+  if (options.signal?.aborted) throw new DOMException("Cursor request cancelled.", "AbortError");
   const child = spawn(
     options.command,
     [
@@ -93,6 +103,7 @@ export const runCursorHeadless = async (
       "ask",
       "--output-format",
       "stream-json",
+      ...(partialOutput ? ["--stream-partial-output"] : []),
       "--model",
       options.model,
     ],
@@ -107,14 +118,16 @@ export const runCursorHeadless = async (
     | { kind: "error"; error: Error }
   >((resolve) => {
     child.once("error", (error) => resolve({ kind: "error", error }));
-    child.once("exit", (code, signal) => resolve({ kind: "exit", code, signal }));
+    child.once("close", (code, signal) => resolve({ kind: "exit", code, signal }));
   });
   const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
   let assistantOutput = "";
   let resultText: string | undefined;
-  let usage: CursorHeadlessUsage | undefined;
+  let usage: CursorHeadlessUsage | null = null;
+  let sawUsageCounters = false;
   let standardError = "";
   let activeProcessKey: string | undefined;
+  let receivedEvent = false;
 
   const emitProcessDelta = (processKey: string, delta: string): void => {
     if (delta === "") return;
@@ -127,7 +140,6 @@ export const runCursorHeadless = async (
   const abort = (): void => {
     child.kill("SIGTERM");
   };
-  if (options.signal?.aborted) abort();
   options.signal?.addEventListener("abort", abort, { once: true });
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk: string) => {
@@ -147,6 +159,7 @@ export const runCursorHeadless = async (
         throw new TiduError("INTERNAL_ERROR", "Cursor stream event exceeds the size limit.");
       }
       if (line.trim() === "") continue;
+      receivedEvent = true;
       let event: unknown;
       try {
         event = JSON.parse(line) as unknown;
@@ -157,6 +170,7 @@ export const runCursorHeadless = async (
       if (!isRecord(event)) continue;
       const type = readString(event, "type");
       const subtype = readString(event, "subtype");
+      if (options.signal?.aborted && type !== "result") continue;
       if (type === "thinking" && subtype === "delta") {
         const text = readString(event, "text");
         if (text !== undefined) emitProcessDelta("thinking", text);
@@ -172,6 +186,8 @@ export const runCursorHeadless = async (
         continue;
       }
       if (type === "assistant") {
+        // Partial streams also flush buffered text before tools and at the end of the turn.
+        if (partialOutput && (event.timestamp_ms == null || event.model_call_id != null)) continue;
         if (activeProcessKey !== undefined) {
           options.onProcessDelta?.("\n\n");
           activeProcessKey = undefined;
@@ -184,26 +200,50 @@ export const runCursorHeadless = async (
         continue;
       }
       if (type !== "result") continue;
-      const inputTokens = readTokenCount(event.usage, "inputTokens");
+      const rawInput = readTokenCount(event.usage, "inputTokens");
       const outputTokens = readTokenCount(event.usage, "outputTokens");
-      if (inputTokens !== undefined && outputTokens !== undefined) {
-        usage = {
-          inputTokens,
-          outputTokens,
-          totalTokens: inputTokens + outputTokens,
-          cachedInputTokens: readTokenCount(event.usage, "cacheReadTokens") ?? 0,
-          cacheWriteInputTokens: readTokenCount(event.usage, "cacheWriteTokens") ?? 0,
-        };
-        options.onUsageUpdate?.(usage);
+      if (rawInput !== undefined && outputTokens !== undefined) {
+        sawUsageCounters = true;
+        const cachedInputTokens = readTokenCount(event.usage, "cacheReadTokens");
+        const cacheWriteInputTokens = readTokenCount(event.usage, "cacheWriteTokens");
+        const reasoningTokens = readTokenCount(event.usage, "reasoningTokens");
+        const cacheTotal =
+          cachedInputTokens === undefined || cacheWriteInputTokens === undefined
+            ? undefined
+            : cachedInputTokens + cacheWriteInputTokens;
+        // Modern CLI input is fresh. Older terminals with an explicit total may report inclusive input.
+        const nativeTotal = readTokenCount(event.usage, "totalTokens");
+        const totalTokens =
+          nativeTotal ??
+          (cacheTotal === undefined ? undefined : rawInput + cacheTotal + outputTokens);
+        if (totalTokens !== undefined) {
+          const inputTokens = totalTokens - outputTokens;
+          if (inputTokens < 0 || !Number.isSafeInteger(totalTokens)) {
+            throw new TiduError("INTERNAL_ERROR", "Cursor returned inconsistent token usage.");
+          }
+          const freshInputTokens = cacheTotal === undefined ? undefined : inputTokens - cacheTotal;
+          usage = {
+            inputTokens,
+            outputTokens,
+            totalTokens,
+            ...(freshInputTokens === undefined || freshInputTokens < 0 ? {} : { freshInputTokens }),
+            ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
+            ...(cacheWriteInputTokens === undefined ? {} : { cacheWriteInputTokens }),
+            ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
+          };
+          options.onUsageUpdate?.(usage);
+        }
       }
       if (subtype !== "success" || event.is_error === true) {
+        if (options.signal?.aborted)
+          throw new DOMException("Cursor request cancelled.", "AbortError");
         throw new TiduError(
           "INTERNAL_ERROR",
           readString(event, "result") ?? "Cursor did not complete the request.",
         );
       }
       resultText = readString(event, "result");
-      if (usage === undefined) {
+      if (!sawUsageCounters) {
         throw new TiduError(
           "INTERNAL_ERROR",
           "Cursor completed without provider-authoritative token usage.",
@@ -218,15 +258,26 @@ export const runCursorHeadless = async (
       throw new TiduError("INTERNAL_ERROR", exit.error.message);
     }
     if (exit.code !== 0 || exit.signal !== null) {
+      if (
+        partialOutput &&
+        !receivedEvent &&
+        exit.signal === null &&
+        /^(?:error:\s*)?(?:unknown|unrecognized) (?:option|argument) ['"]?--stream-partial-output['"]?\s*$/imu.test(
+          standardError,
+        )
+      ) {
+        return runCursorCommand(options, false);
+      }
       throw new TiduError(
         "INTERNAL_ERROR",
         standardError.trim() || "Cursor Agent exited before completing the request.",
       );
     }
     const text = resultText ?? assistantOutput;
-    if (text.trim() === "" || usage === undefined) {
+    if (text.trim() === "" || !sawUsageCounters) {
       throw new TiduError("INTERNAL_ERROR", "Cursor returned an incomplete terminal result.");
     }
+    if (assistantOutput === "") options.onTextDelta?.(text);
     return { text, usage };
   } finally {
     options.signal?.removeEventListener("abort", abort);

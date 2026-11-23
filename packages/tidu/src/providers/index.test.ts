@@ -15,6 +15,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { TiduError } from "../core/index.js";
+import { createCapabilityCompletionProvider } from "../routing/index.js";
 import {
   createCodexHostModelProvider,
   createCursorHostModelProvider,
@@ -37,6 +38,7 @@ import {
   createProviderFromEnvironment,
   discoverOllamaModels,
   type ModelProvider,
+  type ProviderExecutionReceipt,
   type ProviderExecutionRequest,
   type ProviderExecutionResult,
 } from "./index.js";
@@ -254,15 +256,36 @@ readline.on("line", (line) => {
     const disconnectMarker = process.env.TIDU_CODEX_PROVIDER_TEST_LOG + ".disconnect-" + pending.state.spec.case;
     if (pending.state.spec.disconnect && !fs.existsSync(disconnectMarker)) {
       fs.writeFileSync(disconnectMarker, "disconnected\\n");
+      if (pending.state.spec.visibleDisconnect) {
+        const item = { id: "visible-resume", type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text: "Resuming the inspection." }] };
+        send({ method: "rawResponseItem/completed", params: { ...pending.identity, item } });
+        const reasoning = { id: "visible-reasoning", type: "reasoning", summary: [{ type: "summary_text", text: "Verify the completed tool result." }] };
+        send({ method: "rawResponseItem/completed", params: { ...pending.identity, item: reasoning } });
+        send({ method: "item/agentMessage/delta", params: { ...pending.identity, itemId: "interrupted-answer", delta: "Interrupted answer fragment" } });
+        process.stdout.write("", () => process.exit(0));
+        return;
+      }
       process.exit(0);
     }
     pending.state.results.push({ callId: pending.callId, result: request.result });
     fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "matrixResult:" + JSON.stringify({ ...pending.identity, callId: pending.callId, result: request.result }) + "\\n");
     if (pending.state.results.length === pending.state.spec.batch) {
-      const text = JSON.stringify({ case: pending.state.spec.case, results: pending.state.results, history: matrixHistory.get(pending.identity.threadId) || [], guidance: matrixGuidance.get(pending.identity.threadId) || [] });
-      send({ method: "item/agentMessage/delta", params: { ...pending.identity, itemId: "final-" + pending.identity.turnId, delta: text } });
-      send({ method: "thread/tokenUsage/updated", params: { ...pending.identity, tokenUsage: { last: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } } } });
-      send({ method: "turn/completed", params: { threadId: pending.identity.threadId, turn: { id: pending.identity.turnId, status: "completed" } } });
+      const complete = () => {
+        const text = JSON.stringify({ case: pending.state.spec.case, results: pending.state.results, history: matrixHistory.get(pending.identity.threadId) || [], guidance: matrixGuidance.get(pending.identity.threadId) || [] });
+        send({ method: "item/agentMessage/delta", params: { ...pending.identity, itemId: "final-" + pending.identity.turnId, delta: text } });
+        send({ method: "thread/tokenUsage/updated", params: { ...pending.identity, tokenUsage: { last: { inputTokens: 2, outputTokens: 1, totalTokens: 3 } } } });
+        send({ method: "turn/completed", params: { threadId: pending.identity.threadId, turn: { id: pending.identity.turnId, status: "completed" } } });
+      };
+      if (pending.state.spec.waitForObservers) {
+        const item = { id: "shared-resume", type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text: "Resume progress before completion." }] };
+        send({ method: "rawResponseItem/completed", params: { ...pending.identity, item } });
+        const marker = process.env.TIDU_CODEX_PROVIDER_TEST_LOG + ".observers-" + pending.state.spec.case;
+        const timer = setInterval(() => {
+          if (!fs.existsSync(marker)) return;
+          clearInterval(timer);
+          complete();
+        }, 10);
+      } else complete();
     }
     return;
   }
@@ -297,6 +320,13 @@ readline.on("line", (line) => {
       ? "gpt-test"
       : requestedModel || (threadCount === 1 ? "gpt-test" : "ai-tidu9-config");
     fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "threadModel:" + JSON.stringify(requestedModel) + "\\n");
+    if (request.params.sandbox === "read-only") {
+      fs.appendFileSync(process.env.TIDU_CODEX_PROVIDER_TEST_LOG, "readOnlyThread:" + JSON.stringify(request.params) + "\\n");
+      if (process.env.TIDU_CODEX_PROVIDER_REJECT_EVIDENCE === "true") {
+        send({ id: request.id, error: { code: -32602, message: "Read-only thread unavailable." } });
+        return;
+      }
+    }
     matrixTools.set("thread-" + threadCount, request.params.dynamicTools || []);
     send({ jsonrpc: "2.0", id: request.id, result: { thread: { id: "thread-" + threadCount }, model: confirmedModel } });
   }
@@ -335,6 +365,12 @@ readline.on("line", (line) => {
         const rpcId = "matrix-rpc-" + spec.case + "-" + index;
         matrixCalls.set(rpcId, { identity, state, callId });
         send({ method: "rawResponseItem/completed", params: { ...identity, item: { type: "function_call", name: "tidu_caller_tool_0", call_id: callId, arguments: JSON.stringify(argumentsValue) } } });
+      }
+      if (spec.progress) {
+        const item = { id: "matrix-progress-" + spec.case, type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text: "Examining the attachment.", annotations: [] }] };
+        send({ method: "rawResponseItem/completed", params: { ...identity, item } });
+        const reasoning = { id: "matrix-reasoning-" + spec.case, type: "reasoning", summary: [{ type: "summary_text", text: "Review the measurements." }] };
+        send({ method: "rawResponseItem/completed", params: { ...identity, item: reasoning } });
       }
       if (spec.terminal) {
         for (const [rpcId, pending] of matrixCalls) if (pending.state === state) matrixCalls.delete(rpcId);
@@ -441,9 +477,23 @@ if (args[0] !== "acp") {
   process.stdin.on("data", (chunk) => { prompt += chunk; });
   process.stdin.on("end", () => {
     const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+    if (process.env.TIDU_CURSOR_PROVIDER_WAIT_FOR_CANCEL === "true") {
+      process.once("SIGTERM", () => {
+        require("node:fs").appendFileSync(process.env.TIDU_CURSOR_PROVIDER_TEST_LOG, "cancelled\\n");
+        process.exit(0);
+      });
+      send({ type: "thinking", subtype: "delta", text: "Waiting" });
+      setTimeout(() => process.exit(1), 5000);
+      return;
+    }
     send({ type: "thinking", subtype: "delta", text: "分析普通文本请求" });
     send({ type: "tool_call", subtype: "started", call_id: "call-1", tool_call: { searchToolCall: { args: { query: "公开资料" } } } });
-    send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Cursor 中文回答" }] } });
+    const assistant = (text, fields = {}) => send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] }, ...fields });
+    if (args.includes("--stream-partial-output")) {
+      assistant("Cursor ", { timestamp_ms: 1 });
+      assistant("中文回答", { timestamp_ms: 2 });
+    }
+    assistant("Cursor 中文回答");
     send({ type: "result", subtype: "success", is_error: false, result: "Cursor 中文回答", usage: { inputTokens: 21, outputTokens: 5, cacheReadTokens: 8, cacheWriteTokens: 2 } });
   });
   return;
@@ -855,7 +905,14 @@ test("executes text-only Cursor requests through headless streaming with real us
     assert.match(events, /分析普通文本请求/u);
     assert.match(events, /Cursor 正在调用 searchToolCall：公开资料/u);
     assert.match(events, /Cursor 中文回答/u);
-    assert.match(events, /"input_tokens":21/u);
+    const textDeltas = events
+      .split("\n")
+      .filter((line) => line.startsWith("data: {"))
+      .map((line) => JSON.parse(line.slice(6)))
+      .filter((event) => event.type === "response.output_text.delta")
+      .map((event) => event.delta);
+    assert.deepEqual(textDeltas, ["Cursor ", "中文回答"]);
+    assert.match(events, /"input_tokens":31/u);
     assert.match(events, /"cached_tokens":8/u);
     assert.match(events, /"cache_write_tokens":2/u);
     assert.deepEqual(receipts, [
@@ -865,9 +922,10 @@ test("executes text-only Cursor requests through headless streaming with real us
         role: "specialist",
         capabilities: ["text"],
         usage: {
-          inputTokens: 21,
+          inputTokens: 31,
+          freshInputTokens: 21,
           outputTokens: 5,
-          totalTokens: 26,
+          totalTokens: 36,
           cachedInputTokens: 8,
           cacheWriteInputTokens: 2,
         },
@@ -899,6 +957,41 @@ test("executes text-only Cursor requests through headless streaming with real us
   }
 });
 
+test("cancelling the Cursor text response stream interrupts its host process", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-cursor-stream-cancel-"));
+  const processLog = join(directory, "cursor.log");
+  try {
+    const provider = await createCursorHostModelProvider({
+      command: createFakeCursorProviderCommand(directory),
+      environment: {
+        ...process.env,
+        TIDU_CURSOR_PROVIDER_TEST_LOG: processLog,
+        TIDU_CURSOR_PROVIDER_WAIT_FOR_CANCEL: "true",
+      },
+    });
+    const result = await provider?.execute({
+      protocol: "responses",
+      body: { model: "cursor-text-model", input: "test", stream: true },
+      virtualModelId: "test",
+    });
+    assert.ok(result?.kind === "stream");
+    const reader = result.stream.getReader();
+    const first = await reader.read();
+    assert.match(new TextDecoder().decode(first.value), /Waiting/u);
+    await reader.cancel();
+    for (
+      let attempt = 0;
+      attempt < 100 && !readFileSync(processLog, "utf8").includes("cancelled");
+      attempt++
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.match(readFileSync(processLog, "utf8"), /cancelled/u);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("reuses one Codex model session while forwarding effort and live deltas per turn", async () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-"));
   const codexHomeDirectory = join(temporaryDirectory, "codex-home");
@@ -913,6 +1006,21 @@ test("reuses one Codex model session while forwarding effort and live deltas per
   try {
     assert.notEqual(provider, undefined);
     if (provider === undefined) throw new Error("Expected a Codex host provider.");
+    const imageEvidence = await provider.execute({
+      protocol: "responses",
+      virtualModelId: "ai-tidu9-config",
+      routing: { visionEvidenceOnly: true },
+      body: {
+        input: [
+          {
+            role: "user",
+            content: [{ type: "input_image", image_url: "data:image/png;base64,test" }],
+          },
+        ],
+      },
+    });
+    assert.equal(imageEvidence.kind, "json");
+    assert.match(JSON.stringify(imageEvidence), /"total_tokens":15/u);
     const lowProcessDeltas: string[] = [];
     const lowResult = await provider.execute({
       protocol: "responses",
@@ -1004,6 +1112,20 @@ test("reuses one Codex model session while forwarding effort and live deltas per
 
     await provider.close?.();
     const processLogText = readFileSync(processLog, "utf8");
+    const visualThread = JSON.parse(/^readOnlyThread:(.+)$/mu.exec(processLogText)?.[1] ?? "null");
+    assert.equal(visualThread?.ephemeral, true);
+    assert.equal(visualThread.approvalPolicy, "on-request");
+    assert.deepEqual(visualThread.dynamicTools, []);
+    assert.equal(visualThread.config["features.shell_tool"], false);
+    for (const feature of ["browser_use", "code_mode", "code_mode_host", "computer_use"]) {
+      assert.equal(visualThread.config[`features.${feature}`], false);
+    }
+    assert.equal(visualThread.config.web_search, "disabled");
+    assert.equal(visualThread.developerInstructions, undefined);
+    assert.deepEqual(
+      [...processLogText.matchAll(/^turnThread:(.+)$/gmu)].slice(0, 2).map((match) => match[1]),
+      ["thread-2", "thread-1"],
+    );
     assert.match(processLogText, /effort:low/u);
     assert.match(processLogText, /effort:high/u);
     assert.match(processLogText, /summary:auto/u);
@@ -1020,6 +1142,37 @@ test("reuses one Codex model session while forwarding effort and live deltas per
   } finally {
     await provider?.close?.();
     rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
+});
+
+test("does not retry a rejected evidence thread with native workspace tools", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-visual-thread-"));
+  const log = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider(undefined, {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: log,
+      TIDU_CODEX_PROVIDER_REJECT_EVIDENCE: "true",
+    },
+  });
+  try {
+    assert.ok(provider);
+    await assert.rejects(
+      provider.execute({
+        protocol: "responses",
+        virtualModelId: "model",
+        routing: { visionEvidenceOnly: true },
+        body: { input: "Extract the chart values." },
+      }),
+      /Read-only thread unavailable/u,
+    );
+    const events = readFileSync(log, "utf8");
+    assert.equal([...events.matchAll(/^readOnlyThread:/gmu)].length, 1);
+    assert.doesNotMatch(events, /^turnThread:/mu);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -1411,6 +1564,153 @@ test("preserves owner models across 24 continuation and genuine-new-turn combina
   }
 });
 
+test("reuses caller deliveries when partial history repeats an image and native progress", {
+  timeout: 20_000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-partial-replay-"));
+  const processLog = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_CALLER_MATRIX_TEST: "true",
+    },
+  });
+
+  try {
+    assert.ok(provider);
+    let caseId = 0;
+    for (const stream of [false, true]) {
+      for (const disconnect of [false, true]) {
+        caseId += 1;
+        const image = { type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" };
+        const user = {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: JSON.stringify({
+                fixture: "caller-matrix",
+                case: caseId,
+                batch: 1,
+                progress: true,
+                disconnect,
+              }),
+            },
+            image,
+          ],
+        };
+        const progress = {
+          id: `matrix-progress-${caseId}`,
+          type: "message",
+          role: "assistant",
+          phase: "commentary",
+          content: [{ type: "output_text", text: "Examining the attachment.", annotations: [] }],
+        };
+        const execute = async (
+          input: unknown[],
+          webSearch = false,
+        ): ReturnType<typeof readCodexResponseBody> =>
+          readCodexResponseBody(
+            await provider.execute({
+              protocol: "responses",
+              virtualModelId: "tidu",
+              body: {
+                model: "tidu",
+                tools: [
+                  { type: "function", name: "inspect" },
+                  ...(webSearch ? [{ type: "web_search", external_web_access: false }] : []),
+                ],
+                input,
+                stream,
+              },
+            }),
+          );
+        const initial = await execute([user]);
+        const call = initial.output.find((item) => item.type === "function_call");
+        assert.ok(call);
+        if (stream)
+          assert.deepEqual(
+            initial.output.filter((item) => item.id === progress.id),
+            [progress],
+          );
+
+        const result = {
+          type: "function_call_output",
+          call_id: call.call_id,
+          output: "Inspected.",
+        };
+        const copiedUser = { ...user, id: `original-user-${caseId}`, status: "completed" };
+        const before = readFileSync(processLog, "utf8").length;
+        // A user who explicitly attaches the same image again still needs this input delivered.
+        const guidance = {
+          role: "user",
+          content: [{ type: "input_text", text: "Check the dimensions." }, image],
+        };
+        const extra = disconnect ? [] : [guidance];
+        const [first, second] = await Promise.all([
+          execute([copiedUser, progress, result, ...extra]),
+          execute([result, ...extra]),
+        ]);
+        const { id: _progressId, ...copiedProgress } = progress;
+        const copiedReasoning = {
+          role: "assistant",
+          phase: "commentary",
+          content: [{ type: "output_text", text: "Review the measurements." }],
+        };
+        const settledRetry = await execute([
+          copiedUser,
+          call,
+          result,
+          copiedProgress,
+          copiedReasoning,
+          ...extra,
+        ]);
+        for (const response of [first, second, settledRetry]) {
+          assert.ok(response.output.some((item) => item.role === "assistant"));
+          assert.ok(response.output.every((item) => item.id !== progress.id));
+        }
+        await assert.rejects(
+          execute([result, { role: "developer", content: "New constraint." }]),
+          /Conflicting caller tool deliveries/u,
+        );
+        await assert.rejects(
+          execute([{ ...result, output: "Changed." }, ...extra]),
+          /Conflicting caller tool results/u,
+        );
+        if (disconnect)
+          await assert.rejects(execute([result], true), /Conflicting caller tool deliveries/u);
+
+        const activity = readFileSync(processLog, "utf8").slice(before).split("\n");
+        const histories = activity
+          .filter((line) => line.startsWith("history:"))
+          .flatMap(
+            (line) => JSON.parse(line.slice("history:".length)) as Record<string, unknown>[],
+          );
+        const replayedUsers = histories.filter((item) => item.role === "user");
+        assert.equal(replayedUsers.length, disconnect ? 1 : 0);
+        if (disconnect) {
+          assert.deepEqual(replayedUsers[0]?.content, user.content);
+          assert.equal(histories.filter((item) => item.type === "function_call").length, 1);
+          assert.equal(histories.filter((item) => item.type === "function_call_output").length, 1);
+        } else {
+          assert.ok(
+            first.output.some(
+              (item) =>
+                item.role === "assistant" && JSON.stringify(item).includes("Check the dimensions."),
+            ),
+          );
+          assert.equal(activity.filter((line) => line.startsWith("matrixResult:")).length, 1);
+        }
+      }
+    }
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("never exposes caller tools from 24 failed or interrupted terminal combinations", {
   timeout: 20_000,
 }, async () => {
@@ -1651,7 +1951,111 @@ test("keeps the surviving subscriber alive in all six shared-stream cancellation
   }
 });
 
-test("restores full or output-only caller history after connection loss in both transports", {
+test("continues the primary Codex tool turn without asking the vision specialist again", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-vision-continuation-"));
+  const processLog = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_CALLER_MATRIX_TEST: "true",
+    },
+  });
+  const visionInputs: unknown[] = [];
+  const visionProvider: ModelProvider = {
+    descriptor: { type: "cursor-host", model: "reader" },
+    execute: async (request) => {
+      visionInputs.push(request.body.input);
+      return { kind: "json", statusCode: 200, body: { output_text: "The chart is green." } };
+    },
+  };
+  try {
+    assert.ok(provider);
+    const completion = createCapabilityCompletionProvider(
+      provider,
+      async () => ({
+        modelSelection: { source: "official", model: "gpt-test" },
+        capabilityCompletion: {
+          enabled: true,
+          mainCapabilities: ["text"],
+          maximumSpecialists: 1,
+          specialists: [
+            { host: "cursor", source: "official", model: "reader", capabilities: ["vision"] },
+          ],
+        },
+      }),
+      { resolveProviderForHost: async (host) => (host === "codex" ? provider : visionProvider) },
+    );
+    const tools = [{ type: "function", name: "inspect" }];
+    for (const stream of [false, true]) {
+      const initialCase = Number(stream) + 1;
+      const oldImage = `data:image/png;base64,old-chart-${initialCase}`;
+      const resultImage = `data:image/png;base64,tool-result-${initialCase}`;
+      const steerImage = `data:image/png;base64,new-chart-${initialCase}`;
+      const user = {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: JSON.stringify({ fixture: "caller-matrix", case: initialCase, batch: 1 }),
+          },
+          { type: "input_image", image_url: oldImage },
+        ],
+      };
+      const execute = async (input: unknown[]) =>
+        readCodexResponseBody(
+          await completion.execute({
+            protocol: "responses",
+            virtualModelId: "tidu",
+            routing: { host: "codex" },
+            body: { model: "tidu", tools, input, stream },
+          }),
+        );
+      const initial = await execute([user]);
+      const call = initial.output.find((item) => item.type === "function_call");
+      assert.ok(call);
+      assert.ok(JSON.stringify(visionInputs.at(-1)).includes(oldImage));
+
+      const result = {
+        type: "function_call_output",
+        call_id: call.call_id,
+        output: [{ type: "input_image", image_url: resultImage }],
+      };
+      const steer = {
+        role: "user",
+        content: [
+          { type: "input_text", text: "Use this new chart too." },
+          { type: "input_image", image_url: steerImage },
+        ],
+      };
+      const availableBefore = visionInputs.length;
+      const resumed = await execute([user, ...(stream ? [call] : []), result, steer]);
+      const answer = JSON.stringify(resumed.output);
+      assert.equal(
+        visionInputs.length,
+        availableBefore,
+        `Vision calls ${availableBefore} to ${visionInputs.length}; the repeated input contains the original image: ${JSON.stringify(visionInputs.at(-1)).includes(oldImage)}`,
+      );
+      assert.ok(answer.includes(resultImage));
+      assert.ok(answer.includes(steerImage));
+      assert.ok(!answer.includes(oldImage));
+      assert.equal(
+        (await completion.inspectCapabilityCompletion()).records[0]?.observation.calls.length,
+        1,
+      );
+    }
+    const activity = readFileSync(processLog, "utf8");
+    assert.equal(activity.match(/^input:/gmu)?.length, 2);
+    assert.equal(activity.match(/^matrixResult:/gmu)?.length, 2);
+    assert.doesNotMatch(activity, /old-chart/u);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("restores full, partial, and output-only caller history after connection loss", {
   timeout: 20_000,
 }, async () => {
   const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-result-disconnect-"));
@@ -1668,20 +2072,30 @@ test("restores full or output-only caller history after connection loss in both 
   try {
     assert.ok(provider);
     for (const stream of [false, true])
-      for (const fullHistory of [false, true])
+      for (const history of ["full", "partial", "output-only"])
         for (const concurrent of [false, true]) {
           const tools = [{ type: "function", name: "inspect" }];
-          const originalInput = JSON.stringify({
-            fixture: "caller-matrix",
-            case: ++verified,
-            batch: 2,
-            disconnect: true,
-          });
+          const user = {
+            id: `original-user-${verified + 1}`,
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: JSON.stringify({
+                  fixture: "caller-matrix",
+                  case: ++verified,
+                  batch: 2,
+                  disconnect: true,
+                }),
+              },
+              { type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" },
+            ],
+          };
           const initial = await readCodexResponseBody(
             await provider.execute({
               protocol: "responses",
               virtualModelId: "tidu",
-              body: { model: "tidu", tools, input: originalInput, stream },
+              body: { model: "tidu", tools, input: [user], stream },
             }),
           );
           assert.equal(initial.output.length, 2);
@@ -1690,15 +2104,25 @@ test("restores full or output-only caller history after connection loss in both 
             call_id: call.call_id,
             output: `Completed before disconnection ${index}`,
           }));
+          const guidance = { role: "user", content: "Keep the answer brief." };
+          const [firstResult, secondResult] = outputs;
+          const [, secondCall] = initial.output;
+          let retries = 0;
           const request: ProviderExecutionRequest = {
+            onExecutionRetry: () => {
+              retries++;
+            },
             protocol: "responses",
             virtualModelId: "tidu",
             body: {
               model: "tidu",
               tools,
-              input: fullHistory
-                ? [{ role: "user", content: originalInput }, ...initial.output, ...outputs]
-                : outputs,
+              input:
+                history === "output-only"
+                  ? outputs
+                  : history === "partial"
+                    ? [user, firstResult, secondCall, secondResult, guidance]
+                    : [user, user, ...initial.output, ...outputs],
               stream,
             },
           };
@@ -1709,17 +2133,27 @@ test("restores full or output-only caller history after connection loss in both 
           );
           for (const recovered of recoveries)
             assert.match(JSON.stringify(recovered), /medium-result/u);
+          assert.equal(retries, concurrent ? 2 : 1);
         }
-    assert.equal(verified, 8);
+    assert.equal(verified, 12);
     const lines = readFileSync(processLog, "utf8").split("\n");
-    assert.equal(lines.filter((line) => line === "start").length, 9);
+    assert.equal(lines.filter((line) => line === "start").length, 13);
+    assert.equal(
+      lines.filter((line) => line.startsWith("input:") && line.includes("Keep the answer brief."))
+        .length,
+      4,
+    );
     const histories = lines
       .filter((line) => line.startsWith("history:"))
       .map((line) => JSON.parse(line.slice("history:".length)) as Record<string, unknown>[]);
-    assert.equal(histories.length, 8);
+    assert.equal(histories.length, 12);
     for (const history of histories) {
-      assert.equal(history.filter((item) => item.role === "user").length, 1);
-      assert.equal(history.filter((item) => item.type === "function_call").length, 2);
+      const users = history.filter((item) => item.role === "user");
+      assert.equal(users.length, 1);
+      assert.equal((JSON.stringify(users[0]).match(/input_image/gu) ?? []).length, 1);
+      const calls = history.filter((item) => item.type === "function_call");
+      assert.equal(calls.length, 2);
+      assert.equal(new Set(calls.map((item) => item.call_id)).size, 2);
       assert.equal(history.filter((item) => item.type === "function_call_output").length, 2);
     }
     assert.doesNotMatch(lines.join("\n"), /Continue from the supplied conversation/u);
@@ -1864,6 +2298,321 @@ test("shares identical concurrent caller-result deliveries without restarting th
     const lines = readFileSync(processLog, "utf8").split("\n");
     assert.equal(lines.filter((line) => line.startsWith("turnThread:")).length, 1);
     assert.equal(lines.filter((line) => line.startsWith("nativeResult:")).length, 1);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("relays shared caller progress before completion to a late streaming subscriber", {
+  timeout: 8000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-caller-progress-"));
+  const processLog = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_CALLER_MATRIX_TEST: "true",
+    },
+  });
+  try {
+    assert.ok(provider);
+    const tools = [{ type: "function", name: "inspect" }];
+    const initial = await readCodexResponseBody(
+      await provider.execute({
+        protocol: "responses",
+        virtualModelId: "tidu",
+        body: {
+          model: "tidu",
+          tools,
+          input: JSON.stringify({
+            fixture: "caller-matrix",
+            case: 1,
+            batch: 1,
+            waitForObservers: true,
+          }),
+        },
+      }),
+    );
+    const call = initial.output.find((item) => item.type === "function_call");
+    assert.ok(call);
+    const input = [{ type: "function_call_output", call_id: call.call_id, output: "Inspected." }];
+    const subscribe = () => {
+      let markProgress!: () => void;
+      const visible = new Promise<void>((resolve) => {
+        markProgress = resolve;
+      });
+      const result = provider
+        .execute({
+          protocol: "responses",
+          virtualModelId: "tidu",
+          body: { model: "tidu", tools, input, stream: true },
+          signal: AbortSignal.timeout(5000),
+          onProcessEvent: (event) => {
+            if (
+              event.type === "response.output_item.done" &&
+              JSON.stringify(event.item).includes("shared-resume")
+            )
+              markProgress();
+          },
+        })
+        .then(readCodexResponseBody);
+      return {
+        result,
+        visible: Promise.race([
+          visible,
+          result.then(() => assert.fail("Completed before progress.")),
+        ]),
+      };
+    };
+    const first = subscribe();
+    await first.visible;
+    const late = subscribe();
+    await late.visible;
+    writeFileSync(`${processLog}.observers-1`, "ready\n");
+    const [firstAnswer, lateAnswer] = await Promise.all([first.result, late.result]);
+    assert.match(JSON.stringify(firstAnswer), /Inspected\./u);
+    assert.match(JSON.stringify(lateAnswer), /Inspected\./u);
+    const lines = readFileSync(processLog, "utf8").split("\n");
+    assert.equal(lines.filter((line) => line.startsWith("matrixResult:")).length, 1);
+    assert.equal(lines.filter((line) => line.startsWith("turnThread:")).length, 1);
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("continues caller mail after visible progress without resending the tool result", {
+  timeout: 10_000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-caller-mail-"));
+  const processLog = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_CALLER_MATRIX_TEST: "true",
+    },
+  });
+  try {
+    assert.ok(provider);
+    const execute = (
+      input: readonly Record<string, unknown>[],
+      options: Pick<ProviderExecutionRequest, "signal" | "onProcessEvent"> = {},
+    ) =>
+      provider.execute({
+        ...options,
+        protocol: "responses",
+        virtualModelId: "tidu",
+        body: {
+          model: "tidu",
+          tools: [{ type: "function", name: "inspect" }],
+          input,
+          stream: true,
+        },
+      });
+    for (const cancelBeforeFollowup of [false, true]) {
+      const before = readFileSync(processLog, "utf8").length;
+      const user = {
+        role: "user",
+        content: JSON.stringify({
+          fixture: "caller-matrix",
+          case: Number(cancelBeforeFollowup) + 1,
+          batch: 1,
+          waitForObservers: true,
+        }),
+      };
+      const initial = await readCodexResponseBody(await execute([user]));
+      const call = initial.output.find((item) => item.type === "function_call");
+      assert.ok(call);
+      const result = { type: "function_call_output", call_id: call.call_id, output: "Inspected." };
+      const controller = new AbortController();
+      let observeProgress!: (item: Record<string, unknown>) => void;
+      const progress = new Promise<Record<string, unknown>>((resolve) => {
+        observeProgress = resolve;
+      });
+      const running = await execute([user, call, result], {
+        signal: controller.signal,
+        onProcessEvent: (event) => {
+          if (event.type !== "response.output_item.done") return;
+          const item = event.item as Record<string, unknown> | undefined;
+          if (item?.id === "shared-resume") observeProgress(item);
+        },
+      });
+      assert.equal(running.kind, "stream");
+      const wire = readStreamText(running.stream);
+      const completedProgress = await Promise.race([
+        progress,
+        wire.then(() => assert.fail("The first delivery must still be active.")),
+      ]);
+      const history = cancelBeforeFollowup
+        ? [result, completedProgress]
+        : [user, call, result, completedProgress];
+      const agentMessages = ["The audit is complete.", "The independent review is complete."].map(
+        (message, index) => ({
+          type: "agent_message",
+          id: `agent-message-${index + 1}`,
+          author: `/root/reviewer-${index + 1}`,
+          recipient: "/root",
+          content: [{ type: "input_text", text: message }],
+        }),
+      );
+      if (cancelBeforeFollowup) {
+        controller.abort();
+        await wire;
+      }
+      await assert.rejects(
+        execute([
+          ...history,
+          { role: "developer", content: "Replace the original instructions." },
+          ...agentMessages.slice(1),
+        ]).then(readCodexResponseBody),
+        /Conflicting caller tool deliveries/u,
+      );
+      const firstInput = [...history, ...agentMessages.slice(0, 1)];
+      const first = await readCodexResponseBody(await execute(firstInput));
+      assert.match(JSON.stringify(first), /medium-result/u);
+      if (!cancelBeforeFollowup) controller.abort();
+      assert.doesNotMatch(await wire, /event: response\.completed/u);
+
+      const nextInput = [...history, ...agentMessages];
+      const [second, duplicate] = await Promise.all([
+        execute(nextInput).then(readCodexResponseBody),
+        execute(nextInput).then(readCodexResponseBody),
+      ]);
+      assert.match(JSON.stringify(second), /medium-result/u);
+      assert.match(JSON.stringify(duplicate), /medium-result/u);
+      await assert.rejects(
+        execute([{ ...result, output: "Changed." }, completedProgress, ...agentMessages]).then(
+          readCodexResponseBody,
+        ),
+        /Conflicting caller tool (?:deliveries|results)/u,
+      );
+
+      const activity = readFileSync(processLog, "utf8").slice(before).split("\n");
+      assert.equal(activity.filter((line) => line.startsWith("matrixResult:")).length, 1);
+      assert.equal(activity.filter((line) => line.startsWith("turnThread:")).length, 3);
+      const replays = activity
+        .filter((line) => line.startsWith("history:"))
+        .map((line) => JSON.parse(line.slice("history:".length)) as Record<string, unknown>[])
+        .filter((items) => items.some((item) => item.type === "agent_message"));
+      assert.equal(replays.length, 2);
+      replays.forEach((items, index) => {
+        assert.deepEqual(
+          items.filter((item) => item.type === "agent_message"),
+          agentMessages.slice(0, index + 1),
+        );
+        assert.equal(items.filter((item) => item.id === completedProgress.id).length, 1);
+        assert.equal(items.filter((item) => item.type === result.type).length, 1);
+      });
+    }
+  } finally {
+    await provider?.close?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("ends a visible caller stream on disconnect and lets the next delivery recover", {
+  timeout: 8000,
+}, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "tidu-codex-provider-visible-disconnect-"));
+  const processLog = join(directory, "provider.log");
+  const provider = await createCodexHostModelProvider("gpt-test", {
+    command: createFakeCodexProviderCommand(directory),
+    codexHomeDirectory: directory,
+    environment: {
+      TIDU_CODEX_PROVIDER_TEST_LOG: processLog,
+      TIDU_CODEX_PROVIDER_CALLER_MATRIX_TEST: "true",
+    },
+  });
+  try {
+    assert.ok(provider);
+    const tools = [{ type: "function", name: "inspect" }];
+    const initial = await readCodexResponseBody(
+      await provider.execute({
+        protocol: "responses",
+        virtualModelId: "tidu",
+        body: {
+          model: "tidu",
+          tools,
+          input: JSON.stringify({
+            fixture: "caller-matrix",
+            case: 1,
+            batch: 1,
+            disconnect: true,
+            visibleDisconnect: true,
+          }),
+        },
+      }),
+    );
+    const call = initial.output.find((item) => item.type === "function_call");
+    assert.ok(call);
+    const result = { type: "function_call_output", call_id: call.call_id, output: "Inspected." };
+    const guidance = { role: "user", content: "Keep the answer brief." };
+    const request: ProviderExecutionRequest = {
+      protocol: "responses",
+      virtualModelId: "tidu",
+      body: {
+        model: "tidu",
+        tools,
+        input: [result, guidance],
+        stream: true,
+      },
+    };
+    const first = await provider.execute(request);
+    assert.equal(first.kind, "stream");
+    const wire = await readStreamText(first.stream);
+    assert.match(wire, /Resuming the inspection\./u);
+    assert.match(wire, /Interrupted answer fragment/u);
+    assert.match(wire, /response\.failed/u);
+    assert.doesNotMatch(wire, /response\.completed|medium-result/u);
+    const progress = wire.split("\n").flatMap((line) => {
+      if (!line.startsWith("data: {")) return [];
+      const event = JSON.parse(line.slice("data: ".length));
+      return event.type === "response.output_item.done" &&
+        ["visible-resume", "visible-reasoning"].includes(event.item?.id)
+        ? [event.item]
+        : [];
+    });
+    assert.equal(progress.length, 2);
+    assert.equal(
+      readFileSync(processLog, "utf8")
+        .split("\n")
+        .filter((line) => line === "start").length,
+      1,
+    );
+
+    await assert.rejects(
+      provider.execute({
+        ...request,
+        body: { ...request.body, input: [{ ...result, output: "Changed." }, guidance] },
+      }),
+      /Conflicting caller tool results/u,
+    );
+    const newTurn = await provider.execute({
+      ...request,
+      routing: { targetModel: "gpt-other" },
+      body: {
+        ...request.body,
+        input: [call, result, guidance, { role: "user", content: "A genuine new user request." }],
+      },
+    });
+    assert.equal(newTurn.upstreamModel, "gpt-other");
+    await readCodexResponseBody(newTurn);
+
+    const recovered = await readCodexResponseBody(
+      await provider.execute({
+        ...request,
+        body: { ...request.body, input: [result, guidance, ...progress] },
+      }),
+    );
+    const recoveredText = JSON.stringify(recovered);
+    assert.match(recoveredText, /medium-result/u);
+    assert.doesNotMatch(recoveredText, /Resuming the inspection|Interrupted answer fragment/u);
+    assert.match(readFileSync(processLog, "utf8"), /input:.*Keep the answer brief\./u);
   } finally {
     await provider?.close?.();
     rmSync(directory, { recursive: true, force: true });
@@ -2303,7 +3052,7 @@ test("retains the latest user input followed by developer context despite older 
   }
 });
 
-test("retains native summary grouping and distinct IDs in non-streaming responses", async () => {
+test("relays native progress while a non-streaming Codex stage prepares its result", async () => {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "tidu-codex-native-progress-"));
   const codexHomeDirectory = join(temporaryDirectory, "codex-home");
   mkdirSync(codexHomeDirectory, { recursive: true });
@@ -2317,10 +3066,12 @@ test("retains native summary grouping and distinct IDs in non-streaming response
   });
   try {
     if (provider === undefined) throw new Error("Expected a Codex host provider.");
+    const events: Record<string, unknown>[] = [];
     const result = await provider.execute({
       protocol: "responses",
       body: { model: "ai-tidu9-config", input: "Inspect the fixture." },
       virtualModelId: "ai-tidu9-config",
+      onProcessEvent: (event) => events.push(event),
     });
     assert.equal(result.kind, "json");
     if (result.kind !== "json") throw new Error("Expected a JSON provider result.");
@@ -2353,6 +3104,40 @@ test("retains native summary grouping and distinct IDs in non-streaming response
       ],
     );
     assert.match(JSON.stringify(output), /medium-result/u);
+    assert.deepEqual(
+      events
+        .filter((event) => event.type === "response.output_item.done")
+        .map((event) => event.item),
+      [
+        ...output.filter((item) => item.type === "reasoning"),
+        {
+          id: "commentary-1",
+          type: "message",
+          role: "assistant",
+          phase: "commentary",
+          content: [{ type: "output_text", text: "working-", annotations: [] }],
+          status: "completed",
+        },
+      ],
+    );
+    assert.ok(
+      events.some(
+        (event) =>
+          event.type === "response.reasoning_summary_text.delta" &&
+          event.item_id === "reasoning-1" &&
+          event.summary_index === 0 &&
+          event.delta === "reasoning-",
+      ),
+    );
+    assert.ok(
+      events.some(
+        (event) =>
+          event.type === "response.output_text.delta" &&
+          event.item_id === "commentary-1" &&
+          event.delta === "working-",
+      ),
+    );
+    assert.doesNotMatch(JSON.stringify(events), /medium-result/u);
   } finally {
     await provider?.close?.();
     rmSync(temporaryDirectory, { recursive: true, force: true });
@@ -2418,16 +3203,21 @@ test("recreates a closed Codex connection before any visible output", async () =
   try {
     assert.notEqual(provider, undefined);
     if (provider === undefined) throw new Error("Expected a Codex host provider.");
+    let retries = 0;
     const result = await provider.execute({
       protocol: "responses",
       body: { model: "ai-tidu9-config", input: "recover", stream: true },
       virtualModelId: "ai-tidu9-config",
+      onExecutionRetry: () => {
+        retries++;
+      },
     });
     assert.equal(result.kind, "stream");
     if (result.kind !== "stream") throw new Error("Expected a streaming result.");
     const events = await readStreamText(result.stream);
     assert.match(events, /response\.completed/u);
     assert.match(events, /medium-result/u);
+    assert.equal(retries, 1);
     assert.equal(readFileSync(processLog, "utf8").match(/^start$/gmu)?.length, 2);
   } finally {
     await provider?.close?.();
@@ -2478,6 +3268,7 @@ test("preserves failed Codex turn reasons and usage in streamed and JSON results
       assert.deepEqual(receipts.at(-1), {
         inputTokens: 11,
         cachedInputTokens: 3,
+        freshInputTokens: 6,
         cacheWriteInputTokens: 2,
         outputTokens: 4,
         reasoningTokens: 1,
@@ -2826,12 +3617,105 @@ test("forwards OpenAI-compatible requests without exposing provider identity", a
     assert.equal(receivedAuthorization, "Bearer test-only-secret");
     assert.equal(receivedBody.model, "upstream-model");
     assert.equal((result.body as { model: string }).model, "ai-tidu9-config");
+    assert.equal(result.upstreamModel, "upstream-model");
     assert.deepEqual(provider.descriptor, {
       type: "openai-compatible",
       model: "upstream-model",
     });
     assert.equal("apiKey" in provider.descriptor, false);
     assert.equal("baseUrl" in provider.descriptor, false);
+  } finally {
+    await server.close();
+  }
+});
+
+test("attributes OpenAI-compatible image usage to the secondary host with or without model confirmation", async () => {
+  let reportedModel: string | undefined;
+  const server = await startTestServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({
+        model: reportedModel,
+        output_text: "The header says Latency.",
+        usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+      }),
+    );
+  });
+  try {
+    const reader = createOpenAiCompatibleProvider({
+      baseUrl: server.origin,
+      model: "configured-reader",
+    });
+    const writer: ModelProvider = {
+      descriptor: { type: "codex-host", model: "writer" },
+      execute: async () => ({
+        kind: "json",
+        statusCode: 200,
+        upstreamModel: "writer",
+        body: {
+          output_text: "Latency report",
+          usage: { input_tokens: 7, output_tokens: 2, total_tokens: 9 },
+        },
+      }),
+    };
+    const completion = createCapabilityCompletionProvider(
+      writer,
+      async () => ({
+        modelSelection: { source: "official", model: "writer" },
+        capabilityCompletion: {
+          enabled: true,
+          mainCapabilities: ["text"],
+          maximumSpecialists: 1,
+          specialists: [
+            {
+              host: "openai-compatible",
+              source: "custom",
+              model: "configured-reader",
+              capabilities: ["vision"],
+            },
+          ],
+        },
+      }),
+      { resolveProviderForHost: async (host) => (host === "codex" ? writer : reader) },
+    );
+    for (const model of ["confirmed-reader", undefined]) {
+      reportedModel = model;
+      const receipts = new Map<string, ProviderExecutionReceipt>();
+      await completion.execute({
+        protocol: "responses",
+        virtualModelId: "tidu",
+        body: {
+          input: [
+            {
+              role: "user",
+              content: [
+                { type: "input_text", text: "Give this image a title" },
+                { type: "input_image", image_url: "data:image/png;base64,AQ==" },
+              ],
+            },
+          ],
+        },
+        routing: { host: "codex" },
+        onExecutionReceipt: (receipt) => {
+          if (receipt.usage !== null) receipts.set(receipt.host, receipt);
+        },
+      });
+      const secondary = receipts.get("openai-compatible");
+      assert.ok(secondary);
+      const { attemptId: _attemptId, ...actual } = secondary;
+      assert.deepEqual(actual, {
+        host: "openai-compatible",
+        model: reportedModel ?? "configured-reader",
+        ...(reportedModel === undefined ? { modelConfirmed: false } : {}),
+        role: "specialist",
+        capabilities: ["vision"],
+        usage: { inputTokens: 10, outputTokens: 3, totalTokens: 13 },
+      });
+      assert.equal(receipts.get("codex")?.usage?.totalTokens, 9);
+      const status = await completion.inspectCapabilityCompletion();
+      assert.equal(status.records[0]?.observation?.measuredTotalTokens, 22);
+      assert.equal(status.records[0]?.secondaryResults[0]?.executedModel, reportedModel ?? null);
+    }
   } finally {
     await server.close();
   }
@@ -2974,6 +3858,59 @@ test("translates Ollama chat and Responses payloads into the virtual model contr
   }
 });
 
+test("distinguishes missing Ollama usage from explicit zero across both protocols and transports", async () => {
+  let counters: Record<string, number> = {};
+  const server = await startTestServer((request, response) => {
+    void readBody(request).then((body) => {
+      response.writeHead(200, {
+        "content-type": body.stream ? "application/x-ndjson" : "application/json",
+      });
+      const payload = {
+        model: "served-fixture",
+        message: { role: "assistant", content: "ok" },
+        done: true,
+        ...counters,
+      };
+      response.end(`${JSON.stringify(payload)}\n`);
+    });
+  });
+  try {
+    const provider = createOllamaProvider({ baseUrl: server.origin, model: "fixture" });
+    for (const reported of [{}, { eval_count: 0 }, { prompt_eval_count: 0, eval_count: 0 }]) {
+      counters = { ...reported } as Record<string, number>;
+      for (const protocol of ["chat-completions", "responses"] as const) {
+        for (const stream of [true, false]) {
+          const receipts: ProviderExecutionReceipt[] = [];
+          const result = await provider.execute({
+            protocol,
+            virtualModelId: "tidu",
+            body:
+              protocol === "responses"
+                ? { input: "test", stream }
+                : { messages: [{ role: "user", content: "test" }], stream },
+            onExecutionReceipt: (receipt) => receipts.push(receipt),
+          });
+          const wire =
+            result.kind === "json"
+              ? JSON.stringify(result.body)
+              : await new Response(result.stream).text();
+          assert.match(wire, /ok/u);
+          assert.equal(wire.includes('"total_tokens":0'), "prompt_eval_count" in counters);
+          assert.equal(wire.includes('"usage":'), "prompt_eval_count" in counters);
+          assert.doesNotMatch(wire, /served-fixture/u);
+          assert.equal(receipts[0]?.model, "served-fixture");
+          assert.equal(
+            receipts[0]?.usage?.totalTokens ?? null,
+            "prompt_eval_count" in counters ? 0 : null,
+          );
+        }
+      }
+    }
+  } finally {
+    await server.close();
+  }
+});
+
 test("normalizes Ollama function calls and tool-result continuation messages", async () => {
   let receivedBody: Record<string, unknown> = {};
   const server = await startTestServer((request, response) => {
@@ -3064,7 +4001,10 @@ test("streams OpenAI-compatible SSE while preserving the virtual model identity"
       assert.equal(body.stream, true);
       response.writeHead(200, { "content-type": "text/event-stream" });
       response.write(
-        'data: {"id":"chatcmpl-upstream","model":"upstream-model","choices":[{"delta":{"content":"hello"}}]}\n\n',
+        'data: {"id":"chatcmpl-upstream","model":"served-model","choices":[{"delta":{"content":"hello"}}]}\n\n',
+      );
+      response.write(
+        'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}\n\n',
       );
       response.end("data: [DONE]\n\n");
     });
@@ -3075,6 +4015,7 @@ test("streams OpenAI-compatible SSE while preserving the virtual model identity"
       baseUrl: `${server.origin}/v1`,
       model: "upstream-model",
     });
+    const receipts: ProviderExecutionReceipt[] = [];
     const result = await provider.execute({
       protocol: "chat-completions",
       body: {
@@ -3083,6 +4024,7 @@ test("streams OpenAI-compatible SSE while preserving the virtual model identity"
         stream: true,
       },
       virtualModelId: "ai-tidu9-config",
+      onExecutionReceipt: (receipt) => receipts.push(receipt),
     });
 
     assert.equal(result.kind, "stream");
@@ -3091,8 +4033,10 @@ test("streams OpenAI-compatible SSE while preserving the virtual model identity"
     }
     const events = await new Response(result.stream).text();
     assert.match(events, /"model":"ai-tidu9-config"/u);
-    assert.doesNotMatch(events, /upstream-model/u);
+    assert.doesNotMatch(events, /served-model/u);
     assert.match(events, /data: \[DONE\]/u);
+    assert.equal(receipts[0]?.model, "served-model");
+    assert.deepEqual(receipts.at(-1)?.usage, { inputTokens: 7, outputTokens: 2, totalTokens: 9 });
   } finally {
     await server.close();
   }

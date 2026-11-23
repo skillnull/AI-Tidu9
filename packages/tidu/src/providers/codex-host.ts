@@ -27,6 +27,7 @@ import {
   type CodexUsageSummary,
   createCodexAgentClient,
 } from "../connectors/codex-app-server.js";
+import { visionSkillReferenceText } from "../connectors/codex-vision-context.js";
 import {
   type CursorAcpCapabilities,
   type CursorAcpModel,
@@ -41,7 +42,12 @@ import {
   createCallerToolCatalog,
   normalizeCallerToolInput,
 } from "./caller-tools.js";
-import type { ModelProvider, ProviderExecutionRequest, ProviderExecutionResult } from "./index.js";
+import type {
+  ModelProvider,
+  ProviderExecutionReceipt,
+  ProviderExecutionRequest,
+  ProviderExecutionResult,
+} from "./index.js";
 
 const CURSOR_DISCOVERY_TIMEOUT_MILLISECONDS = 30_000;
 const CURSOR_MAX_IMAGE_BYTES = 20 * 1_024 * 1_024;
@@ -62,14 +68,7 @@ const CODEX_REASONING_SUMMARIES = new Set<CodexReasoningSummary>([
   "none",
 ]);
 
-type HostTokenUsage = {
-  inputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
-  cachedInputTokens?: number;
-  cacheWriteInputTokens?: number;
-  reasoningTokens?: number;
-};
+type HostTokenUsage = NonNullable<ProviderExecutionReceipt["usage"]>;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -187,7 +186,18 @@ const normalizePortableHistoryItem = (item: Record<string, unknown>): Record<str
   }
   if (item.type === "compaction" || item.type === "context_compaction") return [];
   const sanitized = sanitizePortableHistoryValue(item);
-  return isRecord(sanitized) ? [sanitized] : [];
+  if (!isRecord(sanitized)) return [];
+  if (sanitized.type === "agent_message" && Array.isArray(sanitized.content)) {
+    return [
+      {
+        ...sanitized,
+        content: sanitized.content.map((part) =>
+          isRecord(part) && part.type === "text" ? { ...part, type: "input_text" } : part,
+        ),
+      },
+    ];
+  }
+  return [sanitized];
 };
 
 /** Removes provider-private history while preserving reusable messages and public summaries. */
@@ -609,6 +619,34 @@ const requestReasoningSummary = (request: ProviderExecutionRequest): CodexReason
     : "auto";
 };
 
+const wireUsage = (
+  usage: HostTokenUsage | null | undefined,
+  protocol: ProviderExecutionRequest["protocol"],
+) => {
+  if (usage == null) return undefined;
+  const chat = protocol === "chat-completions";
+  return {
+    [chat ? "prompt_tokens" : "input_tokens"]: usage.inputTokens,
+    [chat ? "completion_tokens" : "output_tokens"]: usage.outputTokens,
+    total_tokens: usage.totalTokens,
+    ...(usage.cachedInputTokens === undefined && usage.cacheWriteInputTokens === undefined
+      ? {}
+      : {
+          [chat ? "prompt_tokens_details" : "input_tokens_details"]: {
+            cached_tokens: usage.cachedInputTokens,
+            cache_write_tokens: usage.cacheWriteInputTokens,
+          },
+        }),
+    ...(usage.reasoningTokens === undefined
+      ? {}
+      : {
+          [chat ? "completion_tokens_details" : "output_tokens_details"]: {
+            reasoning_tokens: usage.reasoningTokens,
+          },
+        }),
+  };
+};
+
 const createResponse = (
   request: ProviderExecutionRequest,
   text: string,
@@ -630,15 +668,7 @@ const createResponse = (
           finish_reason: "stop",
         },
       ],
-      ...(usage == null
-        ? {}
-        : {
-            usage: {
-              prompt_tokens: usage.inputTokens,
-              completion_tokens: usage.outputTokens,
-              total_tokens: usage.totalTokens,
-            },
-          }),
+      ...(usage == null ? {} : { usage: wireUsage(usage, request.protocol) }),
     };
   }
   return {
@@ -659,23 +689,176 @@ const createResponse = (
         content: [{ type: "output_text", text, annotations: [] }],
       },
     ],
-    ...(usage == null
-      ? {}
-      : {
-          usage: {
-            input_tokens: usage.inputTokens,
-            input_tokens_details: {
-              cached_tokens: usage.cachedInputTokens ?? 0,
-              cache_write_tokens: usage.cacheWriteInputTokens ?? 0,
-            },
-            output_tokens: usage.outputTokens,
-            output_tokens_details: {
-              reasoning_tokens: usage.reasoningTokens ?? 0,
-            },
-            total_tokens: usage.totalTokens,
-          },
-        }),
+    ...(usage == null ? {} : { usage: wireUsage(usage, request.protocol) }),
   };
+};
+
+const createNativeResponseItems = (
+  responseId: string,
+  emitEvent: (type: string, payload: Record<string, unknown>) => void,
+) => {
+  const nativeItems = new Map<
+    string,
+    {
+      item: Record<string, unknown>;
+      outputIndex: number;
+      done: boolean;
+      summaryParts: Map<number, string>;
+      contentText?: string;
+    }
+  >();
+  let nativeOutputIndex = 0;
+  const startNativeItem = (item: Record<string, unknown>) => {
+    const itemId = typeof item.id === "string" ? item.id : `${responseId}_${nativeOutputIndex}`;
+    const existing = nativeItems.get(itemId);
+    if (existing !== undefined) return existing;
+    const state = {
+      item: { ...item, id: itemId },
+      outputIndex: nativeOutputIndex++,
+      done: false,
+      summaryParts: new Map<number, string>(),
+      contentText: undefined as string | undefined,
+    };
+    nativeItems.set(itemId, state);
+    emitEvent("response.output_item.added", {
+      output_index: state.outputIndex,
+      item: state.item,
+    });
+    return state;
+  };
+  const emitMessageDelta = (delta: string, itemId: string, phase: string): void => {
+    const state = startNativeItem({
+      id: itemId,
+      type: "message",
+      role: "assistant",
+      phase,
+      content: [],
+      status: "in_progress",
+    });
+    if (state.done) return;
+    const identity = {
+      item_id: itemId,
+      output_index: state.outputIndex,
+      content_index: 0,
+    };
+    if (state.contentText === undefined) {
+      state.contentText = "";
+      emitEvent("response.content_part.added", {
+        ...identity,
+        part: { type: "output_text", text: "", annotations: [] },
+      });
+    }
+    state.contentText += delta;
+    emitEvent("response.output_text.delta", { ...identity, delta });
+  };
+  const emitProcessDelta = (delta: string, source?: CodexProcessDeltaSource): void => {
+    if (delta === "") return;
+    if (source === undefined || source.type === "activity") {
+      emitEvent("response.reasoning_summary_text.delta", { delta });
+      return;
+    }
+    if (source.separator) return;
+    if (source.type === "commentary") {
+      emitMessageDelta(delta, source.itemId, "commentary");
+      return;
+    }
+    const state = startNativeItem({
+      id: source.itemId,
+      type: "reasoning",
+      summary: [],
+    });
+    if (state.done) return;
+    const summaryIndex = source.summaryIndex ?? 0;
+    const identity = {
+      item_id: source.itemId,
+      output_index: state.outputIndex,
+      summary_index: summaryIndex,
+    };
+    if (!state.summaryParts.has(summaryIndex)) {
+      state.summaryParts.set(summaryIndex, "");
+      emitEvent("response.reasoning_summary_part.added", {
+        ...identity,
+        part: { type: "summary_text", text: "" },
+      });
+    }
+    state.summaryParts.set(summaryIndex, `${state.summaryParts.get(summaryIndex)}${delta}`);
+    emitEvent("response.reasoning_summary_text.delta", {
+      ...identity,
+      delta,
+    });
+  };
+  const emitNativeItem = (item: Record<string, unknown>): void => {
+    const state = startNativeItem(item);
+    if (state.done) return;
+    state.item = { ...item, id: state.item.id };
+    for (const [summaryIndex, text] of state.summaryParts) {
+      const part = Array.isArray(item.summary) ? item.summary[summaryIndex] : undefined;
+      const completedPart = isRecord(part) ? part : { type: "summary_text", text };
+      const identity = {
+        item_id: state.item.id,
+        output_index: state.outputIndex,
+        summary_index: summaryIndex,
+      };
+      emitEvent("response.reasoning_summary_text.done", {
+        ...identity,
+        text: completedPart.text,
+      });
+      emitEvent("response.reasoning_summary_part.done", {
+        ...identity,
+        part: completedPart,
+      });
+    }
+    if (state.contentText !== undefined) {
+      const part = Array.isArray(item.content) ? item.content[0] : undefined;
+      const completedPart = isRecord(part)
+        ? part
+        : { type: "output_text", text: state.contentText, annotations: [] };
+      const identity = {
+        item_id: state.item.id,
+        output_index: state.outputIndex,
+        content_index: 0,
+      };
+      emitEvent("response.output_text.done", {
+        ...identity,
+        text: completedPart.text,
+      });
+      emitEvent("response.content_part.done", {
+        ...identity,
+        part: completedPart,
+      });
+    }
+    state.done = true;
+    emitEvent("response.output_item.done", {
+      output_index: state.outputIndex,
+      item: state.item,
+    });
+  };
+  const finish = (): Record<string, unknown>[] => {
+    for (const state of nativeItems.values()) {
+      if (state.done) continue;
+      emitNativeItem({
+        ...state.item,
+        ...(state.item.type === "reasoning"
+          ? {
+              summary: [...state.summaryParts]
+                .sort(([left], [right]) => left - right)
+                .map(([, text]) => ({ type: "summary_text", text })),
+            }
+          : {
+              status: "completed",
+              content: [
+                {
+                  type: "output_text",
+                  text: state.contentText ?? "",
+                  annotations: [],
+                },
+              ],
+            }),
+      });
+    }
+    return [...nativeItems.values()].map((state) => state.item);
+  };
+  return { emitMessageDelta, emitProcessDelta, emitNativeItem, finish };
 };
 
 export const createLiveJsonStream = (
@@ -707,17 +890,7 @@ export const createLiveJsonStream = (
   return new ReadableStream<Uint8Array>({
     start(controller) {
       let firstChatDelta = true;
-      const nativeItems = new Map<
-        string,
-        {
-          item: Record<string, unknown>;
-          outputIndex: number;
-          done: boolean;
-          summaryParts: Map<number, string>;
-          contentText?: string;
-        }
-      >();
-      let nativeOutputIndex = 0;
+      const publicProcessIds = new Set<string>();
       const write = (event: string): boolean => {
         if (!streamOpen) return false;
         controller.enqueue(encoder.encode(event));
@@ -729,51 +902,34 @@ export const createLiveJsonStream = (
         controller.close();
       };
       const emitEvent = (type: string, payload: Record<string, unknown>): void => {
+        const item = isRecord(payload.item) ? payload.item : undefined;
+        const itemId = item?.id ?? payload.item_id;
+        if (request.onProcessEvent !== undefined && typeof itemId === "string") {
+          if (
+            type === "response.output_item.added" &&
+            item !== undefined &&
+            (item.type === "reasoning" ||
+              item.type === "web_search_call" ||
+              (item.type === "message" && item.phase === "commentary"))
+          )
+            publicProcessIds.add(itemId);
+          if (publicProcessIds.has(itemId)) {
+            request.onProcessEvent({ type, ...payload });
+            return;
+          }
+        }
+        if (
+          type === "response.reasoning_summary_text.delta" &&
+          itemId === undefined &&
+          typeof payload.delta === "string" &&
+          request.onProcessDelta !== undefined
+        ) {
+          request.onProcessDelta(payload.delta);
+          return;
+        }
         write(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`);
       };
-      const startNativeItem = (item: Record<string, unknown>) => {
-        const itemId = typeof item.id === "string" ? item.id : `${responseId}_${nativeOutputIndex}`;
-        const existing = nativeItems.get(itemId);
-        if (existing !== undefined) return existing;
-        const state = {
-          item: { ...item, id: itemId },
-          outputIndex: nativeOutputIndex++,
-          done: false,
-          summaryParts: new Map<number, string>(),
-          contentText: undefined as string | undefined,
-        };
-        nativeItems.set(itemId, state);
-        emitEvent("response.output_item.added", {
-          output_index: state.outputIndex,
-          item: state.item,
-        });
-        return state;
-      };
-      const emitMessageDelta = (delta: string, itemId: string, phase: string): void => {
-        const state = startNativeItem({
-          id: itemId,
-          type: "message",
-          role: "assistant",
-          phase,
-          content: [],
-          status: "in_progress",
-        });
-        if (state.done) return;
-        const identity = {
-          item_id: itemId,
-          output_index: state.outputIndex,
-          content_index: 0,
-        };
-        if (state.contentText === undefined) {
-          state.contentText = "";
-          emitEvent("response.content_part.added", {
-            ...identity,
-            part: { type: "output_text", text: "", annotations: [] },
-          });
-        }
-        state.contentText += delta;
-        emitEvent("response.output_text.delta", { ...identity, delta });
-      };
+      const native = createNativeResponseItems(responseId, emitEvent);
       const emitTextDelta = (delta: string): void => {
         if (request.protocol === "chat-completions") {
           if (
@@ -802,92 +958,18 @@ export const createLiveJsonStream = (
           return;
         }
         if (streamOpen && delta !== "")
-          emitMessageDelta(delta, `${responseId}_message`, "final_answer");
+          native.emitMessageDelta(delta, `${responseId}_message`, "final_answer");
       };
-      const emitProcessDelta = (delta: string, source?: CodexProcessDeltaSource): void => {
-        if (!streamOpen || request.protocol !== "responses" || delta === "") return;
-        if (source === undefined || source.type === "activity") {
-          emitEvent("response.reasoning_summary_text.delta", { delta });
-          return;
-        }
-        if (source.separator) return;
-        if (source.type === "commentary") {
-          emitMessageDelta(delta, source.itemId, "commentary");
-          return;
-        }
-        const state = startNativeItem({
-          id: source.itemId,
-          type: "reasoning",
-          summary: [],
-        });
-        if (state.done) return;
-        const summaryIndex = source.summaryIndex ?? 0;
-        const identity = {
-          item_id: source.itemId,
-          output_index: state.outputIndex,
-          summary_index: summaryIndex,
-        };
-        if (!state.summaryParts.has(summaryIndex)) {
-          state.summaryParts.set(summaryIndex, "");
-          emitEvent("response.reasoning_summary_part.added", {
-            ...identity,
-            part: { type: "summary_text", text: "" },
-          });
-        }
-        state.summaryParts.set(summaryIndex, `${state.summaryParts.get(summaryIndex)}${delta}`);
-        emitEvent("response.reasoning_summary_text.delta", {
-          ...identity,
-          delta,
-        });
-      };
-      const emitNativeItem = (item: Record<string, unknown>): void => {
-        if (!streamOpen || request.protocol !== "responses") return;
-        const state = startNativeItem(item);
-        if (state.done) return;
-        state.item = { ...item, id: state.item.id };
-        for (const [summaryIndex, text] of state.summaryParts) {
-          const part = Array.isArray(item.summary) ? item.summary[summaryIndex] : undefined;
-          const completedPart = isRecord(part) ? part : { type: "summary_text", text };
-          const identity = {
-            item_id: state.item.id,
-            output_index: state.outputIndex,
-            summary_index: summaryIndex,
-          };
-          emitEvent("response.reasoning_summary_text.done", {
-            ...identity,
-            text: completedPart.text,
-          });
-          emitEvent("response.reasoning_summary_part.done", {
-            ...identity,
-            part: completedPart,
-          });
-        }
-        if (state.contentText !== undefined) {
-          const part = Array.isArray(item.content) ? item.content[0] : undefined;
-          const completedPart = isRecord(part)
-            ? part
-            : { type: "output_text", text: state.contentText, annotations: [] };
-          const identity = {
-            item_id: state.item.id,
-            output_index: state.outputIndex,
-            content_index: 0,
-          };
-          emitEvent("response.output_text.done", {
-            ...identity,
-            text: completedPart.text,
-          });
-          emitEvent("response.content_part.done", {
-            ...identity,
-            part: completedPart,
-          });
-        }
-        state.done = true;
-        emitEvent("response.output_item.done", {
-          output_index: state.outputIndex,
-          item: state.item,
-        });
-      };
-      void run(emitTextDelta, emitProcessDelta, emitNativeItem)
+      void run(
+        emitTextDelta,
+        (delta, source) => {
+          if (streamOpen && request.protocol === "responses")
+            native.emitProcessDelta(delta, source);
+        },
+        (item) => {
+          if (streamOpen && request.protocol === "responses") native.emitNativeItem(item);
+        },
+      )
         .then((result) => {
           if (!streamOpen) return;
           const text = typeof result === "string" ? result : result.text;
@@ -902,15 +984,7 @@ export const createLiveJsonStream = (
                 created: Math.floor(Date.now() / 1_000),
                 model: responseModel(request),
                 choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                ...(usage === null
-                  ? {}
-                  : {
-                      usage: {
-                        prompt_tokens: usage.inputTokens,
-                        completion_tokens: usage.outputTokens,
-                        total_tokens: usage.totalTokens,
-                      },
-                    }),
+                usage: wireUsage(usage, request.protocol),
               })}\n\n`,
             );
           } else {
@@ -926,30 +1000,8 @@ export const createLiveJsonStream = (
               ...progressItems,
               ...(responseBody.output as Record<string, unknown>[]),
             ];
-            completedItems.forEach(emitNativeItem);
-            for (const state of nativeItems.values()) {
-              if (state.done) continue;
-              emitNativeItem({
-                ...state.item,
-                ...(state.item.type === "reasoning"
-                  ? {
-                      summary: [...state.summaryParts]
-                        .sort(([left], [right]) => left - right)
-                        .map(([, text]) => ({ type: "summary_text", text })),
-                    }
-                  : {
-                      status: "completed",
-                      content: [
-                        {
-                          type: "output_text",
-                          text: state.contentText ?? "",
-                          annotations: [],
-                        },
-                      ],
-                    }),
-              });
-            }
-            const terminalItems = [...nativeItems.values()].map((state) => state.item);
+            completedItems.forEach(native.emitNativeItem);
+            const terminalItems = native.finish();
             write(
               `event: response.completed\ndata: ${JSON.stringify({
                 type: "response.completed",
@@ -980,7 +1032,7 @@ export const createLiveJsonStream = (
           const usage = readUsage();
           if (request.protocol === "chat-completions") {
             write(
-              `data: ${JSON.stringify({ error: failure, ...(usage === null ? {} : { usage: { prompt_tokens: usage.inputTokens, completion_tokens: usage.outputTokens, total_tokens: usage.totalTokens } }) })}\n\n`,
+              `data: ${JSON.stringify({ error: failure, usage: wireUsage(usage, request.protocol) })}\n\n`,
             );
           } else {
             write(
@@ -1157,7 +1209,34 @@ interface CodexClientSession {
   recover?: () => Promise<CodexClientSession>;
 }
 
-interface CodexCallerContinuation {
+interface CallerDeliveryIdentity {
+  /** Canonical request accepted for this generation step. */
+  key: string;
+  /** The original tool results, shared by all steps in the batch. */
+  resultsKey: string;
+  /** Tool definitions, developer constraints, and generation settings for the batch. */
+  constraintsKey: string;
+  /** Ordered native agent messages appended after the tool batch. */
+  agentMessages: readonly string[];
+  /** Whether the normalized delivery contains user input. */
+  hasUserInput: boolean;
+}
+
+interface CallerDeliveryState {
+  /** Accepted inputs retained when a visible delivery is interrupted. */
+  failedDelivery?: CallerDeliveryIdentity;
+  /** Fingerprints of completed progress published by this delivery. */
+  emittedProgress?: Map<string, string>;
+  /** Atomic delivery shared by concurrent and completed retries. */
+  delivery?: CallerDeliveryIdentity & {
+    promise: Promise<CodexExecutionResult>;
+    controller: AbortController;
+    progress: ReturnType<typeof createCallerDeliveryProgress>;
+    settled: boolean;
+  };
+}
+
+interface CodexCallerContinuation extends CallerDeliveryState {
   /** Model session that owns the original native operation. */
   owner: CodexClientSession;
   /** Thread whose live tool RPCs must receive the caller results. */
@@ -1174,22 +1253,102 @@ interface CodexCallerContinuation {
   instructions: unknown;
   /** Public conversation including this batch, sufficient for isolated recovery. */
   replayItems: readonly Record<string, unknown>[];
+  /** Visible process items already emitted by the native turn. */
+  progressItems: readonly Record<string, unknown>[];
+  /** Routing context retained for a continuation of the primary model. */
+  primaryCapabilities?: {
+    /** Configured source that produced the delegated call. */
+    source: NonNullable<ProviderExecutionRequest["routing"]>["modelSource"];
+    /** Capabilities assigned to the primary model. */
+    available: readonly string[];
+    /** Evidence capabilities already provided to the native turn. */
+    completed: readonly string[];
+  };
   /** A terminal native turn can only be continued through its public replay history. */
   retired?: boolean;
-  /** One atomic delivery shared by concurrent and completed retries. */
-  delivery?: {
-    key: string;
-    resultsKey: string;
-    promise: Promise<CodexExecutionResult>;
-    controller: AbortController;
-    subscribers: number;
-    settled: boolean;
-  };
+  /** Subsequent generation steps triggered by native agent messages. */
+  agentDeliveries?: Map<string, CallerDeliveryState>;
 }
 
 type CodexExecutionResult = CodexTurnResult & {
   /** Public caller tool requests to execute after a successful model response. */
   outputItems?: readonly Record<string, unknown>[];
+};
+
+type CallerDeliveryEvent =
+  | { type: "text"; delta: string }
+  | { type: "process"; delta: string; source?: CodexProcessDeltaSource }
+  | { type: "item"; item: Record<string, unknown> };
+
+interface CallerDeliverySubscriber {
+  onTextDelta?: (delta: string) => void;
+  onProcessDelta?: (delta: string, source?: CodexProcessDeltaSource) => void;
+  onNativeItem?: (item: Record<string, unknown>) => void;
+  beforePrompt?: () => void;
+  onExecutionReceipt?: ProviderExecutionRequest["onExecutionReceipt"];
+}
+
+const createCallerDeliveryProgress = () => {
+  const subscribers = new Map<CallerDeliverySubscriber, boolean>();
+  let history: CallerDeliveryEvent[] | undefined = [];
+  let historyBytes = 0;
+  let visible = false;
+  let promptStarted = false;
+  let latestReceipt: ProviderExecutionReceipt | undefined;
+
+  const forward = (subscriber: CallerDeliverySubscriber, event: CallerDeliveryEvent): void => {
+    if (event.type === "text" && subscriber.onTextDelta !== undefined) {
+      visible ||= event.delta !== "";
+      subscriber.onTextDelta(event.delta);
+    } else if (event.type === "process" && subscriber.onProcessDelta !== undefined) {
+      visible ||= /\S/u.test(event.delta);
+      subscriber.onProcessDelta(event.delta, event.source);
+    } else if (event.type === "item" && subscriber.onNativeItem !== undefined) {
+      visible = true;
+      subscriber.onNativeItem(event.item);
+    }
+  };
+
+  return {
+    subscribe(subscriber: CallerDeliverySubscriber): void {
+      // Past a bounded prefix, late subscribers get complete terminal items without partial deltas.
+      subscribers.set(subscriber, history !== undefined);
+      if (promptStarted) subscriber.beforePrompt?.();
+      if (latestReceipt !== undefined) subscriber.onExecutionReceipt?.(latestReceipt);
+      if (history !== undefined) {
+        for (const event of history) forward(subscriber, event);
+      }
+    },
+    unsubscribe(subscriber: CallerDeliverySubscriber): number {
+      subscribers.delete(subscriber);
+      return subscribers.size;
+    },
+    publish(event: CallerDeliveryEvent): void {
+      if (history !== undefined) {
+        historyBytes += Buffer.byteLength(
+          event.type === "item" ? JSON.stringify(event.item) : event.delta,
+        );
+        if (history.length >= 512 || historyBytes > 256 * 1024) history = undefined;
+        else history.push(event);
+      }
+      for (const [subscriber, live] of subscribers) {
+        if (live) forward(subscriber, event);
+      }
+    },
+    startPrompt(): void {
+      promptStarted = true;
+      for (const subscriber of subscribers.keys()) subscriber.beforePrompt?.();
+    },
+    report(receipt: ProviderExecutionReceipt): void {
+      latestReceipt = receipt;
+      for (const subscriber of subscribers.keys()) subscriber.onExecutionReceipt?.(receipt);
+    },
+    hasVisibleOutput: (): boolean => visible,
+    finish(): void {
+      history = undefined;
+      latestReceipt = undefined;
+    },
+  };
 };
 
 const createCodexClientSession = async (
@@ -1262,31 +1421,91 @@ const requireCodexSessionModel = (session: CodexClientSession, requestedModel: s
   return confirmedModel;
 };
 
+const isCallerOutput = (item: unknown): item is Record<string, unknown> =>
+  isRecord(item) &&
+  ["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(
+    String(item.type),
+  );
+
 const callerOutputs = (request: ProviderExecutionRequest): Record<string, unknown>[] =>
   request.protocol === "responses" && Array.isArray(request.body.input)
-    ? request.body.input.filter(
-        (item): item is Record<string, unknown> =>
-          isRecord(item) &&
-          ["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(
-            String(item.type),
-          ),
-      )
+    ? request.body.input.filter(isCallerOutput)
     : [];
+
+const isOwnedCallerCall = (
+  continuation: CodexCallerContinuation,
+  item: Record<string, unknown>,
+): boolean =>
+  ["function_call", "custom_tool_call", "tool_search_call"].includes(String(item.type)) &&
+  continuation.callIds.includes(String(item.call_id));
+
+const callerHistoryItemKey = (item: Record<string, unknown>): string => {
+  const { id: _id, status: _status, ...content } = item;
+  return callerToolPayloadKey(createPortableCodexResponsesInput([content]));
+};
+
+const isCallerProgressItem = (item: Record<string, unknown>): boolean =>
+  item.type === "reasoning" ||
+  item.type === "web_search_call" ||
+  (item.role === "assistant" && item.phase === "commentary");
+
+const matchesEmittedCallerProgress = (
+  state: CallerDeliveryState | undefined,
+  item: Record<string, unknown>,
+  key: string,
+): boolean => {
+  const progress = state?.emittedProgress;
+  if (progress === undefined) return false;
+  if (typeof item.id === "string") return progress.get(item.id) === key;
+  for (const value of progress.values()) {
+    if (value === key) return true;
+  }
+  return false;
+};
+
+const firstOwnedCallerResult = (
+  continuation: CodexCallerContinuation,
+  items: readonly Record<string, unknown>[],
+): number =>
+  items.findIndex(
+    (item) => isCallerOutput(item) && continuation.callIds.includes(String(item.call_id)),
+  );
+
+// A partial client replay may repeat the previous prompt before its first owned result.
+const omitStoredCallerPrefix = (
+  continuation: CodexCallerContinuation,
+  items: readonly Record<string, unknown>[],
+): readonly Record<string, unknown>[] => {
+  const firstResult = firstOwnedCallerResult(continuation, items);
+  if (firstResult <= 0) return items;
+  const storedKeys = new Set(continuation.replayItems.map(callerHistoryItemKey));
+  return items.filter(
+    (item, index) => index >= firstResult || !storedKeys.has(callerHistoryItemKey(item)),
+  );
+};
 
 const callerContinuationPayload = (
   continuation: CodexCallerContinuation,
   request: ProviderExecutionRequest,
+  agentDelivery?: CallerDeliveryState,
 ) => {
   const items = Array.isArray(request.body.input) ? request.body.input.filter(isRecord) : [];
-  const firstCall = items.findIndex(
-    (item) =>
-      ["function_call", "custom_tool_call", "tool_search_call"].includes(String(item.type)) &&
-      continuation.callIds.includes(String(item.call_id)),
-  );
-  const delta = items.slice(firstCall < 0 ? 0 : firstCall + 1).filter((item) => {
-    if (["function_call", "custom_tool_call", "tool_search_call"].includes(String(item.type)))
-      return !continuation.callIds.includes(String(item.call_id));
-    return true;
+  const firstCall = items.findIndex((item) => isOwnedCallerCall(continuation, item));
+  const firstResult = firstOwnedCallerResult(continuation, items);
+  const start = firstResult >= 0 && firstResult < firstCall ? 0 : firstCall + 1;
+  const delta = omitStoredCallerPrefix(continuation, items.slice(start)).filter((item) => {
+    if (isOwnedCallerCall(continuation, item)) return false;
+    if (!isCallerProgressItem(item)) return true;
+    const key = callerHistoryItemKey(item);
+    return !(
+      matchesEmittedCallerProgress(continuation, item, key) ||
+      matchesEmittedCallerProgress(agentDelivery, item, key) ||
+      continuation.progressItems.some(
+        (emitted) =>
+          (typeof item.id !== "string" || item.id === emitted.id) &&
+          callerHistoryItemKey(emitted) === key,
+      )
+    );
   });
   return requestTurnInput({
     ...request,
@@ -1302,7 +1521,23 @@ const callerContinuationPayload = (
 };
 
 const callerRequestItems = (request: ProviderExecutionRequest): Record<string, unknown>[] => {
-  const input = createPortableCodexResponsesInput(request.body.input);
+  const rawInput = request.body.input;
+  const seenById = new Map<string, Record<string, unknown>[]>();
+  const unique = Array.isArray(rawInput)
+    ? rawInput.filter((item) => {
+        if (!isRecord(item) || typeof item.id !== "string") return true;
+        const seen = seenById.get(item.id);
+        if (seen === undefined) {
+          seenById.set(item.id, [item]);
+          return true;
+        }
+        const key = callerHistoryItemKey(item);
+        if (seen.some((previous) => callerHistoryItemKey(previous) === key)) return false;
+        seen.push(item);
+        return true;
+      })
+    : rawInput;
+  const input = createPortableCodexResponsesInput(unique);
   return Array.isArray(input)
     ? input.filter(isRecord)
     : typeof input === "string"
@@ -1315,13 +1550,18 @@ const callerReplayInput = (
   request: ProviderExecutionRequest,
 ): Record<string, unknown>[] => {
   const supplied = callerRequestItems(request);
-  return supplied.some(
-    (item) =>
-      continuation.callIds.includes(String(item.call_id)) &&
-      ["function_call", "custom_tool_call", "tool_search_call"].includes(String(item.type)),
-  )
-    ? supplied
-    : [...continuation.replayItems, ...supplied];
+  const suppliedCallIds = new Set(
+    supplied
+      .filter((item) => isOwnedCallerCall(continuation, item))
+      .map((item) => String(item.call_id)),
+  );
+  if (continuation.callIds.every((callId) => suppliedCallIds.has(callId))) return supplied;
+  return [
+    ...continuation.replayItems,
+    ...omitStoredCallerPrefix(continuation, supplied).filter(
+      (item) => !isOwnedCallerCall(continuation, item),
+    ),
+  ];
 };
 
 const callerReplayRequest = (
@@ -1341,8 +1581,36 @@ const callerReplayRequest = (
 const callerDeliveryKeys = (
   continuation: CodexCallerContinuation,
   request: ProviderExecutionRequest,
-) => {
-  const payload = callerContinuationPayload(continuation, request);
+): CallerDeliveryIdentity => {
+  const items = Array.isArray(request.body.input) ? request.body.input.filter(isRecord) : [];
+  let lastResult = items.length - 1;
+  for (; lastResult >= 0; lastResult -= 1) {
+    const item = items[lastResult];
+    if (isCallerOutput(item) && continuation.callIds.includes(String(item.call_id))) break;
+  }
+  const agentMessages = items
+    .slice(lastResult + 1)
+    .flatMap((item) =>
+      item.type === "agent_message" &&
+      typeof item.author === "string" &&
+      typeof item.recipient === "string" &&
+      Array.isArray(item.content)
+        ? [typeof item.id === "string" ? item.id : callerHistoryItemKey(item)]
+        : [],
+    );
+  const agentDelivery = continuation.agentDeliveries?.get(callerToolPayloadKey(agentMessages));
+  const payload = callerContinuationPayload(continuation, request, agentDelivery);
+  const { definitions, webSearchMode } = createCallerToolCatalog(request) ?? continuation.catalog;
+  const context = payload.historyItems.filter(
+    (item) => !continuation.callIds.includes(String(item.call_id)),
+  );
+  const settings = {
+    definitions,
+    webSearchMode,
+    effort: requestReasoningEffort(request),
+    summary: requestReasoningSummary(request),
+    outputFormat: structuredOutputFormat(request),
+  };
   const resultsKey = callerToolPayloadKey(
     callerOutputs(request)
       .filter((item) => continuation.callIds.includes(String(item.call_id)))
@@ -1350,36 +1618,65 @@ const callerDeliveryKeys = (
   );
   return {
     resultsKey,
+    constraintsKey: callerToolPayloadKey({
+      settings,
+      instructions: request.body.instructions ?? continuation.instructions,
+      messages: context
+        .filter((item) => item.role === "developer" || item.role === "system")
+        .map(callerHistoryItemKey),
+    }),
+    agentMessages,
+    hasUserInput:
+      payload.input.length > 0 || payload.historyItems.some((item) => item.role === "user"),
     key: callerToolPayloadKey({
       input: payload.input,
-      context: payload.historyItems.filter(
-        (item) => !continuation.callIds.includes(String(item.call_id)),
-      ),
-      definitions:
-        createCallerToolCatalog(request)?.definitions ?? continuation.catalog.definitions,
-      effort: requestReasoningEffort(request),
-      summary: requestReasoningSummary(request),
-      outputFormat: structuredOutputFormat(request),
+      context,
+      settings,
       resultsKey,
     }),
   };
 };
 
+const hasNewCallerUser = (
+  continuation: CodexCallerContinuation,
+  request: ProviderExecutionRequest,
+): boolean => {
+  const payload = callerContinuationPayload(continuation, request);
+  return payload.input.length > 0 || payload.historyItems.some((entry) => entry.role === "user");
+};
+
+const isCallerAgentFollowup = (
+  previous: CallerDeliveryIdentity,
+  current: CallerDeliveryIdentity,
+): boolean =>
+  previous.resultsKey === current.resultsKey &&
+  previous.constraintsKey === current.constraintsKey &&
+  current.agentMessages.length > previous.agentMessages.length &&
+  previous.agentMessages.every((message, index) => message === current.agentMessages[index]);
+
 const resolveCallerContinuation = (
   owners: ReadonlyMap<string, CodexCallerContinuation>,
   request: ProviderExecutionRequest,
 ): CodexCallerContinuation | undefined => {
+  if (request.routing?.visionEvidenceOnly) return undefined;
   const known = [
     ...new Set(callerOutputs(request).flatMap((item) => owners.get(String(item.call_id)) ?? [])),
   ];
-  const hasNewUser = (item: CodexCallerContinuation): boolean => {
-    const payload = callerContinuationPayload(item, request);
-    return payload.input.length > 0 || payload.historyItems.some((entry) => entry.role === "user");
+  const canResumeRetired = (item: CodexCallerContinuation): boolean => {
+    if (item.failedDelivery === undefined) return !hasNewCallerUser(item, request);
+    const keys = callerDeliveryKeys(item, request);
+    if (keys.resultsKey !== item.failedDelivery.resultsKey)
+      throw new TiduError("CONFIGURATION_CONFLICT", "Conflicting caller tool results.");
+    if (keys.key === item.failedDelivery.key) return true;
+    if (keys.hasUserInput) return false;
+    if (isCallerAgentFollowup(item.failedDelivery, keys)) return true;
+    throw new TiduError("CONFIGURATION_CONFLICT", "Conflicting caller tool deliveries.");
   };
   const live = known.filter(
     (item) =>
       item.delivery?.settled !== true &&
-      (item.delivery !== undefined || !item.retired || !hasNewUser(item)),
+      item.agentDeliveries === undefined &&
+      (item.delivery !== undefined || !item.retired),
   );
   if (live.length > 1)
     throw new TiduError("CONFIGURATION_INVALID", "Caller tool results belong to different turns.");
@@ -1387,13 +1684,11 @@ const resolveCallerContinuation = (
   const latest = known.at(-1);
   if (latest === undefined) return undefined;
   if (latest.retired && latest.delivery === undefined)
-    return hasNewUser(latest) ? undefined : latest;
+    return canResumeRetired(latest) ? latest : undefined;
   const keys = callerDeliveryKeys(latest, request);
   if (latest.delivery?.resultsKey !== keys.resultsKey)
     throw new TiduError("CONFIGURATION_CONFLICT", "Conflicting caller tool results.");
-  return requestTurnInput(request).input.length === 0 || latest.delivery.key === keys.key
-    ? latest
-    : undefined;
+  return latest.delivery.key === keys.key || !keys.hasUserInput ? latest : undefined;
 };
 
 const forgetCallerContinuation = (continuation: CodexCallerContinuation): void => {
@@ -1409,39 +1704,91 @@ const runCodexTurn = (
   onTextDelta?: (delta: string) => void,
   onProcessDelta?: (delta: string, source?: CodexProcessDeltaSource) => void,
   onNativeItem?: (item: Record<string, unknown>) => void,
+  beforePrompt?: () => void,
 ): Promise<CodexExecutionResult> => {
   const continuation = resolveCallerContinuation(session.callerOwners, request);
   if (continuation === undefined)
-    return runCodexTurnBody(session, request, onTextDelta, onProcessDelta, onNativeItem);
-  const { key, resultsKey } = callerDeliveryKeys(continuation, request);
-  if (continuation.delivery !== undefined && continuation.delivery.key !== key)
+    return runCodexTurnBody(
+      session,
+      request,
+      onTextDelta,
+      onProcessDelta,
+      onNativeItem,
+      undefined,
+      beforePrompt,
+    );
+  const keys = callerDeliveryKeys(continuation, request);
+  const previous = continuation.delivery ?? continuation.failedDelivery;
+  const agentFollowup =
+    previous !== undefined && isCallerAgentFollowup(previous, keys) && !keys.hasUserInput;
+  let state: CallerDeliveryState = continuation;
+  if (agentFollowup) {
+    // The caller has started another generation step. Keep the original tool result accepted
+    // and replay it as history so we never reply to the original native tool RPC twice.
+    continuation.agentDeliveries ??= new Map();
+    const deliveries = continuation.agentDeliveries;
+    const agentKey = callerToolPayloadKey(keys.agentMessages);
+    state = deliveries.get(agentKey) ?? {};
+    deliveries.set(agentKey, state);
+  }
+  const accepted = state.delivery ?? state.failedDelivery;
+  if (accepted !== undefined && accepted.key !== keys.key)
     return Promise.reject(
       new TiduError("CONFIGURATION_CONFLICT", "Conflicting caller tool deliveries."),
     );
-  if (continuation.delivery === undefined) {
+  if (state.delivery === undefined) {
     const controller = new AbortController();
+    const progress = createCallerDeliveryProgress();
+    const forwardText = (delta: string): void => progress.publish({ type: "text", delta });
+    const forwardProcess = (delta: string, source?: CodexProcessDeltaSource): void =>
+      progress.publish({ type: "process", delta, source });
+    const forwardItem = (item: Record<string, unknown>): void => {
+      // A disconnected client can return completed items from this very delivery.
+      if (isCallerProgressItem(item) && typeof item.id === "string") {
+        state.emittedProgress ??= new Map();
+        if (state.emittedProgress.size < 512)
+          state.emittedProgress.set(item.id, callerHistoryItemKey(item));
+      }
+      progress.publish({ type: "item", item });
+    };
     const delivery = {
-      key,
-      resultsKey,
+      ...keys,
       controller,
-      subscribers: 0,
+      progress,
       settled: false,
       promise: Promise.resolve().then(async () => {
-        const sharedRequest = { ...request, signal: controller.signal };
-        const replay = continuation.owner.closed || continuation.retired === true;
+        const input = request.body.input;
+        const retryInput =
+          accepted !== undefined && Array.isArray(input)
+            ? input.filter(
+                (item) =>
+                  !isRecord(item) ||
+                  !isCallerProgressItem(item) ||
+                  !matchesEmittedCallerProgress(state, item, callerHistoryItemKey(item)),
+              )
+            : input;
+        const sharedRequest = {
+          ...request,
+          body: { ...request.body, input: retryInput },
+          signal: controller.signal,
+          onExecutionReceipt: progress.report,
+        };
+        const replay = agentFollowup || continuation.owner.closed || continuation.retired === true;
         try {
           return await runCodexTurnBody(
             session,
             replay ? callerReplayRequest(continuation, sharedRequest) : sharedRequest,
-            onTextDelta,
-            onProcessDelta,
-            onNativeItem,
+            forwardText,
+            forwardProcess,
+            forwardItem,
             replay ? undefined : continuation,
+            progress.startPrompt,
           );
         } catch (error) {
           if (
             !isCodexConnectionFailure(error) ||
             controller.signal.aborted ||
+            progress.hasVisibleOutput() ||
             session.recover === undefined
           )
             throw error;
@@ -1450,9 +1797,11 @@ const runCodexTurn = (
             return await runCodexTurnBody(
               restoredSession,
               callerReplayRequest(continuation, sharedRequest),
-              onTextDelta,
-              onProcessDelta,
-              onNativeItem,
+              forwardText,
+              forwardProcess,
+              forwardItem,
+              undefined,
+              progress.startPrompt,
             );
           } catch (recoveryError) {
             if (isCodexConnectionFailure(recoveryError)) await restoredSession.discard?.();
@@ -1461,48 +1810,82 @@ const runCodexTurn = (
         }
       }),
     };
-    continuation.delivery = delivery;
+    state.delivery = delivery;
     delivery.promise = delivery.promise.then(
       (result) => {
         delivery.settled = true;
+        progress.finish();
         return result;
       },
       (error: unknown) => {
         delivery.settled = true;
-        if (controller.signal.aborted || isCodexConnectionFailure(error))
+        progress.finish();
+        const disconnected = isCodexConnectionFailure(error);
+        if (
+          (disconnected && progress.hasVisibleOutput() && !controller.signal.aborted) ||
+          (!agentFollowup && continuation.agentDeliveries !== undefined)
+        ) {
+          if (!agentFollowup) continuation.retired = true;
+          state.failedDelivery ??= keys;
+        }
+        if (
+          !agentFollowup &&
+          state.failedDelivery === undefined &&
+          (controller.signal.aborted || disconnected)
+        )
           forgetCallerContinuation(continuation);
-        else continuation.delivery = undefined;
+        else state.delivery = undefined;
         throw error;
       },
     );
   }
-  const delivery = continuation.delivery;
-  delivery.subscribers += 1;
+  const delivery = state.delivery;
+  const subscriber = {
+    onTextDelta,
+    onProcessDelta,
+    onNativeItem,
+    beforePrompt,
+    onExecutionReceipt: request.onExecutionReceipt,
+  };
   return new Promise<CodexExecutionResult>((resolve, reject) => {
     let finished = false;
     const finish = (): boolean => {
       if (finished) return false;
       finished = true;
       request.signal?.removeEventListener("abort", abort);
-      delivery.subscribers -= 1;
       return true;
     };
     const abort = (): void => {
       if (!finish()) return;
-      if (delivery.subscribers === 0 && !delivery.settled) {
-        forgetCallerContinuation(continuation);
+      if (delivery.progress.unsubscribe(subscriber) === 0 && !delivery.settled) {
+        if (
+          !agentFollowup &&
+          (delivery.progress.hasVisibleOutput() || continuation.agentDeliveries !== undefined)
+        ) {
+          continuation.retired = true;
+          state.failedDelivery ??= keys;
+        }
+        if (!agentFollowup && state.failedDelivery === undefined)
+          forgetCallerContinuation(continuation);
         delivery.controller.abort();
       }
       reject(new DOMException("Codex turn cancelled.", "AbortError"));
     };
     request.signal?.addEventListener("abort", abort, { once: true });
     if (request.signal?.aborted) abort();
+    else delivery.progress.subscribe(subscriber);
     delivery.promise.then(
       (result) => {
-        if (finish()) resolve(result);
+        if (finish()) {
+          delivery.progress.unsubscribe(subscriber);
+          resolve(result);
+        }
       },
       (error: unknown) => {
-        if (finish()) reject(error);
+        if (finish()) {
+          delivery.progress.unsubscribe(subscriber);
+          reject(error);
+        }
       },
     );
   });
@@ -1515,6 +1898,7 @@ const runCodexTurnBody = async (
   onProcessDelta?: (delta: string, source?: CodexProcessDeltaSource) => void,
   onNativeItem?: (item: Record<string, unknown>) => void,
   continuation?: CodexCallerContinuation,
+  beforePrompt?: () => void,
 ): Promise<CodexExecutionResult> => {
   const outputs =
     request.protocol === "responses" && Array.isArray(request.body.input)
@@ -1558,7 +1942,8 @@ const runCodexTurnBody = async (
   ) {
     throw new TiduError("CONFIGURATION_INVALID", "All pending caller tool results are required.");
   }
-  const requestedCatalog = createCallerToolCatalog(request);
+  const visionEvidenceOnly = request.routing?.visionEvidenceOnly === true;
+  const requestedCatalog = visionEvidenceOnly ? undefined : createCallerToolCatalog(request);
   const replaceCatalog =
     continuation !== undefined &&
     requestedCatalog !== undefined &&
@@ -1592,16 +1977,39 @@ const runCodexTurnBody = async (
       ],
     };
   }
-  const thread =
-    (replaceCatalog ? undefined : continuation?.thread) ??
-    (callerTools === undefined
-      ? (session.initialThread ?? (await session.client.startThread(session.model)))
-      : await session.client.startThread(
-          session.model,
-          callerTools.definitions,
-          callerTools.webSearchMode,
-        ));
-  session.initialThread = undefined;
+  let thread = replaceCatalog ? undefined : continuation?.thread;
+  if (thread === undefined) {
+    if (visionEvidenceOnly) {
+      const taskText = [
+        ...turnPayload.input.flatMap((part) => (part.type === "text" ? [part.text] : [])),
+        ...turnPayload.historyItems.flatMap((item) => {
+          if (item.role === "assistant" || !Array.isArray(item.content)) return [];
+          return item.content.flatMap((part: unknown) => {
+            if (!isRecord(part) || typeof part.text !== "string") return [];
+            return [visionSkillReferenceText(item.role, part.text)];
+          });
+        }),
+      ].join("\n");
+      thread = await session.client.startThread(
+        session.model,
+        "vision-evidence",
+        undefined,
+        taskText,
+        { history: turnPayload.historyItems, signal: request.signal },
+      );
+      if (thread.visionHistory)
+        turnPayload = { ...turnPayload, historyItems: thread.visionHistory };
+    } else if (callerTools !== undefined) {
+      thread = await session.client.startThread(
+        session.model,
+        callerTools.definitions,
+        callerTools.webSearchMode,
+      );
+    } else {
+      thread = session.initialThread ?? (await session.client.startThread(session.model));
+    }
+  }
+  if (!visionEvidenceOnly) session.initialThread = undefined;
   if (thread.model !== session.model) {
     throw new TiduError(
       "CONFIGURATION_CONFLICT",
@@ -1623,9 +2031,10 @@ const runCodexTurnBody = async (
       : outputFormat?.type === "json_object"
         ? { type: "object" }
         : undefined;
+  beforePrompt?.();
   const result = await session.client
     .prompt(
-      thread.id,
+      thread,
       turnPayload.input,
       request.signal,
       onTextDelta,
@@ -1654,12 +2063,22 @@ const runCodexTurnBody = async (
       onNativeItem,
     )
     .catch((error: unknown) => {
-      if (continuation !== undefined && request.signal?.aborted)
+      if (
+        continuation !== undefined &&
+        continuation.failedDelivery === undefined &&
+        continuation.agentDeliveries === undefined &&
+        request.signal?.aborted
+      )
         forgetCallerContinuation(continuation);
       throw error;
     });
   if (result.status !== "completed") {
-    if (continuation !== undefined) forgetCallerContinuation(continuation);
+    if (
+      continuation !== undefined &&
+      continuation.failedDelivery === undefined &&
+      continuation.agentDeliveries === undefined
+    )
+      forgetCallerContinuation(continuation);
     if (result.status === "interrupted")
       throw new DOMException("Codex turn cancelled.", "AbortError");
     if (result.error?.codexErrorInfo === "serverOverloaded")
@@ -1703,6 +2122,14 @@ const runCodexTurnBody = async (
           : callerReplayInput(continuation, request)),
         ...calls.map((call) => call.item),
       ],
+      progressItems: result.progressItems ?? [],
+      ...(request.routing?.role !== "specialist" && {
+        primaryCapabilities: {
+          source: request.routing?.modelSource,
+          available: request.routing?.availableCapabilities ?? [],
+          completed: request.routing?.completedCapabilities ?? [],
+        },
+      }),
     };
     for (const callId of pending.callIds) {
       session.callerTurns.set(callId, pending);
@@ -1711,7 +2138,14 @@ const runCodexTurnBody = async (
     if (session.callerOwners.size > 512) {
       for (const previous of new Set(session.callerOwners.values())) {
         if (session.callerOwners.size <= 512) break;
-        if (previous.delivery?.settled) forgetCallerContinuation(previous);
+        const activeAgentDelivery = [...(previous.agentDeliveries?.values() ?? [])].some(
+          (state) => state.delivery !== undefined && !state.delivery.settled,
+        );
+        if (
+          !activeAgentDelivery &&
+          (previous.delivery?.settled || (previous.retired && previous.delivery === undefined))
+        )
+          forgetCallerContinuation(previous);
       }
     }
     return {
@@ -1909,6 +2343,65 @@ export const createCodexHostModelProvider = async (
 
   const provider: ModelProvider = {
     descriptor: { type: "codex-host", model: initialModel },
+    prepareCallerContinuation: (request) => {
+      if (request.protocol !== "responses" || !Array.isArray(request.body.input)) return undefined;
+      const candidates = new Set(
+        request.body.input.flatMap((item) =>
+          isCallerOutput(item) ? (callerOwners.get(String(item.call_id)) ?? []) : [],
+        ),
+      );
+      if (candidates.size === 0) return undefined;
+      const normalized = normalizeCallerToolInput(request.body.input);
+      if (!Array.isArray(normalized)) return undefined;
+      let input: unknown[] = normalized;
+      for (const candidate of candidates) {
+        const capabilities = candidate.primaryCapabilities;
+        if (
+          !capabilities?.completed.includes("vision") ||
+          capabilities.available.includes("vision")
+        )
+          continue;
+        const firstResult = input.findIndex(
+          (item) => isCallerOutput(item) && candidate.callIds.includes(String(item.call_id)),
+        );
+        const firstCall = input.findIndex(
+          (item) => isRecord(item) && isOwnedCallerCall(candidate, item),
+        );
+        const boundary = firstCall < 0 ? firstResult : Math.min(firstCall, firstResult);
+        const originalHistory = new Set(candidate.replayItems.map(callerHistoryItemKey));
+        input = input.map((item, index) => {
+          if (index >= boundary || !isRecord(item)) return item;
+          const field =
+            item.role === "user" ? "content" : isCallerOutput(item) ? "output" : undefined;
+          if (field === undefined || !Array.isArray(item[field])) return item;
+          const parts = item[field];
+          const projected = parts.filter(
+            (part: unknown) => !isRecord(part) || !imageTypes.has(String(part.type)),
+          );
+          if (projected.length === parts.length) return item;
+          const projectedItem = { ...item, [field]: projected };
+          return originalHistory.has(callerHistoryItemKey(projectedItem)) ? projectedItem : item;
+        });
+      }
+      const owned = resolveCallerContinuation(callerOwners, {
+        ...request,
+        body: { ...request.body, input },
+      });
+      const capabilities = owned?.primaryCapabilities;
+      return capabilities === undefined ||
+        request.routing?.host !== "codex" ||
+        capabilities.source !== request.routing.modelSource ||
+        owned?.owner.model !== requestedModelFor(request) ||
+        capabilities.available.some(
+          (capability) => !request.routing?.availableCapabilities?.includes(capability),
+        )
+        ? undefined
+        : {
+            input,
+            availableCapabilities: capabilities.available,
+            completedCapabilities: capabilities.completed,
+          };
+    },
     execute: async (request): Promise<ProviderExecutionResult> => {
       request = {
         ...request,
@@ -1926,10 +2419,18 @@ export const createCodexHostModelProvider = async (
       const session = await sessionPromise;
       const upstreamModel = requireCodexSessionModel(session, requestedModel);
       request.onModelConfirmed?.(upstreamModel);
+      let promptStarted = false;
+      let reportedUsage: HostTokenUsage | null = null;
+      const beforePrompt = (): void => {
+        if (promptStarted) {
+          reportedUsage = null;
+          request.onExecutionRetry?.();
+        }
+        promptStarted = true;
+      };
       try {
         if (request.body.stream === true) {
           const streamController = new AbortController();
-          let reportedUsage: HostTokenUsage | null = null;
           const streamingRequest: ProviderExecutionRequest = {
             ...request,
             signal:
@@ -1971,6 +2472,7 @@ export const createCodexHostModelProvider = async (
                     forwardTextDelta,
                     forwardProcessDelta,
                     forwardNativeItem,
+                    beforePrompt,
                   );
                   reportCodexExecution(request, upstreamModel, result.usage);
                   return {
@@ -2000,6 +2502,7 @@ export const createCodexHostModelProvider = async (
                       forwardTextDelta,
                       forwardProcessDelta,
                       forwardNativeItem,
+                      beforePrompt,
                     );
                     reportCodexExecution(request, retryModel, result.usage);
                     return {
@@ -2025,7 +2528,31 @@ export const createCodexHostModelProvider = async (
             ),
           };
         }
-        const result = await runCodexTurn(session, request, undefined, request.onProcessDelta);
+        const onProcessEvent = request.onProcessEvent;
+        const native =
+          request.protocol === "responses" && onProcessEvent !== undefined
+            ? createNativeResponseItems(`tidu_${randomUUID()}`, (type, payload) =>
+                onProcessEvent({ type, ...payload }),
+              )
+            : undefined;
+        const result = await runCodexTurn(
+          session,
+          request,
+          undefined,
+          native === undefined
+            ? request.onProcessDelta
+            : (delta, source) => {
+                if (source === undefined || source.type === "activity")
+                  request.onProcessDelta?.(delta);
+                else native.emitProcessDelta(delta, source);
+              },
+          native?.emitNativeItem,
+          beforePrompt,
+        );
+        if (native !== undefined) {
+          result.progressItems?.forEach(native.emitNativeItem);
+          native.finish();
+        }
         reportCodexExecution(request, upstreamModel, result.usage);
         const body = createResponse(
           request,
@@ -2147,6 +2674,7 @@ export const createCursorHostModelProvider = async (
         const executeHeadless = async (
           onTextDelta?: (delta: string) => void,
           onProcessDelta?: (delta: string) => void,
+          signal = request.signal,
         ) =>
           runCursorHeadless({
             command: cursorLaunch.command,
@@ -2155,11 +2683,15 @@ export const createCursorHostModelProvider = async (
             model: headlessModel,
             prompt: requestPrompt(request),
             onUsageUpdate: reportUsage,
-            ...(request.signal === undefined ? {} : { signal: request.signal }),
+            ...(signal === undefined ? {} : { signal }),
             ...(onTextDelta === undefined ? {} : { onTextDelta }),
             ...(onProcessDelta === undefined ? {} : { onProcessDelta }),
           });
         if (request.body.stream === true) {
+          const streamController = new AbortController();
+          const signal = request.signal
+            ? AbortSignal.any([request.signal, streamController.signal])
+            : streamController.signal;
           return {
             kind: "stream",
             statusCode: 200,
@@ -2168,7 +2700,7 @@ export const createCursorHostModelProvider = async (
               request,
               async (onTextDelta, onProcessDelta) => {
                 try {
-                  const result = await executeHeadless(onTextDelta, onProcessDelta);
+                  const result = await executeHeadless(onTextDelta, onProcessDelta, signal);
                   request.onModelConfirmed?.(requestedModel);
                   reportUsage(result.usage);
                   return result;
@@ -2177,6 +2709,7 @@ export const createCursorHostModelProvider = async (
                 }
               },
               () => reportedUsage,
+              () => streamController.abort(),
             ),
           };
         }

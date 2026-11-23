@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,13 +14,64 @@ import { createCodexHostModelProvider, createLiveJsonStream } from "../providers
 import { startLocalRuntime } from "../runtime/index.js";
 import { createCodexAgentClient } from "./codex-app-server.js";
 import { createCodexThreadLinks } from "./codex-thread-links.js";
+import { foldVisionContext, visionSkillReferenceText } from "./codex-vision-context.js";
 import { createStdioJsonRpcClient, type JsonRpcNotification } from "./json-rpc.js";
 
-test("native idle turns resume injected tool history without replaying the user or tools", {
+test("vision context folding keeps changed, reordered, explicitly repeated and referenced instructions", () => {
+  const text = (value: string) => ({ type: "input_text", text: value });
+  const message = (role: string, ...content: ReturnType<typeof text>[]) => ({
+    type: "message",
+    role,
+    content,
+  });
+  const permission = text(
+    "<permissions instructions>Read /workspace/permission-fixture/Documents/notes.</permissions instructions>",
+  );
+  const rules = text("# AGENTS.md instructions for /work\nPreserve the local rules.");
+  const env = text("<environment_context>Workspace</environment_context>");
+  const guidance = text("Preserve this additional caller rule.");
+  const userId = "msg_12345678-1234-1234-1234-123456789abc";
+  const developerContext = message("developer", guidance, permission);
+  const userContext = { ...message("user", rules, env), id: userId };
+  const prelude = [developerContext, userContext];
+  const task = message("user", text("Describe the image."));
+  const laterReminder = message("user", rules, env);
+  assert.deepEqual(foldVisionContext([...prelude, task, laterReminder], prelude, ""), [
+    message("developer", guidance),
+    task,
+    laterReminder,
+  ]);
+  assert.equal(foldVisionContext(prelude, prelude, userId), undefined);
+  for (const invalid of [
+    [message("system", permission), userContext],
+    [message("developer", text(`${permission.text} Extra rule.`)), userContext],
+    [developerContext, message("user", env, rules)],
+    [developerContext, { ...message("user", rules, env), phase: "commentary" }],
+    [developerContext, message("user", rules, env, guidance)],
+    [task, ...prelude],
+  ])
+    assert.equal(foldVisionContext(invalid, prelude, ""), undefined);
+  assert.doesNotMatch(visionSkillReferenceText("developer", permission.text), /Documents/u);
+  assert.match(visionSkillReferenceText("user", permission.text), /Documents/u);
+  for (const reference of [
+    "$documents",
+    "documents:documents",
+    "/workspace/skill-fixture/skills/documents/SKILL.md",
+  ]) {
+    assert.ok(
+      visionSkillReferenceText(
+        "developer",
+        permission.text.replace("notes.", `notes. Use ${reference}.`),
+      ).includes(reference),
+    );
+  }
+});
+
+test("native threads isolate visual evidence and resume injected tool history without replay", {
   skip: !process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND,
   timeout: 30_000,
-}, async () => {
-  const directory = await mkdtemp(join(tmpdir(), "native-history-continuation-"));
+}, async (context) => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "native-history-continuation-")));
   const received: Record<string, unknown>[] = [];
   const modelServer = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
@@ -56,9 +107,27 @@ test("native idle turns resume injected tool history without replaying the user 
   await new Promise<void>((resolve) => modelServer.listen(0, "127.0.0.1", resolve));
   const address = modelServer.address();
   assert.ok(address !== null && typeof address !== "string");
+  for (let index = 0; index < 20; index++) {
+    const name = index === 19 ? "z-charts:z-chart-reader" : `a-fixture-${index}`;
+    const skillDirectory = join(directory, "skills", name);
+    await mkdir(skillDirectory, { recursive: true });
+    await writeFile(
+      join(skillDirectory, "SKILL.md"),
+      `---\nname: ${name}\ndescription: Interpret chart axes, units, legends, and labels in input images.\n---\nLocal chart workflow.\n`,
+    );
+  }
+  const workspaceRule =
+    "Preserve the workspace evidence policy. A skill name can be written, for example `z-chart-reader`.";
+  await writeFile(join(directory, "AGENTS.md"), workspaceRule);
   await writeFile(
     join(directory, "config.toml"),
     [
+      'developer_instructions="Preserve the host evidence policy."',
+      "[features]",
+      "code_mode=true",
+      "code_mode_host=true",
+      "computer_use=true",
+      "browser_use=true",
       "[model_providers.fixture]",
       'name="fixture"',
       `base_url="http://127.0.0.1:${address.port}/v1"`,
@@ -78,15 +147,16 @@ process.on("SIGTERM",()=>child.kill("SIGTERM"));child.on("exit",code=>process.ex
 `,
     { mode: 0o700 },
   );
-  const client = createCodexAgentClient({
+  const options = {
     command: wrapper,
     codexHomeDirectory: directory,
     workingDirectory: directory,
     model: "gpt-5.1-codex",
     modelProvider: "fixture",
     ephemeral: true,
-    sandbox: "read-only",
-  });
+    sandbox: "read-only" as const,
+  };
+  const client = createCodexAgentClient(options);
   try {
     await client.initialize();
     for (const bootstrap of [false, true]) {
@@ -135,6 +205,142 @@ process.on("SIGTERM",()=>child.kill("SIGTERM"));child.on("exit",code=>process.ex
       assert.doesNotMatch(JSON.stringify(input), /Continue from the supplied conversation/u);
     }
     assert.equal(received.length, 2);
+    const imageInput = [
+      { type: "text" as const, text: "Describe the image.", text_elements: [] },
+      {
+        type: "image" as const,
+        url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR4nGNgQAYAAA4AAamRc7EAAAAASUVORK5CYII=",
+      },
+    ];
+    for (const mode of [undefined, "vision-evidence"] as const) {
+      const thread = await client.startThread(
+        undefined,
+        mode,
+        undefined,
+        `${workspaceRule}\nDescribe the image.`,
+      );
+      const result = await client.prompt(thread.id, imageInput, AbortSignal.timeout(10_000));
+      assert.equal(result.status, "completed");
+      assert.equal(result.usage?.totalTokens, 7);
+      assert.equal(result.toolCalls?.length ?? 0, 0);
+    }
+    assert.equal(received.length, 4);
+    const toolsBefore = received[2]?.tools as Record<string, unknown>[];
+    const toolsAfter = received[3]?.tools as Record<string, unknown>[];
+    assert.ok(toolsAfter.length < toolsBefore.length);
+    assert.ok(
+      !toolsAfter.some((tool) =>
+        ["exec", "wait", "exec_command", "apply_patch", "view_image"].includes(String(tool.name)),
+      ),
+    );
+    assert.doesNotMatch(
+      JSON.stringify(toolsAfter.map((tool) => [tool.type, tool.name])),
+      /browser_use|code_mode|computer_use|cua_repl|unified_computer_use/iu,
+    );
+    const messages = received[3]?.input as { role?: string; content?: { type: string }[] }[];
+    const userContent = messages
+      .filter((item) => item.role === "user")
+      .flatMap((item) => item.content ?? []);
+    context.diagnostic(
+      `Native tool definitions: ${toolsBefore.length} to ${toolsAfter.length}, ${Buffer.byteLength(JSON.stringify(toolsBefore))} to ${Buffer.byteLength(JSON.stringify(toolsAfter))} bytes.`,
+    );
+    assert.equal(userContent.filter((part) => part.type === "input_image").length, 1);
+    assert.match(JSON.stringify(received[3]?.input), /Preserve the workspace evidence policy/u);
+    assert.match(JSON.stringify(received[3]?.input), /Preserve the host evidence policy/u);
+    const skillCatalog = (callIndex: number): string => {
+      const input = received[callIndex]?.input as { role: string; content: { text?: string }[] }[];
+      return (
+        input
+          .filter((item) => item.role === "developer")
+          .flatMap((item) => item.content.map((part) => part.text))
+          .find((text) => text?.includes("<skills_instructions>")) ?? ""
+      );
+    };
+    assert.match(skillCatalog(2), /z-chart-reader/u);
+    assert.doesNotMatch(skillCatalog(3), /z-chart-reader/u);
+    assert.ok(skillCatalog(3).length > 0 && skillCatalog(3).length < skillCatalog(2).length);
+    const namedTask = "请用z-chart-reader读取图表。";
+    const namedThread = await client.startThread(
+      undefined,
+      "vision-evidence",
+      undefined,
+      namedTask,
+    );
+    await client.prompt(
+      namedThread.id,
+      [{ type: "text", text: namedTask }],
+      AbortSignal.timeout(10_000),
+    );
+    assert.match(skillCatalog(4), /z-chart-reader/u);
+    await writeFile(join(directory, "AGENTS.md"), "All image tasks require z-chart-reader.");
+    const requiredThread = await client.startThread(
+      undefined,
+      "vision-evidence",
+      undefined,
+      "Describe the chart.",
+    );
+    await client.prompt(requiredThread.id, imageInput, AbortSignal.timeout(10_000));
+    assert.match(skillCatalog(5), /z-chart-reader/u);
+    await writeFile(join(directory, "AGENTS.md"), workspaceRule);
+    const unicodeDirectory = join(directory, "skills", "图表取证");
+    await mkdir(unicodeDirectory, { recursive: true });
+    await writeFile(
+      join(unicodeDirectory, "SKILL.md"),
+      "---\nname: 图表取证\ndescription: Inspect chart labels.\n---\nInspect chart labels.\n",
+    );
+    const unicodeClient = createCodexAgentClient(options);
+    try {
+      await unicodeClient.initialize();
+      await unicodeClient.startThread();
+      const thread = await unicodeClient.startThread(
+        undefined,
+        "vision-evidence",
+        undefined,
+        "Read the image.",
+      );
+      await unicodeClient.prompt(thread.id, imageInput, AbortSignal.timeout(10_000));
+      assert.match(skillCatalog(6), /图表取证/u);
+      assert.match(skillCatalog(6), /z-chart-reader/u);
+    } finally {
+      await unicodeClient.close();
+    }
+    const original = received[2]?.input as Record<string, unknown>[];
+    const taskIndex = original.findIndex(
+      (item) =>
+        item.role === "user" &&
+        Array.isArray(item.content) &&
+        item.content.some((part) => part.type === "input_image"),
+    );
+    assert.ok(taskIndex > 0);
+    const replay = original.slice(0, taskIndex).filter((item) => item.type === "message");
+    const evidence = await client.startThread(
+      undefined,
+      "vision-evidence",
+      undefined,
+      "Describe the image.",
+      { history: replay },
+    );
+    assert.ok(evidence.visionHistory);
+    const result = await client.prompt(
+      evidence.id,
+      imageInput,
+      AbortSignal.timeout(10_000),
+      undefined,
+      undefined,
+      undefined,
+      evidence.visionHistory,
+    );
+    assert.equal(result.usage?.totalTokens, 7);
+    const visible = ((received.at(-1)?.input ?? []) as { content?: { text?: string }[] }[]).flatMap(
+      (item) => item.content ?? [],
+    );
+    for (const marker of [
+      "<permissions instructions>",
+      "Preserve the workspace evidence policy.",
+      "<environment_context>",
+    ]) {
+      assert.equal(visible.filter((part) => part.text?.includes(marker)).length, 1, marker);
+    }
   } finally {
     await client.close();
     modelServer.closeAllConnections();
@@ -425,7 +631,7 @@ test("official stdio accepts requests above 64 MiB directly and through the clie
   }
 });
 
-test("official Codex retries a disconnected managed response with native reconnect notifications", {
+test("official Codex retries disconnected responses and preserves usage on terminal failures", {
   skip: !process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND,
   timeout: 30_000,
 }, async () => {
@@ -530,7 +736,16 @@ test("official Codex retries a disconnected managed response with native reconne
         const terminal = JSON.stringify(await completion);
         assert.match(terminal, disableRetries ? /"status":"failed"/u : /"status":"completed"/u);
         assert.equal(attempts, disableRetries ? 1 : 2);
-        if (!disableRetries) {
+        if (disableRetries) {
+          assert.match(terminal, /Fixture upstream stream disconnected/u);
+          assert.match(terminal, /Codex：入 12 · 出 3 · 合 15/u);
+          assert.match(terminal, /Cursor：入 7 · 出 2 · 合 9/u);
+          assert.match(terminal, /总：入 19 · 出 5 · 合 24/u);
+          const saved = await client.request<{
+            thread: { turns: { error?: { message: string } }[] };
+          }>("thread/read", { threadId: thread.thread.id, includeTurns: true });
+          assert.match(saved.thread.turns[0]?.error?.message ?? "", /总：入 19 · 出 5 · 合 24/u);
+        } else {
           const reconnect = notifications.filter((notification) => notification.method === "error");
           assert.match(JSON.stringify(reconnect), /Reconnecting/u);
           assert.match(JSON.stringify(reconnect), /"willRetry":true/u);
@@ -1667,11 +1882,18 @@ test("official caller executes delegated commands as native command items and re
   const directory = await mkdtemp(join(tmpdir(), "tidu-caller-tools-"));
   const command = process.env.TIDU_CODEX_PROTOCOL_TEST_COMMAND ?? "codex";
   const nativeTracePath = join(directory, "native-rpc.jsonl");
+  const fixtureImage =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR4nGNgQAYAAA4AAamRc7EAAAAASUVORK5CYII=";
+  const agentMessageText = "The independent audit is complete.";
+  const agentContinuationAnswer = "The audit result reached the resumed model.";
   let modelRequests = 0;
   let receivedToolOutput = false;
   let cancelFixture = false;
   let waitingFixture = false;
   let cancellationRequests = 0;
+  let activeAgentFixture = false;
+  let finishActiveReasoning: (() => void) | undefined;
+  let closeActiveResponse: (() => void) | undefined;
   const modelServer = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -1696,6 +1918,12 @@ test("official caller executes delegated commands as native command items and re
           item.type === "function_call_output" &&
           JSON.stringify(item.output).includes("native-edit-content"),
       ) ?? false;
+    const receivedAgentMessage =
+      !cancelFixture &&
+      body.input?.some(
+        (item) =>
+          item.type === "agent_message" && JSON.stringify(item.content).includes(agentMessageText),
+      ) === true;
     response.writeHead(200, { "content-type": "text/event-stream" });
     const send = (type: string, payload: Record<string, unknown>): void => {
       response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`);
@@ -1726,60 +1954,54 @@ test("official caller executes delegated commands as native command items and re
       response.end();
       return;
     }
-    if (waitingFixture) {
+    const holdForAgent = activeAgentFixture && receivedFollowupOutput && !receivedAgentMessage;
+    if (waitingFixture || holdForAgent) {
+      const reasoningText = holdForAgent
+        ? "Checking the pending audit."
+        : "Waiting for the fixture model.";
+      const item = {
+        type: "reasoning",
+        id: holdForAgent ? "fixture_agent_reasoning" : "waiting_reasoning",
+        summary: [{ type: "summary_text", text: reasoningText }],
+      };
       send("response.created", {
         response: {
-          id: "waiting_response",
+          id: holdForAgent ? "resp_fixture_agent_pending" : "waiting_response",
           object: "response",
           status: "in_progress",
           output: [],
         },
       });
-      const item = {
-        type: "reasoning",
-        id: "waiting_reasoning",
-        summary: [{ type: "summary_text", text: "Waiting for the fixture model." }],
-      };
       send("response.output_item.added", { output_index: 0, item });
+      const identity = { item_id: item.id, output_index: 0, summary_index: 0 };
       send("response.reasoning_summary_part.added", {
-        item_id: item.id,
-        output_index: 0,
-        summary_index: 0,
+        ...identity,
         part: { type: "summary_text", text: "" },
       });
-      send("response.reasoning_summary_text.delta", {
-        item_id: item.id,
-        output_index: 0,
-        summary_index: 0,
-        delta: "Waiting for the fixture model.",
-      });
-      send("response.reasoning_summary_text.done", {
-        item_id: item.id,
-        output_index: 0,
-        summary_index: 0,
-        text: "Waiting for the fixture model.",
-      });
-      send("response.reasoning_summary_part.done", {
-        item_id: item.id,
-        output_index: 0,
-        summary_index: 0,
-        part: item.summary[0],
-      });
-      send("response.output_item.done", { output_index: 0, item });
+      send("response.reasoning_summary_text.delta", { ...identity, delta: reasoningText });
+      const finishReasoning = (): void => {
+        send("response.reasoning_summary_text.done", { ...identity, text: reasoningText });
+        send("response.reasoning_summary_part.done", { ...identity, part: item.summary[0] });
+        send("response.output_item.done", { output_index: 0, item });
+      };
+      if (holdForAgent) {
+        finishActiveReasoning = finishReasoning;
+        closeActiveResponse = () => response.destroy();
+      } else finishReasoning();
       return;
     }
     const output: Record<string, unknown>[] =
-      receivedFollowupOutput && !cancelFixture
+      (receivedFollowupOutput && !cancelFixture) || receivedAgentMessage
         ? [
             {
               type: "message",
-              id: "msg_fixture",
+              id: receivedAgentMessage ? "msg_fixture_agent_update" : "msg_fixture",
               role: "assistant",
               phase: "final_answer",
               content: [
                 {
                   type: "output_text",
-                  text: "Native fixture verified.",
+                  text: receivedAgentMessage ? agentContinuationAnswer : "Native fixture verified.",
                   annotations: [],
                 },
               ],
@@ -1837,7 +2059,7 @@ test("official caller executes delegated commands as native command items and re
                 }),
               },
             ];
-    if (!receivedToolOutput && !cancelFixture) {
+    if (!receivedToolOutput && !cancelFixture && !receivedAgentMessage) {
       output.push({
         type: "function_call",
         id: "fc_parallel_fixture",
@@ -1945,10 +2167,30 @@ process.on("SIGTERM",()=>child.kill("SIGTERM"));child.on("exit",code=>process.ex
     modelProvider: "fixture",
   });
   assert.ok(provider);
+  let finalDelivery:
+    | {
+        body: Record<string, unknown>;
+        result: Record<string, unknown>;
+      }
+    | undefined;
   const runtime = await startLocalRuntime({
     databasePath: ":memory:",
     port: 0,
-    provider,
+    provider: {
+      ...provider,
+      execute: (request) => {
+        if (finalDelivery === undefined && Array.isArray(request.body.input)) {
+          const result = request.body.input.find(
+            (item) =>
+              item?.type === "function_call_output" &&
+              typeof item.call_id === "string" &&
+              JSON.stringify(item.output)?.includes("native-edit-content"),
+          );
+          if (result !== undefined) finalDelivery = { body: request.body, result };
+        }
+        return provider.execute(request);
+      },
+    },
   });
   const notifications: JsonRpcNotification[] = [];
   let notify: (() => void) | undefined;
@@ -2016,7 +2258,10 @@ process.on("SIGTERM",()=>child.kill("SIGTERM"));child.on("exit",code=>process.ex
     });
     await caller.request("turn/start", {
       threadId: started.thread.id,
-      input: [{ type: "text", text: "Read the fixture file and report its content." }],
+      input: [
+        { type: "text", text: "Read the fixture file and report its content." },
+        { type: "image", url: fixtureImage },
+      ],
     });
     const waitFor = async (matches: () => boolean): Promise<void> => {
       while (!matches()) {
@@ -2064,7 +2309,8 @@ process.on("SIGTERM",()=>child.kill("SIGTERM"));child.on("exit",code=>process.ex
     );
     assert.equal(modelRequests, 3);
     assert.equal(receivedToolOutput, true);
-    const nativeTrace = (await readFile(nativeTracePath, "utf8"))
+    const nativeTraceContents = await readFile(nativeTracePath, "utf8");
+    const nativeTrace = nativeTraceContents
       .trim()
       .split("\n")
       .map(
@@ -2200,6 +2446,127 @@ process.on("SIGTERM",()=>child.kill("SIGTERM"));child.on("exit",code=>process.ex
         ?.text ?? "";
     assert.match(answer, /Native fixture verified\./u);
     assert.match(answer, /(?:合|total) 45/u);
+    const delivery = finalDelivery;
+    assert.ok(delivery);
+    assert.ok(Array.isArray(delivery.body.input));
+    const replayHistory = delivery.body.input.filter(
+      (item) =>
+        (item?.role === "user" && JSON.stringify(item.content).includes(fixtureImage)) ||
+        (item?.phase === "commentary" &&
+          JSON.stringify(item.content).includes("Reading the fixture.")),
+    );
+    assert.equal(replayHistory.length, 2);
+    const replayDelivery = (result: Record<string, unknown>) =>
+      fetch(`${runtime.origin}/v1/hosts/codex/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ...delivery.body,
+          stream: true,
+          input: [{ type: "context_compaction" }, ...replayHistory, result],
+        }),
+      });
+    const replay = await replayDelivery(delivery.result);
+    assert.equal(replay.status, 200);
+    const replayEvents = await replay.text();
+    assert.match(replayEvents, /event: response\.completed/u);
+    assert.match(replayEvents, /Native fixture verified\./u);
+    assert.doesNotMatch(replayEvents, /response\.failed|Reading the fixture\./u);
+    const conflict = await replayDelivery({ ...delivery.result, output: "Mismatching output." });
+    assert.match(await conflict.text(), /Conflicting caller tool results/u);
+    assert.equal(modelRequests, 3, "Replay and conflict must use no additional model calls.");
+    assert.equal(await readFile(nativeTracePath, "utf8"), nativeTraceContents);
+
+    notifications.length = 0;
+    await caller.request("thread/inject_items", {
+      threadId: started.thread.id,
+      items: [
+        {
+          type: "agent_message",
+          id: "fixture_agent_update",
+          author: "fixture_worker",
+          recipient: "fixture_parent",
+          content: [{ type: "input_text", text: agentMessageText }],
+        },
+      ],
+    });
+    const resumed = await caller.request<{ turn: { id: string } }>("turn/start", {
+      threadId: started.thread.id,
+      input: [],
+    });
+    await waitFor(() =>
+      notifications.some((notification) => notification.method === "turn/completed"),
+    );
+    const resumedTerminal = notifications.find(
+      (notification) => notification.method === "turn/completed",
+    )?.params as { turn?: { id?: string; status?: string } } | undefined;
+    assert.equal(resumedTerminal?.turn?.id, resumed.turn.id);
+    assert.equal(resumedTerminal?.turn?.status, "completed", JSON.stringify(resumedTerminal));
+    assert.deepEqual(
+      notifications.filter((notification) => notification.method === "error"),
+      [],
+    );
+    const resumedItems = notifications.filter(
+      (notification) => notification.method === "item/completed",
+    );
+    assert.ok(JSON.stringify(resumedItems).includes(agentContinuationAnswer));
+    assert.doesNotMatch(JSON.stringify(resumedItems), /"type":"commandExecution"/u);
+    assert.equal(modelRequests, 4, "The agent update must trigger exactly one new model call.");
+
+    activeAgentFixture = true;
+    const requestsBeforeActiveAgent = modelRequests;
+    notifications.length = 0;
+    const pendingThread = await caller.request<{ thread: { id: string } }>("thread/start", {
+      model: "ai-tidu9-config",
+      modelProvider: "fixture",
+      cwd: directory,
+      approvalPolicy: "never",
+      sandbox: "workspace-write",
+      config: {
+        "features.multi_agent": true,
+        "features.multi_agent_v2": true,
+        "agents.enabled": true,
+      },
+    });
+    const pendingTurn = await caller.request<{ turn: { id: string } }>("turn/start", {
+      threadId: pendingThread.thread.id,
+      input: [{ type: "text", text: "Read the fixture while the audit runs." }],
+    });
+    await waitFor(() => finishActiveReasoning !== undefined);
+    await caller.request("thread/inject_items", {
+      threadId: pendingThread.thread.id,
+      items: [
+        {
+          type: "agent_message",
+          id: "fixture_active_agent_update",
+          author: "/root/worker",
+          recipient: "/root",
+          content: [{ type: "input_text", text: agentMessageText }],
+        },
+      ],
+    });
+    finishActiveReasoning?.();
+    await waitFor(() =>
+      notifications.some((notification) => notification.method === "turn/completed"),
+    );
+    closeActiveResponse?.();
+    const activeTerminal = notifications.find(
+      (notification) => notification.method === "turn/completed",
+    )?.params as { turn?: { id?: string; status?: string } } | undefined;
+    assert.equal(activeTerminal?.turn?.id, pendingTurn.turn.id);
+    assert.equal(activeTerminal?.turn?.status, "completed", JSON.stringify(activeTerminal));
+    assert.deepEqual(
+      notifications.filter((notification) => notification.method === "error"),
+      [],
+    );
+    const activeItems = notifications.filter(
+      (notification) => notification.method === "item/completed",
+    );
+    assert.ok(JSON.stringify(activeItems).includes(agentContinuationAnswer));
+    assert.equal(JSON.stringify(activeItems).match(/"type":"commandExecution"/gu)?.length, 3);
+    assert.equal(modelRequests - requestsBeforeActiveAgent, 4);
+    activeAgentFixture = false;
+
     cancelFixture = true;
     notifications.length = 0;
     const cancellable = await caller.request<{ turn: { id: string } }>("turn/start", {
@@ -2395,6 +2762,7 @@ process.on("SIGTERM",()=>child.kill("SIGTERM"));child.on("exit",code=>process.ex
       assert.doesNotMatch(earlyStoppedHtml, /\b0秒|\b0s/u);
     }
   } finally {
+    closeActiveResponse?.();
     await caller.close();
     await runtime.close();
     modelServer.closeAllConnections();

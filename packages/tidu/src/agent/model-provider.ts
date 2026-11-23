@@ -5,7 +5,7 @@ import type {
   ProviderExecutionRequest,
   ProviderExecutionResult,
 } from "../providers/index.js";
-import { formatModelFailureMessage } from "../providers/index.js";
+import { extractProviderUsage, formatModelFailureMessage } from "../providers/index.js";
 import {
   AgentExecutionError,
   type AgentModelPreferences,
@@ -143,34 +143,6 @@ const extractTextContent = (body: unknown): string => {
 };
 
 type ProviderTokenUsage = NonNullable<ProviderExecutionReceipt["usage"]>;
-
-const readTokenCount = (value: unknown): number | undefined =>
-  typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
-
-const extractProviderUsage = (value: unknown): ProviderTokenUsage | null => {
-  if (!isRecord(value)) return null;
-  const inputTokens = readTokenCount(value.input_tokens ?? value.prompt_tokens);
-  const outputTokens = readTokenCount(value.output_tokens ?? value.completion_tokens);
-  if (inputTokens === undefined || outputTokens === undefined) return null;
-  const totalTokens = readTokenCount(value.total_tokens) ?? inputTokens + outputTokens;
-  const inputDetails = isRecord(value.input_tokens_details)
-    ? value.input_tokens_details
-    : undefined;
-  const outputDetails = isRecord(value.output_tokens_details)
-    ? value.output_tokens_details
-    : undefined;
-  const cachedInputTokens = readTokenCount(inputDetails?.cached_tokens);
-  const cacheWriteInputTokens = readTokenCount(inputDetails?.cache_write_tokens);
-  const reasoningTokens = readTokenCount(outputDetails?.reasoning_tokens);
-  return {
-    inputTokens,
-    outputTokens,
-    totalTokens,
-    ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
-    ...(cacheWriteInputTokens === undefined ? {} : { cacheWriteInputTokens }),
-    ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
-  };
-};
 
 const extractStreamUsage = (body: unknown): ProviderTokenUsage | null => {
   if (!isRecord(body)) return null;
@@ -683,22 +655,16 @@ export const createModelProviderAgentAdapters = (
                 : "openai-compatible");
         const reportedUsage = new Set<string>();
         let executedModel = provider.descriptor.model;
+        let confirmedOutputModel: string | undefined;
         let executionSource: Pick<
           ProviderExecutionReceipt,
-          "host" | "model" | "role" | "capabilities"
+          "host" | "model" | "modelConfirmed" | "role" | "capabilities"
         > = {
           host: executionHost,
           model: executedModel,
           role: "worker",
           capabilities: executionCapabilities,
         };
-        const hasReportedOutputUsage = (model: string): boolean =>
-          reportedUsage.has(
-            JSON.stringify([
-              executionSource.model === model ? executionSource.host : executionHost,
-              model,
-            ]),
-          );
         const failureBody = input.modelRequest.body;
         const failModel = (error: unknown): never => {
           if (!(error instanceof Error) || error.name === "AbortError") throw error;
@@ -721,6 +687,16 @@ export const createModelProviderAgentAdapters = (
           input.modelRequest?.onExecutionReceipt?.(receipt);
         };
         let providerProcessStarted = false;
+        const onProcessEvent = input.modelRequest.onProcessEvent;
+        const forwardProcessEvent =
+          onProcessEvent === undefined
+            ? undefined
+            : (event: Record<string, unknown>): void => {
+                const item = event.item;
+                onProcessEvent(
+                  isRecord(item) ? { ...event, item: createPublicProgressItem(item) } : event,
+                );
+              };
         const forwardProcessDelta =
           input.modelRequest.onProcessDelta === undefined
             ? undefined
@@ -737,14 +713,20 @@ export const createModelProviderAgentAdapters = (
             virtualModelId: input.modelRequest.virtualModelId,
             signal: input.signal,
             onProcessDelta: forwardProcessDelta,
+            onProcessEvent: forwardProcessEvent,
             onExecutionReceipt: forwardExecutionReceipt,
+            ...(input.modelRequest.visualEvidence
+              ? { visualEvidence: input.modelRequest.visualEvidence }
+              : {}),
             onModelConfirmed: (model) => {
               executedModel = model;
+              confirmedOutputModel = model;
             },
             routing: {
               role: "worker",
               securityScopeId: input.task.taskId,
               requiredCapabilities: executionCapabilities,
+              inferredImageCapability: input.modelRequest.inferredImageCapability,
               host: input.task.originHost,
             },
             body: {
@@ -766,18 +748,34 @@ export const createModelProviderAgentAdapters = (
           })
           .catch(failModel);
         executedModel = directResult.upstreamModel ?? executedModel;
+        const outputSource = () => {
+          const upstreamHost = directResult.upstreamHost;
+          const confirmedModel = directResult.upstreamModel ?? confirmedOutputModel;
+          const model =
+            confirmedModel ??
+            (upstreamHost === executionSource.host
+              ? executionSource.model
+              : provider.descriptor.model);
+          if (
+            executionSource.model === model &&
+            (upstreamHost === undefined || upstreamHost === executionSource.host)
+          ) {
+            return executionSource;
+          }
+          return {
+            host: upstreamHost ?? executionHost,
+            model,
+            ...(confirmedModel === undefined ? { modelConfirmed: false as const } : {}),
+            role: "worker" as const,
+            capabilities: executionCapabilities,
+          };
+        };
+        const hasReportedOutputUsage = (): boolean => {
+          const { host, model } = outputSource();
+          return reportedUsage.has(JSON.stringify([host, model]));
+        };
         const recordOutputUsage = (usage: ProviderTokenUsage): void => {
-          const model = directResult.upstreamModel ?? provider.descriptor.model;
-          const source =
-            executionSource.model === model
-              ? executionSource
-              : {
-                  host: executionHost,
-                  model,
-                  role: "worker" as const,
-                  capabilities: executionCapabilities,
-                };
-          forwardExecutionReceipt({ ...source, usage });
+          forwardExecutionReceipt({ ...outputSource(), usage });
         };
         if (directResult.statusCode < 200 || directResult.statusCode >= 300) {
           failModel(
@@ -798,9 +796,7 @@ export const createModelProviderAgentAdapters = (
             input.modelRequest.onOutputDelta,
             forwardProcessDelta,
             (usage) => {
-              if (
-                !hasReportedOutputUsage(directResult.upstreamModel ?? provider.descriptor.model)
-              ) {
+              if (!hasReportedOutputUsage()) {
                 recordOutputUsage(usage);
               }
             },
@@ -832,9 +828,16 @@ export const createModelProviderAgentAdapters = (
             if (
               isRecord(item) &&
               (item.type === "reasoning" ||
+                item.type === "web_search_call" ||
                 (item.type === "message" && item.phase === "commentary"))
-            )
-              input.modelRequest.onOutputItem?.(createPublicProgressItem(item));
+            ) {
+              if (forwardProcessEvent !== undefined && typeof item.id === "string") {
+                forwardProcessEvent({ type: "response.output_item.added", item });
+                forwardProcessEvent({ type: "response.output_item.done", item });
+              } else {
+                input.modelRequest.onOutputItem?.(createPublicProgressItem(item));
+              }
+            }
           }
         }
         if (toolItems.length > 0 && input.modelRequest.onOutputItem === undefined)
@@ -847,8 +850,7 @@ export const createModelProviderAgentAdapters = (
             ? "Tool requests forwarded to the calling client."
             : extractTextContent(body);
         const responseUsage =
-          isRecord(directResult.body) &&
-          !hasReportedOutputUsage(directResult.upstreamModel ?? provider.descriptor.model)
+          isRecord(directResult.body) && !hasReportedOutputUsage()
             ? extractProviderUsage(directResult.body.usage)
             : null;
         if (responseUsage !== null) {

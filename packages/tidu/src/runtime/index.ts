@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
@@ -75,6 +75,7 @@ import {
   type CapabilityCompletionProvider,
   type CapabilityCompletionUsageRecord,
   createCapabilityCompletionProvider,
+  hasImageConversation,
   inferModelRequestCapabilities,
 } from "../routing/index.js";
 import type { ScalingControlPlane, ScalingTaskRequest } from "../scaling/index.js";
@@ -656,10 +657,21 @@ const createAgentUsageCollector = (
   /** Returns model identities and independently reported consumption for the active response. */
   readModels: () => readonly ResponseModelUsage[];
 } => {
-  const usageByExecution = new Map<string, ProviderExecutionReceipt>();
+  const usageByExecution = new Map<string | symbol, ProviderExecutionReceipt>();
+  const modelKey = ({ host, model }: Pick<ProviderExecutionReceipt, "host" | "model">): string =>
+    JSON.stringify([host, model]);
+  const readReceipts = (): readonly ProviderExecutionReceipt[] => {
+    const receipts = [...usageByExecution.values()];
+    const trackedModels = new Set(
+      receipts.flatMap((receipt) => (receipt.attemptId === undefined ? [] : [modelKey(receipt)])),
+    );
+    return receipts.filter(
+      (receipt) => receipt.attemptId !== undefined || !trackedModels.has(modelKey(receipt)),
+    );
+  };
   return {
     record: (receipt) => {
-      const executionKey = JSON.stringify([receipt.host, receipt.model]);
+      const executionKey = receipt.attemptId ?? modelKey(receipt);
       const previous = usageByExecution.get(executionKey);
       usageByExecution.set(executionKey, {
         ...receipt,
@@ -667,7 +679,7 @@ const createAgentUsageCollector = (
       });
     },
     read: () => {
-      const reported = [...usageByExecution.values()]
+      const reported = readReceipts()
         .map((receipt) => receipt.usage)
         .filter((usage): usage is AgentTokenUsage => usage !== null);
       if (reported.length === 0) return null;
@@ -692,7 +704,7 @@ const createAgentUsageCollector = (
       );
     },
     readModels: () =>
-      [...usageByExecution.values()].map((receipt) => ({
+      readReceipts().map((receipt) => ({
         host: receipt.host,
         model: receipt.model,
         role: receipt.host === originHost ? "main" : "secondary",
@@ -785,6 +797,19 @@ const resolveAgentFailure = (error: unknown): { code: string; message: string; t
       ? error.type
       : "server_error",
 });
+
+const withReportedFailureUsage = (
+  failure: ReturnType<typeof resolveAgentFailure>,
+  snapshot: ResponseUsageSnapshot | undefined,
+  chinese: boolean,
+): ReturnType<typeof resolveAgentFailure> => {
+  const usage = snapshot?.usage;
+  if (!usage || (usage.inputTokens === 0 && usage.outputTokens === 0 && usage.totalTokens === 0))
+    return failure;
+  const footer = formatResponseTokenFooter(snapshot, chinese);
+  const partial = snapshot.complete ? "" : chinese ? "（部分统计）" : " (partial)";
+  return { ...failure, message: `${failure.message}\n\n${footer}${partial}` };
+};
 
 const createAgentResponsesStream = (
   model: string,
@@ -1112,7 +1137,11 @@ const createAgentResponsesStream = (
           close();
         })
         .catch((error: unknown) => {
-          const failure = resolveAgentFailure(error);
+          const failure = withReportedFailureUsage(
+            resolveAgentFailure(error),
+            usageDisplay?.snapshot(),
+            chineseRequest,
+          );
           const failureUsage = readUsage();
           finishProcessLifecycle();
           if (messageStarted) {
@@ -1268,6 +1297,7 @@ const runAgentResponsesTask = async (
   onExecutionReceipt?: (receipt: ProviderExecutionReceipt) => void,
   onOutputItem?: (item: Record<string, unknown>) => void,
   onProcessEvent?: AgentModelRequest["onProcessEvent"],
+  visualEvidence?: AgentModelRequest["visualEvidence"],
 ): Promise<string> => {
   const model = typeof body.model === "string" ? body.model : "ai-tidu9-config";
   const requiredCapabilities = inferModelRequestCapabilities({
@@ -1313,6 +1343,8 @@ const runAgentResponsesTask = async (
       protocol,
       body,
       virtualModelId: model,
+      inferredImageCapability: requiredCapabilities.includes("vision"),
+      ...(visualEvidence === undefined ? {} : { visualEvidence }),
       ...(onOutputDelta === undefined ? {} : { onOutputDelta }),
       ...(onProcessDelta === undefined ? {} : { onProcessDelta }),
       ...(onExecutionReceipt === undefined ? {} : { onExecutionReceipt }),
@@ -1499,6 +1531,9 @@ const handleOpenAiInference = async (
     const model = typeof requestBody.model === "string" ? requestBody.model : "ai-tidu9-config";
     const usageCollector = createAgentUsageCollector(originHost);
     let usageDisplay: Parameters<typeof createAgentResponsesStream>[5];
+    let visualTurn:
+      | ReturnType<ReturnType<typeof createResponseUsageLedger>["visualTurn"]>
+      | undefined;
     if (protocol === "responses" && originHost === "codex") {
       let ledger = responseUsageLedgers.get(storage);
       if (ledger === undefined) {
@@ -1506,10 +1541,45 @@ const handleOpenAiInference = async (
         responseUsageLedgers.set(storage, ledger);
       }
       const usageTurn = ledger.begin(requestBody.input);
+      const imageConversation = hasImageConversation({
+        protocol,
+        body: requestBody,
+        virtualModelId: model,
+      });
+      if (imageConversation) {
+        const nativeSession = request.headers["session-id"] ?? request.headers.session_id;
+        const session =
+          requestedHost === "codex" &&
+          typeof nativeSession === "string" &&
+          /^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/iu.test(nativeSession)
+            ? nativeSession
+            : undefined;
+        const scope = createHash("sha256")
+          .update(
+            JSON.stringify([
+              originHost,
+              requestedHost,
+              workspace.active.revision,
+              activeModelId,
+              request.headers.authorization,
+              request.headers["x-api-key"],
+              requestBody.user,
+              requestBody.safety_identifier,
+              requestBody.instructions,
+              requestBody.tools,
+              requestBody.tool_choice,
+            ]),
+          )
+          .digest("hex");
+        visualTurn = ledger.visualTurn(requestBody.input, scope, session);
+      }
       usageDisplay = {
         snapshot: () => usageTurn.snapshot(usageCollector.read(), usageCollector.readModels()),
-        finish: (items, completed = true) =>
-          usageTurn.finish(items, usageCollector.read(), usageCollector.readModels(), completed),
+        finish: (items, completed = true) => {
+          usageTurn.finish(items, usageCollector.read(), usageCollector.readModels(), completed);
+          if (visualTurn && completed && !response.destroyed)
+            response.once("finish", () => visualTurn?.finish(items));
+        },
       };
     }
     const controller = new AbortController();
@@ -1534,6 +1604,7 @@ const handleOpenAiInference = async (
         usageCollector.record,
         onOutputItem,
         onProcessEvent,
+        visualTurn,
       );
     try {
       if (requestBody.stream === true) {
@@ -1579,7 +1650,7 @@ const handleOpenAiInference = async (
             ...outputItems,
             ...(responseBody.output as Record<string, unknown>[]),
           ];
-        usageDisplay?.finish(outputItems);
+        usageDisplay?.finish(responseBody.output as Record<string, unknown>[]);
         sendOpenAiJson(
           response,
           200,
@@ -1590,7 +1661,11 @@ const handleOpenAiInference = async (
         );
       }
     } catch (error) {
-      const failure = resolveAgentFailure(error);
+      const failure = withReportedFailureUsage(
+        resolveAgentFailure(error),
+        usageDisplay?.snapshot(),
+        isChineseAgentRequest(requestBody),
+      );
       usageDisplay?.finish([], false);
       sendOpenAiJson(
         response,

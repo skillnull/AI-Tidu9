@@ -400,6 +400,8 @@ test("accepts fast response streams only after a successful terminal event", asy
 
 test("keeps worker terminal usage after a specialist reports usage first", async () => {
   const receipts: ProviderExecutionReceipt[] = [];
+  const workerUsage = { inputTokens: 10, outputTokens: 2, totalTokens: 12 };
+  let confirmsDuringStream = false;
   const provider: ModelProvider = {
     descriptor: { type: "openai-compatible", model: "worker-model" },
     execute: async (request) => {
@@ -413,9 +415,19 @@ test("keeps worker terminal usage after a specialist reports usage first", async
       return {
         kind: "stream",
         statusCode: 200,
-        upstreamModel: "worker-model",
+        ...(confirmsDuringStream ? {} : { upstreamModel: "worker-model" }),
         stream: new ReadableStream<Uint8Array>({
           start: (controller) => {
+            if (confirmsDuringStream) {
+              request.onModelConfirmed?.("served-worker");
+              request.onExecutionReceipt?.({
+                host: "openai-compatible",
+                model: "served-worker",
+                role: "worker",
+                capabilities: ["text"],
+                usage: workerUsage,
+              });
+            }
             controller.enqueue(
               encodeAgentSseData({ type: "response.output_text.delta", delta: "complete" }),
             );
@@ -443,8 +455,9 @@ test("keeps worker terminal usage after a specialist reports usage first", async
   const step = plan.steps[0];
   if (step === undefined) throw new Error("Usage test requires one step.");
 
-  const output = await createModelProviderAgentAdapters(provider, "ai-tidu9-config").worker.execute(
-    {
+  const worker = createModelProviderAgentAdapters(provider, "ai-tidu9-config").worker;
+  const execute = () =>
+    worker.execute({
       task: createTask({ taskId: "usage-test", goal: "Return a streamed result" }),
       understanding: { ...understanding, requiredCapabilities: ["text"] },
       plan,
@@ -458,8 +471,8 @@ test("keeps worker terminal usage after a specialist reports usage first", async
         onOutputDelta: () => undefined,
         onExecutionReceipt: (receipt) => receipts.push(receipt),
       },
-    },
-  );
+    });
+  const output = await execute();
 
   assert.equal(output.summary, "complete");
   assert.deepEqual(receipts, [
@@ -475,9 +488,19 @@ test("keeps worker terminal usage after a specialist reports usage first", async
       model: "worker-model",
       role: "worker",
       capabilities: ["text"],
-      usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+      usage: workerUsage,
     },
   ]);
+  receipts.length = 0;
+  confirmsDuringStream = true;
+  assert.equal((await execute()).summary, "complete");
+  assert.deepEqual(
+    receipts.map((receipt) => [receipt.model, receipt.usage?.totalTokens]),
+    [
+      ["specialist-model", 5],
+      ["served-worker", 12],
+    ],
+  );
 });
 
 test("rejects every unsuccessful fast-stream terminal and partial EOF", async () => {

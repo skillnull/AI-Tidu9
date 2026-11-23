@@ -26,6 +26,7 @@ import {
   indexCodexRecoveryRecords,
   readCodexRecoveryRecords,
   recoverCodexTurn,
+  stripCodexFailureTokenFooter,
 } from "../clients/codex-recovery.js";
 import { createCodexThreadLinks } from "./codex-thread-links.js";
 import type { JsonRpcProcessLaunch } from "./json-rpc.js";
@@ -800,10 +801,16 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
         try {
           result = await request("thread/resume", updatedParams, targetChannel);
         } catch (error) {
+          if (!isRecord(error)) throw error;
+          const providerMismatch =
+            error.code === -32600 && typeof error.message === "string"
+              ? /^failed to load configuration: Cannot change this thread's model provider from `[^`\r\n]+` to `([^`\r\n]+)` on resume\.$/u.exec(
+                  error.message,
+                )
+              : null;
           if (
-            !isRecord(error) ||
-            !isRecord(error.data) ||
-            error.data.type !== "modelProviderMismatch"
+            !(isRecord(error.data) && error.data.type === "modelProviderMismatch") &&
+            providerMismatch?.[1] !== selection.modelProvider
           )
             throw error;
           requiresFork = true;
@@ -982,6 +989,21 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
       rememberThread({ id: params.threadId, ...params.threadSettings });
     }
     if (
+      message.method === "error" &&
+      params?.willRetry === true &&
+      typeof params.threadId === "string" &&
+      typeof params.turnId === "string" &&
+      turnSelections.get(`${params.threadId}:${params.turnId}`)?.modelProvider === provider &&
+      isRecord(params.error) &&
+      typeof params.error.additionalDetails === "string"
+    ) {
+      const additionalDetails = stripCodexFailureTokenFooter(params.error.additionalDetails);
+      if (additionalDetails !== params.error.additionalDetails) {
+        send({ ...message, params: { ...params, error: { ...params.error, additionalDetails } } });
+        return;
+      }
+    }
+    if (
       message.method === "thread/tokenUsage/updated" &&
       typeof params?.threadId === "string" &&
       typeof params.turnId === "string"
@@ -1123,26 +1145,33 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
             const footerItem = recovered.completedItems.find(
               (item) => item.type === "agentMessage" && typeof item.text === "string",
             );
-            terminalTurns.set(key, {
-              threadId,
-              turnId: String(params.turn.id),
-              turn: {
-                id: params.turn.id,
-                status: params.turn.status,
-                durationMs: recovered.turn.durationMs,
-              },
-              footer:
-                typeof footerItem?.text === "string"
-                  ? footerItem.text.slice(footerItem.text.lastIndexOf("\n") + 1)
-                  : "",
-              footerItemId:
-                typeof footerItem?.id === "string"
-                  ? footerItem.id
-                  : `tidu_usage_${String(params.turn.id)}`,
-            });
-            if (terminalTurns.size > 32) {
-              const oldest = terminalTurns.keys().next().value;
-              if (oldest !== undefined) terminalTurns.delete(oldest);
+            const hasFailureUsage =
+              params.turn.status === "failed" &&
+              isRecord(params.turn.error) &&
+              typeof params.turn.error.message === "string" &&
+              stripCodexFailureTokenFooter(params.turn.error.message) !== params.turn.error.message;
+            if (!hasFailureUsage) {
+              terminalTurns.set(key, {
+                threadId,
+                turnId: String(params.turn.id),
+                turn: {
+                  id: params.turn.id,
+                  status: params.turn.status,
+                  durationMs: recovered.turn.durationMs,
+                },
+                footer:
+                  typeof footerItem?.text === "string"
+                    ? footerItem.text.slice(footerItem.text.lastIndexOf("\n") + 1)
+                    : "",
+                footerItemId:
+                  typeof footerItem?.id === "string"
+                    ? footerItem.id
+                    : `tidu_usage_${String(params.turn.id)}`,
+              });
+              if (terminalTurns.size > 32) {
+                const oldest = terminalTurns.keys().next().value;
+                if (oldest !== undefined) terminalTurns.delete(oldest);
+              }
             }
             const savedItemIds = new Set(
               (Array.isArray(saved.items) ? saved.items : [])
@@ -1305,20 +1334,28 @@ export const createCodexClientProxy = (options: CodexClientProxyOptions): CodexC
               const added: JsonObject[] = [];
               for (const turnId of turnIds) {
                 const records = byTurn.get(turnId) ?? [];
-                if (
-                  !records.some(
-                    (record) =>
+                const terminal = [...records]
+                  .reverse()
+                  .find(
+                    (record): record is { payload: JsonObject } =>
                       isRecord(record) &&
+                      record.type === "event_msg" &&
                       isRecord(record.payload) &&
-                      record.payload.type === "turn_aborted",
-                  )
-                )
-                  continue;
+                      (record.payload.type === "turn_aborted" ||
+                        (record.payload.type === "task_complete" &&
+                          isRecord(record.payload.error))),
+                  );
+                if (terminal === undefined) continue;
                 const existing = data
                   .filter((entry) => entry.turnId === turnId)
                   .map((entry) => entry.item);
                 const recovered = recoverCodexTurn(
-                  { id: turnId, status: "interrupted", items: existing },
+                  {
+                    id: turnId,
+                    status: terminal.payload.type === "turn_aborted" ? "interrupted" : "failed",
+                    error: terminal.payload.error,
+                    items: existing,
+                  },
                   records,
                   cwd,
                   provider,
