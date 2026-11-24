@@ -74,7 +74,7 @@ test("reuses only an exact successful checkout while refreshing push policies", 
   assert.match(state.commands[4], /project-policy\.mjs release-lines$/u);
   assert.match(state.messages.join(""), /Reused successful/u);
   const reused = state.messages.at(-1);
-  assert.match(reused, /local Node/u);
+  assert.match(reused, /^\[check\] 100% Reused successful validation \(3\/5 stages\).*local Node/u);
   assert.ok(reused.includes(process.version));
   assert.ok(reused.includes(`${process.platform}/${process.arch}`));
   assert.match(reused, /remote GitHub Quality not checked/u);
@@ -336,7 +336,7 @@ test("tracks broken dependency links consistently and falls back for external lo
   assert.equal(state.commands.length, 8);
 });
 
-test("real concurrent CLI checks execute one suite and a clean push reuses its result", {
+test("real CLI checks share exact results and show test logs only on local failure", {
   timeout: 30_000,
 }, async (context) => {
   const state = fixture(context);
@@ -353,7 +353,18 @@ test("real concurrent CLI checks execute one suite and a clean push reuses its r
   );
   writeFileSync(
     join(state.root, "phase.mjs"),
-    "import {appendFileSync,existsSync} from 'node:fs';import {setTimeout as delay} from 'node:timers/promises';appendFileSync('.cache/phases',process.argv[2]+'\\n');if(process.argv[2]==='tests')while(!existsSync('.cache/release'))await delay(10);\n",
+    `import {appendFileSync,existsSync} from 'node:fs';
+import {setTimeout as delay} from 'node:timers/promises';
+appendFileSync('.cache/phases',process.argv[2]+'\\n');
+if(process.argv[2]==='tests') {
+  console.log('test output marker');
+  while(!existsSync('.cache/release')) await delay(10);
+  if(existsSync('.cache/fail')) {
+    console.error('test failure details');
+    process.exitCode = 7;
+  }
+}
+`,
   );
   writeFileSync(
     join(state.root, "package.json"),
@@ -366,16 +377,18 @@ test("real concurrent CLI checks execute one suite and a clean push reuses its r
     }),
   );
   state.commit();
-  const launch = (refs) =>
+  const launch = ({ refs, releaseCandidate = false } = {}) =>
     new Promise((resolveRun, rejectRun) => {
       const child = spawn(
         process.execPath,
         [
           join(state.root, "scripts", "check-project.mjs"),
+          ...(releaseCandidate ? ["--release-candidate"] : []),
           ...(refs === undefined ? [] : ["--pre-push"]),
         ],
         {
           cwd: state.root,
+          env: { ...process.env, CI: "" },
           stdio: ["pipe", "pipe", "pipe"],
           signal: context.signal,
         },
@@ -400,10 +413,16 @@ test("real concurrent CLI checks execute one suite and a clean push reuses its r
   writeFileSync(join(state.root, ".cache", "release"), "ready\n");
   const [firstResult, secondResult] = await Promise.all([first, second]);
   assert.equal(firstResult.status, 0, firstResult.output);
+  assert.match(firstResult.output, /\[check\] 66% Running tests \(3\/3\)/u);
+  assert.match(firstResult.output, /\[check\] 100% Full validation passed/u);
+  assert.doesNotMatch(firstResult.output, /test output marker/u);
   assert.equal(secondResult.status, 0, secondResult.output);
   assert.match(secondResult.output, /Reused successful validation/u);
   assert.deepEqual(readFileSync(phases, "utf8").trim().split("\n"), ["versions", "lint", "tests"]);
-  const pushed = await launch(state.refs());
+  const candidate = await launch({ releaseCandidate: true });
+  assert.equal(candidate.status, 0, candidate.output);
+  assert.match(candidate.output, /100% Reused successful validation \(3\/3 stages\)/u);
+  const pushed = await launch({ refs: state.refs() });
   assert.equal(pushed.status, 0, pushed.output);
   assert.match(pushed.output, /Reused successful validation/u);
   assert.deepEqual(readFileSync(phases, "utf8").trim().split("\n"), [
@@ -413,4 +432,21 @@ test("real concurrent CLI checks execute one suite and a clean push reuses its r
     "branch",
     "release-lines",
   ]);
+
+  writeFileSync(join(state.root, "source.txt"), "changed source\n");
+  writeFileSync(join(state.root, ".cache", "fail"), "fail tests\n");
+  const failed = await launch({ refs: state.refs() });
+  assert.equal(failed.status, 7, failed.output);
+  assert.match(failed.output, /\[check\] 80% Running tests \(5\/5\)/u);
+  assert.match(failed.output, /test output marker/u);
+  assert.match(failed.output, /test failure details/u);
+  assert.doesNotMatch(failed.output, /\[check\] 100%/u);
+
+  rmSync(join(state.root, ".cache", "fail"));
+  const dirtyCandidate = await launch({ releaseCandidate: true });
+  assert.equal(dirtyCandidate.status, 0, dirtyCandidate.output);
+  assert.match(dirtyCandidate.output, /100% Full validation passed/u);
+  const dirtyRetry = await launch({ releaseCandidate: true });
+  assert.equal(dirtyRetry.status, 0, dirtyRetry.output);
+  assert.match(dirtyRetry.output, /100% Full validation passed/u);
 });

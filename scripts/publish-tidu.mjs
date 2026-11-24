@@ -688,7 +688,11 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
       if (!synchronizingPublishedVersion) {
         assertVersionIsUnpublished(RELEASE.packageName, candidateVersion, repositoryRoot);
       }
-      runCommand("npm", ["run", "check"], { cwd: repositoryRoot });
+      runCommand(
+        process.execPath,
+        [resolve(repositoryRoot, "scripts/check-project.mjs"), "--release-candidate"],
+        { cwd: repositoryRoot },
+      );
       runCommand("npm", ["pack", "--workspace", RELEASE.packageName, "--dry-run"], {
         cwd: repositoryRoot,
       });

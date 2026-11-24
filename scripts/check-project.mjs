@@ -149,8 +149,11 @@ export const validationFingerprint = (root, environment = process.env) => {
   return hash.digest("hex");
 };
 
+const hasCleanWorktree = (root) =>
+  git(root, ["status", "--porcelain", "--untracked-files=all"]).trim() === "";
+
 const matchesPush = (root, refs) => {
-  if (git(root, ["status", "--porcelain", "--untracked-files=all"]).trim() !== "") return false;
+  if (!hasCleanWorktree(root)) return false;
   const tree = git(root, ["rev-parse", "HEAD^{tree}"]).trim();
   return refs
     .trim()
@@ -245,14 +248,28 @@ const acquire = async (directory, output) => {
   };
 };
 
-const executeCommand = (command, args, options) =>
+const executeCommand = (command, args, { captureOutput, ...options }) =>
   new Promise((resolveExit) => {
     const child = spawn(command, args, {
       ...options,
-      stdio: "inherit",
+      stdio: captureOutput ? ["inherit", "pipe", "pipe"] : "inherit",
       // Batch launchers require a shell on Windows; these arguments are fixed check commands.
       shell: process.platform === "win32" && command.endsWith(".cmd"),
     });
+    const outputLimit = 512 * 1024;
+    let diagnosticTail = "";
+    let truncated = false;
+    if (captureOutput) {
+      for (const stream of [child.stdout, child.stderr]) {
+        stream.setEncoding("utf8").on("data", (chunk) => {
+          diagnosticTail += chunk;
+          if (diagnosticTail.length > outputLimit) {
+            diagnosticTail = diagnosticTail.slice(-outputLimit);
+            truncated = true;
+          }
+        });
+      }
+    }
     const terminate = () => child.kill("SIGTERM");
     const cancel = () => child.kill("SIGINT");
     process.once("SIGTERM", terminate);
@@ -264,6 +281,10 @@ const executeCommand = (command, args, options) =>
     child.once("close", (code) => {
       process.off("SIGTERM", terminate);
       process.off("SIGINT", cancel);
+      if (code !== 0 && diagnosticTail !== "") {
+        if (truncated) process.stderr.write("[check] Showing the end of the test output.\n");
+        process.stderr.write(diagnosticTail);
+      }
       resolveExit(code ?? 1);
     });
   });
@@ -271,6 +292,7 @@ const executeCommand = (command, args, options) =>
 /**
  * @param options.repositoryRoot Repository whose existing checks are executed.
  * @param options.prePush Whether fresh ref policies and exact-tree reuse are requested.
+ * @param options.releaseCandidate Whether an exact successful clean checkout may be reused.
  * @param options.refs Git's pending ref updates, never a shell command.
  * @param options.environment Check environment; only public runtime fields enter the digest.
  * @param options.execute Process adapter for isolated runner tests.
@@ -279,6 +301,7 @@ const executeCommand = (command, args, options) =>
 export const runProjectCheck = async ({
   repositoryRoot,
   prePush = false,
+  releaseCandidate = false,
   refs = "",
   environment = process.env,
   execute = executeCommand,
@@ -287,21 +310,36 @@ export const runProjectCheck = async ({
   if (prePush && refs.trim() === "") return 0;
   const started = performance.now();
   const validationScope = `local Node ${process.version}, ${process.platform}/${process.arch}; remote GitHub Quality not checked`;
+  const pushPolicies = prePush ? ["branch", "release-lines"] : [];
+  const policy = (...args) => [join(repositoryRoot, "scripts", "project-policy.mjs"), ...args];
+  const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+  const validationStages = [
+    ["versions", process.execPath, policy("versions")],
+    ["lint", npm, ["run", "lint"]],
+    ["tests", npm, ["test"]],
+  ];
+  const totalStages = pushPolicies.length + validationStages.length;
+  let completedStages = 0;
+  const progress = (message) => {
+    const percentage = Math.floor((completedStages / totalStages) * 100);
+    output(`[check] ${percentage}% ${message}\n`);
+  };
   const run = async (label, command, args) => {
-    const begin = performance.now();
-    const code = await execute(command, args, { cwd: repositoryRoot, env: environment });
-    output(
-      `[check] ${label}: ${((performance.now() - begin) / 1000).toFixed(2)}s${code === 0 ? "" : " (failed)"}\n`,
-    );
+    progress(`Running ${label} (${completedStages + 1}/${totalStages})`);
+    const code = await execute(command, args, {
+      cwd: repositoryRoot,
+      env: environment,
+      captureOutput: label === "tests" && !environment.CI,
+    });
+    if (code !== 0) progress(`${label} failed (exit ${code})`);
     return code;
   };
-  const policy = (...args) => [join(repositoryRoot, "scripts", "project-policy.mjs"), ...args];
-  if (prePush) {
-    for (const name of ["branch", "release-lines"]) {
-      const code = await run(name, process.execPath, policy(name));
-      if (code !== 0) return code;
-    }
+  for (const name of pushPolicies) {
+    const code = await run(name, process.execPath, policy(name));
+    if (code !== 0) return code;
+    completedStages += 1;
   }
+  progress("Checking local validation state");
   const directory = resolve(
     repositoryRoot,
     git(repositoryRoot, ["rev-parse", "--git-path", "tidu-validation"]).trim(),
@@ -330,45 +368,48 @@ export const runProjectCheck = async ({
     const before = fingerprint();
     const prior = readJson(receiptPath);
     const joined = lock.waitedFor !== undefined;
-    const eligible = !prePush || matchesPush(repositoryRoot, refs);
+    const eligible = prePush
+      ? matchesPush(repositoryRoot, refs)
+      : !releaseCandidate || hasCleanWorktree(repositoryRoot);
     const canReuse =
       before !== undefined &&
       prior?.fingerprint === before &&
       Number.isInteger(prior?.status) &&
       prior.status >= 0 &&
       prior.status <= 255 &&
-      ((joined && prior.status !== 0) || (prior.status === 0 && eligible && (joined || prePush)));
+      ((joined && prior.status !== 0) ||
+        (prior.status === 0 && eligible && (joined || prePush || releaseCandidate)));
     if (canReuse) {
       record(prior);
       const failedStage = ["versions", "lint", "tests"].includes(prior.failedStage)
         ? ` at ${prior.failedStage}`
         : "";
-      output(
-        `[check] ${prior.status === 0 ? "Reused successful validation" : `Shared validation failed${failedStage}`} (${validationScope}): ${((performance.now() - started) / 1000).toFixed(2)}s\n`,
+      if (prior.status === 0) completedStages = totalStages;
+      progress(
+        `${prior.status === 0 ? `Reused successful validation (${validationStages.length}/${totalStages} stages)` : `Shared validation failed${failedStage}`} (${validationScope}): ${((performance.now() - started) / 1000).toFixed(2)}s`,
       );
       return prior.status;
     }
     rmSync(receiptPath, { force: true });
-    const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-    for (const [label, command, args] of [
-      ["versions", process.execPath, policy("versions")],
-      ["lint", npm, ["run", "lint"]],
-      ["tests", npm, ["test"]],
-    ]) {
+    for (const [label, command, args] of validationStages) {
       const status = await run(label, command, args);
       if (status !== 0) {
         record({ fingerprint: before, status, failedStage: label });
         return status;
       }
+      if (label !== "tests") completedStages += 1;
     }
     const after = fingerprint();
     const status = before !== after ? 1 : 0;
     record({ fingerprint: after, status });
-    output(
-      status === 0
-        ? `[check] Full validation passed (${validationScope}): ${((performance.now() - started) / 1000).toFixed(2)}s\n`
-        : "[check] Inputs changed during validation; a fresh check is required.\n",
-    );
+    if (status === 0) {
+      completedStages = totalStages;
+      progress(
+        `Full validation passed (${validationScope}): ${((performance.now() - started) / 1000).toFixed(2)}s`,
+      );
+    } else {
+      progress("Inputs changed during validation; a fresh check is required.");
+    }
     return status;
   } finally {
     process.off("exit", releaseOnExit);
@@ -384,6 +425,7 @@ if (entryPath !== undefined && import.meta.url === pathToFileURL(realpathSync(en
     process.exitCode = await runProjectCheck({
       repositoryRoot: root,
       prePush,
+      releaseCandidate: process.argv.includes("--release-candidate"),
       refs: prePush ? readFileSync(0, "utf8") : "",
     });
   } catch (error) {
