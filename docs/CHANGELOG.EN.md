@@ -9,6 +9,8 @@ This file records user-visible changes in every public AI-Tidu9 release. Compati
 
 ## Unreleased
 
+## 1.1.2 - 2026-11-24
+
 - Route explicit requests to invoke a declared tool and active Codex tool results through a model assigned tool use. Plain text requests can still use the text model when they carry an optional tool catalog.
 - Continue the current Codex turn when a subagent message arrives. Completed tool results are carried forward as history, repeated requests share one generation step, and conflicting tool results are still rejected.
 - Fix false Codex continuation conflicts when a retry returns reasoning or commentary already emitted during the interrupted delivery. Preserve native continuation when newer Codex versions report a Provider mismatch as a plain error during mode switching.
