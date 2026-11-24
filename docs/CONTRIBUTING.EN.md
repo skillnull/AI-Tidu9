@@ -92,6 +92,7 @@ Versions follow SemVer. Prereleases are limited to `alpha.N`, `beta.N`, and `rc.
 - Before the first stable release, the newest public prerelease updates its channel and `latest`. Afterwards, only stable releases update `latest`.
 - `npm run publish:tidu` prepares the version and Changelog, prints a concise summary, and requires exact-version confirmation.
 - The release script pushes the release commit and waits for a successful branch `Quality` run, then pushes the immutable Tag and waits for its `Quality` run. Any remote failure stops the flow before npm publication.
+- On retry, a live lookup skips the branch push only if the release branch on `origin` already points to the exact release commit. A remote Tag pointing to the same commit is not pushed again. Both branch and Tag `Quality` checks must pass before npm publication.
 - `npm run publish:tidu -- --dry-run` validates an already prepared release without writing, tagging, or publishing.
 - Never commit release changes, push, tag, or publish without explicit maintainer confirmation.
 

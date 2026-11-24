@@ -285,6 +285,33 @@ const waitForQualityWorkflow = async (headCommit, headBranch) => {
   throw new Error(`Timed out waiting for GitHub Quality on ${headBranch}.`);
 };
 
+export const ensureReleaseBranchQuality = async (
+  { repositoryRoot, branchName, releaseCommit, colorEnabled = false },
+  {
+    read = readCommand,
+    run = runCommand,
+    waitForQuality = waitForQualityWorkflow,
+    output = (message) => process.stdout.write(message),
+  } = {},
+) => {
+  const branchRef = `refs/heads/${branchName}`;
+  const commandOptions = { cwd: repositoryRoot };
+  const remoteRefs = read(
+    "git",
+    ["ls-remote", "--exit-code", "--refs", "origin", branchRef],
+    commandOptions,
+  );
+  if (remoteRefs.split(/\r?\n/u).includes(`${releaseCommit}\t${branchRef}`)) {
+    output(`Origin ${branchName} already matches the release commit; skipping branch push.\n`);
+  } else {
+    run("git", ["push", "origin", branchName], commandOptions);
+  }
+  output(
+    `${applyTerminalColor("Waiting for branch Quality checks...", "magenta", colorEnabled)}\n`,
+  );
+  await waitForQuality(releaseCommit, branchName);
+};
+
 export const parseGitStatusPaths = (status) =>
   status
     .split(/\r?\n/u)
@@ -728,13 +755,12 @@ const prepareAndPublishInteractively = async (repositoryRoot) => {
       cwd: repositoryRoot,
     });
     releaseCommitPrepared = true;
-    runCommand("git", ["push", "origin", initialContext.branchName], {
-      cwd: repositoryRoot,
+    await ensureReleaseBranchQuality({
+      repositoryRoot,
+      branchName: initialContext.branchName,
+      releaseCommit,
+      colorEnabled,
     });
-    process.stdout.write(
-      `${applyTerminalColor("Waiting for branch Quality checks...", "magenta", colorEnabled)}\n`,
-    );
-    await waitForQualityWorkflow(releaseCommit, initialContext.branchName);
 
     const releaseTag = `v${candidateVersion}`;
     runCommand("npm", ["run", "policy", "--", "tag", releaseTag], {

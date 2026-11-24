@@ -147,6 +147,7 @@ flowchart LR
 - 首个稳定版之前，最新公开预发布同时更新所属渠道和 `latest`；稳定版之后，只有稳定版本更新 `latest`。
 - 发布入口是 `npm run publish:tidu`。它准备版本和 Changelog、展示摘要并要求输入完整版本号确认。
 - 发布脚本先推送发布提交并等待分支 `Quality` 成功，再推送不可变 Tag 并等待 Tag `Quality` 成功；任一远端门禁失败都会在 npm 发布前停止。
+- 续发时，如果实时查询确认 `origin` 上的发布分支已经指向同一提交，则不重复推送分支。已指向同一提交的远端 Tag 也不重复推送。分支和 Tag 的 `Quality` 都必须通过，才会发布 npm。
 - `npm run publish:tidu -- --dry-run` 只验证已准备版本，不写入、不打 Tag、不发布。
 - 未经维护者明确确认，禁止提交发布变更、推送、打 Tag 或发布 npm。
 

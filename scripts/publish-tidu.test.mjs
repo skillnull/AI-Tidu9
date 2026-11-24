@@ -7,6 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  ensureReleaseBranchQuality,
   formatPublishedPackageSyncFailure,
   formatPublishFailure,
   formatPublishSuccess,
@@ -284,6 +285,69 @@ test("selects only the newest Quality run for the exact release ref and commit",
 
   assert.equal(selected?.id, 12);
   assert.equal(selectQualityWorkflowRun([], "release-commit", "main"), undefined);
+});
+
+test("resumes a release already pushed to origin but still requires branch Quality", async () => {
+  const progress = [];
+  const qualityFailure = new Error("Branch Quality failed.");
+  await assert.rejects(
+    ensureReleaseBranchQuality(
+      { repositoryRoot: "repository", branchName: "main", releaseCommit: "release-commit" },
+      {
+        read: (...call) => {
+          assert.deepEqual(call, [
+            "git",
+            ["ls-remote", "--exit-code", "--refs", "origin", "refs/heads/main"],
+            { cwd: "repository" },
+          ]);
+          return "release-commit\trefs/heads/main";
+        },
+        run: () => assert.fail("An already-pushed release must not invoke git push."),
+        waitForQuality: async (...call) => {
+          assert.deepEqual(call, ["release-commit", "main"]);
+          throw qualityFailure;
+        },
+        output: (message) => progress.push(message),
+      },
+    ),
+    qualityFailure,
+  );
+  assert.match(progress[0], /skipping branch push/u);
+  assert.match(progress[1], /Waiting for branch Quality/u);
+});
+
+test("pushes a release with a different origin branch tip before waiting for Quality", async () => {
+  const calls = [];
+  await ensureReleaseBranchQuality(
+    { repositoryRoot: "repository", branchName: "support/1.x", releaseCommit: "release-commit" },
+    {
+      read: () => "previous-commit\trefs/heads/support/1.x\nrelease-commit\trefs/heads/main",
+      run: (...call) => calls.push(call),
+      waitForQuality: async (...call) => calls.push(call),
+      output: () => {},
+    },
+  );
+  assert.deepEqual(calls, [
+    ["git", ["push", "origin", "support/1.x"], { cwd: "repository" }],
+    ["release-commit", "support/1.x"],
+  ]);
+});
+
+test("stops the release if querying the origin branch fails", async () => {
+  const remoteFailure = new Error("Cannot read origin.");
+  await assert.rejects(
+    ensureReleaseBranchQuality(
+      { repositoryRoot: "repository", branchName: "main", releaseCommit: "release-commit" },
+      {
+        read: () => {
+          throw remoteFailure;
+        },
+        run: () => assert.fail("Remote lookup failure must not trigger a push."),
+        waitForQuality: async () => assert.fail("Remote lookup failure must stop the release."),
+      },
+    ),
+    remoteFailure,
+  );
 });
 
 test("accepts a clean tagged release context", () => {
