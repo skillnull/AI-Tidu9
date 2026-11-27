@@ -3,7 +3,7 @@
   <p><strong>面向全领域场景的智能协作中枢</strong></p>
   <p>用一个目标，调度模型、Agent、Skill、MCP、工具、知识与专家，交付可验证结果。</p>
   <p>
-    <a href="https://www.npmjs.com/package/@skillnull/tidu"><img alt="npm version" src="https://img.shields.io/npm/v/%40skillnull%2Ftidu?label=npm&color=0f766e"></a>
+    <a href="https://www.npmjs.com/package/@skillnull/tidu">npm: @skillnull/tidu</a>
     <a href="https://github.com/skillnull/AI-Tidu9/actions/workflows/quality.yml"><img alt="quality" src="https://github.com/skillnull/AI-Tidu9/actions/workflows/quality.yml/badge.svg"></a>
     <img alt="Node.js" src="https://img.shields.io/badge/Node.js-%E2%89%A522.14-3c873a">
     <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/license-AGPL--3.0--only-2563eb"></a>
